@@ -55,6 +55,8 @@ pub struct Parts {
     pub render: Box<dyn Render>,
     /// Git reads in the repo the caller stands in (`show` text, `eval verify-gold`, `gc`).
     pub repo: Box<dyn Repo>,
+    /// Opens another circle's repo (a tree circle of another root), for `show`.
+    pub open_repo: RepoOpener,
     /// The index store (`gc`).
     pub store: Box<dyn Store>,
     pub cwd: PathBuf,
@@ -70,7 +72,7 @@ fn wire() -> Result<Parts, Error> {
     let open_repo: RepoOpener = std::rc::Rc::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
     let mut opener = Opener::new(
         Box::new(GitRepo::open(&cwd)?),
-        open_repo,
+        open_repo.clone(),
         Box::new(FsStore::new(index.clone())),
         Box::new(Extractor::citing(CircleName(circles::MAKEPAD.into()), RevSpec::Pinned("HEAD".into()))),
         Box::new(Terms),
@@ -83,6 +85,7 @@ fn wire() -> Result<Parts, Error> {
         search: Box::new(Engine::default()),
         render: Box::new(Renderer),
         repo: Box::new(repo),
+        open_repo,
         store: Box::new(FsStore::new(index)),
         cwd,
     })
@@ -302,11 +305,31 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
             };
             let rev = handle.rev.clone().map(RevSpec::Pinned).unwrap_or_else(|| rev_of(&a));
             let opened = parts.circles.open(&manifest, &bases(&manifest, &exprs)?, &rev)?;
-            let found = parts.search.resolve(&opened, &handle)?;
+            let mut found = parts.search.resolve(&opened, &handle)?;
+            // a range `a-b` prints exactly those lines; when no one item holds them, the file does
+            let range = match &handle.target {
+                Target::Lines { path, lines } if lines.start > 0 && lines.end > lines.start => Some((path.clone(), *lines)),
+                _ => None,
+            };
+            if let (true, Some((path, _))) = (found.is_empty(), &range) {
+                let file = Handle { target: Target::Lines { path: path.clone(), lines: Lines::default() }, ..handle.clone() };
+                found = parts.search.resolve(&opened, &file)?;
+            }
             let Some(at) = found.first() else {
                 return Err(Failure::Error(Error::Rev(format!("no record at {handle_text}"))));
             };
-            let shown = show(parts.repo.as_mut(), &manifest, &opened, *at, handle, context, a.has("--all"))?;
+            // the circle's own repo: another root's blobs and worktree files are not the caller's
+            let mut other: Option<Box<dyn Repo>> = None;
+            if let Some(root) = circle_root(&manifest, &opened.open[at.circle].name) {
+                if !crate::open::same_dir(&root, &parts.repo.root()) {
+                    other = Some((parts.open_repo)(&root)?);
+                }
+            }
+            let repo: &mut dyn Repo = match other.as_mut() {
+                Some(r) => r.as_mut(),
+                None => parts.repo.as_mut(),
+            };
+            let shown = show(repo, &manifest, &opened, *at, handle, ShowSpan { range: range.map(|(_, l)| l), context, all: a.has("--all") })?;
             emit(parts, out, &Output::Show(Box::new(shown)), a.has("--json"))
         }
         "crate" => {
@@ -504,15 +527,24 @@ fn status(manifest: &CircleManifest, opened: &Opened) -> StatusOutput {
 }
 
 /// The record a [`Located`] names, as `show` prints it.
-fn show(
-    repo: &mut dyn Repo,
-    manifest: &CircleManifest,
-    opened: &Opened,
-    at: Located,
-    handle: Handle,
+/// The root of a tree or history circle's repo.
+fn circle_root(manifest: &CircleManifest, name: &CircleName) -> Option<PathBuf> {
+    match circles::find_def(manifest, name).map(|d| &d.body) {
+        Some(crate::CircleBody::Base(crate::BaseCircle { source: crate::BaseSource::Tree { root } | crate::BaseSource::History { root, .. }, .. })) => Some(root.clone()),
+        _ => None,
+    }
+}
+
+/// Which lines `show` prints.
+struct ShowSpan {
+    /// An explicit range (`path:a-b`): exactly those lines, whatever item holds them.
+    range: Option<Lines>,
     context: u32,
     all: bool,
-) -> Result<ShowOutput, Failure> {
+}
+
+fn show(repo: &mut dyn Repo, manifest: &CircleManifest, opened: &Opened, at: Located, handle: Handle, span: ShowSpan) -> Result<ShowOutput, Failure> {
+    let ShowSpan { range, context, all } = span;
     let c = &opened.open[at.circle];
     let (kind, path, lines, name, package, blob, commit, detail) = match at.at {
         ChunkAt::Segment { segment, chunk } => {
@@ -527,10 +559,17 @@ fn show(
     let overlay = matches!(at.at, ChunkAt::Overlay { .. });
     let source = source_text(repo, manifest, c, &Src { path: &path, blob, commit, detail: &detail, overlay })?;
     let all_lines: Vec<&str> = source.lines().collect();
-    let (from, to) = if kind.family() == crate::Family::Commit || lines.start == 0 {
-        (1, all_lines.len() as u32)
-    } else {
-        (lines.start.saturating_sub(context).max(1), (lines.end + context).min(all_lines.len() as u32))
+    let n = all_lines.len() as u32;
+    // a range no one item holds is the file's: say so rather than name an item
+    let (kind, name) = match range {
+        Some(r) if !(lines.start <= r.start && lines.end >= r.end) || lines.start == 0 => (crate::Kind::File, path.rsplit('/').next().unwrap_or(&path).to_string()),
+        _ => (kind, name),
+    };
+    let (from, to) = match range {
+        Some(r) if r.start > n => return Err(Failure::Error(Error::Rev(format!("{path} has {n} lines; {}-{} is past its end", r.start, r.end)))),
+        Some(r) => (r.start.saturating_sub(context).max(1), (r.end + context).min(n)),
+        None if kind.family() == crate::Family::Commit || lines.start == 0 => (1, n),
+        None => (lines.start.saturating_sub(context).max(1), (lines.end + context).min(n)),
     };
     let span: Vec<String> = all_lines.iter().skip(from as usize - 1).take((to + 1).saturating_sub(from) as usize).map(|s| s.to_string()).collect();
     let cap = if all { span.len() } else { SHOW_MAX_LINES.min(span.len()) };
@@ -779,10 +818,73 @@ mod tests {
             search: Box::new(EchoSearch(seen.clone())),
             render: Box::new(DebugRender),
             repo: Box::new(show_repo),
+            open_repo: Rc::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display())))),
             store: Box::new(store.clone()),
             cwd: root.join("src"),
         };
         (p, seen, root, store)
+    }
+
+    /// Parts over the real extractor and query engine, the fake repo `repo` (shown from a twin
+    /// made by `twin`) and `open_repo` for other roots.
+    fn real_parts(repo: FakeRepo, twin: FakeRepo, open_repo: RepoOpener, conf: &Path, cwd: PathBuf) -> Parts {
+        let store = crate::open::fakes::FakeStore::default();
+        let o = Opener::new(Box::new(repo), open_repo.clone(), Box::new(store.clone()), Box::new(Extractor::new()), Box::new(Terms), conf.to_path_buf(), cwd.clone());
+        Parts {
+            circles: Box::new(o),
+            search: Box::new(Engine::default()),
+            render: Box::new(Renderer),
+            repo: Box::new(twin),
+            open_repo,
+            store: Box::new(store),
+            cwd,
+        }
+    }
+
+    #[test]
+    fn show_prints_exactly_the_range_asked_for() {
+        let root = std::env::temp_dir().join(format!("repo-index-cli-range-{}", std::process::id())).join("makepad");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let files: &[(&str, &str)] = &[
+            ("src/a.rs", "// one\nfn alpha() {\n    1\n}\nfn beta() {\n    2\n}\n// eight\n"),
+            ("docs/d.md", "# Top\nintro\n## First\none\ntwo\n## Second\nthree\nfour\n"),
+        ];
+        let make = || {
+            let mut r = FakeRepo::new(&root);
+            r.rev(&["HEAD", "refs/remotes/upstream/work"], 1, files);
+            r
+        };
+        let fail: RepoOpener = Rc::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display()))));
+        let mut p = real_parts(make(), make(), fail, &root.join("none.conf"), root.clone());
+        let body = |out: &str| out.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+        // across two items: exactly lines 3-6, not the file from line 1
+        let (code, out, err) = call(&mut p, &["show", "src/a.rs:3-6"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(body(&out), ["    1", "}", "fn beta() {", "    2"], "{out}");
+        // inside one item: still exactly the range
+        let (_, out, _) = call(&mut p, &["show", "src/a.rs:5-6"]);
+        assert_eq!(body(&out), ["fn beta() {", "    2"], "{out}");
+        // a markdown range across two sections resolves against the file
+        let (code, out, err) = call(&mut p, &["show", "docs/d.md:4-7"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(body(&out), ["one", "two", "## Second", "three"], "{out}");
+        // past the end is said, not an empty print
+        let (code, _, err) = call(&mut p, &["show", "src/a.rs:40-50"]);
+        assert!(code == 1 && err.contains("past its end"), "{err}");
+    }
+
+    #[test]
+    fn show_reads_another_repos_circle_from_that_repo() {
+        let top = std::env::temp_dir().join(format!("repo-index-cli-tworepos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (main, open_repo, conf) = crate::open::fakes::two_repos(&top);
+        let mut twin = FakeRepo::new(&top.join("makepad"));
+        twin.rev(&["HEAD", "refs/remotes/upstream/work"], 1, &[("a.rs", "fn a() {}\n")]);
+        let mut p = real_parts(main, twin, open_repo, &conf, top.join("makepad"));
+        let (code, out, err) = call(&mut p, &["show", "ext/ext.rs:1"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("fn unique_ext_gadget() {}"), "{out}");
     }
 
     fn call(p: &mut Parts, args: &[&str]) -> (i32, String, String) {

@@ -69,7 +69,8 @@ impl Opener {
     }
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// Whether two paths name one directory.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
 }
@@ -652,15 +653,31 @@ fn branch_files(repo: &mut dyn Repo, at: &Rev, tips: &[Oid], tree: Option<&BaseC
     Ok(out)
 }
 
-/// A reader of the repo at `root`'s blobs that opens its handle on the first read.
-fn lazy_blobs(open_repo: RepoOpener, root: PathBuf) -> BlobReader {
-    let repo: RefCell<Option<Box<dyn Repo>>> = RefCell::new(None);
+/// A reader of the blobs of the repos at `roots` (the caller's first, then each other root an
+/// opened circle stands on), each repo opened on its first read. A blob id names its content, so
+/// the first repo that holds it gives the same bytes as any other; a blob none holds is an error
+/// naming every repo's answer.
+fn lazy_blobs(open_repo: RepoOpener, roots: Vec<PathBuf>) -> BlobReader {
+    let repos: RefCell<Vec<Option<Box<dyn Repo>>>> = RefCell::new(roots.iter().map(|_| None).collect());
     Box::new(move |oid| {
-        let mut r = repo.borrow_mut();
-        if r.is_none() {
-            *r = Some(open_repo(&root)?);
+        let mut repos = repos.borrow_mut();
+        let mut errors = Vec::new();
+        for (root, slot) in roots.iter().zip(repos.iter_mut()) {
+            if slot.is_none() {
+                match open_repo(root) {
+                    Ok(r) => *slot = Some(r),
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", root.display()));
+                        continue;
+                    }
+                }
+            }
+            match slot.as_mut().expect("opened above").read_blob(oid) {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => errors.push(format!("{}: {e}", root.display())),
+            }
         }
-        r.as_mut().expect("opened above").read_blob(oid)
+        Err(Error::Git(format!("blob {} is in no opened repo ({})", hex(&oid), errors.join("; "))))
     })
 }
 
@@ -742,7 +759,15 @@ impl Circles for Opener {
                 }
             }
         }
-        let blobs = Some(lazy_blobs(self.open_repo.clone(), self.repo.root()));
+        let mut roots = vec![self.repo.root()];
+        for c in open.iter().chain(&others) {
+            if let Some(CircleBody::Base(BaseCircle { source: BaseSource::Tree { root } | BaseSource::History { root, .. }, .. })) = circles::find_def(manifest, &c.name).map(|d| &d.body) {
+                if !roots.iter().any(|r| same_dir(r, root)) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        let blobs = Some(lazy_blobs(self.open_repo.clone(), roots));
         Ok(Opened { open, others, unbuilt, blobs })
     }
 }
@@ -1172,6 +1197,29 @@ pub(crate) mod fakes {
         }
     }
 
+    /// A main repo at `top/makepad` and a second one at `top/ext` holding `ext.rs`, with
+    /// `ext = tree <top/ext>` configured; the opener opens the second through its repo opener.
+    pub fn two_repos(top: &Path) -> (FakeRepo, crate::open::RepoOpener, PathBuf) {
+        let root = top.join("makepad");
+        let ext = top.join("ext");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&ext).unwrap();
+        let mut main = FakeRepo::new(&root);
+        main.rev(&["HEAD", "refs/remotes/upstream/work"], 1, &[("a.rs", "fn a() {}\n")]);
+        let ext_root = ext.clone();
+        let open_repo: crate::open::RepoOpener = Rc::new(move |p: &Path| {
+            if !crate::open::same_dir(p, &ext_root) {
+                return Err(Error::Git(format!("no repo at {}", p.display())));
+            }
+            let mut r = FakeRepo::new(&ext_root);
+            r.rev(&["HEAD"], 5, &[("ext.rs", "fn unique_ext_gadget() {}\nfn second() {}\n")]);
+            Ok(Box::new(r) as Box<dyn Repo>)
+        });
+        let conf = top.join("circles.conf");
+        std::fs::write(&conf, format!("ext = tree {}\n", ext.display())).unwrap();
+        (main, open_repo, conf)
+    }
+
     /// An [`Opener`](crate::open::Opener) over the fakes for a repo at `root` (the store is
     /// returned too, for inspection).
     pub fn opener(repo: FakeRepo, conf: &Path) -> (crate::open::Opener, FakeStore) {
@@ -1545,6 +1593,23 @@ mod tests {
         let before = notes_stamp(&sources, &def).unwrap();
         std::fs::write(real.join("doc.md"), "beta_after_edit\n").unwrap();
         assert_ne!(notes_stamp(&sources, &def).unwrap(), before, "an edit behind a link restamps");
+    }
+
+    #[test]
+    fn blobs_of_another_repos_circle_are_read_from_that_repo() {
+        let top = scratch("tworepos");
+        let (main, open_repo, conf) = two_repos(&top);
+        let mut ext = open_repo(&top.join("ext")).unwrap();
+        let tree = ext.resolve(&RevSpec::Pinned("HEAD".into())).unwrap().tree;
+        let blob = ext.files(tree).unwrap()[0].blob;
+        let store = FakeStore::default();
+        let mut o = Opener::new(Box::new(main), open_repo, Box::new(store), Box::new(FakeExtract), Box::new(FakeTokenize), conf, top.clone());
+        let m = o.manifest().unwrap();
+        let opened = o.open(&m, &[n("ext")], &RevSpec::Worktree).unwrap();
+        let read = opened.blobs.as_ref().unwrap();
+        assert_eq!(read(blob).unwrap(), b"fn unique_ext_gadget() {}\nfn second() {}\n");
+        let e = read(oid(0xee)).unwrap_err().to_string();
+        assert!(e.contains("is in no opened repo"), "{e}");
     }
 
     #[test]
