@@ -670,13 +670,13 @@ mod tests {
     fn pointer_lines_wrap_whole() {
         let p = |c: &str, n| Pointer { circle: Some(circle(c)), branch: None, count: n, unit: PointerUnit::Blobs, commits: 0, sample: String::new() };
         let mut pointers: Vec<Pointer> = (0..6).map(|i| p(&format!("notes:a-rather-long-topic-name-{i}"), 10 + i)).collect();
-        pointers.push(Pointer { circle: None, branch: Some("work".into()), count: 3, unit: PointerUnit::Files, commits: 1, sample: "a9e2df5db next-solver 2x recursion_limit root retry".into() });
+        pointers.push(Pointer { circle: None, branch: Some("work".into()), count: 3, unit: PointerUnit::Files, commits: 1, sample: "1234abcde next-solver 2x recursion_limit root retry".into() });
         let text = Renderer.text(&Output::Find(FindOutput { blocks: Vec::new(), pointers }));
         assert!(text.lines().all(|l| l.chars().count() <= MAX_LINE_CHARS), "{text}");
         for i in 0..6 {
             assert!(text.contains(&format!("notes:a-rather-long-topic-name-{i} {} files", 10 + i)), "{text}");
         }
-        assert!(text.contains("branch work: 3 files in 1 commit not upstream (a9e2df5db next-solver 2x recursion_limit root retry)"), "{text}");
+        assert!(text.contains("branch work: 3 files in 1 commit not upstream (1234abcde next-solver 2x recursion_limit root retry)"), "{text}");
         assert!(text.starts_with("also: ") && text.lines().skip(1).all(|l| l.starts_with("      ")), "{text}");
     }
 
