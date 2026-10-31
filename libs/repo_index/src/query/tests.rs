@@ -427,7 +427,7 @@ fn absence_is_an_answer_with_nearest_hits() {
     assert!(b.nearest.iter().any(|h| h.name.to_lowercase().contains("spin")));
     let text = Renderer.text(&Output::Find(out));
     assert!(text.starts_with("makepad @"), "{text}");
-    assert!(text.lines().next().unwrap().ends_with(" · absent: 0 definitions, 0 uses"), "{text}");
+    assert!(text.lines().next().unwrap().ends_with(" · 0 definitions, 0 uses · absent: spin_wheel_limit"), "{text}");
     assert!(text.contains("nearest:"), "{text}");
 }
 
@@ -757,6 +757,12 @@ fn a_missing_named_thing_is_absent_beside_present_words() {
     // An identifier with no whole-word match, next to present words.
     let b = &find(&o, &query("is spin_wheel_limit in gizmo", &["makepad"])).blocks[0];
     assert!(b.absent);
+    assert_eq!(b.absent_terms, ["spin_wheel_limit"]);
+    let header = Renderer.text(&Output::Find(FindOutput { blocks: vec![b.clone()], pointers: Vec::new() }));
+    assert!(header.lines().next().unwrap().ends_with("uses · absent: spin_wheel_limit"), "{header}");
+    // Nothing matches at all: every content word is absent, function words aside.
+    let b = &find(&o, &query("where is zzqx_none wombat", &["makepad"])).blocks[0];
+    assert_eq!(b.absent_terms, ["zzqx_none", "wombat"]);
     // Present things are never absent.
     for q in ["alpha/src/lib.rs", "clamp_turn in beta", "what is fixture-beta", "MAX_TURN"] {
         assert!(!find(&o, &query(q, &["makepad"])).blocks[0].absent, "{q}");
