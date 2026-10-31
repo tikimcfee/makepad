@@ -14,8 +14,8 @@
 //! hits of an absent term (`recursion_depth_exceeding_limit` reaches `recursion_limit`).
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
-use makepad_search::fold;
 
 use crate::{Chunk, Field, FieldTerms, QueryTerm, TermForm, TermOcc, Tokenize};
 
@@ -26,23 +26,39 @@ pub struct Terms;
 impl Tokenize for Terms {
     fn chunk_terms(&self, chunk: &Chunk) -> FieldTerms {
         let f = &chunk.fields;
-        let mut counts: HashMap<(usize, TermForm, String), u32> = HashMap::new();
+        // Count each distinct word per field first: folding and splitting then run once per
+        // distinct word, and no term is allocated per occurrence.
+        let mut seen: HashMap<(usize, &str), u32, BuildHasherDefault<WordHasher>> = HashMap::default();
         let mut lengths = [0u32; 5];
         for (at, text) in [&f.name, &f.path, &f.sig, &f.doc, &f.body].into_iter().enumerate() {
             for word in words(text) {
                 lengths[at] += 1;
-                for (form, term) in word_terms(word) {
-                    *counts.entry((at, form, term)).or_insert(0) += 1;
+                *seen.entry((at, word)).or_insert(0) += 1;
+            }
+        }
+        // Distinct words can share a term (`Foo` and `foo` fold alike; `id` is a part of many):
+        // order by (field, form, hash of the text), cheap to compare, then merge equal texts.
+        let mut raw: Vec<(u64, TermOcc)> = Vec::with_capacity(seen.len() * 2);
+        for ((at, word), n) in seen {
+            for (form, text) in word_terms(word) {
+                let mut h = WordHasher::default();
+                h.write(text.as_bytes());
+                let key = ((at as u64) << 60) | ((form_index(form) as u64) << 58) | (h.finish() >> 6);
+                raw.push((key, TermOcc { field: Field::ALL[at], form, text, tf: n }));
+            }
+        }
+        raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.text.cmp(&b.1.text)));
+        let mut terms: Vec<TermOcc> = Vec::with_capacity(raw.len());
+        let mut last_key = None;
+        for (key, t) in raw {
+            match terms.last_mut() {
+                Some(prev) if last_key == Some(key) && prev.text == t.text => prev.tf += t.tf,
+                _ => {
+                    last_key = Some(key);
+                    terms.push(t);
                 }
             }
         }
-        let mut terms: Vec<TermOcc> = counts
-            .into_iter()
-            .map(|((at, form, text), tf)| TermOcc { field: Field::ALL[at], form, text, tf })
-            .collect();
-        terms.sort_by(|a, b| {
-            (field_index(a.field), form_index(a.form), &a.text).cmp(&(field_index(b.field), form_index(b.form), &b.text))
-        });
         FieldTerms { terms, lengths }
     }
 
@@ -60,6 +76,27 @@ impl Tokenize for Terms {
             }
         }
         out
+    }
+}
+
+/// A fast, unseeded hasher for a chunk's words (FxHash's multiply-rotate). Only for maps that
+/// live inside one call; nothing persisted depends on it.
+#[derive(Default)]
+pub struct WordHasher(u64);
+
+impl Hasher for WordHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(b)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -83,13 +120,31 @@ fn form_index(form: TermForm) -> u8 {
 }
 
 /// The words of a text: runs of alphanumerics and `_` holding at least one alphanumeric.
-pub fn words(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|w| w.chars().any(char::is_alphanumeric))
+pub fn words(text: &str) -> Box<dyn Iterator<Item = &str> + '_> {
+    let real = |w: &&str| !w.is_empty() && w.bytes().any(|b| b != b'_');
+    if text.is_ascii() {
+        // Byte splitting: the same words for ASCII text, without decoding chars.
+        Box::new(text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(real))
+    } else {
+        Box::new(text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(real))
+    }
+}
+
+/// `makepad_search::fold`, with a fast path for ASCII (the same result).
+fn fold(word: &str) -> String {
+    if word.is_ascii() {
+        word.to_ascii_lowercase()
+    } else {
+        makepad_search::fold(word)
+    }
 }
 
 /// The terms one word contributes: exact (when it has upper case), parts, folded whole.
 pub fn word_terms(word: &str) -> Vec<(TermForm, String)> {
+    // The common case: a lower-case ASCII word is its own fold and its own only part.
+    if word.bytes().all(|b| b.is_ascii_lowercase()) {
+        return vec![(TermForm::Folded, word.to_string())];
+    }
     let folded = fold(word);
     let mut out = Vec::with_capacity(4);
     if word != folded {
@@ -163,6 +218,9 @@ fn class(c: char) -> Class {
 /// before a capitalized word (`HTTPServer` → `http`, `server`), and letter↔digit (`vec3f` →
 /// `vec`, `3`, `f`).
 pub fn split_parts(word: &str) -> Vec<String> {
+    if word.is_ascii() {
+        return split_ascii(word);
+    }
     let mut parts = Vec::new();
     for piece in word.split('_').filter(|p| !p.is_empty()) {
         let chars: Vec<char> = piece.chars().collect();
@@ -181,6 +239,41 @@ pub fn split_parts(word: &str) -> Vec<String> {
             }
         }
         parts.push(fold(&chars[start..].iter().collect::<String>()));
+    }
+    parts
+}
+
+/// [`split_parts`] over bytes, for ASCII words.
+fn split_ascii(word: &str) -> Vec<String> {
+    let class = |b: u8| {
+        if b.is_ascii_uppercase() {
+            Class::Upper
+        } else if b.is_ascii_digit() {
+            Class::Digit
+        } else if b.is_ascii_lowercase() {
+            Class::Lower
+        } else {
+            Class::Other
+        }
+    };
+    let mut parts = Vec::new();
+    for piece in word.split('_').filter(|p| !p.is_empty()) {
+        let b = piece.as_bytes();
+        let mut start = 0;
+        for i in 1..b.len() {
+            let boundary = match (class(b[i - 1]), class(b[i])) {
+                (Class::Lower, Class::Upper)
+                | (Class::Digit, Class::Upper | Class::Lower)
+                | (Class::Upper | Class::Lower, Class::Digit) => true,
+                (Class::Upper, Class::Upper) => b.get(i + 1).is_some_and(|c| class(*c) == Class::Lower),
+                _ => false,
+            };
+            if boundary {
+                parts.push(piece[start..i].to_ascii_lowercase());
+                start = i;
+            }
+        }
+        parts.push(piece[start..].to_ascii_lowercase());
     }
     parts
 }
