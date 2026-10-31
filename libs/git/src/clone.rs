@@ -35,9 +35,9 @@ struct FileEntry {
     mode: u32,
 }
 
-/// Thread-safe pack reader: pre-loaded pack data + immutable index metadata.
+/// Thread-safe pack reader: the pack mapping + immutable index metadata.
 struct SharedPack {
-    pack_data: Vec<u8>,
+    pack_data: std::sync::Arc<makepad_shared_bytes::MappedBytes>,
     fanout: [u32; 256],
     oids: Vec<ObjectId>,
     offsets: Vec<u64>,
@@ -79,16 +79,12 @@ impl SharedPack {
 
     fn read_object(&self, oid: &ObjectId) -> Result<Object, GitError> {
         if let Some(offset) = self.find_offset(oid) {
-            read_pack_object_from_data(&self.pack_data, offset as usize, self)
+            read_pack_object_from_data(self.pack_data.as_slice(), offset as usize, self)
         } else {
             Err(GitError::ObjectNotFound(oid.to_hex()))
         }
     }
 }
-
-// SharedPack has no interior mutability — all fields are plain data.
-unsafe impl Send for SharedPack {}
-unsafe impl Sync for SharedPack {}
 
 /// Perform a local depth=1 clone using git alternates.
 ///
