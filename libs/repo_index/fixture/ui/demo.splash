@@ -1,0 +1,9 @@
+use mod.widgets.*
+
+let GizmoView = View{
+    width: Fill height: 40
+}
+
+fn spin_label(step){
+    "spin " + step
+}
