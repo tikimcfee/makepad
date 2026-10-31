@@ -18,13 +18,17 @@
 
 use crate::{
     circles, delta, BaseCircle, BaseSource, Chunk, CircleBody, CircleExpr, CircleManifest, CircleName, CircleStats, Circles,
-    Error, Extract, FieldTerms, Key, ManifestChange, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
+    BlobReader, Error, Extract, FieldTerms, Key, ManifestChange, Oid, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
     SegmentSink, SourceStamp, Store, Tokenize, Visibility, INDEXER_VERSION,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Opens repos other than the one the caller stands in (another tree circle's root).
-pub type RepoOpener = Box<dyn FnMut(&Path) -> Result<Box<dyn Repo>, Error>>;
+/// Shared, so the lazy blob reader an [`Opened`] carries can open its own handle.
+pub type RepoOpener = Rc<dyn Fn(&Path) -> Result<Box<dyn Repo>, Error>>;
 
 /// The [`Circles`] implementation, over the other parts.
 pub struct Opener {
@@ -66,7 +70,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 fn repo_at<'a>(
     main: &'a mut Box<dyn Repo>,
     others: &'a mut Vec<(PathBuf, Box<dyn Repo>)>,
-    open_repo: &mut RepoOpener,
+    open_repo: &RepoOpener,
     root: &Path,
 ) -> Result<&'a mut dyn Repo, Error> {
     if same_dir(&main.root(), root) {
@@ -389,10 +393,12 @@ impl Opener {
                     }
                     None => return Ok(None),
                 };
+                let local_files = branch_files(repo, &at, &local_tips, tree_on(manifest, root))?;
                 let visible = Visibility {
                     reachable: repo.commits(&[at.commit], &[])?.into_iter().map(|c| c.oid).collect(),
                     local: repo.commits(&local_tips, &[up.commit])?.into_iter().map(|c| c.oid).collect(),
                     local_refs,
+                    local_files,
                 };
                 let segments = manifest_now
                     .segments
@@ -417,6 +423,52 @@ impl Opener {
 /// `upstream/work`.
 pub fn short_ref(r: &str) -> String {
     r.strip_prefix("refs/heads/").or_else(|| r.strip_prefix("refs/remotes/")).or_else(|| r.strip_prefix("refs/")).unwrap_or(r).to_string()
+}
+
+/// The tree circle on `root`, whose exclusions the branch files honour.
+fn tree_on<'m>(manifest: &'m CircleManifest, root: &Path) -> Option<&'m BaseCircle> {
+    manifest.defs.iter().find_map(|d| match &d.body {
+        CircleBody::Base(b @ BaseCircle { source: BaseSource::Tree { root: r }, .. }) if same_dir(r, root) => Some(b),
+        _ => None,
+    })
+}
+
+/// [`Visibility::local_files`]: each file a local tip holds with another blob than `at` (or that
+/// `at` lacks), once per (path, blob), outside the tree circle's exclusions.
+fn branch_files(repo: &mut dyn Repo, at: &Rev, tips: &[Oid], tree: Option<&BaseCircle>) -> Result<Vec<(String, Oid)>, Error> {
+    let mut out: Vec<(String, Oid)> = Vec::new();
+    if tips.is_empty() {
+        return Ok(out);
+    }
+    let here: HashMap<String, Oid> = repo.files(at.tree)?.into_iter().map(|f| (f.path, f.blob)).collect();
+    for tip in tips {
+        let t = repo.resolve(&RevSpec::Pinned(hex(tip)))?.tree;
+        if t == at.tree {
+            continue;
+        }
+        for f in repo.files(t)? {
+            if here.get(&f.path) == Some(&f.blob) || tree.is_some_and(|d| circles::excluded(d, &f.path).is_some()) {
+                continue;
+            }
+            if !out.iter().any(|(p, b)| *p == f.path && *b == f.blob) {
+                out.push((f.path, f.blob));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// A reader of the repo at `root`'s blobs that opens its handle on the first read.
+fn lazy_blobs(open_repo: RepoOpener, root: PathBuf) -> BlobReader {
+    let repo: RefCell<Option<Box<dyn Repo>>> = RefCell::new(None);
+    Box::new(move |oid| {
+        let mut r = repo.borrow_mut();
+        if r.is_none() {
+            *r = Some(open_repo(&root)?);
+        }
+        r.as_mut().expect("opened above").read_blob(oid)
+    })
 }
 
 /// HEAD's base: its merge-base with `upstream`. An upstream ref that does not resolve, or no
@@ -497,7 +549,8 @@ impl Circles for Opener {
                 }
             }
         }
-        Ok(Opened { open, others, unbuilt })
+        let blobs = Some(lazy_blobs(self.open_repo.clone(), self.repo.root()));
+        Ok(Opened { open, others, unbuilt, blobs })
     }
 }
 
@@ -909,7 +962,7 @@ pub(crate) mod fakes {
         let root = repo.root.clone();
         let o = crate::open::Opener::new(
             Box::new(repo),
-            Box::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display())))),
+            Rc::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display())))),
             Box::new(store.clone()),
             Box::new(FakeExtract),
             Box::new(FakeTokenize),
@@ -924,7 +977,7 @@ pub(crate) mod fakes {
 mod tests {
     use super::fakes::*;
     use super::*;
-    use crate::Change;
+    use crate::{Change, CommitInfo, CommitRecord};
 
     fn n(s: &str) -> CircleName {
         CircleName(s.into())
@@ -1020,6 +1073,41 @@ mod tests {
             .unwrap();
         assert_eq!(seg.chunk_count() as usize, chunks.len());
         assert!((0..seg.chunk_count()).all(|i| seg.chunk(crate::ChunkId(i)).name == chunks[i as usize].name));
+    }
+
+    #[test]
+    fn history_carries_branch_files_and_reads_them_lazily() {
+        let root = scratch("branch").join("makepad");
+        std::fs::create_dir_all(&root).unwrap();
+        let make = |root: &Path| {
+            let mut repo = FakeRepo::new(root);
+            let up = repo.rev(&["refs/remotes/upstream/work", "HEAD"], 1, &[("a.rs", "fn a() {}\n"), ("b.rs", "same\n")]);
+            let tip = repo.rev(
+                &["refs/heads/work"],
+                2,
+                &[("a.rs", "fn a_changed() {}\n"), ("b.rs", "same\n"), ("c.rs", "new text\n"), ("libs/repo_index/eval/questions.jsonl", "q\n")],
+            );
+            repo.commits = vec![CommitRecord { oid: tip.commit, info: CommitInfo { time: 0, parents: vec![up.commit] }, message: "w".into(), touched: vec![] }];
+            (repo, tip)
+        };
+        let (mut repo, tip) = make(&root);
+        let blobs: HashMap<String, Oid> = repo.files(tip.tree).unwrap().into_iter().map(|f| (f.path, f.blob)).collect();
+        let (mut o, _) = opener(repo, &root.join("none.conf"));
+        let opens = Rc::new(RefCell::new(0));
+        let counted = opens.clone();
+        o.open_repo = Rc::new(move |r: &Path| {
+            *counted.borrow_mut() += 1;
+            Ok(Box::new(make(r).0) as Box<dyn Repo>)
+        });
+        let m = o.manifest().unwrap();
+        let opened = o.open(&m, &[n("makepad:history")], &RevSpec::Pinned("HEAD".into())).unwrap();
+        let vis = opened.open[0].visible.as_ref().unwrap();
+        assert_eq!(vis.local_files, [("a.rs".to_string(), blobs["a.rs"]), ("c.rs".to_string(), blobs["c.rs"])], "unchanged and excluded files are left out");
+        assert_eq!(*opens.borrow(), 0, "no repo is opened until a read");
+        let read = opened.blobs.as_ref().unwrap();
+        assert_eq!(read(blobs["c.rs"]).unwrap(), b"new text\n");
+        read(blobs["a.rs"]).unwrap();
+        assert_eq!(*opens.borrow(), 1, "one handle, opened on the first read");
     }
 
     #[test]

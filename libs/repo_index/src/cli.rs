@@ -67,7 +67,7 @@ fn wire() -> Result<Parts, Error> {
     let cwd = std::env::current_dir().map_err(|error| Error::Io { context: "the current directory".into(), error })?;
     let repo = GitRepo::open(&cwd)?;
     let index = index_root()?;
-    let open_repo: RepoOpener = Box::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
+    let open_repo: RepoOpener = std::rc::Rc::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
     let opener = Opener::new(
         Box::new(GitRepo::open(&cwd)?),
         open_repo,
