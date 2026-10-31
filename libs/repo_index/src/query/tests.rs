@@ -1007,3 +1007,117 @@ fn a_query_passed_as_one_argument_reads_as_its_words() {
     let b = &words("how are FOO_BAR_ values used", &["makepad"]).blocks[0];
     assert_eq!(b.absent_terms, ["FOO_BAR_"]);
 }
+
+// Phase 1d: the cross-review's query findings, one regression test each.
+
+#[test]
+fn a_notes_hit_handle_reads_back_one_shot() {
+    // F1: a source labelled like a bare circle name (`makepad/local`) must not read as that
+    // circle's prefix when the notes circle is the query's first.
+    let mut chunks = notes_chunks();
+    chunks.push(note("makepad/local/lanes.md", "makepad/local", Kind::Note, (1, 3), "Lanes", "lanes split the work", 9));
+    let o = opened(vec![open("notes:topic-a", None, chunks, None), makepad()], vec![]);
+    let out = find(&o, &query("lanes", &["notes:topic-a"]));
+    let hit = &out.blocks[0].hits[0];
+    let text = format(&hit.handle);
+    assert!(text.starts_with("notes:topic-a/makepad/local/lanes.md:"), "{text}");
+    let back = parse(&text, &[CircleName("makepad".into())]).unwrap();
+    assert_eq!(back, hit.handle);
+    let found = super::handle::resolve(&o, &back).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(view(&o.open[found[0].circle], found[0].at).name, "Lanes");
+    // Tree hits of the first circle stay unprefixed.
+    let tree = find(&o, &query("spin", &["makepad"]));
+    assert!(tree.blocks[0].hits.iter().all(|h| h.handle.circle.is_none()));
+}
+
+#[test]
+fn a_filter_with_no_hits_claims_no_absence() {
+    // F2: absence is judged before `--kind/--crate/--path` and a derived circle's selector.
+    let o = opened(vec![makepad()], vec![]);
+    let mut q = query("MAX_TURN", &["makepad"]);
+    q.paths = vec!["beta/".into()];
+    let b = &find(&o, &q).blocks[0];
+    assert_eq!(b.total, 0);
+    assert!(!b.absent, "{:?}", b.absent_terms);
+    let mut q = query("MAX_TURN", &[]);
+    q.circles = vec![CircleExpr::Select { of: Box::new(CircleExpr::Circle(CircleName("makepad".into()))), by: Selector::PathPrefix("docs/".into()) }];
+    q.kinds = vec![KindFilter::Kind(Kind::Struct)];
+    let b = &find(&o, &q).blocks[0];
+    assert_eq!(b.total, 0);
+    assert!(!b.absent, "{:?}", b.absent_terms);
+    // A word the circle lacks is still absent under a filter.
+    let mut q = query("MAX_TURN NoSuchWidget", &["makepad"]);
+    q.paths = vec!["beta/".into()];
+    assert_eq!(find(&o, &q).blocks[0].absent_terms, ["NoSuchWidget"]);
+}
+
+#[test]
+fn a_word_deleted_in_the_worktree_is_absent_beside_matching_words() {
+    // F3: `SPIN_TABLE` lives only in a file the worktree deleted (shadowed, no overlay chunks).
+    let mut c = makepad();
+    c.shadowed = vec!["alpha/src/tables.rs".into()];
+    let o = opened(vec![c], vec![]);
+    let b = &find(&o, &query("SPIN_TABLE", &["makepad"])).blocks[0];
+    assert_eq!(b.absent_terms, ["SPIN_TABLE"]);
+    let b = &find(&o, &query("SPIN_TABLE clamp_turn", &["makepad"])).blocks[0];
+    assert!(b.total > 0);
+    assert_eq!(b.absent_terms, ["SPIN_TABLE"]);
+    // A prefix whose only terms are shadowed is absent too (`spin_label` lives in the splash).
+    let b = &find(&o, &query("SPIN_ clamp_turn", &["makepad"])).blocks[0];
+    assert!(b.absent_terms.is_empty(), "{:?}", b.absent_terms);
+    let mut c = makepad();
+    c.shadowed = vec!["alpha/src/tables.rs".into(), "ui/demo.splash".into()];
+    let o = opened(vec![c], vec![]);
+    let b = &find(&o, &query("SPIN_ clamp_turn", &["makepad"])).blocks[0];
+    assert_eq!(b.absent_terms, ["SPIN_"]);
+    // History: a word only in a commit the revision does not reach is absent there.
+    let mut h = history();
+    let mut c3 = commit(3, "ZorbleThing on another branch", &["alpha/src/lib.rs"]);
+    c3.fields.body = "ZorbleThing on another branch".into();
+    let mut chunks = vec![commit(1, "alpha: gizmos spin by a clamped step", &["alpha/src/lib.rs"]), c3];
+    chunks.push(commit(2, "beta: clamp the turn harder", &["beta/src/lib.rs"]));
+    h.segments = vec![Box::new(MemSegment::new("makepad:history", chunks))];
+    let o = opened(vec![h], vec![]);
+    let b = &find(&o, &query("ZorbleThing gizmos", &["makepad:history"])).blocks[0];
+    assert!(b.total > 0);
+    assert_eq!(b.absent_terms, ["ZorbleThing"]);
+}
+
+#[test]
+fn a_limit_below_a_group_is_honoured() {
+    // F4.
+    let o = opened(vec![makepad()], vec![]);
+    for n in 1..=4 {
+        let mut q = query("spin", &["makepad"]);
+        q.limit = n;
+        let b = &find(&o, &q).blocks[0];
+        assert!(b.total >= 4);
+        assert_eq!(b.hits.len(), n, "-n {n}");
+    }
+}
+
+#[test]
+fn rank_fusion_lists_each_absent_term_once() {
+    // F5: two blocks sharing two absent terms.
+    let o = opened(vec![makepad(), notes()], vec![]);
+    let mut q = query("zz_nope_a zz_nope_b spin", &[]);
+    q.circles = vec![CircleExpr::Union {
+        of: vec![CircleExpr::Circle(CircleName("makepad".into())), CircleExpr::Circle(CircleName("notes:topic-a".into()))],
+        fuse: Fuse::Rank,
+    }];
+    let b = &find(&o, &q).blocks[0];
+    assert!(b.total > 0);
+    assert_eq!(b.absent_terms, ["zz_nope_a", "zz_nope_b"]);
+}
+
+#[test]
+fn def_counts_the_definitions_it_shows() {
+    // XR §4: `def` printed the shown pool's size beside the circle's definition count.
+    let o = opened(vec![makepad()], vec![]);
+    let mut q = query("spin", &["makepad"]);
+    q.mode = Mode::Def;
+    let b = &find(&o, &q).blocks[0];
+    assert_eq!(b.hits.len() as u64, b.total);
+    assert_eq!(b.definitions, b.total, "{} of {} · {} definitions", b.hits.len(), b.total, b.definitions);
+}

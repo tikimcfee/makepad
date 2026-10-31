@@ -629,16 +629,28 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
         avg: c.stats.field_lengths.iter().map(|l| *l as f32 / n).collect(),
         n,
     };
-    let overlay_has = |form: TermForm, text: &str| {
-        c.overlay.iter().any(|f| f.chunks.iter().any(|(_, ft)| ft.terms.iter().any(|t| t.form == form && t.text == text)))
+    // A term is present when a live chunk holds it: an overlay chunk, or a segment chunk whose
+    // file the overlay does not shadow and (history) that the revision reaches. Judged before
+    // any filter: absence is the circle's answer, not the filter's.
+    let shadowed: HashSet<&str> = c.shadowed.iter().map(String::as_str).collect();
+    let check_postings = !shadowed.is_empty() || (c.visible.is_some() && !filter.any_rev);
+    let present = |form: TermForm, text: &str| {
+        c.segments.iter().any(|seg| {
+            seg.df(form, text) > 0
+                && (!check_postings
+                    || seg.postings(form, text).any(|p| {
+                        let v = seg.chunk(p.chunk);
+                        !shadowed.contains(v.path) && (filter.any_rev || visible(c, &v))
+                    }))
+        }) || c.overlay.iter().any(|f| f.chunks.iter().any(|(_, ft)| ft.terms.iter().any(|t| t.form == form && t.text == text)))
     };
     let tree = c.rev.is_some() && c.visible.is_none();
     let mut absent_terms = Vec::new();
-    // An identifier is absent when no chunk holds it as a whole word (its parts don't count:
-    // `vec3d` is not `3d`), in every circle; a history circle with no commit naming it says so.
+    // An identifier is absent when no live chunk holds it as a whole word (its parts don't
+    // count: `vec3d` is not `3d`), in every circle; a history circle with no commit naming it
+    // says so.
     for (folded, written) in &plan.subjects {
-        let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, folded) > 0) || overlay_has(TermForm::Folded, folded);
-        if !present && !absent_terms.contains(written) {
+        if !present(TermForm::Folded, folded) && !absent_terms.contains(written) {
             absent_terms.push(written.clone());
         }
     }
@@ -649,8 +661,7 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
     for (word, stem, parts, written) in &plan.prefixes {
         let open = groups.iter().any(|g| g.word == *word && g.role == Role::PrefixPart);
         if !open {
-            let present = parts.iter().all(|p| c.segments.iter().any(|seg| seg.df(TermForm::Folded, p) > 0) || overlay_has(TermForm::Folded, p));
-            if !present && !absent_terms.contains(written) {
+            if !parts.iter().all(|p| present(TermForm::Folded, p)) && !absent_terms.contains(written) {
                 absent_terms.push(written.clone());
             }
             continue;
@@ -660,7 +671,7 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
         let mut terms: Vec<(u32, String)> = Vec::new();
         for seg in &c.segments {
             for t in seg.terms_with_prefix(TermForm::Folded, &start) {
-                if !terms.iter().any(|(_, x)| *x == t) {
+                if !terms.iter().any(|(_, x)| *x == t) && (!check_postings || present(TermForm::Folded, &t)) {
                     terms.push((0, t));
                 }
             }
@@ -709,6 +720,9 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
             }
             let mut consider = |at: ChunkAt| {
                 let v = view(c, at);
+                if matches!(at, ChunkAt::Segment { .. }) && shadowed.contains(v.path) {
+                    return;
+                }
                 if let Some(m) = path_match(c, at, &v, &pw.token) {
                     found = true;
                     let e = path_hits.entry(at_key(at)).or_insert((at, m, pw.word));
