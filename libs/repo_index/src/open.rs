@@ -189,27 +189,14 @@ fn segments_now(store: &dyn Store, key: &SegmentKey, m: &SegmentManifest) -> Opt
     Some(out)
 }
 
-/// The package a path belongs to in a base: that of its own chunks, else of the nearest
-/// enclosing directory's `Cargo.toml` card (a file added since the base).
-pub fn base_package(segment: &dyn SegmentRead, path: &str) -> Option<String> {
-    let of = |p: &str| {
-        segment
-            .chunks_with(&Key::Path { path: p.to_string(), line: None })
-            .into_iter()
-            .map(|id| segment.chunk(id).package.to_string())
-            .find(|s| !s.is_empty())
-    };
-    if let Some(p) = of(path) {
-        return Some(p);
-    }
-    let mut dir = path;
-    while let Some((up, _)) = dir.rsplit_once('/') {
-        if let Some(p) = of(&format!("{up}/Cargo.toml")) {
-            return Some(p);
-        }
-        dir = up;
-    }
-    of("Cargo.toml")
+/// The package of the base's manifest at `manifest` (`<dir>/Cargo.toml`), when it is a card.
+pub fn card_package(segment: &dyn SegmentRead, manifest: &str) -> Option<String> {
+    segment
+        .chunks_with(&Key::Path { path: manifest.to_string(), line: None })
+        .into_iter()
+        .map(|id| segment.chunk(id))
+        .find(|c| c.kind == crate::Kind::Crate && !c.package.is_empty())
+        .map(|c| c.package.to_string())
 }
 
 fn sum_stats(segments: &[Box<dyn SegmentRead>]) -> CircleStats {
@@ -383,7 +370,7 @@ impl Opener {
                 // others carry it too: their pointer counts and `build`'s report follow the worktree
                 let (overlay, shadowed) = match overlay_from {
                     Some(base) => {
-                        let package = |p: &str| base_package(segment.as_ref(), p);
+                        let package = |p: &str| card_package(segment.as_ref(), p);
                         let over = delta::Over { circle: name, def: &def, base: &base, root, package: &package };
                         let o = delta::overlay(repo, extract.as_mut(), tokenize.as_ref(), &over)?;
                         (o.files, o.shadowed)

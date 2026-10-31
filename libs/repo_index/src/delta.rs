@@ -9,6 +9,7 @@
 //! build skipped it, so a lane editing `libs/repo_index/eval/` never reaches the `makepad` circle.
 
 use crate::{circles, BaseCircle, Change, Chunk, CircleName, Error, Extract, OverlayFile, Repo, Rev, Tokenize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// A worktree's overlay over one tree circle.
@@ -29,7 +30,8 @@ pub struct Over<'a> {
     pub base: &'a Rev,
     /// The worktree root the changed files are read from.
     pub root: &'a Path,
-    /// A path's package in the base (a lone file's chunks carry none: no tree is around them).
+    /// The package of the base's manifest at a path (`<dir>/Cargo.toml`), when it is a card.
+    /// The overlay's own manifests come first ([`package_of`]).
     pub package: &'a dyn Fn(&str) -> Option<String>,
 }
 
@@ -41,6 +43,7 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
     let Over { circle, def, base, root, package } = *over;
     let mut out = Overlay::default();
     let mut read: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
     for change in repo.changes(base)? {
         let (path, shadows) = match &change {
             Change::Added(p) => (p, false),
@@ -54,6 +57,7 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
             out.shadowed.push(path.clone());
         }
         if matches!(change, Change::Deleted(_)) {
+            deleted.push(path.clone());
             continue;
         }
         match std::fs::read(root.join(path)) {
@@ -64,15 +68,25 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
                 if !shadows {
                     out.shadowed.push(path.clone());
                 }
+                deleted.push(path.clone());
             }
             Err(error) => return Err(Error::Io { context: format!("overlay: reading {path}"), error }),
         }
     }
+    let extracted = extract.extract_files(circle, def, &read)?;
+    // the overlay's manifests: a card's package, or none (a virtual workspace manifest)
+    let cards: Vec<(&str, Option<String>)> = read
+        .iter()
+        .zip(&extracted)
+        .filter(|((p, _), _)| p == "Cargo.toml" || p.ends_with("/Cargo.toml"))
+        .map(|((p, _), chunks)| (p.as_str(), chunks.iter().find(|c| c.kind == crate::Kind::Crate).and_then(|c| c.keys.package.clone())))
+        .collect();
+    let deleted: HashSet<&str> = deleted.iter().map(String::as_str).collect();
     // every file's chunks in one run, with each file's (path, chunk count)
     let mut all: Vec<Chunk> = Vec::new();
     let mut files: Vec<(String, usize)> = Vec::new();
-    for ((path, _), mut chunks) in read.iter().zip(extract.extract_files(circle, def, &read)?) {
-        let pkg = package(path);
+    for ((path, _), mut chunks) in read.iter().zip(extracted) {
+        let pkg = package_of(path, &cards, &deleted, package);
         for c in &mut chunks {
             if c.keys.package.is_none() {
                 c.keys.package = pkg.clone();
@@ -92,6 +106,35 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
     out.shadowed.sort();
     out.shadowed.dedup();
     Ok(out)
+}
+
+/// The package of `path` in the worktree: that of the nearest enclosing manifest that is a card,
+/// the overlay's own first (a crate new since the base, an edited manifest), then the base's,
+/// skipping a manifest the worktree deleted and one that is no card (a virtual workspace).
+pub fn package_of(path: &str, cards: &[(&str, Option<String>)], deleted: &HashSet<&str>, base: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut dir = path;
+    while let Some((up, _)) = dir.rsplit_once('/') {
+        dirs.push(up);
+        dir = up;
+    }
+    dirs.push("");
+    for d in dirs {
+        let manifest = if d.is_empty() { "Cargo.toml".to_string() } else { format!("{d}/Cargo.toml") };
+        if let Some((_, card)) = cards.iter().find(|(p, _)| *p == manifest) {
+            match card {
+                Some(pkg) => return Some(pkg.clone()),
+                None => continue,
+            }
+        }
+        if deleted.contains(manifest.as_str()) {
+            continue;
+        }
+        if let Some(pkg) = base(&manifest) {
+            return Some(pkg);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -141,5 +184,56 @@ mod tests {
         assert!(!names.contains(&"never_indexed"));
         assert!(o.files.iter().all(|f| f.chunks.iter().all(|(_, t)| !t.is_empty())));
         assert!(o.files.iter().all(|f| f.chunks.iter().all(|(c, _)| c.keys.package.as_deref() == Some("pkg-a"))));
+    }
+
+    #[test]
+    fn packages_resolve_against_the_overlay_cards_then_the_base() {
+        let root = std::env::temp_dir().join(format!("repo-index-delta-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (p, text) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"libs/new\"]\n"),
+            ("libs/new/Cargo.toml", "[package]\nname = \"new-crate\"\nversion = \"0.1.0\"\n"),
+            ("libs/new/src/lib.rs", "pub fn fresh() {}\n"),
+            ("libs/old/src/a.rs", "pub fn edited() {}\n"),
+            ("libs/gone/src/b.rs", "pub fn orphan() {}\n"),
+        ] {
+            let f = root.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        }
+        let m = circles::manifest_for(&root, None, &root).unwrap();
+        let def = match &circles::find_def(&m, &CircleName("makepad".into())).unwrap().body {
+            crate::CircleBody::Base(b) => b.clone(),
+            _ => unreachable!(),
+        };
+        let mut repo = FakeRepo::new(&root);
+        repo.changes = vec![
+            Change::Modified("Cargo.toml".into()),
+            Change::Added("libs/new/Cargo.toml".into()), // a crate new since the base
+            Change::Added("libs/new/src/lib.rs".into()),
+            Change::Modified("libs/old/src/a.rs".into()),
+            Change::Deleted("libs/gone/Cargo.toml".into()), // its manifest went away
+            Change::Modified("libs/gone/src/b.rs".into()),
+        ];
+        let base = Rev { spec: RevSpec::Worktree, commit: Oid([1; 20]), tree: Oid([2; 20]) };
+        let cards = |p: &str| match p {
+            "libs/old/Cargo.toml" => Some("old-crate".to_string()),
+            "libs/gone/Cargo.toml" => Some("gone-crate".to_string()),
+            _ => None,
+        };
+        let name = CircleName("makepad".into());
+        let over = Over { circle: &name, def: &def, base: &base, root: &root, package: &cards };
+        let o = overlay(&mut repo, &mut crate::extract::Extractor::new(), &FakeTokenize, &over).unwrap();
+        let pkg = |path: &str| {
+            let f = o.files.iter().find(|f| f.path == path).unwrap_or_else(|| panic!("{path} not in the overlay"));
+            f.chunks[0].0.keys.package.clone()
+        };
+        assert_eq!(pkg("libs/new/src/lib.rs").as_deref(), Some("new-crate"));
+        assert_eq!(pkg("libs/old/src/a.rs").as_deref(), Some("old-crate"));
+        assert_eq!(pkg("libs/gone/src/b.rs"), None, "a deleted manifest is no card");
+        // the virtual root manifest is no card: nothing falls through to it
+        let none: HashSet<&str> = HashSet::new();
+        assert_eq!(package_of("x/y.rs", &[("Cargo.toml", None)], &none, &|p: &str| (p == "Cargo.toml").then(|| "root-pkg".into())), None);
+        assert_eq!(package_of("x/y.rs", &[], &none, &|p: &str| (p == "Cargo.toml").then(|| "root-pkg".into())).as_deref(), Some("root-pkg"));
     }
 }
