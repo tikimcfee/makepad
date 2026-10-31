@@ -6,7 +6,7 @@
 
 use super::segment::*;
 use super::{io_err, log};
-use crate::{ChunkId, ChunkView, CircleStats, Detail, Edge, Error, Key, Keys, Kind, Lines, Oid, Posting, SegmentKey, SegmentRead, Span, TermForm};
+use crate::{ChunkId, ChunkView, CircleStats, Detail, Edge, Error, Key, Keys, Kind, Lines, Oid, Posting, SegmentId, SegmentKey, SegmentRead, Span, TermForm};
 use makepad_git::oid::ObjectHasher;
 use makepad_git::ObjectId;
 use makepad_shared_bytes::{MappedBytes, SharedBytes};
@@ -372,6 +372,9 @@ fn term_key(form: TermForm, term: &str) -> Vec<u8> {
 impl SegmentRead for Segment {
     fn key(&self) -> &SegmentKey {
         &self.key
+    }
+    fn id(&self) -> SegmentId {
+        SegmentId(self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
     }
     fn stats(&self) -> CircleStats {
         self.stats
