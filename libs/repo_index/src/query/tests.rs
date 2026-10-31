@@ -761,7 +761,8 @@ fn a_missing_named_thing_is_absent_beside_present_words() {
         assert!(!find(&o, &query(q, &["makepad"])).blocks[0].absent, "{q}");
     }
     // Paths are judged in tree circles only; history never claims absence.
-    assert!(!find(&o, &query("alpha/src/gone.rs", &["notes:topic-a"])).blocks[0].absent);
+    // (A note names alpha/src/lib.rs in its text; no note file has that path.)
+    assert!(!find(&o, &query("alpha/src/lib.rs", &["notes:topic-a"])).blocks[0].absent);
     assert!(!find(&o, &query("spin_wheel_limit spin", &["makepad:history"])).blocks[0].absent);
 }
 
