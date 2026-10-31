@@ -649,6 +649,9 @@ pub(crate) mod fakes {
             }
             Ok(Self::chunks(circle, path, &String::from_utf8_lossy(bytes), 0))
         }
+        fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error> {
+            files.iter().map(|(p, b)| self.extract_file(circle, def, p, b)).collect()
+        }
     }
 
     /// Lowercased words of name and body.

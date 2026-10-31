@@ -394,6 +394,27 @@ fn the_cite_is_computed_only_for_notes_and_reused() {
 }
 
 #[test]
+fn extract_files_is_extract_file_per_file_in_order() {
+    let mut files = Vec::new();
+    files_under(&fixture_dir(), "", &mut files);
+    let inputs: Vec<(String, Vec<u8>)> = files.iter().map(|f| (f.clone(), fs::read(fixture_dir().join(f)).unwrap())).collect();
+    let def = tree_def(&fixture_dir(), CODE.to_vec());
+    let mut ex = Extractor::new();
+    let c = circle("fixture");
+    let together = ex.extract_files(&c, &def, &inputs).unwrap();
+    assert_eq!(together.len(), inputs.len());
+    let debug = |v: &Vec<Chunk>| format!("{v:?}");
+    for ((path, bytes), got) in inputs.iter().zip(&together) {
+        assert_eq!(debug(got), debug(&ex.extract_file(&c, &def, path, bytes).unwrap()), "{path}");
+    }
+    assert!(together[inputs.iter().position(|(p, _)| p == "excluded/sentinel.rs").unwrap()].is_empty());
+    assert!(together.iter().any(|v| v.iter().any(|c| c.name == "Gizmo::spin")));
+    // a history circle has no files: the error comes back
+    let history = BaseCircle { source: BaseSource::History { root: fixture_dir(), upstream: "x".into(), local: vec![] }, families: vec![Family::Commit], exclude: vec![] };
+    assert!(ex.extract_files(&c, &history, &inputs[..1]).is_err());
+}
+
+#[test]
 fn history_drops_eval_only_commits() {
     let tmp = fixture_repo();
     let dir = tmp.path();
@@ -588,8 +609,12 @@ fn real_overlay_parts() {
     };
     let mut ex = Extractor::new();
     let mut chunks = 0;
-    for (p, b) in &files {
-        chunks += ex.extract_file(&circle("makepad"), &def, p, b).unwrap().len();
+    if part == "extract-files" {
+        chunks = ex.extract_files(&circle("makepad"), &def, &files).unwrap().iter().map(Vec::len).sum();
+    } else {
+        for (p, b) in &files {
+            chunks += ex.extract_file(&circle("makepad"), &def, p, b).unwrap().len();
+        }
     }
     println!("extract {} files, {bytes} bytes, {chunks} chunks", files.len());
 }
