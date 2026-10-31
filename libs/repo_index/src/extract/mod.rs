@@ -266,6 +266,9 @@ fn crate_chunk(circle: &CircleName, name: &str, card: CrateCard, vendored: bool)
     let mut c = base_chunk(Kind::Crate, circle, &manifest, name);
     c.fields.path = card.dir.clone();
     c.fields.doc = card.description.clone();
+    // the targets a package builds (`lib, bin relax, example demo`), so a question about a
+    // binary finds its package
+    c.fields.sig = card.targets.join(", ");
     c.gist = gist(&card.description);
     c.keys.package = Some(name.to_string());
     c.flags.documented = !card.description.is_empty();
