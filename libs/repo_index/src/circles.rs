@@ -105,7 +105,7 @@ pub fn manifest_for(root: &Path, conf: Option<(&Path, &str)>, home: &Path) -> Re
     }
     let local = root.join("local");
     if local.is_dir() {
-        let sources = vec![NotesSource { dir: local.clone(), label: repo_label(root, &local) }];
+        let sources = vec![NotesSource { dir: local.clone(), label: repo_label(root, &local)? }];
         defs.push(base_def(NOTES_LOCAL, BaseSource::Notes { sources }, NOTES_FAMILIES, Vec::new()));
     }
     let mut eval = Vec::new();
@@ -115,16 +115,17 @@ pub fn manifest_for(root: &Path, conf: Option<(&Path, &str)>, home: &Path) -> Re
     Ok(CircleManifest { defs, conf: conf.map(|(f, _)| f.to_path_buf()), eval })
 }
 
-/// The label of a directory inside a repo: the checkout directory's name and the path from the
-/// root (`makepad/local/plans`).
-fn repo_label(root: &Path, dir: &Path) -> String {
-    let checkout = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+/// The label of a directory inside a repo: the repo's name and the path from the root
+/// (`makepad/local/plans`). The name is the main checkout's directory, the same in every
+/// worktree (`extract::git::repo_name`); a root that is no git worktree root has only its own
+/// directory name.
+fn repo_label(root: &Path, dir: &Path) -> Result<String, Error> {
+    let checkout = match crate::extract::git::repo_name(root)? {
+        Some(name) => name,
+        None => root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    };
     let rel = dir.strip_prefix(root).map(slash_path).unwrap_or_default();
-    if rel.is_empty() {
-        checkout
-    } else {
-        format!("{checkout}/{rel}")
-    }
+    Ok(if rel.is_empty() { checkout } else { format!("{checkout}/{rel}") })
 }
 
 /// A relative path as `/`-separated text.
@@ -319,13 +320,11 @@ fn add_notes(defs: &mut Vec<CircleDef>, existing: Option<usize>, cname: &CircleN
         _ => return Err(parse_err(file, line, "expected `notes <dir> [as <label>]`")),
     };
     let dir = expand(dir_word, root, home);
-    let label = label.unwrap_or_else(|| {
-        if dir.starts_with(root) {
-            repo_label(root, &dir)
-        } else {
-            dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        }
-    });
+    let label = match label {
+        Some(l) => l,
+        None if dir.starts_with(root) => repo_label(root, &dir)?,
+        None => dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+    };
     if label.is_empty() {
         return Err(parse_err(file, line, format!("`{dir_word}` gives an empty label; add `as <label>`")));
     }
