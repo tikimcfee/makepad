@@ -30,9 +30,12 @@ static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex:
 /// bases again and again.
 const DELTA_BASE_CACHE: usize = 8 << 20;
 
+/// A resolved delta base: its kind, content and the reservation it holds.
+type DeltaBase = (ObjectKind, std::sync::Arc<[u8]>, Option<crate::memory::Reservation>);
+
 #[derive(Default)]
 struct DeltaBases {
-    entries: std::collections::HashMap<u64, (ObjectKind, std::sync::Arc<[u8]>, Option<crate::memory::Reservation>)>,
+    entries: std::collections::HashMap<u64, DeltaBase>,
     order: std::collections::VecDeque<u64>,
     used: usize,
 }
@@ -142,15 +145,15 @@ fn parse_pack_index(idx_path: &Path) -> Result<IdxTables, GitError> {
 
     // Fanout table: 256 x 4-byte big-endian
     let mut fanout = [0u32; 256];
-    for i in 0..256 {
-        fanout[i] = read_u32(&data, pos);
+    for slot in &mut fanout {
+        *slot = read_u32(&data, pos);
         pos += 4;
     }
     let total_objects = fanout[255] as usize;
 
     // OID table: total_objects x 20 bytes
     let table = data.get(pos..pos + total_objects * 20).ok_or_else(|| GitError::CorruptPack("truncated OID table".into()))?;
-    let oids: Vec<ObjectId> = table.chunks_exact(20).map(|c| ObjectId::from_bytes(c.try_into().unwrap())).collect();
+    let oids: Vec<ObjectId> = table.as_chunks::<20>().0.iter().map(|c| ObjectId::from_bytes(*c)).collect();
     pos += total_objects * 20;
 
     // CRC32 table: skip (total_objects x 4 bytes)
@@ -456,7 +459,7 @@ fn read_pack_object_at(
     }
 
     match type_num {
-        1 | 2 | 3 | 4 => {
+        1..=4 => {
             let kind = ObjectKind::from_type_num(type_num)?;
             let decompressed = zlib_decompress(&pack_data[pos..], size as usize)?;
             Ok(Object {
@@ -661,35 +664,6 @@ pub fn find_packs_in_objects_dir(objects_dir: &Path) -> Result<Vec<PackIndex>, G
     Ok(packs)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_from_pack() {
-        let dir = crate::test_support::tempdir().unwrap();
-        let git_dir = dir.path().join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        let ids = crate::test_support::write_pack(
-            &git_dir,
-            &[(ObjectKind::Blob, b"packed content\n".to_vec())],
-        )
-        .unwrap();
-
-        let packs = find_packs(&git_dir).unwrap();
-        assert!(!packs.is_empty(), "should have at least one pack");
-
-        // The id git assigns to this content.
-        let blob_oid = ObjectId::from_hex("5e4999f3bfe35be914c4bba7b0a362112cd4474c").unwrap();
-        assert_eq!(ids[0], blob_oid);
-
-        let pack = &packs[0];
-        let offset = pack.find_offset(&blob_oid).expect("blob should be in pack");
-        let obj = read_pack_object(&pack.pack_path, offset, pack).unwrap();
-        assert_eq!(obj.kind, ObjectKind::Blob);
-        assert_eq!(obj.data, b"packed content\n");
-    }
-}
 
 /// Save a verified, self-contained incoming pack and its standard v2 index.
 /// Offsets and object identities come from the importer's delta resolution.
@@ -745,4 +719,34 @@ pub(crate) fn write_imported_pack(
         result?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_from_pack() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let ids = crate::test_support::write_pack(
+            &git_dir,
+            &[(ObjectKind::Blob, b"packed content\n".to_vec())],
+        )
+        .unwrap();
+
+        let packs = find_packs(&git_dir).unwrap();
+        assert!(!packs.is_empty(), "should have at least one pack");
+
+        // The id git assigns to this content.
+        let blob_oid = ObjectId::from_hex("5e4999f3bfe35be914c4bba7b0a362112cd4474c").unwrap();
+        assert_eq!(ids[0], blob_oid);
+
+        let pack = &packs[0];
+        let offset = pack.find_offset(&blob_oid).expect("blob should be in pack");
+        let obj = read_pack_object(&pack.pack_path, offset, pack).unwrap();
+        assert_eq!(obj.kind, ObjectKind::Blob);
+        assert_eq!(obj.data, b"packed content\n");
+    }
 }
