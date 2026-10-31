@@ -59,7 +59,6 @@ pub fn refs(opened: &Opened, ident: &str, uses: bool) -> Result<RefsOutput, Erro
         for (ci, (_, ft)) in file.chunks.iter().enumerate() {
             let at = ChunkAt::Overlay { file: fi, chunk: ci };
             let n: u32 = ft
-                .terms
                 .iter()
                 .filter(|t| t.form == form && t.text == text && matches!(t.field, Field::Sig | Field::Body))
                 .map(|t| t.tf)

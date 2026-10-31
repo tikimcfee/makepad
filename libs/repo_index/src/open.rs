@@ -904,13 +904,14 @@ pub(crate) mod fakes {
 
     impl Tokenize for FakeTokenize {
         fn chunk_terms(&self, chunk: &Chunk) -> FieldTerms {
-            let mut terms = Vec::new();
+            let mut terms = FieldTerms::default();
             for (field, text) in [(Field::Name, &chunk.fields.name), (Field::Body, &chunk.fields.body)] {
                 for w in text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()) {
-                    terms.push(TermOcc { field, form: TermForm::Folded, text: w.to_lowercase(), tf: 1 });
+                    terms.push(field, TermForm::Folded, &w.to_lowercase(), 1);
                 }
             }
-            FieldTerms { lengths: [terms.len() as u32, 0, 0, 0, 0], terms }
+            terms.lengths = [terms.len() as u32, 0, 0, 0, 0];
+            terms
         }
         fn query_terms(&self, words: &[String]) -> Vec<QueryTerm> {
             words
@@ -941,7 +942,7 @@ pub(crate) mod fakes {
             self.chunks.len() as u32
         }
         fn df(&self, _form: TermForm, term: &str) -> u32 {
-            self.chunks.iter().filter(|(_, t)| t.terms.iter().any(|o| o.text == term)).count() as u32
+            self.chunks.iter().filter(|(_, t)| t.iter().any(|o| o.text == term)).count() as u32
         }
         fn postings(&self, _form: TermForm, term: &str) -> Box<dyn Iterator<Item = Posting> + '_> {
             let term = term.to_string();
@@ -949,12 +950,12 @@ pub(crate) mod fakes {
                 self.chunks
                     .iter()
                     .enumerate()
-                    .filter(move |(_, (_, t))| t.terms.iter().any(|o| o.text == term))
+                    .filter(move |(_, (_, t))| t.iter().any(|o| o.text == term))
                     .map(|(i, _)| Posting { chunk: ChunkId(i as u32), tf: [1, 0, 0, 0, 0] }),
             )
         }
         fn terms_with_prefix(&self, form: TermForm, prefix: &str) -> Vec<String> {
-            let mut out: Vec<String> = self.chunks.iter().flat_map(|(_, t)| &t.terms).filter(|o| o.form == form && o.text.starts_with(prefix)).map(|o| o.text.clone()).collect();
+            let mut out: Vec<String> = self.chunks.iter().flat_map(|(_, t)| t.iter()).filter(|o| o.form == form && o.text.starts_with(prefix)).map(|o| o.text.to_string()).collect();
             out.sort();
             out.dedup();
             out
@@ -1209,7 +1210,7 @@ mod tests {
         let par = tokenize_all(&FakeTokenize, &chunks);
         let seq: Vec<FieldTerms> = chunks.iter().map(|c| FakeTokenize.chunk_terms(c)).collect();
         assert_eq!(par.len(), seq.len());
-        assert!(par.iter().zip(&seq).all(|(a, b)| a.terms == b.terms && a.lengths == b.lengths));
+        assert!(par.iter().zip(&seq).all(|(a, b)| a == b));
         // a build adds them in stream order, batch by batch
         let store = FakeStore::default();
         let key = SegmentKey { repo: None, circle: n("makepad"), source: SourceStamp::Tree { tree: oid(1) }, def_hash: 0, indexer: 1 };

@@ -38,7 +38,7 @@ impl MemSegment {
     }
     fn tf(&self, i: usize, form: TermForm, term: &str) -> [u32; 5] {
         let mut tf = [0; 5];
-        for t in &self.terms[i].terms {
+        for t in self.terms[i].iter() {
             if t.form == form && t.text == term {
                 tf[crate::terms::field_index(t.field)] += t.tf;
             }
@@ -87,7 +87,7 @@ impl SegmentRead for MemSegment {
         }))
     }
     fn terms_with_prefix(&self, form: TermForm, prefix: &str) -> Vec<String> {
-        let mut out: Vec<String> = self.terms.iter().flat_map(|t| &t.terms).filter(|o| o.form == form && o.text.starts_with(prefix)).map(|o| o.text.clone()).collect();
+        let mut out: Vec<String> = self.terms.iter().flat_map(|t| t.iter()).filter(|o| o.form == form && o.text.starts_with(prefix)).map(|o| o.text.to_string()).collect();
         out.sort();
         out.dedup();
         out

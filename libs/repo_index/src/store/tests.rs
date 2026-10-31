@@ -34,9 +34,14 @@ impl Tokenize for FakeTokens {
                 }
             }
         }
-        let mut terms: Vec<TermOcc> = tf.into_iter().map(|((field, form, text), tf)| TermOcc { field, form, text, tf }).collect();
-        terms.sort_by(|a, b| a.text.cmp(&b.text));
-        FieldTerms { terms, lengths }
+        let mut sorted: Vec<((Field, TermForm, String), u32)> = tf.into_iter().collect();
+        sorted.sort_by(|a, b| a.0 .2.cmp(&b.0 .2));
+        let mut terms = FieldTerms::default();
+        for ((field, form, text), tf) in sorted {
+            terms.push(field, form, &text, tf);
+        }
+        terms.lengths = lengths;
+        terms
     }
     fn query_terms(&self, words: &[String]) -> Vec<QueryTerm> {
         words.iter().enumerate().map(|(i, w)| QueryTerm { form: TermForm::Folded, text: w.to_lowercase(), word: i as u16 }).collect()
@@ -286,8 +291,8 @@ fn segment_round_trip() {
             *s += l as u64;
         }
         let mut tf: HashMap<(TermForm, String), [u32; 5]> = HashMap::new();
-        for t in &terms.terms {
-            tf.entry((t.form, t.text.clone())).or_default()[segment::field_index(t.field)] += t.tf;
+        for t in terms.iter() {
+            tf.entry((t.form, t.text.to_string())).or_default()[segment::field_index(t.field)] += t.tf;
         }
         for (k, tf) in tf {
             expect.entry(k).or_default().push(Posting { chunk: ChunkId(i as u32), tf });
@@ -895,7 +900,10 @@ fn long_field_lengths_read_back_exactly() {
     let lengths = [[3, 1, 0, 0, 70_000], [1, 1, 1, 1, 65_535], [1, 1, 1, 1, 65_534]];
     for (i, l) in lengths.iter().enumerate() {
         let ch = chunk(&c, Kind::File, &format!("big{i}.rs"), "big");
-        sink.add(&ch, &FieldTerms { terms: vec![TermOcc { field: Field::Body, form: TermForm::Exact, text: "x".into(), tf: 7 }], lengths: *l }).unwrap();
+        let mut terms = FieldTerms::default();
+        terms.push(Field::Body, TermForm::Exact, "x", 7);
+        terms.lengths = *l;
+        sink.add(&ch, &terms).unwrap();
     }
     let id = sink.finish().unwrap();
     let seg = store.segment(Some(RepoId(0xfeed)), &c, &id).unwrap();
@@ -918,8 +926,8 @@ fn terms_with_prefix_scans_the_dictionary() {
     let seg = store.segment(Some(RepoId(0xfeed)), &c, &id).unwrap();
     let mut all: HashMap<TermForm, BTreeSet<String>> = HashMap::new();
     for ch in &chunks {
-        for t in FakeTokens.chunk_terms(ch).terms {
-            all.entry(t.form).or_default().insert(t.text);
+        for t in FakeTokens.chunk_terms(ch).iter() {
+            all.entry(t.form).or_default().insert(t.text.to_string());
         }
     }
     let brute = |form: TermForm, prefix: &str| all.get(&form).map_or(Vec::new(), |s| s.iter().filter(|t| t.starts_with(prefix)).cloned().collect::<Vec<_>>());

@@ -205,7 +205,7 @@ impl Builder {
             text: notes.then_some(chunk.fields.body.as_str()),
         })?;
         // one posting per (form, text), its tfs summed per field
-        let mut occ: Vec<(u8, &str, usize, u32)> = terms.terms.iter().map(|t| (form_code(t.form), t.text.as_str(), field_index(t.field), t.tf)).collect();
+        let mut occ: Vec<(u8, &str, usize, u32)> = terms.iter().map(|t| (form_code(t.form), t.text, field_index(t.field), t.tf)).collect();
         occ.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let mut i = 0;
         while i < occ.len() {
