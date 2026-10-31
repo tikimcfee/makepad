@@ -500,14 +500,14 @@ fn overlay_cards_are_the_base_build_of_the_worktree() {
     let mut repo = GitRepo::open(dir).unwrap();
     let base = repo.resolve(&RevSpec::Pinned("HEAD".into())).unwrap();
     let def = tree_def(dir, CODE.to_vec());
-    let ex = Extractor::new();
+    let mut ex = Extractor::new();
     let c = circle("fixture");
     let (before, _) = extract(&def, "fixture", Some(&base), &mut repo, &mut Extractor::new());
 
     // no change the graph sees: nothing
     fs::write(dir.join("alpha/src/lib.rs"), fs::read_to_string(dir.join("alpha/src/lib.rs")).unwrap() + "\npub fn more() {}\n").unwrap();
     let changes = repo.changes(&base).unwrap();
-    assert!(ex.cards(&c, &def, &base, dir, &changes, &mut repo).unwrap().is_empty());
+    assert!(ex.extract_cards(&c, &def, &base, dir, &changes, &mut repo).unwrap().is_empty());
 
     // a manifest edited, a crate added that depends on beta, a module file deleted
     let alpha = fs::read_to_string(dir.join("alpha/Cargo.toml")).unwrap();
@@ -518,7 +518,7 @@ fn overlay_cards_are_the_base_build_of_the_worktree() {
     fs::write(dir.join("gamma/src/wheel.rs"), "pub fn roll() {}\n").unwrap();
     fs::remove_file(dir.join("beta/src/broken.rs")).unwrap();
     let changes = repo.changes(&base).unwrap();
-    let overlay = ex.cards(&c, &def, &base, dir, &changes, &mut repo).unwrap();
+    let overlay = ex.extract_cards(&c, &def, &base, dir, &changes, &mut repo).unwrap();
     assert!(overlay.iter().all(|c| c.kind == Kind::Crate && c.parent.is_none()));
 
     commit_all(dir, "the worktree, committed", 1_700_000_400);
@@ -706,23 +706,8 @@ fn real_overlay_parts() {
         exclude: crate::INDEX_OWN_DATA.iter().map(|p| Exclusion { prefix: p.to_string(), provenance: Provenance::IndexOwnData }).collect(),
     };
     let mut ex = Extractor::new();
-    if part == "cards-files" || part == "cards-read" || part == "cards-graph" {
-        let files = repo.files(base.tree).unwrap();
-        let mut manifests = Vec::new();
-        if part != "cards-files" {
-            for f in files.iter().filter(|f| f.path.ends_with("Cargo.toml")) {
-                manifests.push((f.path.clone(), String::from_utf8_lossy(&repo.read_blob(f.blob).unwrap()).into_owned()));
-            }
-        }
-        if part == "cards-graph" {
-            let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-            let g = super::cargo::Graph::build(&manifests, &paths, None);
-            return println!("graph {}", g.packages.len());
-        }
-        return println!("{} files {} manifests", files.len(), manifests.len());
-    }
     if part == "cards" {
-        let cards = ex.cards(&circle("makepad"), &def, &base, &root, &changes, &mut repo).unwrap();
+        let cards = ex.extract_cards(&circle("makepad"), &def, &base, &root, &changes, &mut repo).unwrap();
         let names: Vec<&str> = cards.iter().map(|c| c.name.as_str()).collect();
         return println!("cards {}: {names:?}", cards.len());
     }
