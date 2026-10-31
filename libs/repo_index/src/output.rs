@@ -47,6 +47,7 @@ impl Render for Renderer {
                         uses: b.uses,
                         absent: b.absent,
                         absent_terms: b.absent_terms.clone(),
+                        under: b.under.clone(),
                     });
                     for (hits, nearest) in [(&b.hits, false), (&b.nearest, true)] {
                         r.extend(hits.iter().map(|h| Record::Hit { circle: b.circle.clone(), rev: b.rev.clone(), hit: Box::new(h.clone()), nearest }));
@@ -431,7 +432,7 @@ fn hit_json(circle: &CircleName, rev: &str, h: &Hit, nearest: bool) -> Value {
 
 fn record_json(r: &Record) -> Value {
     match r {
-        Record::Header { circle, rev, total, definitions, uses, absent, absent_terms } => obj(vec![
+        Record::Header { circle, rev, total, definitions, uses, absent, absent_terms, under } => obj(vec![
             ("header", Value::Bool(true)),
             ("circle", s(circle.0.as_str())),
             ("rev", s(rev.as_str())),
@@ -440,6 +441,7 @@ fn record_json(r: &Record) -> Value {
             ("uses", int(*uses)),
             ("absent", Value::Bool(*absent)),
             ("absent_terms", strs(absent_terms)),
+            ("under", strs(under)),
         ]),
         Record::Hit { circle, rev, hit, nearest } => hit_json(circle, rev, hit, *nearest),
         Record::Pointer(p) => obj(vec![
@@ -559,7 +561,7 @@ mod tests {
         let mut h = hit("alpha/src/lib.rs", "Gizmo::spin", &"y".repeat(80));
         h.handle.target = Target::Lines { path: "a/".repeat(40) + "lib.rs", lines: Lines { start: 1, end: 2 } };
         let text = Renderer.text(&Output::Find(FindOutput {
-            blocks: vec![CircleBlock { circle: circle("makepad"), rev: "c0ffee123".into(), total: 4, definitions: 1, uses: 3, hits: vec![h], absent: false, absent_terms: Vec::new(), nearest: Vec::new() }],
+            blocks: vec![CircleBlock { circle: circle("makepad"), rev: "c0ffee123".into(), total: 4, definitions: 1, uses: 3, hits: vec![h], absent: false, absent_terms: Vec::new(), nearest: Vec::new(), under: Vec::new() }],
             pointers: Vec::new(),
         }));
         assert!(text.lines().all(|l| l.chars().count() <= MAX_LINE_CHARS), "{text}");

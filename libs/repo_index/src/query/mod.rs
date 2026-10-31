@@ -233,6 +233,7 @@ impl Engine {
             absent: !absent_terms.is_empty(),
             absent_terms,
             nearest,
+            under: b.under,
         }
     }
 }
