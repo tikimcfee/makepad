@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever extraction, tokenizing or the segment format changes: a base is keyed by
 /// (tree oid, indexer version), so a new indexer never reads an old segment.
-pub const INDEXER_VERSION: u32 = 2;
+pub const INDEXER_VERSION: u32 = 3;
 /// Hits per `find`, unless `-n` says otherwise.
 pub const DEFAULT_LIMIT: usize = 10;
 /// Hits shown per package group before the group's count line.
