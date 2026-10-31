@@ -273,10 +273,6 @@ fn families_filter_and_reparent() {
 fn notes_circle_labels_copies_binaries_and_edges() {
     let tmp = fixture_repo();
     let mut repo = GitRepo::open(tmp.path()).unwrap();
-    let rev = repo.resolve(&RevSpec::Pinned("HEAD".into())).unwrap();
-    let mut cite = Cite::from_repo(circle("fixture"), &mut repo, &rev).unwrap();
-    // notes/ is part of the scratch tree here; the real makepad circle excludes it
-    cite.paths.retain(|p| !p.starts_with("notes/"));
     let notes = fixture_dir().join("notes");
     let def = BaseCircle {
         source: BaseSource::Notes {
@@ -288,7 +284,7 @@ fn notes_circle_labels_copies_binaries_and_edges() {
         families: vec![Family::Note],
         exclude: vec![],
     };
-    let mut ex = Extractor { cite: Some(cite) };
+    let mut ex = Extractor::citing(circle("fixture"), RevSpec::Pinned("HEAD".into()));
     let (chunks, report) = extract(&def, "notes:topic-a", None, &mut repo, &mut ex);
     assert_eq!(report.files, 5);
     let paths: Vec<&str> = chunks.iter().map(|c| c.path.as_str()).collect();
@@ -315,6 +311,68 @@ fn notes_circle_labels_copies_binaries_and_edges() {
 
 fn local_label_len(chunks: &[Chunk]) -> usize {
     chunks.iter().find(|c| c.path.starts_with("fixture/notes/local-a/")).unwrap().label_len as usize
+}
+
+/// A repo that counts its commit walks (what a cite costs).
+struct Counting<'a> {
+    inner: &'a mut GitRepo,
+    walks: usize,
+}
+
+impl Repo for Counting<'_> {
+    fn id(&self) -> crate::RepoId {
+        self.inner.id()
+    }
+    fn root(&self) -> PathBuf {
+        self.inner.root()
+    }
+    fn resolve(&mut self, spec: &RevSpec) -> Result<Rev, crate::Error> {
+        self.inner.resolve(spec)
+    }
+    fn files(&mut self, tree: crate::Oid) -> Result<Vec<crate::TreeFile>, crate::Error> {
+        self.inner.files(tree)
+    }
+    fn read_blob(&mut self, blob: crate::Oid) -> Result<Vec<u8>, crate::Error> {
+        self.inner.read_blob(blob)
+    }
+    fn changes(&mut self, base: &Rev) -> Result<Vec<Change>, crate::Error> {
+        self.inner.changes(base)
+    }
+    fn commits(&mut self, tips: &[crate::Oid], hide: &[crate::Oid]) -> Result<Vec<crate::CommitRecord>, crate::Error> {
+        self.walks += 1;
+        self.inner.commits(tips, hide)
+    }
+    fn worktrees(&mut self) -> Result<Vec<(PathBuf, crate::Oid)>, crate::Error> {
+        self.inner.worktrees()
+    }
+    fn merge_base(&mut self, a: crate::Oid, b: crate::Oid) -> Result<Option<crate::Oid>, crate::Error> {
+        self.inner.merge_base(a, b)
+    }
+}
+
+#[test]
+fn the_cite_is_computed_only_for_notes_and_reused() {
+    let tmp = fixture_repo();
+    let mut git = GitRepo::open(tmp.path()).unwrap();
+    let rev = git.resolve(&RevSpec::Pinned("HEAD".into())).unwrap();
+    let mut repo = Counting { inner: &mut git, walks: 0 };
+    let mut ex = Extractor::citing(circle("fixture"), RevSpec::Pinned("HEAD".into()));
+    extract(&tree_def(tmp.path(), CODE.to_vec()), "fixture", Some(&rev), &mut repo, &mut ex);
+    assert_eq!(repo.walks, 0, "a tree circle computes no cite");
+    let notes = BaseCircle {
+        source: BaseSource::Notes { sources: vec![NotesSource { dir: fixture_dir().join("notes/topic-a"), label: "topic-a".into() }] },
+        families: vec![Family::Note],
+        exclude: vec![],
+    };
+    let (chunks, _) = extract(&notes, "notes:topic-a", None, &mut repo, &mut ex);
+    assert_eq!(repo.walks, 1, "the first notes circle computes it");
+    assert!(chunks.iter().any(|c| !c.keys.edges.is_empty()));
+    extract(&notes, "notes:topic-a", None, &mut repo, &mut ex);
+    assert_eq!(repo.walks, 1, "the same revision reuses it");
+    let mut plain = Extractor::new();
+    let (chunks, _) = extract(&notes, "notes:topic-a", None, &mut repo, &mut plain);
+    assert_eq!(repo.walks, 1);
+    assert!(chunks.iter().all(|c| c.keys.edges.is_empty()), "no cite, no edges");
 }
 
 #[test]
@@ -411,4 +469,22 @@ fn whole_repo_extraction() {
     println!("field text {:.1} MB; chunks by kind {kinds:?}", bytes as f64 / 1e6);
     println!("fallbacks {}: {:?}", report.fallbacks.len(), report.fallbacks);
     println!("skipped {}: {:?}; excluded {:?}", report.skipped.len(), report.skipped, report.excluded);
+}
+
+/// The cost parts of a Cite over a real checkout, timed with `time` around each:
+/// `MAKEPAD_INDEX_REPO=<checkout> MAKEPAD_INDEX_PART=files|commits|cite <test binary>
+/// real_cite_parts --ignored --nocapture`.
+#[test]
+#[ignore]
+fn real_cite_parts() {
+    let Some(root) = std::env::var_os("MAKEPAD_INDEX_REPO") else { panic!("set MAKEPAD_INDEX_REPO") };
+    let part = std::env::var("MAKEPAD_INDEX_PART").unwrap_or_default();
+    let mut repo = GitRepo::open(Path::new(&root)).unwrap();
+    let head = repo.resolve(&RevSpec::Pinned("HEAD".into())).unwrap();
+    match part.as_str() {
+        "files" => println!("files {}", repo.files(head.tree).unwrap().len()),
+        "commits" => println!("commits {}", repo.commits(&[head.commit], &[]).unwrap().len()),
+        "cite" => println!("cite {}", Cite::from_repo(circle("makepad"), &mut repo, &head).unwrap().commits.len()),
+        _ => println!("resolved"),
+    }
 }

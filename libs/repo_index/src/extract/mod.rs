@@ -29,10 +29,19 @@ use cargo::{Graph, APPS_JSON};
 use notes::Cite;
 use std::collections::BTreeMap;
 
-/// The [`Extract`] implementation. With a [`Cite`], notes circles record edges to that circle.
+/// The [`Extract`] implementation. [`Extractor::citing`] makes notes circles record edges to a
+/// repo circle; the cite (that circle's paths and commits) is computed the first time a notes
+/// circle is extracted, in the repo passed to [`Extract::extract`], and reused while the
+/// revision resolves to the same commit. Nothing is computed for tree or history circles.
 #[derive(Default)]
 pub struct Extractor {
-    pub cite: Option<Cite>,
+    cite: Option<CiteTarget>,
+}
+
+struct CiteTarget {
+    circle: CircleName,
+    rev: RevSpec,
+    resolved: Option<Cite>,
 }
 
 /// A chunk whose `parent` indexes its own batch.
@@ -309,6 +318,21 @@ impl Extractor {
         Extractor::default()
     }
 
+    /// Notes circles cite `circle` as it is at `rev`.
+    pub fn citing(circle: CircleName, rev: RevSpec) -> Extractor {
+        Extractor { cite: Some(CiteTarget { circle, rev, resolved: None }) }
+    }
+
+    /// The cite for a notes extraction, computed on first use (or when `rev` moved).
+    fn cite(&mut self, repo: &mut dyn Repo) -> Result<Option<&Cite>, Error> {
+        let Some(t) = self.cite.as_mut() else { return Ok(None) };
+        let rev = repo.resolve(&t.rev)?;
+        if t.resolved.as_ref().is_none_or(|c| c.commit != rev.commit) {
+            t.resolved = Some(Cite::from_repo(t.circle.clone(), repo, &rev)?);
+        }
+        Ok(t.resolved.as_ref())
+    }
+
     fn tree(&mut self, circle: &CircleName, def: &BaseCircle, rev: &Rev, repo: &mut dyn Repo, emit: &mut Emit, report: &mut ExtractReport) -> Result<(), Error> {
         let mut files = Vec::new();
         for f in repo.files(rev.tree)? {
@@ -382,7 +406,8 @@ impl Extractor {
         Ok(())
     }
 
-    fn notes(&mut self, circle: &CircleName, def: &BaseCircle, sources: &[crate::NotesSource], emit: &mut Emit, report: &mut ExtractReport) -> Result<(), Error> {
+    fn notes(&mut self, circle: &CircleName, def: &BaseCircle, sources: &[crate::NotesSource], repo: &mut dyn Repo, emit: &mut Emit, report: &mut ExtractReport) -> Result<(), Error> {
+        let cite = self.cite(repo)?;
         for src in sources {
             if !src.dir.is_dir() {
                 report.skipped.push((src.label.clone(), format!("notes directory {} is missing", src.dir.display())));
@@ -401,7 +426,7 @@ impl Extractor {
                     }
                 };
                 report.files += 1;
-                emit.batch(note_batch(circle, &src.label, &rel, &bytes, self.cite.as_ref())?, None)?;
+                emit.batch(note_batch(circle, &src.label, &rel, &bytes, cite)?, None)?;
             }
         }
         Ok(())
@@ -448,7 +473,7 @@ impl Extract for Extractor {
                 self.tree(circle, def, rev, repo, &mut emit, &mut report)?;
             }
             BaseSource::History { .. } => self.history(circle, def, repo, &mut emit, &mut report)?,
-            BaseSource::Notes { sources } => self.notes(circle, def, sources, &mut emit, &mut report)?,
+            BaseSource::Notes { sources } => self.notes(circle, def, sources, repo, &mut emit, &mut report)?,
         }
         report.chunks = emit.next as u64;
         Ok(report)
@@ -483,7 +508,18 @@ impl Extract for Extractor {
                 if excluded(rel, &def.exclude).is_some() {
                     return Ok(Vec::new());
                 }
-                note_batch(circle, &src.label, rel, bytes, self.cite.as_ref())?
+                let cite = match &self.cite {
+                    None => None,
+                    Some(CiteTarget { resolved: Some(c), .. }) => Some(c),
+                    Some(CiteTarget { resolved: None, circle: cited, .. }) => {
+                        return Err(Error::Parse {
+                            file: path.to_string(),
+                            line: 0,
+                            message: format!("{}'s cite of {} is resolved by extracting the circle first", circle.0, cited.0),
+                        });
+                    }
+                };
+                note_batch(circle, &src.label, rel, bytes, cite)?
             }
             BaseSource::History { .. } => {
                 return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("{} is a history circle: it has no files", circle.0) });
