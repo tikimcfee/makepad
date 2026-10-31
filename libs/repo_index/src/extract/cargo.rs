@@ -9,7 +9,7 @@
 
 use crate::CrateCard;
 use makepad_toml_parser::{parse_toml, Toml, TomlTable};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Where the app registry lives in a tree.
 pub const APPS_JSON: &str = "libs/app_registry/apps.json";
@@ -68,6 +68,25 @@ pub fn join(dir: &str, rel: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Targets cargo finds by layout under `<dir>/<sub>`: `<name>.rs` and `<name>/main.rs`, as
+/// `(name, path relative to dir)`, sorted.
+fn discovered(files: &BTreeSet<&str>, dir: &str, sub: &str) -> Vec<(String, String)> {
+    let prefix = if dir.is_empty() { format!("{sub}/") } else { format!("{dir}/{sub}/") };
+    let mut out = Vec::new();
+    for f in files.range(prefix.as_str()..).take_while(|f| f.starts_with(&prefix)) {
+        let rest = &f[prefix.len()..];
+        let name = match rest.split_once('/') {
+            None => rest.strip_suffix(".rs"),
+            Some((d, "main.rs")) => Some(d),
+            Some(_) => None,
+        };
+        if let Some(n) = name {
+            out.push((n.to_string(), format!("{sub}/{rest}")));
+        }
+    }
+    out
+}
+
 fn str_of(t: &Toml) -> Option<&str> {
     t.as_str()
 }
@@ -97,7 +116,7 @@ struct Parsed {
     workspace: Option<HashMap<String, String>>,
 }
 
-fn parse(path: &str, text: &str, files: &HashSet<&str>) -> Result<Parsed, String> {
+fn parse(path: &str, text: &str, files: &BTreeSet<&str>) -> Result<Parsed, String> {
     let doc = parse_toml(text).map_err(|e| format!("{} (byte {})", e.msg, e.span.start))?;
     let dir = dir_of(path).to_string();
     let workspace = match doc.get_path(&["workspace"]) {
@@ -132,24 +151,43 @@ fn parse(path: &str, text: &str, files: &HashSet<&str>) -> Result<Parsed, String
         targets.push("lib".to_string());
         roots.extend(file(&lp));
     }
-    let mut main_is_bin = false;
-    if let Some(bins) = doc.get_path(&["bin"]).and_then(|b| b.as_array_of_tables()) {
-        for b in bins {
-            let bname = b.get("name").and_then(str_of).unwrap_or(&name);
-            let bpath = b.get("path").and_then(str_of).unwrap_or("src/main.rs");
-            main_is_bin |= bpath == "src/main.rs";
-            targets.push(format!("bin {bname}"));
-            if roots.is_empty() {
-                roots.extend(file(bpath));
+    // binaries and examples: declared ones, then what cargo discovers on its own
+    // (src/main.rs, src/bin/<name>.rs, src/bin/<name>/main.rs, examples/<name>.rs,
+    // examples/<name>/main.rs); one entry per name
+    let mut bins: Vec<(String, String)> = Vec::new();
+    let mut examples: Vec<(String, String)> = Vec::new();
+    for (key, out, default_dir) in [("bin", &mut bins, "src/bin"), ("example", &mut examples, "examples")] {
+        if let Some(declared) = doc.get_path(&[key]).and_then(|b| b.as_array_of_tables()) {
+            for b in declared {
+                let tname = b.get("name").and_then(str_of).unwrap_or(&name).to_string();
+                let tpath = match b.get("path").and_then(str_of) {
+                    Some(p) => p.to_string(),
+                    None if key == "bin" && tname == name => "src/main.rs".to_string(),
+                    None => format!("{default_dir}/{tname}.rs"),
+                };
+                out.push((tname, tpath));
             }
         }
     }
-    if !main_is_bin && file("src/main.rs").is_some() {
-        targets.push(format!("bin {name}"));
+    if file("src/main.rs").is_some() {
+        bins.push((name.clone(), "src/main.rs".to_string()));
+    }
+    bins.extend(discovered(files, &dir, "src/bin"));
+    examples.extend(discovered(files, &dir, "examples"));
+    for list in [&mut bins, &mut examples] {
+        // the declared entry of a name wins: it came first
+        let mut seen = HashSet::new();
+        list.retain(|(n, p)| seen.insert(n.clone()) && seen.insert(format!("\0{p}")));
+    }
+    for (bname, bpath) in &bins {
+        targets.push(format!("bin {bname}"));
         if roots.is_empty() {
-            roots.extend(file("src/main.rs"));
+            roots.extend(file(bpath));
         }
     }
+    let mut example_names: Vec<&String> = examples.iter().map(|(n, _)| n).collect();
+    example_names.sort();
+    targets.extend(example_names.into_iter().map(|n| format!("example {n}")));
     let mut raw = Vec::new();
     let mut escapes = false;
     deps_in(&doc.root, "", &mut raw, &dir, &mut escapes);
@@ -176,7 +214,7 @@ fn parse(path: &str, text: &str, files: &HashSet<&str>) -> Result<Parsed, String
 /// A card from one manifest alone (the overlay): its dependencies by the names written (path
 /// and `workspace = true` ones, unresolved), and no dependents, apps, file counts or modules.
 pub fn written_card(path: &str, text: &str) -> Result<Option<(String, CrateCard, bool)>, String> {
-    let parsed = parse(path, text, &HashSet::new())?;
+    let parsed = parse(path, text, &BTreeSet::new())?;
     let Some((p, raw)) = parsed.package else { return Ok(None) };
     let deps = raw
         .into_iter()
@@ -199,7 +237,7 @@ impl Graph {
     /// The graph of a tree: `manifests` are `(path, text)` of every `Cargo.toml`, `files` every
     /// tracked path, `apps_json` the registry's text when present.
     pub fn build(manifests: &[(String, String)], files: &[&str], apps_json: Option<&str>) -> Graph {
-        let file_set: HashSet<&str> = files.iter().copied().collect();
+        let file_set: BTreeSet<&str> = files.iter().copied().collect();
         let mut g = Graph::default();
         let mut raws: Vec<Vec<RawDep>> = Vec::new();
         let mut workspaces: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
@@ -374,12 +412,12 @@ mod tests {
             ),
             ("libs/port/Cargo.toml".to_string(), format!("# {CARGO_NORMALIZED}\n[package]\nname = \"port\"\n")),
         ];
-        let files = vec!["tools/run/src/main.rs", "libs/lexer/src/lib.rs"];
+        let files = vec!["tools/run/src/main.rs", "tools/run/src/bin/relax.rs", "tools/run/src/bin/multi/main.rs", "tools/run/src/bin/multi/util.rs", "tools/run/examples/demo.rs", "tools/run/examples/big/main.rs", "libs/lexer/src/lib.rs"];
         let g = Graph::build(&manifests, &files, None);
         let run = g.package_of("tools/run/src/main.rs").unwrap();
         let card = g.card(run, vec![]);
         assert_eq!(card.description, "Runs");
-        assert_eq!(card.targets, vec!["bin makepad".to_string()]);
+        assert_eq!(card.targets, vec!["bin makepad", "bin multi", "bin relax", "example big", "example demo"]);
         assert_eq!(card.deps, vec![("lexer".to_string(), String::new()), ("lexer".to_string(), "cfg(unix)".to_string())]);
         assert!(card.private_members);
         let lexer = g.package_of("libs/lexer/src/lib.rs").unwrap();

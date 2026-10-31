@@ -223,6 +223,7 @@ fn tree_circle_from_the_fixture() {
     assert_eq!(card.modules, vec!["tables".to_string()]);
     assert_eq!(card.apps, vec!["spinner".to_string()]);
     assert_eq!(card.rs_files, 2);
+    assert_eq!(alpha.fields.sig, "lib");
     let (_, beta) = by_name(&chunks, "fixture-beta");
     let Detail::Crate(bcard) = &beta.detail else { panic!("no card") };
     assert_eq!(bcard.dependents, vec!["alpha".to_string()]);
@@ -488,6 +489,9 @@ fn whole_repo_extraction() {
     let report = Extractor::new()
         .extract(&circle("makepad"), &def, Some(&rev), &mut repo, &mut |c| {
             *kinds.entry(c.kind.as_str()).or_default() += 1;
+            if c.kind == Kind::Crate && std::env::var("MAKEPAD_INDEX_CARD").is_ok_and(|n| n == c.name) {
+                println!("card {} sig: {}", c.name, c.fields.sig);
+            }
             if c.flags.generated {
                 *generated.entry(c.path.clone()).or_default() += 1;
             }
