@@ -161,6 +161,13 @@ fn lists_worktrees_with_their_heads() {
     commit_all(&lane, "lane: work", 1_700_000_400);
     fs::remove_dir_all(&gone).unwrap();
     let lane_head = GitRepo::open(&lane).unwrap().resolve(&RevSpec::Worktree).unwrap().commit;
+    // every worktree goes by the main checkout's name
+    let main_name = tmp.path().canonicalize().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(GitRepo::open(&lane).unwrap().name(), main_name);
+    assert_eq!(GitRepo::open(tmp.path()).unwrap().name(), main_name);
+    assert_eq!(super::git::repo_name(&lane).unwrap(), Some(main_name.clone()));
+    assert_eq!(super::git::repo_name(tmp.path()).unwrap(), Some(main_name));
+    assert_eq!(super::git::repo_name(&lane.join("alpha")).unwrap(), None, "not a worktree root");
     assert_ne!(lane_head, main_head);
     for from in [tmp.path(), lane.as_path()] {
         let mut repo = GitRepo::open(from).unwrap();
