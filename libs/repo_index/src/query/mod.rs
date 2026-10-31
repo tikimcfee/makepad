@@ -48,7 +48,8 @@ pub fn short(oid: &Oid) -> String {
 
 /// How hits name their circle and revision.
 pub(crate) struct HitCtx {
-    /// The query's first circle: its hits print no `<circle>/` prefix.
+    /// The query's first circle: its tree and history hits print no `<circle>/` prefix (notes
+    /// hits always do).
     pub first: Option<CircleName>,
     /// The query asked for a pinned revision: handles carry `@<rev>`.
     pub pinned: bool,
@@ -63,6 +64,24 @@ struct BlockRank {
     definitions: u64,
     near: Vec<Scored>,
     absent_terms: Vec<String>,
+    /// The filters the entries were held to, as written (`--kind fn`); empty when none.
+    under: Vec<String>,
+}
+
+/// A filter as the flags that set it (a derived circle's selector reads as its flag).
+fn under(f: &Filter) -> Vec<String> {
+    let kinds = f.kinds.iter().map(|k| match k {
+        KindFilter::Kind(k) => k.as_str(),
+        KindFilter::Family(f) => f.as_str(),
+    });
+    let mut out: Vec<String> = Vec::new();
+    let kinds: Vec<&str> = kinds.collect();
+    if !kinds.is_empty() {
+        out.push(format!("--kind {}", kinds.join(",")));
+    }
+    out.extend(f.packages.iter().map(|p| format!("--crate {p}")));
+    out.extend(f.paths.iter().map(|p| format!("--path {p}")));
+    out
 }
 
 fn circle_rev(c: &OpenCircle) -> String {
@@ -86,9 +105,10 @@ impl Search for Engine {
         // The hit limit is the whole answer's: blocks share it, so a two-circle find costs about
         // what a one-circle find does (the byte budget).
         let limit = if query.limit == 0 { crate::DEFAULT_LIMIT } else { query.limit };
-        // A block with nothing to rank (its words are absent there) takes no share.
+        // A block with nothing to rank (its words are absent there) takes no share. Each block
+        // shows at least a group's worth when the limit allows it, and one hit when it doesn't.
         let sharing = ranked.iter().filter(|b| !b.entries.is_empty()).count().max(1);
-        let share = limit.div_ceil(sharing).max(crate::HITS_PER_GROUP);
+        let share = limit.div_ceil(sharing).max(crate::HITS_PER_GROUP.min(limit));
         let blocks: Vec<CircleBlock> = ranked.into_iter().map(|b| self.block(opened, b, query, &ctx, share)).collect();
         let absent: Vec<String> = {
             let mut a: Vec<String> = Vec::new();
@@ -135,7 +155,7 @@ impl Engine {
                 let ci = circle_index(opened, name)?;
                 let c = &opened.open[ci];
                 let Ranked { entries, total, definitions, near, absent_terms, .. } = rank(c, ci, plan, filter, rank::KEEP, opened.blobs.as_ref());
-                vec![BlockRank { name: name.clone(), rev: circle_rev(c), entries, total, definitions, near, absent_terms }]
+                vec![BlockRank { name: name.clone(), rev: circle_rev(c), entries, total, definitions, near, absent_terms, under: under(filter) }]
             }
             CircleExpr::Select { of, by } => {
                 let mut f = filter.clone();
@@ -171,6 +191,8 @@ impl Engine {
                     // Counted over the ranked entries kept, not the whole circle.
                     b.total = b.entries.len() as u64;
                     b.definitions = b.entries.iter().filter(|e| e.definition).count() as u64;
+                    // Keeping only shared records filters: an empty overlap is no absence.
+                    b.under.push(format!("{} shared with {}", format!("{on:?}").to_lowercase(), rights.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join("+")));
                     b.name = CircleName(format!("{} & {}", b.name.0, rights.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join("+")));
                     out.push(b);
                 }
@@ -194,14 +216,18 @@ impl Engine {
         let hits = selected.into_iter().map(|e| build_hit(opened, e, ctx)).collect();
         let nearest = nearest_pool.into_iter().take(rank::NEAREST).map(|e| build_hit(opened, e, ctx)).collect();
         let total = b.total;
-        // Nothing here matches at all: every shaped word is absent. Plain words never are, and
-        // a block with no shaped word absent claims no absence.
-        let absent_terms = if total == 0 { shaped_words(query) } else { b.absent_terms };
+        // Nothing in the whole circle matches: every shaped word is absent. Plain words never
+        // are, and a block with no shaped word absent claims no absence. Under a filter, nothing
+        // matching says nothing about the circle: only the words ranking judged absent before
+        // filtering are.
+        let absent_terms = if total == 0 && b.under.is_empty() { shaped_words(query) } else { b.absent_terms };
+        // `def` counts the exact definitions it shows from, beside the circle's uses.
+        let definitions = if def_mode { pool.len() as u64 } else { b.definitions };
         CircleBlock {
             circle: b.name,
             rev: b.rev,
             total: if def_mode { pool.len() as u64 } else { total },
-            definitions: b.definitions,
+            definitions,
             uses: total - b.definitions,
             hits,
             absent: !absent_terms.is_empty(),
@@ -266,11 +292,15 @@ fn fuse_by_rank(blocks: Vec<BlockRank>) -> BlockRank {
     let rev = blocks.iter().map(|b| b.rev.as_str()).find(|r| !r.is_empty()).unwrap_or("").to_string();
     let definitions = blocks.iter().map(|b| b.definitions).sum();
     let total = blocks.iter().map(|b| b.total).sum();
-    let mut absent_terms: Vec<String> = Vec::new();
-    for b in &blocks {
-        absent_terms.extend(b.absent_terms.iter().filter(|t| blocks.iter().all(|o| o.absent_terms.contains(t))).cloned());
+    let mut under: Vec<String> = Vec::new();
+    for u in blocks.iter().flat_map(|b| &b.under) {
+        if !under.contains(u) {
+            under.push(u.clone());
+        }
     }
-    absent_terms.dedup();
+    // The terms every fused block calls absent, once each, in the first block's order.
+    let absent_terms: Vec<String> =
+        blocks.first().map(|f| f.absent_terms.iter().filter(|t| blocks.iter().all(|o| o.absent_terms.contains(t))).cloned().collect()).unwrap_or_default();
     let mut entries = Vec::new();
     let mut near = Vec::new();
     for b in blocks {
@@ -289,7 +319,7 @@ fn fuse_by_rank(blocks: Vec<BlockRank>) -> BlockRank {
     entries.sort_by(by);
     near.sort_by(by);
     near.truncate(rank::NEAREST);
-    BlockRank { name, rev, entries, total, definitions, near, absent_terms }
+    BlockRank { name, rev, entries, total, definitions, near, absent_terms, under }
 }
 
 fn base_names(expr: &CircleExpr) -> Vec<CircleName> {
@@ -311,8 +341,11 @@ pub(crate) fn build_hit(opened: &Opened, e: &Scored, ctx: &HitCtx) -> Hit {
         _ => Target::Lines { path: v.path.to_string(), lines: e.line.map_or(v.lines, |l| crate::Lines { start: l, end: l }) },
     };
     let rev = circle_rev(c);
+    // A notes hit's path starts with its source's label (`makepad/local/...`), which can read
+    // as a circle prefix: it always carries its own circle, so `show` reads it back one-shot.
+    let notes = c.rev.is_none();
     let handle = Handle {
-        circle: if ctx.first.as_ref() == Some(&c.name) { None } else { Some(c.name.clone()) },
+        circle: if ctx.first.as_ref() == Some(&c.name) && !notes { None } else { Some(c.name.clone()) },
         target,
         rev: (ctx.pinned && !rev.is_empty()).then_some(rev),
     };
