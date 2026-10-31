@@ -387,7 +387,7 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
             }
             let manifest = parts.circles.manifest()?;
             let (bases, circles_live) = live(&manifest, parts.repo.as_mut(), parts.circles.as_ref())?;
-            let report = parts.store.gc(&bases, &circles_live)?;
+            let report = parts.store.gc(parts.repo.id(), &bases, &circles_live)?;
             for p in &report.removed {
                 writeln!(out, "removed {}", p.display()).map_err(io)?;
             }
@@ -770,6 +770,11 @@ mod tests {
     }
 
     fn parts(tag: &str) -> (Parts, Rc<RefCell<Seen>>, PathBuf) {
+        let (p, seen, root, _) = parts_and_store(tag);
+        (p, seen, root)
+    }
+
+    fn parts_and_store(tag: &str) -> (Parts, Rc<RefCell<Seen>>, PathBuf, crate::open::fakes::FakeStore) {
         let root = std::env::temp_dir().join(format!("repo-index-cli-{tag}-{}", std::process::id())).join("makepad");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -785,10 +790,10 @@ mod tests {
             search: Box::new(EchoSearch(seen.clone())),
             render: Box::new(DebugRender),
             repo: Box::new(show_repo),
-            store: Box::new(store),
+            store: Box::new(store.clone()),
             cwd: root.join("src"),
         };
-        (p, seen, root)
+        (p, seen, root, store)
     }
 
     fn call(p: &mut Parts, args: &[&str]) -> (i32, String, String) {
@@ -883,6 +888,18 @@ mod tests {
         let names: Vec<&str> = live_circles.iter().map(|(_, n)| n.0.as_str()).collect();
         assert_eq!(names, ["makepad:history", "notes:local"]);
         assert!(live_circles.iter().all(|(r, _)| r.is_some()), "both belong to the repo");
+    }
+
+    #[test]
+    fn gc_runs_for_this_repo_only() {
+        let (mut p, _, _, store) = parts_and_store("gcscope");
+        assert_eq!(call(&mut p, &["build"]).0, 0);
+        assert_eq!(call(&mut p, &["gc"]).0, 0);
+        let st = store.state.borrow();
+        let [(repo, keys, live_circles)] = st.gc_calls.as_slice() else { panic!("one gc call, got {}", st.gc_calls.len()) };
+        assert_eq!(*repo, p.repo.id(), "the sweep is scoped to the repo gc runs from");
+        assert!(!keys.is_empty() && keys.iter().all(|k| k.repo == Some(*repo)), "only this repo's bases are named live");
+        assert!(live_circles.iter().all(|(r, _)| r.is_none() || *r == Some(*repo)));
     }
 
     #[test]
