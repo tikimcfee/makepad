@@ -15,29 +15,36 @@
 //! META      key, stats (chunks, 5 field-length sums), chunk count
 //! STR_OFFS  (n+1) × u32 into STR_BYTES; string 0 is ""
 //! OIDS      n × [20]
-//! CHUNKS    count × 76 B: kind u8, flags u8, label_len u16, path name package gist sig (string ids),
-//!           span lo hi, lines start end, parent, field lengths 5 × u32, blob commit (oid ids),
-//!           extra (offset into EXTRA); NONE = u32::MAX
-//! EXTRA     per chunk, varints: paths, idents, edges, detail, record text
-//! dict      TERMS, KEYS, CITES: entries (n+1) × (key_off u32, val_off u32, count u32),
-//!           sorted key bytes, values
+//! CHUNKS    count × 66 B: kind u8, flags u8, label_len u16, path name package gist sig (string ids),
+//!           span lo hi, lines start end, parent, field lengths 5 × u16, blob commit (oid ids),
+//!           extra (offset into EXTRA); NONE = u32::MAX; a length of 0xFFFF means "in EXTRA"
+//! EXTRA     per chunk, varints: paths, idents, edges, detail, record text, exact lengths
+//! dict      TERMS, KEYS, CITES, each three sections:
+//!           INDEX   n:u32, then (blocks+1) × u32 offsets into BLOCKS
+//!           BLOCKS  per 16 sorted keys: (shared prefix, suffix len, suffix, count,
+//!                   zigzag value offset delta) varints; a block's first key shares nothing
+//!           VALUES  the lists, each stored once however many keys name it
 //! ```
-//! A term key is its [`crate::TermForm`] byte and its text; its value is postings: per chunk the
-//! id gap (varint), a mask of the fields with a nonzero tf, and those tfs (varints). A key-table
-//! key is a [`crate::Key`] without its line (tag byte, payload); its value is delta-varint chunk
-//! ids. A cite key is an edge's key the same way; its value is (chunk gap, edge index) pairs.
+//! A term key is its [`crate::TermForm`] byte and its text; its value is postings: per chunk a
+//! varint `gap << 6 | field mask << 1 | all-ones`, then, unless every nonzero tf is 1, the tfs
+//! of the masked fields (varints). A key-table key is a [`crate::Key`] without its line (tag
+//! byte, payload); its value is delta-varint chunk ids. A cite key is an edge's key the same
+//! way; its value is (chunk gap, edge index) pairs.
 
 use crate::{CircleName, CircleStats, CommitInfo, CrateCard, Detail, Edge, Field, Flags, Key, Kind, Oid, RepoId, SegmentKey, SourceStamp, TermForm};
 
 pub const MAGIC: &[u8; 4] = b"MPXS";
 pub const FOOTER_MAGIC: &[u8; 4] = b"MPXE";
 /// The segment format; part of [`crate::INDEXER_VERSION`]'s promise.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 pub const HEADER_LEN: usize = 16;
 pub const TABLE_ENTRY_LEN: usize = 24;
 pub const FOOTER_LEN: usize = 24;
-pub const CHUNK_LEN: usize = 76;
-pub const DICT_ENTRY_LEN: usize = 12;
+pub const CHUNK_LEN: usize = 66;
+/// Keys per front-coded dictionary block.
+pub const BLOCK: usize = 16;
+/// A stored field length that does not fit u16 (the exact one is in EXTRA).
+pub const LONG: u16 = u16::MAX;
 pub const NONE: u32 = u32::MAX;
 
 /// Section ids, in file order.
@@ -48,19 +55,11 @@ pub mod sec {
     pub const OIDS: u32 = 4;
     pub const CHUNKS: u32 = 5;
     pub const EXTRA: u32 = 6;
-    pub const TERM_ENTRIES: u32 = 7;
-    pub const TERM_KEYS: u32 = 8;
-    pub const TERM_VALUES: u32 = 9;
-    pub const KEY_ENTRIES: u32 = 10;
-    pub const KEY_KEYS: u32 = 11;
-    pub const KEY_VALUES: u32 = 12;
-    pub const CITE_ENTRIES: u32 = 13;
-    pub const CITE_KEYS: u32 = 14;
-    pub const CITE_VALUES: u32 = 15;
-    pub const ALL: [u32; 15] = [
-        META, STR_OFFS, STR_BYTES, OIDS, CHUNKS, EXTRA, TERM_ENTRIES, TERM_KEYS, TERM_VALUES, KEY_ENTRIES, KEY_KEYS,
-        KEY_VALUES, CITE_ENTRIES, CITE_KEYS, CITE_VALUES,
-    ];
+    /// A dictionary's sections are `INDEX`, `INDEX + 1` (blocks) and `INDEX + 2` (values).
+    pub const TERMS: u32 = 7;
+    pub const KEYS: u32 = 10;
+    pub const CITES: u32 = 13;
+    pub const ALL: [u32; 15] = [META, STR_OFFS, STR_BYTES, OIDS, CHUNKS, EXTRA, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 }
 
 /// Byte offsets of the fields of a chunk record.
@@ -77,9 +76,9 @@ pub mod rec {
     pub const LINES: usize = 32;
     pub const PARENT: usize = 40;
     pub const LENGTHS: usize = 44;
-    pub const BLOB: usize = 64;
-    pub const COMMIT: usize = 68;
-    pub const EXTRA: usize = 72;
+    pub const BLOB: usize = 54;
+    pub const COMMIT: usize = 58;
+    pub const EXTRA: usize = 62;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,6 +390,8 @@ pub struct ExtraIds {
     pub detail: DetailIds,
     /// Record text's string id + 1, or 0.
     pub text: u32,
+    /// The exact field lengths, when one does not fit the record's u16 ([`LONG`]).
+    pub lengths: Option<[u32; 5]>,
 }
 
 /// An edge: target circle (string id), key tag, payload (string or oid id), line + 1 or 0.
@@ -473,6 +474,15 @@ pub fn encode_extra(out: &mut Vec<u8>, x: &ExtraIds) {
         }
     }
     put_varint(out, x.text as u64);
+    match x.lengths {
+        None => out.push(0),
+        Some(l) => {
+            out.push(5);
+            for v in l {
+                put_varint(out, v as u64);
+            }
+        }
+    }
 }
 
 pub fn decode_extra(r: &mut Reader) -> Option<ExtraIds> {
@@ -509,7 +519,12 @@ pub fn decode_extra(r: &mut Reader) -> Option<ExtraIds> {
         _ => return None,
     };
     let text = r.varint_u32()?;
-    Some(ExtraIds { paths, idents, edges, detail, text })
+    let lengths = match r.u8()? {
+        0 => None,
+        5 => Some([r.varint_u32()?, r.varint_u32()?, r.varint_u32()?, r.varint_u32()?, r.varint_u32()?]),
+        _ => return None,
+    };
+    Some(ExtraIds { paths, idents, edges, detail, text, lengths })
 }
 
 /// Rebuilds a [`Detail`] from its ids.
@@ -556,26 +571,32 @@ fn ungap(r: &mut Reader, prev: Option<u32>) -> Option<u32> {
     prev.map_or(0, |p| p + 1).checked_add(r.varint_u32()?)
 }
 
-/// Appends one posting after `prev` (ids strictly ascend): the gap, the mask of nonzero
-/// fields, their tfs.
+/// Appends one posting after `prev` (ids strictly ascend): `gap << 6 | mask << 1 | all-ones`,
+/// then the masked tfs unless they are all 1.
 pub fn put_posting(out: &mut Vec<u8>, prev: Option<u32>, chunk: u32, tf: &[u32; 5]) {
-    put_varint(out, gap(prev, chunk));
-    let mask = tf.iter().enumerate().fold(0u8, |m, (i, &t)| if t != 0 { m | 1 << i } else { m });
-    out.push(mask);
-    for &t in tf {
-        if t != 0 {
-            put_varint(out, t as u64);
+    let mask = tf.iter().enumerate().fold(0u64, |m, (i, &t)| if t != 0 { m | 1 << i } else { m });
+    let ones = tf.iter().all(|&t| t <= 1);
+    put_varint(out, gap(prev, chunk) << 6 | mask << 1 | ones as u64);
+    if !ones {
+        for &t in tf {
+            if t != 0 {
+                put_varint(out, t as u64);
+            }
         }
     }
 }
 
 pub fn get_posting(r: &mut Reader, prev: Option<u32>) -> Option<(u32, [u32; 5])> {
-    let chunk = ungap(r, prev)?;
-    let mask = r.u8()?;
+    let h = r.varint()?;
+    let chunk = prev.map_or(0, |p| p + 1).checked_add(u32::try_from(h >> 6).ok()?)?;
+    let mask = (h >> 1) & 31;
+    if mask == 0 {
+        return None;
+    }
     let mut tf = [0u32; 5];
     for (i, t) in tf.iter_mut().enumerate() {
         if mask & (1 << i) != 0 {
-            *t = r.varint_u32()?;
+            *t = if h & 1 == 1 { 1 } else { r.varint_u32()? };
         }
     }
     Some((chunk, tf))
@@ -588,4 +609,128 @@ pub fn put_id(out: &mut Vec<u8>, prev: Option<u32>, id: u32) {
 
 pub fn get_id(r: &mut Reader, prev: Option<u32>) -> Option<u32> {
     ungap(r, prev)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Front-coded dictionaries
+
+/// Encodes sorted `(key, count, value offset)` entries as an INDEX and a BLOCKS section.
+pub fn encode_dict(entries: &[(&[u8], u32, u32)]) -> (Vec<u8>, Vec<u8>) {
+    let mut index = Vec::with_capacity(8 + entries.len().div_ceil(BLOCK) * 4);
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut blocks = Vec::new();
+    for block in entries.chunks(BLOCK) {
+        index.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        let (mut prev_key, mut prev_val): (&[u8], u32) = (&[], 0);
+        for &(key, count, val) in block {
+            let shared = prev_key.iter().zip(key).take_while(|(a, b)| a == b).count();
+            put_varint(&mut blocks, shared as u64);
+            put_bytes(&mut blocks, &key[shared..]);
+            put_varint(&mut blocks, count as u64);
+            put_varint(&mut blocks, zigzag(val as i64 - prev_val as i64));
+            (prev_key, prev_val) = (key, val);
+        }
+    }
+    index.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    (index, blocks)
+}
+
+/// A front-coded dictionary over its three sections.
+pub struct DictView<'a> {
+    n: usize,
+    index: &'a [u8],
+    blocks: &'a [u8],
+    values: &'a [u8],
+}
+
+impl<'a> DictView<'a> {
+    /// `None` when the index does not fit the blocks.
+    pub fn new(index: &'a [u8], blocks: &'a [u8], values: &'a [u8]) -> Option<DictView<'a>> {
+        let n = u32::from_le_bytes(index.get(0..4)?.try_into().ok()?) as usize;
+        let nb = n.div_ceil(BLOCK);
+        if index.len() != 4 + (nb + 1) * 4 || le_u32(index, 4) != 0 || le_u32(index, 4 + nb * 4) as usize != blocks.len() {
+            return None;
+        }
+        Some(DictView { n, index, blocks, values })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn block(&self, b: usize) -> Reader<'a> {
+        Reader::at(self.blocks, le_u32(self.index, 4 + b * 4) as usize)
+    }
+
+    fn first_key(&self, b: usize) -> Option<&'a [u8]> {
+        let mut r = self.block(b);
+        (r.varint()? == 0).then_some(())?;
+        r.bytes()
+    }
+
+    /// The value (from its offset to the end of VALUES; the count bounds it) and count.
+    fn value(&self, off: i64, count: u32) -> Option<(&'a [u8], u32)> {
+        Some((self.values.get(usize::try_from(off).ok()?..)?, count))
+    }
+
+    pub fn find(&self, key: &[u8]) -> Option<(&'a [u8], u32)> {
+        let nb = self.n.div_ceil(BLOCK);
+        // the last block whose first key is <= key
+        let (mut lo, mut hi) = (0, nb);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.first_key(mid)? <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let b = lo.checked_sub(1)?;
+        let mut r = self.block(b);
+        let mut k: Vec<u8> = Vec::with_capacity(key.len());
+        let mut val = 0i64;
+        for _ in 0..BLOCK.min(self.n - b * BLOCK) {
+            let shared = r.varint()? as usize;
+            k.truncate(shared);
+            k.extend_from_slice(r.bytes()?);
+            let count = r.varint_u32()?;
+            val += unzigzag(r.varint()?);
+            match k.as_slice().cmp(key) {
+                std::cmp::Ordering::Equal => return self.value(val, count),
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        None
+    }
+
+    /// Every entry in key order: key, value, count. Stops at the first entry that does not
+    /// decode (the caller reports it by the shortfall against [`DictView::len`]).
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, &'a [u8], u32)> + '_ {
+        let mut i = 0;
+        let mut r = self.block(0);
+        let mut k: Vec<u8> = Vec::new();
+        let mut val = 0i64;
+        std::iter::from_fn(move || {
+            if i == self.n {
+                return None;
+            }
+            if i % BLOCK == 0 {
+                r = self.block(i / BLOCK);
+                val = 0;
+            }
+            i += 1;
+            let shared = r.varint()? as usize;
+            k.truncate(shared);
+            k.extend_from_slice(r.bytes()?);
+            let count = r.varint_u32()?;
+            val += unzigzag(r.varint()?);
+            let (v, n) = self.value(val, count)?;
+            Some((k.clone(), v, n))
+        })
+    }
 }
