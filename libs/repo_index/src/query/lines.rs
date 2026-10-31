@@ -28,8 +28,13 @@ pub const LINES_PER_FILE: usize = 2;
 struct LineWord {
     word: u16,
     texts: Vec<String>,
+    /// A prefix word's folded stem: a line token must start with it.
+    prefix: Option<String>,
+    /// A `::` prefix: the module's own name counts as a token.
+    module: bool,
     weight: f32,
 }
+
 
 fn line_words(c: &OpenCircle, plan: &Plan) -> Vec<LineWord> {
     let n = c.stats.chunks.max(1) as f32;
@@ -41,18 +46,20 @@ fn line_words(c: &OpenCircle, plan: &Plan) -> Vec<LineWord> {
         let mut texts: Vec<String> = plan
             .groups
             .iter()
-            .filter(|g| g.word == w && matches!(g.role, crate::query::rank::Role::Primary | crate::query::rank::Role::Variant))
+            .filter(|g| g.word == w && matches!(g.role, crate::query::rank::Role::Primary | crate::query::rank::Role::Variant | crate::query::rank::Role::PrefixPart))
             .map(|g| g.text.clone())
             .collect();
         for p in plan.paths.iter().filter(|p| p.word == w) {
             texts.extend(p.parts.iter().cloned());
         }
+        let prefix = plan.prefixes.iter().find(|p| p.0 == w).map(|p| p.1.clone());
+        let module = plan.groups.iter().any(|g| g.word == w && g.role == crate::query::rank::Role::Primary) && prefix.is_some();
         if texts.is_empty() {
             continue;
         }
         let rarity = texts.iter().map(|t| idf(df(t).min(n))).fold(0.0, f32::max) / max_idf;
         let named = if plan.named.contains(&w) { crate::query::rank::NAMED_WEIGHT } else { 1.0 };
-        out.push(LineWord { word: w, texts, weight: rarity * named });
+        out.push(LineWord { word: w, texts, prefix, module, weight: rarity * named });
     }
     out
 }
@@ -70,7 +77,11 @@ fn line_score(line: &str, qw: &[LineWord], paths: &[u16]) -> f32 {
     }
     let mut score = 0.0;
     for q in qw {
-        let hit = if paths.contains(&q.word) {
+        let hit = if let Some(stem) = &q.prefix {
+            // `FOO_` wants something after it; a `::` prefix (a module) is its own token.
+            let open = format!("{stem}_");
+            toks.iter().any(|x| x.starts_with(&open) || (q.module && x == stem))
+        } else if paths.contains(&q.word) {
             q.texts.iter().all(|t| toks.iter().any(|x| x == t))
         } else {
             q.texts.iter().any(|t| toks.iter().any(|x| x == t))
@@ -147,7 +158,12 @@ pub fn refine(c: &OpenCircle, circle: usize, plan: &Plan, entries: &mut Vec<Scor
             .lines()
             .zip(lower.lines())
             .enumerate()
-            .filter(|(_, (_, low))| qw.iter().any(|q| q.texts.iter().any(|t| low.contains(t.as_str()))))
+            .filter(|(_, (_, low))| {
+                qw.iter().any(|q| match &q.prefix {
+                    Some(stem) => low.contains(stem.as_str()),
+                    None => q.texts.iter().any(|t| low.contains(t.as_str())),
+                })
+            })
             .map(|(i, (l, _))| (line_score(l, &qw, &paths), first + i as u32))
             .filter(|(s, _)| *s > 0.0)
             .collect();

@@ -762,7 +762,11 @@ fn a_missing_named_thing_is_absent_beside_present_words() {
     assert!(header.lines().next().unwrap().ends_with("uses · absent: spin_wheel_limit"), "{header}");
     // Nothing matches at all: every content word is absent, function words aside.
     let b = &find(&o, &query("where is zzqx_none wombat", &["makepad"])).blocks[0];
-    assert_eq!(b.absent_terms, ["zzqx_none", "wombat"]);
+    // Plain words are never named absent: only the identifier is.
+    assert_eq!(b.absent_terms, ["zzqx_none"]);
+    // Nothing shaped is missing and nothing matches: no absence is claimed.
+    let b = &find(&o, &query("why does the wombat yodel", &["makepad"])).blocks[0];
+    assert!(!b.absent && b.absent_terms.is_empty() && b.hits.is_empty());
     // Present things are never absent.
     for q in ["alpha/src/lib.rs", "clamp_turn in beta", "what is fixture-beta", "MAX_TURN"] {
         assert!(!find(&o, &query(q, &["makepad"])).blocks[0].absent, "{q}");
@@ -939,4 +943,24 @@ fn plain_words_match_their_inflections() {
     // matches now cover the word.
     let b = &find(&o, &query("gizmos spins", &["makepad"])).blocks[0];
     assert!(b.hits.iter().any(|h| h.name == "Gizmo::spin"), "{:?}", names(b));
+}
+
+#[test]
+fn a_prefix_word_matches_identifiers_that_start_with_it() {
+    use rank::{classify, Class};
+    assert_eq!(classify("FOO_BAR_"), ("FOO_BAR".into(), Class::Prefix));
+    assert_eq!(classify("`foo::`"), ("foo".into(), Class::Prefix));
+    assert_eq!(classify("MAX_TURN"), ("MAX_TURN".into(), Class::Subject { call: false, macro_call: false }));
+    let o = opened(vec![makepad()], vec![]);
+    // SPIN_TABLE and spin_label start with SPIN_ (folded alike; the generated table ranks
+    // down); a chunk that only says "spin" as a word does not count.
+    let b = &find(&o, &query("SPIN_", &["makepad"])).blocks[0];
+    assert!(!b.absent);
+    assert_eq!(names(b), ["spin_label", "SPIN_TABLE"]);
+    assert!(!b.hits.iter().any(|h| h.name == "Gizmo::spin"), "{:?}", names(b));
+    let b = &find(&o, &query("where is MAX_ used", &["makepad"])).blocks[0];
+    assert!(b.hits.iter().take(3).any(|h| h.name == "MAX_TURN"), "{:?}", names(b));
+    // A prefix whose parts occur nowhere is absent, named as written.
+    let b = &find(&o, &query("WOMBAT_YODEL_", &["makepad"])).blocks[0];
+    assert_eq!(b.absent_terms, ["WOMBAT_YODEL_"]);
 }

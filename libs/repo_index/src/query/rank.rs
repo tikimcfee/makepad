@@ -83,6 +83,9 @@ pub enum Role {
     /// A part of a path-shaped word other than its rarest: scored only on chunks the rarest
     /// part found, so the word covers a chunk only when all its parts are there.
     PathPart,
+    /// A part of an identifier prefix ending in `_` (`spin` in `SPIN_`): matched only as a part of
+    /// an identifier, never a word on its own; all parts are needed.
+    PrefixPart,
     /// An English inflection of a plain word (`remotely` → `remote`, `guides` → `guide`): an
     /// alternative that covers the word, at [`VARIANT_WEIGHT`].
     Variant,
@@ -152,6 +155,8 @@ pub enum Class {
     Package,
     /// Identifier-shaped: pinned definitions and an absence check.
     Subject { call: bool, macro_call: bool },
+    /// An identifier prefix (`FOO_BAR_`, `foo::`): matches identifiers that start with it.
+    Prefix,
     Plain,
 }
 
@@ -168,6 +173,12 @@ pub fn classify(raw: &str) -> (String, Class) {
     }
     for possessive in ["'s", "\u{2019}s"] {
         s = s.strip_suffix(possessive).unwrap_or(s);
+    }
+    // A trailing `_` or `::` leaves the identifier open: a prefix.
+    let stem = s.trim_end_matches(['_', ':']);
+    let prefix = stem.len() < s.len() && (s.ends_with('_') || s.ends_with("::")) && stem.chars().any(char::is_alphanumeric) && !stem.contains('/');
+    if prefix {
+        return (stem.to_string(), Class::Prefix);
     }
     s = s.trim_end_matches([':', '.']);
     if let Some((head, tail)) = s.rsplit_once(':') {
@@ -252,6 +263,8 @@ pub struct Plan {
     pub packages: Vec<String>,
     /// Identifier-shaped words judged for absence: (folded whole, as written).
     pub subjects: Vec<(String, String)>,
+    /// Identifier prefixes: (word, folded stem, folded parts, as written with its `_`).
+    pub prefixes: Vec<(u16, String, Vec<String>, String)>,
 }
 
 impl Plan {
@@ -279,6 +292,18 @@ impl Plan {
                     continue;
                 }
                 Class::Package => plan.packages.push(core.clone()),
+                Class::Prefix => {
+                    // All its parts must match; an `_` prefix's parts only as identifier parts,
+                    // a `::` prefix (a module) as words. Lines check that a token really starts
+                    // with it.
+                    let parts = crate::terms::split_parts(core);
+                    let module = raw_words[i].trim_end_matches(['`', '"', '\'', ',', ';', '?', ')', '*']).ends_with("::");
+                    let role = if module { Role::Primary } else { Role::PrefixPart };
+                    for p in &parts {
+                        plan.groups.push(Group { text: p.clone(), word, role, span: 1 });
+                    }
+                    plan.prefixes.push((word, makepad_search::fold(core), parts, format!("{core}_")));
+                }
                 Class::Subject { call, macro_call } => {
                     if *call {
                         plan.kinds.extend([Kind::Fn, Kind::Method]);
@@ -311,7 +336,7 @@ impl Plan {
                 }
             }
         }
-        let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).collect();
+        let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).chain(plan.prefixes.iter().map(|p| p.0)).collect();
         for t in terms.iter().filter(|t| kept.contains(&t.word) && !path_words.contains(&t.word)) {
             let role = match t.form {
                 TermForm::Folded => Role::Primary,
@@ -376,7 +401,7 @@ impl Plan {
         plan.named = kept
             .iter()
             .copied()
-            .filter(|w| matches!(classes[*w as usize].1, Class::Path | Class::Package | Class::Subject { .. }))
+            .filter(|w| matches!(classes[*w as usize].1, Class::Path | Class::Package | Class::Subject { .. } | Class::Prefix))
             .collect();
         plan
     }
@@ -611,6 +636,17 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
             absent_terms.push(written.clone());
         }
     }
+    // A prefix is absent when one of its parts occurs nowhere, whole or as a part.
+    for (_, _, parts, written) in &plan.prefixes {
+        let occurs = |p: &str| {
+            c.segments.iter().any(|seg| seg.df(TermForm::Folded, p) > 0 || seg.df(TermForm::Part, p) > 0)
+                || overlay_has(TermForm::Folded, p)
+                || overlay_has(TermForm::Part, p)
+        };
+        if !parts.iter().all(|p| occurs(p)) && !absent_terms.contains(written) {
+            absent_terms.push(written.clone());
+        }
+    }
 
     // Path words: each through its rarest part (by df in this circle) as a text term, and the
     // chunks whose path meets it.
@@ -705,6 +741,7 @@ fn forms(role: Role) -> &'static [(TermForm, f32)] {
         Role::Exact => &[(TermForm::Exact, 1.0)],
         Role::Phrase | Role::Run | Role::Variant => &[(TermForm::Folded, 1.0)],
         Role::PathPart => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
+        Role::PrefixPart => &[(TermForm::Part, 1.0)],
     }
 }
 
@@ -718,7 +755,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
     // circle covers little; the identifier the query names covers much.
     let mut word_idf: HashMap<u16, f32> = HashMap::new();
     for (g, i) in groups.iter().zip(&idfs) {
-        if matches!(g.role, Role::Primary | Role::Phrase | Role::Run) {
+        if matches!(g.role, Role::Primary | Role::Phrase | Role::Run | Role::PrefixPart) {
             let e = word_idf.entry(g.word).or_insert(0.0);
             *e = e.max(*i);
         }
@@ -814,7 +851,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
 
     // Words with several primary terms cover a chunk only when all of them match.
     let mut need: HashMap<u16, usize> = HashMap::new();
-    for g in groups.iter().filter(|g| matches!(g.role, Role::Primary | Role::PathPart)) {
+    for g in groups.iter().filter(|g| matches!(g.role, Role::Primary | Role::PathPart | Role::PrefixPart)) {
         *need.entry(g.word).or_insert(0) += 1;
     }
     let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).collect();
@@ -859,14 +896,14 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 continue;
             }
             let role_weight = match g.role {
-                Role::Primary | Role::Phrase | Role::Run | Role::PathPart => 1.0,
+                Role::Primary | Role::Phrase | Role::Run | Role::PathPart | Role::PrefixPart => 1.0,
                 Role::Variant => VARIANT_WEIGHT,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
             };
             score += role_weight * idfs[*gi] * pseudo / (K1 + pseudo);
             match g.role {
-                Role::Primary | Role::PathPart => {
+                Role::Primary | Role::PathPart | Role::PrefixPart => {
                     *matched.entry(g.word).or_insert(0) += 1;
                     in_name |= tf[0] > 0.0 && !path_words.contains(&g.word);
                 }
