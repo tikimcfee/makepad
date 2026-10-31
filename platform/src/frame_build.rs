@@ -1754,6 +1754,9 @@ impl Cx {
         if call.options.alpha_blend {
             flags |= Draw::BLEND;
         }
+        if self.passes[pass_id].reverse_z {
+            flags |= Draw::REVERSE_Z;
+        }
         if index32 {
             flags |= Draw::INDEX_U32;
         }
