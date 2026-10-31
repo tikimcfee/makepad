@@ -129,6 +129,37 @@ impl Eval<'_> {
     }
 }
 
+/// The content stamp of every notes circle configured here, by name.
+pub fn notes_stamps(manifest: &CircleManifest) -> Result<Vec<(CircleName, u64)>, Error> {
+    use crate::{BaseCircle, BaseSource, CircleBody};
+    let mut out = Vec::new();
+    for d in &manifest.defs {
+        if let CircleBody::Base(def @ BaseCircle { source: BaseSource::Notes { sources }, .. }) = &d.body {
+            out.push((d.name.clone(), crate::open::notes_stamp(sources, def)?));
+        }
+    }
+    Ok(out)
+}
+
+/// Why a question is stale: a pinned notes circle whose content stamp differs now. A pinned
+/// circle not configured here leaves the question to the configuration check.
+fn stale_pin(manifest: &CircleManifest, q: &Question) -> Result<Option<String>, Error> {
+    if q.pins.is_empty() {
+        return Ok(None);
+    }
+    let now = notes_stamps(manifest)?;
+    for (c, pinned) in &q.pins {
+        match now.iter().find(|(n, _)| n == c) {
+            Some((_, stamp)) if stamp != pinned => {
+                return Ok(Some(format!("{} changed since its gold: pinned {pinned:016x}, now {stamp:016x}", c.0)))
+            }
+            Some(_) => {}
+            None => return Ok(Some(format!("{} is pinned but not a notes circle configured here", c.0))),
+        }
+    }
+    Ok(None)
+}
+
 /// Every base circle whose index a revision of the repo at `root` decides: its tree and history
 /// circles, and every notes circle. Another repo's circles (`commercial`) are not opened at this
 /// repo's revisions.
@@ -217,6 +248,10 @@ impl Harness for Eval<'_> {
             }
             if let Some(c) = q.circles.iter().find(|c| !configured.contains(c)) {
                 report.skipped.push((q.id.clone(), format!("circle {} is not configured here", c.0)));
+                continue;
+            }
+            if let Some(why) = stale_pin(&manifest, q)? {
+                report.stale.push((q.id.clone(), why));
                 continue;
             }
             let key = (q.rev.clone(), q.circles.clone());
@@ -400,6 +435,9 @@ pub fn report_text(report: &EvalReport, qtype: &dyn Fn(&str) -> String) -> Strin
     for (id, why) in &report.skipped {
         t.push_str(&format!("skipped {id}: {why}\n"));
     }
+    for (id, why) in &report.stale {
+        t.push_str(&format!("stale {id}: {why}\n"));
+    }
     for f in &report.failures {
         t.push_str(&format!("FAIL {f}\n"));
     }
@@ -433,6 +471,10 @@ pub fn report_json(report: &EvalReport) -> String {
     }
     for (id, why) in &report.skipped {
         obj(vec![("skipped", s(id)), ("why", s(why))]).write_into(&mut out);
+        out.push('\n');
+    }
+    for (id, why) in &report.stale {
+        obj(vec![("stale", s(id)), ("why", s(why))]).write_into(&mut out);
         out.push('\n');
     }
     for f in &report.failures {
@@ -717,6 +759,39 @@ mod tests {
         assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
         assert!(report.failures[0].starts_with("circle notes:gone cannot be built here"), "{:?}", report.failures);
         assert!(report.rows.iter().all(|r| r.solved));
+    }
+
+    #[test]
+    fn a_question_on_changed_notes_is_stale_not_failed() {
+        let top = std::env::temp_dir().join(format!("repo-index-eval-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let root = top.join("makepad");
+        std::fs::create_dir_all(top.join("mail/t")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(top.join("mail/t/a.md"), "# a\n").unwrap();
+        let conf = top.join("c.conf");
+        std::fs::write(&conf, format!("notes:t = notes {}\n", top.join("mail/t").display())).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["9a76551d7", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, &[]);
+        let (mut circles, _) = opener(repo, &conf);
+        let mut answers = HashMap::new();
+        answers.insert("x".to_string(), FindOutput { blocks: vec![block("makepad", vec![], true)], pointers: vec![] });
+        let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
+        let mut r = FakeRepo::new(&root);
+        let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
+        let m = eval.circles.manifest().unwrap();
+        let pinned = notes_stamps(&m).unwrap()[0].1;
+        let pointer = GoldTarget::Pointer { circle: CircleName("notes:t".into()), count: Some(1), unit: crate::PointerUnit::Blobs };
+        let question = Question { pins: vec![(CircleName("notes:t".into()), pinned)], ..q("n01", &["makepad"], vec![(2, pointer)]) };
+        let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: None };
+        let fresh = eval.run(std::slice::from_ref(&question), &opts).unwrap();
+        assert!(fresh.stale.is_empty() && fresh.rows.len() == 1, "unchanged notes: scored");
+        std::fs::write(top.join("mail/t/b.md"), "# b\n").unwrap();
+        let later = eval.run(&[question], &opts).unwrap();
+        assert!(later.rows.is_empty() && later.failures.is_empty(), "stale: neither scored nor failed");
+        assert_eq!(later.stale.len(), 1);
+        assert!(later.stale[0].1.starts_with(&format!("notes:t changed since its gold: pinned {pinned:016x}")), "{:?}", later.stale);
+        assert!(report_text(&later, &|_| "circle".into()).contains("stale n01: notes:t changed"));
     }
 
     #[test]
