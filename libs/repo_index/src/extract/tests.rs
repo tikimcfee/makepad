@@ -259,6 +259,12 @@ fn tree_circle_from_the_fixture() {
     assert!(spinning.fields.doc.contains("steps above `MAX_TURN` are clamped"));
     assert_eq!(spinning.gist, "Call `Gizmo::spin` with a step; steps above `MAX_TURN` are clamped.");
     assert!(chunks.iter().any(|c| c.kind == Kind::Doc && c.path == "README.md"));
+    // every other tracked file is one path-only record; a card's own Cargo.toml is not
+    let path_only: Vec<&str> = chunks.iter().filter(|c| c.kind == Kind::File && !c.path.ends_with(".rs")).map(|c| c.path.as_str()).collect();
+    assert_eq!(path_only, vec!["Cargo.toml", "libs/app_registry/apps.json"]);
+    let apps = chunks.iter().find(|c| c.path == "libs/app_registry/apps.json").unwrap();
+    assert_eq!((apps.name.as_str(), apps.fields.path.as_str(), apps.keys.paths.clone()), ("apps.json", "libs/app_registry/apps.json", vec!["libs/app_registry/apps.json".to_string()]));
+    assert!(apps.keys.blob.is_some() && apps.fields.body.is_empty() && apps.gist.is_empty() && apps.parent.is_none() && apps.keys.package.is_none());
     let view = by_name(&chunks, "GizmoView").1;
     assert_eq!((view.kind, view.lines.start, view.keys.idents.clone()), (Kind::Splash, 3, vec!["GizmoView".to_string()]));
 }
