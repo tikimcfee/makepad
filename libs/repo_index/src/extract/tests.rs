@@ -116,6 +116,18 @@ fn by_name<'a>(chunks: &'a [Chunk], name: &str) -> (usize, &'a Chunk) {
 }
 
 #[test]
+fn gists_are_first_sentences_within_the_cap() {
+    assert_eq!(super::gist("# Title\n\nFirst sentence. Second one."), "Title");
+    assert_eq!(super::gist("First sentence. Second one.\nmore"), "First sentence.");
+    assert_eq!(super::gist("- a bullet line\n- next"), "a bullet line next");
+    assert_eq!(super::gist("\n\n"), "");
+    let long = "word ".repeat(40);
+    let g = super::gist(&long);
+    assert_eq!(g.chars().count(), crate::MAX_GIST_CHARS);
+    assert!(g.ends_with('…'));
+}
+
+#[test]
 fn resolves_revisions() {
     let tmp = fixture_repo();
     let mut repo = GitRepo::open(tmp.path()).unwrap();
@@ -179,6 +191,10 @@ fn tree_circle_from_the_fixture() {
     assert_eq!(spin.parent, Some(ii as u32));
     assert_eq!((spin.lines.start, spin.keys.idents.clone()), (15, vec!["spin".to_string()]));
     assert!(spin.flags.definition && spin.flags.public && spin.flags.documented);
+    assert_eq!(spin.gist, "Spins the gizmo by `step`, clamped to [`MAX_TURN`].");
+    assert_eq!(spin.label_len, 0);
+    assert_eq!(file.gist, "Spinning gizmos: a gizmo turns by a step each tick.");
+    assert_eq!(alpha.gist, "Spinning gizmos for the index fixture");
     assert_eq!(spin.keys.blob, file.keys.blob);
 
     // generated: skeleton; unpairable: a bag
@@ -194,6 +210,7 @@ fn tree_circle_from_the_fixture() {
     let spinning = by_name(&chunks, "Spinning").1;
     assert_eq!((spinning.kind, spinning.parent, spinning.lines.start), (Kind::Doc, None, 5));
     assert!(spinning.fields.doc.contains("steps above `MAX_TURN` are clamped"));
+    assert_eq!(spinning.gist, "Call `Gizmo::spin` with a step; steps above `MAX_TURN` are clamped.");
     assert!(chunks.iter().any(|c| c.kind == Kind::Doc && c.path == "README.md"));
     let view = by_name(&chunks, "GizmoView").1;
     assert_eq!((view.kind, view.lines.start, view.keys.idents.clone()), (Kind::Splash, 3, vec!["GizmoView".to_string()]));
@@ -242,6 +259,10 @@ fn notes_circle_labels_copies_binaries_and_edges() {
     assert_eq!(plan[0].keys.blob, copy[0].keys.blob, "copies share a blob");
     assert_eq!(plan[1].kind, Kind::Note);
     assert_eq!(plan[1].fields.path, "PLAN.md", "the label is not in the path field");
+    assert_eq!(plan[1].label_len as usize, "topic-a".len());
+    assert_eq!(&plan[1].path[plan[1].label_len as usize + 1..], "PLAN.md");
+    assert_eq!(plan[1].gist, "`Gizmo::spin` at alpha/src/lib.rs:15 clamps the step through `clamp_turn`.");
+    assert_eq!(local_label_len(&chunks), "fixture/notes/local-a".len());
     assert!(plan[1].fields.body.starts_with("## Gizmo spin"), "record text is the body");
     assert!(plan[1].keys.edges.iter().any(|e| e.key == Key::Path { path: "alpha/src/lib.rs".into(), line: Some(15) }));
     let bin = chunks.iter().find(|c| c.path == "topic-a/pixel.bin").unwrap();
@@ -250,6 +271,10 @@ fn notes_circle_labels_copies_binaries_and_edges() {
     let local_spin = chunks.iter().find(|c| c.path == "fixture/notes/local-a/spin.rs").unwrap();
     assert_eq!(local_spin.kind, Kind::NoteFile);
     assert!(local_spin.fields.body.contains("spin_note_local"));
+}
+
+fn local_label_len(chunks: &[Chunk]) -> usize {
+    chunks.iter().find(|c| c.path.starts_with("fixture/notes/local-a/")).unwrap().label_len as usize
 }
 
 #[test]

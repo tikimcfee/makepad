@@ -72,7 +72,38 @@ fn base_chunk(kind: Kind, circle: &CircleName, path: &str, name: &str) -> Chunk 
         keys: Keys { paths: vec![path.to_string()], ..Default::default() },
         flags: Flags::default(),
         detail: Detail::None,
+        gist: String::new(),
+        label_len: 0,
     }
+}
+
+/// The first sentence of a text's first paragraph (Markdown heading, quote and bullet markers
+/// dropped), at most [`crate::MAX_GIST_CHARS`]: a hit's gist, never generated.
+pub fn gist(text: &str) -> String {
+    let mut para = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("```") || t.starts_with("~~~") {
+            if para.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let t = t.trim_start_matches('#').trim_start_matches('>').trim_start();
+        let t = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).unwrap_or(t);
+        if !para.is_empty() {
+            para.push(' ');
+        }
+        para.push_str(t.trim());
+    }
+    let end = para.find(". ").map_or(para.len(), |i| i + 1);
+    let sentence = para[..end].trim();
+    if sentence.chars().count() <= crate::MAX_GIST_CHARS {
+        return sentence.to_string();
+    }
+    let mut cut: String = sentence.chars().take(crate::MAX_GIST_CHARS - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// The chunks of a batch the families admit, parents remapped within the result: a dropped
@@ -131,6 +162,7 @@ fn rust_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, 
     file.keys.package = package.map(str::to_string);
     file.flags.generated = generated;
     file.flags.documented = !scanned.header.is_empty();
+    file.gist = gist(&scanned.header);
     if let Some(reason) = &scanned.fallback {
         file.flags.fallback = true;
         file.fields.body = rust::identifier_bag(bytes);
@@ -146,6 +178,7 @@ fn rust_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, 
         c.lines = item.lines;
         c.parent = Some(item.parent.map_or(0, |p| p as u32 + 1));
         c.fields.sig = item.sig;
+        c.gist = gist(&item.doc);
         c.fields.doc = item.doc;
         c.fields.body = item.body;
         if !item.ident.is_empty() {
@@ -176,6 +209,10 @@ fn doc_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, p
             c.lines = s.lines;
             // the section's prose, its heading line left to the name
             c.fields.doc = if s.heading.is_empty() { s.text } else { s.text.split_once('\n').map_or(String::new(), |(_, rest)| rest.to_string()) };
+            c.gist = match gist(&c.fields.doc) {
+                g if g.is_empty() => gist(&s.heading),
+                g => g,
+            };
             c.keys.blob = blob;
             c.keys.package = package.map(str::to_string);
             c.flags.documented = true;
@@ -208,6 +245,7 @@ fn crate_chunk(circle: &CircleName, name: &str, card: CrateCard, vendored: bool)
     let mut c = base_chunk(Kind::Crate, circle, &manifest, name);
     c.fields.path = card.dir.clone();
     c.fields.doc = card.description.clone();
+    c.gist = gist(&card.description);
     c.keys.package = Some(name.to_string());
     c.flags.documented = !card.description.is_empty();
     c.flags.definition = true;
@@ -216,10 +254,11 @@ fn crate_chunk(circle: &CircleName, name: &str, card: CrateCard, vendored: bool)
     c
 }
 
-fn note_batch(circle: &CircleName, label: &str, rel: &str, bytes: &[u8], cite: Option<&Cite>) -> Batch {
+fn note_batch(circle: &CircleName, label: &str, rel: &str, bytes: &[u8], cite: Option<&Cite>) -> Result<Batch, Error> {
     let path = format!("{label}/{rel}");
+    let label_len = u16::try_from(label.len()).map_err(|_| Error::Parse { file: path.clone(), line: 0, message: "a notes label longer than 65535 bytes".into() })?;
     let blob = git::blob_oid(bytes);
-    notes::records(rel, bytes)
+    Ok(notes::records(rel, bytes)
         .into_iter()
         .map(|r| {
             let mut c = base_chunk(if r.section { Kind::Note } else { Kind::NoteFile }, circle, &path, &r.name);
@@ -227,6 +266,14 @@ fn note_batch(circle: &CircleName, label: &str, rel: &str, bytes: &[u8], cite: O
             c.lines = r.lines;
             // the path within the source, without the label (the pointer rule matches it)
             c.fields.path = rel.to_string();
+            c.label_len = label_len;
+            if r.section {
+                let prose = r.text.split_once('\n').map_or("", |(_, rest)| rest);
+                c.gist = match gist(prose) {
+                    g if g.is_empty() => gist(&r.name),
+                    g => g,
+                };
+            }
             c.keys.blob = Some(blob);
             c.keys.edges = cite.map(|k| k.edges(&r.text)).unwrap_or_default();
             c.flags.binary = r.binary;
@@ -234,7 +281,7 @@ fn note_batch(circle: &CircleName, label: &str, rel: &str, bytes: &[u8], cite: O
             c.fields.body = r.text;
             c
         })
-        .collect()
+        .collect())
 }
 
 fn commit_batch(circle: &CircleName, rec: CommitRecord, touched: Vec<String>) -> Batch {
@@ -354,7 +401,7 @@ impl Extractor {
                     }
                 };
                 report.files += 1;
-                emit.batch(note_batch(circle, &src.label, &rel, &bytes, self.cite.as_ref()), None)?;
+                emit.batch(note_batch(circle, &src.label, &rel, &bytes, self.cite.as_ref())?, None)?;
             }
         }
         Ok(())
@@ -436,7 +483,7 @@ impl Extract for Extractor {
                 if excluded(rel, &def.exclude).is_some() {
                     return Ok(Vec::new());
                 }
-                note_batch(circle, &src.label, rel, bytes, self.cite.as_ref())
+                note_batch(circle, &src.label, rel, bytes, self.cite.as_ref())?
             }
             BaseSource::History { .. } => {
                 return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("{} is a history circle: it has no files", circle.0) });
