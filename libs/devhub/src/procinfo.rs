@@ -40,6 +40,29 @@ pub fn machine() -> Machine {
     m
 }
 
+/// Whether a process has ended, reaping it if it is this process's own child (a child of an
+/// earlier image of this process after an exec is a zombie until then, and `alive` calls a zombie
+/// alive): None while it runs; `Some(code)`, its exit code when it can be known (None: a signal).
+/// One that is gone and was not a child counts as a clean exit.
+pub fn exited(pid: u32) -> Option<Option<i32>> {
+    // (`waitpid(0)` would reap any child of the group)
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        const WNOHANG: i32 = 1;
+        let mut st = 0i32;
+        if unsafe { waitpid(pid as i32, &mut st, WNOHANG) } == pid as i32 {
+            return Some((st & 0x7f == 0).then_some((st >> 8) & 0xff));
+        }
+    }
+    (!alive(pid)).then_some(Some(0))
+}
+
 pub fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {

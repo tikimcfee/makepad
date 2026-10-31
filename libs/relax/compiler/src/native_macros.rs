@@ -39,7 +39,8 @@ fn validate_package(reg: &Reg, unit: usize, overlays: &std::collections::HashMap
     }
     let features: &[&str] = match u.name.as_str() {
         "makepad_derive_widget" => &["default", "nightly"],
-        "makepad_live_id" => &["default"],
+        // (the loader's own graph, `makepad check makepad-run`, asks for the build it links)
+        "makepad_live_id" => &["default", "host-shims"],
         // see `optional` below: the target side's feature of a graph that links relax-native-macros
         "makepad_micro_proc_macro" => &["relax-tokens"],
         // the loader's copy is built with it (the loader links makepad-hal, which enables it): a

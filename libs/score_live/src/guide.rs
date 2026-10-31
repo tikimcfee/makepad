@@ -54,6 +54,12 @@ make plays at once: a changed loop switches at its next cycle, a changed
 knob now. A source that does not load changes nothing; the problems come
 back with their lines.
 
+Work in small steps. Write a piece a part at a time with a tool call for each
+(for a fugue: the subject, then the answer, then each episode; for a song: the
+drums, the bass, the chords, the hook), and listen after each. The person hears
+it grow. Do not plan the whole piece before the first call, and do not write it
+in one call.
+
 ## The document
 
 ```
@@ -574,8 +580,48 @@ every 4, transitions on the boundaries, a resolved ending, a mix and a
 master chain, nothing clips.
 "#;
 
+/// What `score_guide` answers with no section: the opening, the names of
+/// the sections and the first one. A tool result carries at most 16 KB, less
+/// than the whole guide, and each section read is context the model pays for.
+pub fn overview() -> String {
+    let guide = guide();
+    let mut parts = guide.split("\n## ");
+    let opening = parts.next().unwrap_or_default().trim_end();
+    let sections: Vec<&str> = parts.collect();
+    let names: Vec<&str> = sections.iter().map(|section| section.lines().next().unwrap_or_default()).collect();
+    format!(
+        "{opening}\n\nThis is the start of the guide. Read the rest with `score_guide {{section}}` when you need it: {}.\n\n## {}\n",
+        names.join(", "),
+        sections.first().copied().unwrap_or_default().trim_end(),
+    )
+}
+
+/// One section of the guide by the start of its name, any case (`piano`).
+pub fn section(name: &str) -> Option<String> {
+    let name = name.trim().to_lowercase();
+    let guide = guide();
+    guide.split("\n## ").skip(1).find(|section| section.to_lowercase().starts_with(&name)).map(|section| format!("## {}\n", section.trim_end()))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A tool result over 16 KB is cut: what is past the cut, the model never reads.
+    #[test]
+    fn every_part_of_the_guide_fits_a_tool_result() {
+        let overview = super::overview();
+        assert!(overview.len() < 16 * 1024, "{}", overview.len());
+        assert!(overview.contains("Work in small steps") && overview.contains("Piano"));
+        let guide = super::guide();
+        let names: Vec<&str> = guide.split("\n## ").skip(1).map(|section| section.lines().next().unwrap()).collect();
+        assert!(names.len() > 5);
+        for name in names {
+            let section = super::section(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(section.len() < 16 * 1024, "{name}: {}", section.len());
+        }
+        assert!(super::section("piano").unwrap().starts_with("## Piano"));
+        assert!(super::section("no such section").is_none());
+    }
+
     #[test]
     fn the_guide_names_the_vocabulary_and_every_template() {
         let guide = super::guide();

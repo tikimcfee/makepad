@@ -183,9 +183,22 @@ mod unix {
         dlsym(handle, name)
     }
 
+    /// The program's atexit handlers, in the order it registered them.
+    static PROGRAM_ATEXIT: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
+
+    /// The program's `atexit`: [`exit`] runs the handler, while JIT code can still compile.
+    pub extern "C" fn program_atexit(f: extern "C" fn()) -> i32 {
+        PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()).push(f);
+        0
+    }
+
     /// exit(): the main thread's pthread key destructors do not run (the program's thread locals
     /// are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
+        // last registered first; one a handler registers runs too
+        while let Some(f) = { let mut g = PROGRAM_ATEXIT.lock().unwrap_or_else(|e| e.into_inner()); g.pop() } {
+            f();
+        }
         // An embedded run (the Android host: its library handle is named) failed: exit() would run the
         // process's atexit/static destructors on this thread while the host's UI thread still locks
         // the mutexes they destroy (FORTIFY abort, no message). The host owns the process: the failure
@@ -254,7 +267,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     #[cfg(target_env = "gnu")]
@@ -357,7 +370,7 @@ mod imp {
 
 #[cfg(target_os = "android")]
 mod imp {
-    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, set_last_error};
+    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// The library Relax itself is (libmakepad.so): System.loadLibrary loads it into a scope of its
@@ -514,7 +527,7 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{program_atexit, os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// Symbol in any loaded image (RTLD_DEFAULT). libm lives in libSystem, always loaded.

@@ -114,6 +114,7 @@ impl XrDepthDebugMeshWorker {
         let join_handle = thread::Builder::new()
             .name("makepad-xr-depth-debug-mesh".to_string())
             .spawn(move || {
+                #[cfg(not(target_arch = "wasm32"))]
                 crate::depth_writer::background_priority();
                 depth_debug_mesh_worker_loop(mailbox_thread, results_thread, chunk_world_size_meters, stride_voxels)
             })

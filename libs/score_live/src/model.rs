@@ -523,6 +523,13 @@ impl ScoreDoc {
         self.insts.iter().any(|inst| matches!(&inst.kind, InstKind::Native { native, font: None, .. } if native == "soundfont"))
     }
 
+    /// Whether it names patches of the optional patch library that this
+    /// machine does not have: they play the plain starting sound until the
+    /// library is installed (Resources).
+    pub fn lacks_patch_library(&self) -> bool {
+        self.insts.iter().any(|inst| matches!(&inst.kind, InstKind::Tandem { patch, path, .. } if !patch.is_empty() && path.is_empty()))
+    }
+
     /// The library files its native instruments load (SoundFonts).
     pub fn files(&self) -> Vec<AssetRef> {
         let mut out: Vec<AssetRef> = self.insts.iter().filter_map(|inst| match &inst.kind {
@@ -1856,7 +1863,7 @@ pub fn load(source: &str) -> Result<Loaded, Vec<Diag>> {
     let fx_names: Vec<&str> = doc.fx.iter().map(|f| f.name.as_str()).collect();
     for l in &doc.loops {
         match &l.play {
-            Some(play) if !is(play, &["Synth", "Drums", "Sampler", "Ironfish", "Morph", "Tandem", "Shader", "Voice", "Instrument"]) => r.err(&l.name, Some("play"), format!("`{play}` is not an instrument in Score{{…}}")),
+            Some(play) if !is(play, &crate::instruments::INSTRUMENT_TYPES) => r.err(&l.name, Some("play"), format!("`{play}` is not an instrument in Score{{…}}")),
             None if l.hits.as_ref().is_none_or(|h| h.drum.is_none()) && l.code.is_some() => r.err(&l.name, Some("play"), "a loop names the instrument it plays: play: synth"),
             _ => {}
         }

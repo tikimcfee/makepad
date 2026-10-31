@@ -227,6 +227,18 @@ impl Store {
         std::fs::canonicalize(&dir).ok().filter(|d| d.starts_with(common.join("worktrees")))
     }
 
+    /// Whether the tree at `work` is this store's and holds `to` already (its HEAD and the
+    /// checkout ref): a lease on a warm box then moves nothing, with one git call.
+    pub fn holds(&self, work: &Path, to: &str) -> bool {
+        if !valid_sha(to) || !self.admin_of(work).is_some_and(|a| a.join("HEAD").exists()) {
+            return false;
+        }
+        run(Some(work), None, &[], &["rev-parse", "HEAD", CHECKOUT_REF]).is_ok_and(|o| {
+            let l: Vec<&str> = o.lines().map(str::trim).collect();
+            l == [to, to]
+        })
+    }
+
     /// Moves the tree at `work` from `from` (None: an empty or missing dir) to `to`, in place:
     /// only files that differ between the two commits are written (cargo fingerprints and the
     /// JITs' watchers see exactly the change). Any two commits (a lease's pin, then landed work

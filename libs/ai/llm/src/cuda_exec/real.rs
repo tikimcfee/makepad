@@ -1633,6 +1633,20 @@ fn mmvq_q81_shape_ok(t: &Tensor, act: &Tensor, dst: &Tensor, kind: i32) -> bool 
         && mmvq_q81_kind_ok(kind)
 }
 
+/// Whether a node leaves the quantized activations in `scratch_acts` good for
+/// the next `mul_mat_vec_q` over the same source. Only those matmuls do: any
+/// other node may write the scratch (a dequant slab, an MMQ tile) or the source
+/// address itself, and a stale hit reads as a model that talks nonsense. A
+/// file that keeps to one weight type never showed it; Qwen3.5 9B's mix of
+/// Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS did.
+fn keeps_quantized_activations(kernel: KernelSel) -> bool {
+    match kernel {
+        KernelSel::Skip | KernelSel::MmvqFusedSwiglu { .. } => true,
+        KernelSel::MmvQuant(kind) => mmvq_q81_kind_ok(kind),
+        _ => false,
+    }
+}
+
 /// Kinds the official `mul_mat_vec_q` route is *verified* for. The table lives
 /// on the CUDA side (`mkllm_kind_route_mask`) next to the kernels it describes,
 /// so enabling a route is a one-line change in one file. Q8_0 is absent here
@@ -2811,6 +2825,31 @@ impl ExecView<'_> {
 
     fn dispatch_node(&self, index: usize) -> Result<()> {
         let PlannedNode { node_id, kernel } = self.plan.nodes[index];
+        if !keeps_quantized_activations(kernel) {
+            self.forget_quantized_activations();
+        }
+        self.dispatch_kernel(node_id, kernel)?;
+        // A mat-vec that keeps them can still land on their source once the
+        // planner has freed it: a fused FFN's output often takes the block of
+        // the activations it just read.
+        if !matches!(kernel, KernelSel::Skip) {
+            let src = self.state.last_q81_src.get() as usize;
+            let src_end = src + self.state.last_q81_k.get() * self.state.last_q81_m.get() * 4;
+            let dst = self.ptr_of(node_id)? as usize;
+            if dst < src_end && src < dst + self.tensor(node_id)?.nbytes() {
+                self.forget_quantized_activations();
+            }
+        }
+        Ok(())
+    }
+
+    fn forget_quantized_activations(&self) {
+        self.state.last_q81_src.set(std::ptr::null());
+        self.state.last_q81_k.set(0);
+        self.state.last_q81_m.set(0);
+    }
+
+    fn dispatch_kernel(&self, node_id: TensorId, kernel: KernelSel) -> Result<()> {
         let stream = self.state.stream;
         let t = self.tensor(node_id)?.clone();
         let tensors = self.ctx.tensors();

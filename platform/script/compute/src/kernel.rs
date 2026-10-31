@@ -452,7 +452,7 @@ pub(crate) fn compile_items_impl(items: Vec<crate::parse::Item>, src_len: usize,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             vector,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            wide: Wide { code: std::sync::Arc::new(std::sync::OnceLock::new()), elements: std::sync::atomic::AtomicU64::new(if upgrade { 0 } else { u64::MAX }) },
+            wide: Wide { code: std::sync::Arc::new(std::sync::OnceLock::new()), elements: std::sync::atomic::AtomicU64::new(if upgrade { 0 } else { u64::MAX }), compiling: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
             admission: std::sync::OnceLock::new(),
             slice_ops: std::sync::OnceLock::new(),
             wasm_slots: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -690,6 +690,14 @@ impl KernelBody {
 
     pub fn program(&self) -> &Program {
         &self.program
+    }
+
+    /// Its eight-lane compile (the kernel went hot) is running now, on a thread of its own.
+    pub fn wide_compiling(&self) -> bool {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        return self.wide.compiling.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        false
     }
 
     /// The lanes of the vector code that runs now (4 or 8; 0: none).
@@ -1152,6 +1160,8 @@ pub fn wasm_module(kernels: &[&Kernel], target: crate::wasm::Target) -> Option<(
 struct Wide {
     code: std::sync::Arc<std::sync::OnceLock<(crate::native::Code, u32)>>,
     elements: std::sync::atomic::AtomicU64,
+    /// its compile runs on a thread of its own now
+    compiling: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1163,13 +1173,18 @@ impl Wide {
         }
         let before = self.elements.fetch_add(n as u64, Ordering::Relaxed);
         if before < crate::native_vec::HOT_ELEMENTS && before + n as u64 >= crate::native_vec::HOT_ELEMENTS {
-            let (p, code) = (flat.clone(), self.code.clone());
+            let (p, code, compiling) = (flat.clone(), self.code.clone(), self.compiling.clone());
+            compiling.store(true, Ordering::Release);
             // (no thread: the kernel keeps its four-lane code)
-            let _ = std::thread::Builder::new().name("kernel-x8".into()).spawn(move || {
+            let started = std::thread::Builder::new().name("kernel-x8".into()).spawn(move || {
                 if let Some(c) = crate::native_vec::compile_at(&p, 8).filter(|c| c.1 == 8) {
                     let _ = code.set(c);
                 }
+                compiling.store(false, Ordering::Release);
             });
+            if started.is_err() {
+                self.compiling.store(false, Ordering::Release);
+            }
         }
     }
 }

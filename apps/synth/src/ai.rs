@@ -13,6 +13,7 @@ use makepad_ai_services::wire::{CardLayout, Risk, ServiceCall, ServiceManifest, 
 use makepad_ai_services::{Suggestion, Target};
 use makepad_app_aichat::AiChatPanel;
 use makepad_strict_json::{self as json, Value as Json};
+use makepad_widgets::ai_slot::AiSlotRequests;
 use makepad_widgets::*;
 
 /// The service's id on the chat's bus.
@@ -20,8 +21,8 @@ pub const SERVICE: &str = "synth";
 
 fn brief() -> String {
     "Makepad Synth: live-coded music. A score is a document the app plays; the person hears it while you edit it, and every change plays at once. Work only through the tools. \
-First call score_guide once and read the score with score_read, then make focused changes with score_patch (exact old text, new text: small, source-preserving) or score_write (a rewrite), and check each change with score_listen: you cannot hear, so read its levels, band balance, onset grid and notes, and fix what is off. \
-Check the result with score_check. Keep what the person did not ask to change. Answer in one or two short sentences, in plain words a musician uses; never paste source into your reply. \
+First call score_guide once (its sections, such as piano or composing, one at a time when you need them) and read the score with score_read, then build a piece in small steps, a part per tool call (a fugue: subject, answer, then each episode), never planning all of it before the first call. Make focused changes with score_patch (exact old text, new text: small, source-preserving) or score_write (a rewrite), and check each change with score_listen: you cannot hear, so read its levels, band balance, onset grid and notes, and fix what is off. \
+Check the result with score_check, and when a piece you were asked for is done, start it with score_play so the person hears it. Keep what the person did not ask to change. Answer in one or two short sentences, in plain words a musician uses; never paste source into your reply. \
 The score has one editor panel (a synthesiser UI written into the score): to change it, read score_panel_guide and score_editor_paths, write it with score_editor_write, and check it with score_panel_status; score_editor_make makes the instruments' tweaks at once. \
 To write several songs, learn from the ratings, render to audio or start a new score, call score_batch, score_learn, score_render or score_new: the person gets a settings card first. The batch's songs show beside the code, where the person rates them (score_rate also rates); score_batch_status follows a batch and score_batch_stop ends it. \
 The song library (songs the person installed in Resources) is searched with midi_lookup and read with midi_transcribe (score_text reads the open score the same way, to compare); midi_open opens a song as the score. The songs are their owners' works: learn from them, never copy a melody into a new song."
@@ -51,7 +52,8 @@ pub fn manifest() -> ServiceManifest {
             .with_layout(CardLayout::new("New score", "Make it").field("template", "Starting point").field("bpm", "Tempo (bpm)").field("label", "Name")))
         .with_tool(t("score_play", "Start or stop the open score, optionally from a bar or a section.",
             r#"{"type": "object", "properties": {"play": {"type": "boolean", "description": "true starts, false stops"}, "bar": {"type": "integer", "minimum": 0, "description": "start from this bar (0 is the first)"}, "section": {"type": "string", "description": "start from this section"}}, "required": ["play"]}"#, Risk::Act))
-        .with_tool(t("score_status", "What is playing now: bar and beat, tempo, section, each loop's cycle, length and its runtime error if any, params, the levels of every loop (peak and RMS in dBFS) and the master, events that came late.", NO_ARGS, Risk::Read))
+        .with_tool(t("score_rewind", "Start the open score over from scratch at its first beat, as the transport's Rewind button: every voice and effect tail cut, params as written. Playing, it goes on from the top; stopped, it stays stopped at the top.", NO_ARGS, Risk::Act))
+        .with_tool(t("score_status","What is playing now: bar and beat, tempo, section, each loop's cycle, length and its runtime error if any, params, the levels of every loop (peak and RMS in dBFS) and the master, events that came late.", NO_ARGS, Risk::Read))
         .with_tool(t("score_set", "Perform the playing score: set a param (`param` and `value`), jump to a `section` on the next bar, or `trigger` a Stinger. Not written into the source.",
             r#"{"type": "object", "properties": {"param": {"type": "string", "description": "a Clock param"}, "value": {"type": "number", "description": "its value"}, "section": {"type": "string", "description": "a section to go to"}, "trigger": {"type": "string", "description": "a Stinger to play"}}}"#, Risk::Act))
         .with_tool(t("score_render", "Render the open score to a WAV file (48 kHz, 16-bit stereo): the arrangement's length plus its tail, or `seconds`; into `path`, else the renders folder. Returns the file and its timing: bpm, beats_per_bar, seconds and the sections with their start and end.",
@@ -188,6 +190,23 @@ impl Ai {
                 match desk.jobs.take(job) {
                     Some(result) => self.reply(&call_id, result, "done"),
                     None => self.pending.push((job, call_id)),
+                }
+            }
+        }
+        // The bridge's `/ai` routes reach this one panel. The window's F10
+        // overlay is never opened: a second engine on the process's registry
+        // would take this panel's tool results.
+        let requests = cx.global::<AiSlotRequests>();
+        requests.open = None;
+        let says = std::mem::take(&mut requests.say);
+        let answers = std::mem::take(&mut requests.confirm);
+        if !says.is_empty() || !answers.is_empty() {
+            if let Some(mut panel) = chat_panel(cx, ui).borrow_mut::<AiChatPanel>() {
+                for how in answers {
+                    panel.answer_cards(cx, &how);
+                }
+                for line in says {
+                    panel.say(cx, line);
                 }
             }
         }

@@ -144,10 +144,15 @@ pub fn take(id: &str, pin: &Pin, root: &Path) -> Result<Taken, String> {
     for (repo, to) in [("makepad", Some(&pin.makepad)), ("commercial", pin.commercial.as_ref())] {
         let Some(to) = to else { continue };
         let store = Store::open(repo)?;
+        let dir = if repo == "makepad" { root.clone() } else { root.join("apps").join("commercial") };
+        // warm: the tree is at the pin already
+        if store.holds(&dir, to) {
+            moved.push((repo.to_string(), 0));
+            continue;
+        }
         if !store.has(to) {
             return Err(format!("{repo} {} is not in this node's store", &to[..10]));
         }
-        let dir = if repo == "makepad" { root.clone() } else { root.join("apps").join("commercial") };
         let from = store.rev(CHECKOUT_REF).or_else(|| fleet_revision(&root, repo)).filter(|f| store.has(f));
         if from.is_none() && dir.read_dir().is_ok_and(|mut d| d.next().is_some()) && !(repo == "makepad" && crate::sync::serve::only_commercial(&dir)) {
             return Err(format!("{} holds files but no known commit: sync it first", dir.display()));

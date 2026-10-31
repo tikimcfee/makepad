@@ -108,6 +108,8 @@ pub struct Vulkan {
     /// their retained image holds an older one: a badge layer is never composed over it (the
     /// stale picture showed in the WM for a frame each time a badge came up)
     retained_stale: std::collections::HashSet<u32>,
+    /// The shell target of a host window's newest frame while `retained_stale` says the retained image is older.
+    direct_frame: FastMap<u32, Arc<Image>>,
     /// the composed image the badge frame being encoded draws into
     compose: Option<Arc<Image>>,
     aliases: FastMap<(u32, Id), Id>,
@@ -210,7 +212,7 @@ impl Vulkan {
         crate::gpu_limits::set_gpu_working_set_bytes(info.working_set);
         Ok(Self { #[cfg(target_os = "linux")] native_apps: Default::default(), #[cfg(any(target_os = "linux", target_os = "android"))] media: Default::default(), #[cfg(target_os = "linux")] capture_pool: FastMap::default(), #[cfg(any(target_os = "linux", target_os = "android"))] shell: None, dev, info, tex: FastMap::default(), buf: FastMap::default(), pipe: FastMap::default(), programs: FastMap::default(), draw_bins: Vec::new(), draw_images: Vec::new(),
             #[cfg(target_os = "android")] native_layers: Default::default(),
-            passes: FastMap::default(), msaa: FastMap::default(), win: FastMap::default(), hosted_sizes: FastMap::default(), scanout_images: FastMap::default(), #[cfg(target_os = "linux")] stamp: None, #[cfg(target_os = "linux")] window_px: [0, 0], badged: FastMap::default(), retained_stale: Default::default(), compose: None, aliases: FastMap::default(), pick_ids: FastMap::default(), pick_pending: HashSet::new(),
+            passes: FastMap::default(), msaa: FastMap::default(), win: FastMap::default(), hosted_sizes: FastMap::default(), scanout_images: FastMap::default(), #[cfg(target_os = "linux")] stamp: None, #[cfg(target_os = "linux")] window_px: [0, 0], badged: FastMap::default(), retained_stale: Default::default(), direct_frame: FastMap::default(), compose: None, aliases: FastMap::default(), pick_ids: FastMap::default(), pick_pending: HashSet::new(),
             fallback: FastMap::default(), windows: surface::Windows::new(source), sharing,
             #[cfg(target_os = "linux")] foreign_support,
             batch: None, spares: Default::default(), mailbox: Mailbox::new(sessions),
@@ -559,7 +561,7 @@ impl Backend for Vulkan {
         self.capture_pool.retain(|key, _| key.0 != sid);
         self.windows.close_session(sid, self.queue.as_ref().unwrap());
         self.tex.retain(|k, _| k.0 != sid); self.buf.retain(|k, _| k.0 != sid); self.pipe.retain(|k, _| k.0 != sid);
-        if sid == HOST { self.badged.clear(); self.retained_stale.clear(); }
+        if sid == HOST { self.badged.clear(); self.retained_stale.clear(); self.direct_frame.clear(); }
         self.win.retain(|k, _| k.0 != sid); self.hosted_sizes.retain(|k, _| k.0 != sid); self.aliases.retain(|k, _| k.0 != sid);
         self.scanout_images.retain(|k, _| k.0 != sid);
         self.pick_ids.retain(|k, _| k.0 != sid); self.pick_pending.retain(|k| k.0 != sid);
@@ -943,7 +945,7 @@ impl Gpu for Vulkan {
         self.capture_pool.remove(&(sid, id));
         self.win.remove(&(sid, id.index)); self.hosted_sizes.remove(&(sid, id.index)); self.pick_ids.remove(&(sid, id));
         self.scanout_images.remove(&(sid, id));
-        if sid == HOST { self.badged.remove(&id.index); self.retained_stale.remove(&id.index); }
+        if sid == HOST { self.badged.remove(&id.index); self.retained_stale.remove(&id.index); self.direct_frame.remove(&id.index); }
         self.windows.remove((sid, id), self.queue.as_ref().unwrap());
     }
     fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {

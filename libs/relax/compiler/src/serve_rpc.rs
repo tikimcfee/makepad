@@ -353,6 +353,8 @@ fn connect(start: bool) -> Result<PathBuf, String> {
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e|e.to_string())?);
     cmd.arg("serve").arg("--workspace").arg(&root).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e|e.to_string())?).stderr(log);
     serve_os::detach(&mut cmd);
+    // the check server outlives what started it: not one of a devhub lease's processes
+    cmd.env_remove("MAKEPAD_DEVHUB_LEASE");
     let mut child = cmd.spawn().map_err(|e|e.to_string())?; let started = Instant::now();
     loop {
         if request(&dir,"status","{}").is_ok() { return Ok(dir); }

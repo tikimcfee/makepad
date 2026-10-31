@@ -4530,6 +4530,7 @@ impl FilesView {
                 );
                 self.redraw_chat(cx);
             }
+            ChatEvent::Working(_) => {}
             ChatEvent::ContextFull => {
                 self.chat.commit_pending();
                 self.chat_busy = false;

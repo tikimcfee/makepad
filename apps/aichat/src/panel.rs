@@ -1336,24 +1336,29 @@ impl AiChatPanel {
             Status::Idle | Status::Error(_) => None,
             Status::Loading { phase, fraction } => Some(format!("Loading the model · {phase} {:.0}%", fraction * 100.0)),
             Status::Thinking => {
-                if state.thinking.is_empty() {
-                    Some("Thinking…".to_string())
+                let waited = match state.model_secs {
+                    0 => String::new(),
+                    secs if secs < 60 => format!(" {secs} s"),
+                    secs => format!(" {} min {} s", secs / 60, secs % 60),
+                };
+                if !state.model_note.is_empty() {
+                    Some(format!("{}…{waited}", state.model_note))
+                } else if state.thinking.is_empty() {
+                    Some(format!("Thinking…{waited}"))
                 } else {
                     let tail: String = state.thinking.chars().rev().take(140).collect::<Vec<_>>().into_iter().rev().collect();
                     Some(format!("Thinking… {}", tail.split_whitespace().collect::<Vec<_>>().join(" ")))
                 }
             }
             Status::Streaming => Some(format!("Writing{rate}")),
-            Status::WaitingForTool => {
-                let running = state.entries.iter().rev().find_map(|entry| match entry {
-                    Entry::Tool(t) if matches!(t.status, ToolStatus::Running { .. } | ToolStatus::NotResponding { .. }) => Some(t.tool.clone()),
+            Status::WaitingForTool => state.entries.iter().rev().find_map(|entry| match entry {
+                Entry::Tool(t) => match t.status {
+                    ToolStatus::Running { .. } | ToolStatus::NotResponding { .. } => Some(format!("Running {}…", t.tool)),
+                    ToolStatus::Confirm => Some(format!("{} waits for your answer", t.tool)),
                     _ => None,
-                });
-                Some(match running {
-                    Some(tool) => format!("Running {tool}…"),
-                    None => "Waiting for the app…".to_string(),
-                })
-            }
+                },
+                _ => None,
+            }),
         }
     }
 
@@ -1478,9 +1483,7 @@ impl Widget for AiChatPanel {
                     }
                 }
             }
-            busy = engine.needs_pump()
-                || engine.state().status.is_busy()
-                || matches!(engine.state().status, Status::Loading { .. });
+            busy = engine.needs_pump() || engine.state().status.is_busy();
         }
         self.bus.relay_down(&self.registry);
         if changed {
@@ -1505,7 +1508,7 @@ impl Widget for AiChatPanel {
 
         // The header's dot: ready, working, or nothing answers.
         let silent = matches!(state.status, Status::Error(_)) || state.provider_label == "No model";
-        let working = state.status.is_busy() || matches!(state.status, Status::Loading { .. });
+        let working = state.status.is_busy();
         let dot = if silent {
             StatusKind::Error
         } else if working {
@@ -1774,9 +1777,15 @@ impl Widget for AiChatPanel {
                 row.draw_all(cx, &mut Scope::empty());
             }
         }
+        // The composer takes the keyboard the first time it is on screen, not while the panel
+        // is drawn collapsed or hidden: an app that starts with its chat closed has nothing
+        // focused (a focused field blinks its caret, and keeps an idle app drawing).
         if !self.composer_focused {
-            self.composer_focused = true;
-            self.view.text_input(cx, ids!(input)).take_key_focus(cx);
+            let shown = self.view.widget(cx, ids!(input)).area().rect(cx.cx).size;
+            if shown.x > 1.0 && shown.y > 1.0 {
+                self.composer_focused = true;
+                self.view.text_input(cx, ids!(input)).take_key_focus(cx);
+            }
         }
         DrawStep::done()
     }

@@ -9,12 +9,11 @@
 //! the manifest entry, not a store of its own; it is written again with the manifest when it did
 //! not prelink whole.
 //!
-//! The slots the image's keys name are made in one go, in image order, with their identities
-//! still encoded (`ImageIds`): relocations between image slots go by image key index, and a key
-//! is decoded (`complete_identities`) after main started, on a background thread, or at once by
-//! the first thread to make a unit call for anything else (jit.rs `ids_on_serve`), so every
-//! caller on the owner thread sees every slot's key. A lookup by encoded bytes finds an image slot through
-//! the image's sorted key index, with or without its identity decoded.
+//! The slots the image's keys name are made in one go, in image order, and every key is decoded
+//! (`decode_identities`) before any code is linked to its slot: a stored key that does not decode
+//! in this run (an edit, a crate's definitions that are not loaded) has no slot, so what names it
+//! stays lazy and is built from source, and no code ever reaches a slot without an identity. A
+//! lookup by encoded bytes finds an image slot through the image's sorted key index.
 
 use super::*;
 
@@ -239,33 +238,6 @@ impl Cache {
             eprintln!("makepad-run cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3]);
         }
         Ok(Some((e.0, n)))
-    }
-
-    /// The loaded startup image is not to be trusted (`why`): code reached one of its slots
-    /// without an identity (a key that decodes for sure did not, after code was linked to its
-    /// slot). That may not happen; if it does, the manifest is replaced at once by an empty one
-    /// (no slots, no image), so the next run starts without it and records a fresh one: a broken
-    /// image never outlives the run that found it.
-    pub(super) fn image_broken(&mut self, why: &str) {
-        if self.image_bad {
-            return;
-        }
-        self.image_bad = true;
-        self.image_rewrite = true;
-        eprintln!("makepad-run cache: startup image dropped: {}", why);
-        let Some(root) = self.manifest_root else { return };
-        let Some(key) = self.manifest_key(root) else { return };
-        if self.mode == Mode::ReadOnly {
-            return;
-        }
-        let mut e = E::default();
-        e.u32(ENTRY_VERSION);
-        e.u32(0);
-        e.u32(0);
-        self.push_pending(root, NewEntry { key, kind: KIND_MANIFEST, payload: e.0 });
-        if let Err(err) = self.flush() {
-            eprintln!("makepad-run cache: dropping the startup image: {}", err);
-        }
     }
 
     /// The crates (of this run) image key `b` names: the crates of the definitions it names and
@@ -1324,20 +1296,16 @@ impl Img {
 
 /// The slots the prelinked startup image's keys name in this run (kept for the run; the store
 /// keeps the image mapped): found by their encoded bytes, and the ones whose identity is still
-/// encoded, decoded in image order by `complete_identities`.
+/// encoded, decoded in image order by `decode_identities`.
 pub(super) struct ImageIds {
     _store: std::sync::Arc<Store>,
     keys: Vec<&'static [u8]>,
     sorted: &'static [u8],
     /// per key: its slot (NO_SLOT: none, or its key did not decode)
     slot: Vec<u32>,
-    /// per key: it decodes for sure (Img::key_ok); the others the prelink decoded already
-    key_ok: Vec<bool>,
-    /// the keys whose slots the prelink made, in image order (slots `first..`); the first `done`
-    /// are decoded (later ones may be too: a lookup by key or a build decodes its slot's first)
+    /// the keys whose slots the prelink made, in image order (slots `first..`)
     pending: Vec<u32>,
     first: u32,
-    done: usize,
 }
 
 impl ImageIds {
@@ -1347,16 +1315,10 @@ impl ImageIds {
         Some(self.slot[k]).filter(|&s| s != NO_SLOT)
     }
 
-    /// The key slot `id` was made from, if the prelink made it (and the key decoded, or is
-    /// still encoded).
+    /// The key slot `id` was made from, if the prelink made it and the key decoded.
     pub(super) fn bytes_of(&self, id: u32) -> Option<&'static [u8]> {
         let k = *self.pending.get(id.checked_sub(self.first)? as usize)? as usize;
         (self.slot[k] == id).then(|| self.keys[k])
-    }
-
-    /// Identities still encoded.
-    pub(super) fn pending(&self) -> bool {
-        self.done < self.pending.len()
     }
 }
 
@@ -1782,13 +1744,12 @@ impl Linker {
     }
 
     /// Prelinks the startup image of the loaded manifest: makes the slots its keys name in one
-    /// go (identities still encoded: `complete_identities`; decoded here already when `eager`),
-    /// resolves its symbols in this run (each once), places the code of every slot whose crates
+    /// go and decodes their identities (`decode_identities`), resolves its symbols in this run (each once), places the code of every slot whose crates
     /// are unchanged, whose identities resolve and that has no code yet, and hands those slots to
     /// `install` (jit.rs) -- in two blocks: the slots that name no static first, then, once the
     /// statics are initialized (their initializers run code: it finds the first block
     /// installed), the rest. Returns the slots installed (on the owner thread).
-    fn prelink(&mut self, u: &mut Unit, eager: bool, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
+    fn prelink(&mut self, u: &mut Unit, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
         let t0 = crate::jit::wall_ns();
         let Some((img, store)) = self.cache().image.as_ref().map(|i| (i.bytes(), i._store.clone())) else { return 0 };
         let parsed = {
@@ -1827,24 +1788,16 @@ impl Linker {
         for (i, &k) in fresh.iter().enumerate() {
             im.slot[k as usize] = first + i as u32;
         }
-        self.cache().image_ids = Some(ImageIds { _store: store, keys: im.keys.clone(), sorted: im.sorted, slot: im.slot.clone(), key_ok: im.key_ok.clone(), pending: fresh, first, done: 0 });
-        if eager {
-            // every identity now: a key that does not decode leaves the slots naming it lazy
-            self.complete_identities(u, usize::MAX, false);
-        } else {
-            // a key naming a crate changed since the image was made may not decode (an edit
-            // shifted a closure's expression or an item's offset, removed a definition): decoded
-            // now, before any slot is linked to its slot. One that does not decode has no slot:
-            // the slots and data naming it stay lazy and build from source, so no code reaches a
-            // slot without an identity. The rest decode for sure, after main started (a build
-            // or a lookup by key before -- a static's initializer below -- decodes them first).
-            self.decode_unsure(u);
-            if self.cache().image_ids.as_ref().map_or(false, |i| i.pending()) {
-                crate::jit::ids_pending(u);
-            }
-        }
+        self.cache().image_ids = Some(ImageIds { _store: store, keys: im.keys.clone(), sorted: im.sorted, slot: im.slot.clone(), pending: fresh, first });
+        self.decode_identities(u);
         if let Some(ids) = self.cache().image_ids.as_ref() {
             im.slot.copy_from_slice(&ids.slot);
+        }
+        if self.cache().verbose {
+            let s = &self.cache().stats;
+            let unchanged = (0..nk).filter(|&k| need[k] && im.slot[k] == NO_SLOT && im.key_ok[k]).count();
+            eprintln!("makepad-run cache: startup identities decoded: {} ({} duplicate, {} did not decode, {} of those naming only unchanged crates) in {:.1} ms",
+                s.ids_decoded, s.ids_dup, s.ids_failed, unchanged, s.ids_ns as f64 / 1e6);
         }
         let t_check = crate::jit::wall_ns();
         for &si in &candidates {
@@ -1928,15 +1881,15 @@ impl Linker {
 
     /// The slot of the fn key encoded at `d` when it is a key of the startup image (`d` then
     /// moves past it): found by its bytes, decoded or not.
-    /// A key that may not decode (`ImageIds::key_ok`) is decoded first (only while the prelink
-    /// decodes those: its slot is never handed out undecoded); None when it does not decode.
+    /// A key still encoded is decoded first (a slot is never handed out undecoded); None when it
+    /// does not decode.
     pub(super) fn image_slot_at(&mut self, u: &mut Unit, d: &mut D) -> Option<u32> {
         let ids = self.cache().image_ids.as_ref()?;
         let mut e = D { b: d.b, p: d.p };
         skip_fnkey(&mut e, 0, &mut no_atoms)?;
         let k = key_index(&ids.keys, ids.sorted, &d.b[d.p..e.p])?;
         let s = Some(ids.slot[k]).filter(|&s| s != NO_SLOT)?;
-        if !ids.key_ok[k] && is_unnamed(u, s) {
+        if is_unnamed(u, s) {
             self.name_unnamed(u, s);
             self.cache().image_ids.as_ref()?.slot_of(&d.b[d.p..e.p])?;
         }
@@ -1944,69 +1897,16 @@ impl Linker {
         Some(s)
     }
 
-    /// Decodes the identities of the startup image's slots whose keys name a crate changed since
-    /// the image was made, or one it did not know (`prelink`).
-    fn decode_unsure(&mut self, u: &mut Unit) {
-        let t0 = crate::jit::wall_ns();
-        let Some(ids) = self.cache().image_ids.as_ref() else { return };
-        let unsure: Vec<u32> = ids.pending.iter().enumerate().filter(|&(_, &k)| !ids.key_ok[k as usize]).map(|(i, _)| ids.first + i as u32).collect();
-        if unsure.is_empty() {
-            return;
-        }
-        for &id in &unsure {
+    /// Decodes the identities of the startup image's slots, in image order, before any code is
+    /// linked to them. A key that does not decode leaves its slot unnamed (no lookup finds it,
+    /// and the slots and data naming it stay lazy and build from source); a key an earlier slot
+    /// has already leaves the image's slot a second slot of that function (it keeps its code;
+    /// the map names the first).
+    fn decode_identities(&mut self, u: &mut Unit) {
+        let Some((first, n)) = self.cache().image_ids.as_ref().map(|ids| (ids.first, ids.pending.len() as u32)) else { return };
+        for id in first..first + n {
             self.name_unnamed(u, id);
         }
-        let c = self.cache();
-        c.stats.ids_unsure += unsure.len() as u64;
-        c.stats.ids_unsure_ns += crate::jit::wall_ns() - t0;
-    }
-
-    /// Decodes up to `budget` of the startup image slots' identities still encoded, in image
-    /// order (on the owner thread); true when none is left. A key that does not decode leaves its
-    /// slot unnamed (no lookup finds it); a key an earlier slot has already leaves the image's
-    /// slot a second slot of that function (it keeps its code; the map names the first).
-    fn complete_identities(&mut self, u: &mut Unit, budget: usize, bg: bool) -> bool {
-        let t0 = crate::jit::wall_ns();
-        let mut left = budget;
-        let (mut dup, mut failed, mut n) = (0, 0, 0);
-        let done = loop {
-            let (k, id, b) = {
-                let Some(ids) = self.cache().image_ids.as_mut() else { break true };
-                if ids.done == ids.pending.len() {
-                    break true;
-                }
-                if left == 0 {
-                    break false;
-                }
-                let k = ids.pending[ids.done] as usize;
-                let id = ids.first + ids.done as u32;
-                ids.done += 1;
-                // (a key that did not decode already has no slot)
-                if ids.slot[k] != id {
-                    continue;
-                }
-                (k, id, ids.keys[k])
-            };
-            if !is_unnamed(u, id) {
-                continue;
-            }
-            left -= 1;
-            n += 1;
-            match self.name_image_slot(u, k, id, b) {
-                Some(true) => {}
-                Some(false) => dup += 1,
-                None => failed += 1,
-            }
-        };
-        let c = self.cache();
-        c.stats.ids_decoded += n;
-        if bg {
-            c.stats.ids_bg += n;
-        }
-        c.stats.ids_dup += dup;
-        c.stats.ids_failed += failed;
-        c.stats.ids_ns += crate::jit::wall_ns() - t0;
-        done
     }
 }
 
@@ -2032,7 +1932,7 @@ impl Linker {
     }
 
     /// Slot `id`'s identity, if it is a startup image slot whose key is still encoded: decoded
-    /// now (before it is built). On the owner thread.
+    /// now. On the owner thread.
     fn name_unnamed(&mut self, u: &mut Unit, id: u32) {
         if !is_unnamed(u, id) {
             return;
@@ -2052,76 +1952,12 @@ impl Linker {
         c.stats.ids_ns += crate::jit::wall_ns() - t0;
     }
 
-    /// The startup image slot keyed `key` while image identities are still encoded (a lookup by
-    /// key that the map did not answer): found by the key's encoding, its identity decoded now.
-    fn image_slot_by_key(&mut self, u: &mut Unit, key: &crate::jit::FnKey) -> Option<u32> {
-        // a closure's key encodes its parents' keys: those named first
-        let parent = |u: &Unit, k: &crate::jit::FnKey| match k {
-            crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) if (*p as usize) < u.fns.len() => Some(*p),
-            _ => None,
-        };
-        let mut p = parent(u, key);
-        while let Some(id) = p {
-            self.name_unnamed(u, id);
-            p = parent(u, &u.fns[id as usize].key);
-        }
-        let b = {
-            let c = self.cache();
-            let mut e = E::default();
-            let mut cr = Vec::new();
-            let outer = std::mem::replace(&mut c.key_waits, false);
-            let r = c.enc_fnkey(u, key, &mut e, &mut cr, 0);
-            c.key_waits = outer;
-            r?;
-            e.0
-        };
-        let id = self.cache().image_ids.as_ref()?.slot_of(&b)?;
-        self.name_unnamed(u, id);
-        // (a key that did not decode: no slot)
-        self.cache().image_ids.as_ref()?.slot_of(&b)
-    }
-}
-
-/// Code reached startup image slot `id`, whose key did not decode (jit.rs): see `image_broken`.
-pub(crate) unsafe fn image_broken_unit(up: *mut Unit, id: u32) {
-    let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return };
-    (&mut *cache).image_broken(&format!("code reached slot {} without an identity", id));
-}
-
-/// See `Linker::name_unnamed` (on the owner thread).
-pub(crate) unsafe fn name_unnamed_unit(up: *mut Unit, id: u32) {
-    let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return };
-    Linker::new(cache).name_unnamed(&mut *up, id)
-}
-
-/// See `Linker::image_slot_by_key` (on the owner thread).
-pub(crate) unsafe fn image_slot_by_key_unit(up: *mut Unit, key: &crate::jit::FnKey) -> Option<u32> {
-    let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return None };
-    Linker::new(cache).image_slot_by_key(&mut *up, key)
 }
 
 /// Prelinks the startup image (see `Linker::prelink`); the caller is on the owner thread.
-pub(crate) unsafe fn prelink_unit(up: *mut Unit, eager: bool, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
+pub(crate) unsafe fn prelink_unit(up: *mut Unit, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return 0 };
-    Linker::new(cache).prelink(&mut *up, eager, install)
-}
-
-/// Decodes up to `budget` of the startup image's identities still encoded (see
-/// `Linker::complete_identities`); true when none is left. On the owner thread.
-pub(crate) unsafe fn complete_identities_unit(up: *mut Unit, budget: usize, bg: bool) -> bool {
-    let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return true };
-    Linker::new(cache).complete_identities(&mut *up, budget, bg)
-}
-
-/// --verbose: how the startup identities were decoded (`by`: the thread that decoded the last).
-pub(crate) unsafe fn ids_report_unit(up: *mut Unit, by: &str) {
-    let Some(c) = (&*up).cache.as_ref() else { return };
-    if !c.verbose {
-        return;
-    }
-    let s = &c.stats;
-    eprintln!("makepad-run cache: startup identities decoded: {} ({} in the background, {} in the prelink (keys naming a changed crate, {:.1} ms); {} duplicate, {} did not decode) in {:.1} ms, finished by {} (t={:.0} ms)",
-        s.ids_decoded, s.ids_bg, s.ids_unsure, s.ids_unsure_ns as f64 / 1e6, s.ids_dup, s.ids_failed, s.ids_ns as f64 / 1e6, by, crate::clock::ms_since_start());
+    Linker::new(cache).prelink(&mut *up, install)
 }
 
 #[cfg(test)]

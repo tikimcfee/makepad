@@ -39,6 +39,8 @@ pub struct Head {
     pub lan: String,
     /// the dev switch (writes from the network allowed)
     pub dev: bool,
+    /// a person uses the node: it takes no new lease until they leave (`lease::user`)
+    pub user: bool,
     /// (id, lane, kind)
     pub leases: Vec<(String, String, &'static str)>,
     /// the JIT cache clear: its confirmation and its last outcome
@@ -323,7 +325,7 @@ impl DevhubTasks {
             self.d.label(cx, rect(tx, y + 22.0 + i as f64 * 15.0, w - 32.0, 15.0), false, tok.font.caption, p.secondary, HAlign::Left, l);
         }
         let extra = 15.0 * lines.len().saturating_sub(1) as f64;
-        let dev = if head.dev { "DEV ON" } else { "DEV OFF" };
+        let dev = if head.user { "USER" } else if head.dev { "DEV ON" } else { "DEV OFF" };
         let dw = self.d.measure(cx, true, tok.font.caption, dev) + 16.0;
         let pill = rect(x + w - dw, y + 4.0, dw, 18.0);
         self.dev_pill = pill;

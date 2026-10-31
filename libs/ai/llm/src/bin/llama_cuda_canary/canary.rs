@@ -44,6 +44,7 @@ pub fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         Some("opcheck") => opcheck(),
+        Some("opcheck-activation-reuse") => opcheck_activation_reuse(),
         Some("opcheck-shared") => opcheck_shared_cuda(),
         #[cfg(target_os = "linux")]
         Some("opcheck-vulkan") => opcheck_vulkan(),
@@ -55,7 +56,7 @@ pub fn main() {
         Some("bench") => bench(&args[2..]),
         _ => {
             eprintln!(
-                "usage: llama-cuda-canary <opcheck|opcheck-shared|opcheck-vulkan|mmvq-error|opcheck-q4k-mmq|opcheck-q5k-mmq|opcheck-q6k-mmq|generate|bench> ..."
+                "usage: llama-cuda-canary <opcheck|opcheck-activation-reuse|opcheck-shared|opcheck-vulkan|mmvq-error|opcheck-q4k-mmq|opcheck-q5k-mmq|opcheck-q6k-mmq|generate|bench> ..."
             );
             2
         }
@@ -2161,22 +2162,19 @@ fn quant_matmul_case(
 /// Make the activation columns non-contiguous so the official Q8_1 MMVQ
 /// route is naturally ineligible and the surviving f32 `mmv_quant` fallback
 /// is compared with its f32 CPU oracle.
-fn quant_matmul_strided_f32_fallback_case(
+/// Activations as a view of larger storage, with columns `stride` floats apart
+/// from float `offset` on: such columns need not be 16-byte aligned.
+fn run_quant_matmul_view(
     exec: &CudaExecRuntime,
-    name: &str,
     ty: TensorType,
-    rows: &[Vec<f32>],
     weights: &[u8],
     acts: &[f32],
-    k: usize,
-    n: usize,
-    m: usize,
-    failures: &mut usize,
-) {
-    let stride = k + 3;
-    let mut padded = vec![0.0f32; stride * m];
+    (k, n, m): (usize, usize, usize),
+    (stride, offset): (usize, usize),
+) -> Vec<f32> {
+    let mut padded = vec![0.0f32; offset + stride * m];
     for column in 0..m {
-        padded[column * stride..column * stride + k]
+        padded[offset + column * stride..offset + column * stride + k]
             .copy_from_slice(&acts[column * k..(column + 1) * k]);
     }
     let mut bench = Bench::new(64 << 20);
@@ -2184,25 +2182,139 @@ fn quant_matmul_strided_f32_fallback_case(
     let storage = bench.tensor(
         "x_padded",
         TensorType::F32,
-        &[(stride * m) as i64],
+        &[padded.len() as i64],
         &as_bytes_f32(&padded),
     );
+    let size = std::mem::size_of::<f32>();
     let x = bench
         .ctx
-        .view_2d(storage, k as i64, m as i64, stride * std::mem::size_of::<f32>(), 0)
-        .expect("strided mmv activation view");
+        .view_2d(storage, k as i64, m as i64, stride * size, offset * size)
+        .expect("mmv activation view");
     let out = bench
         .ctx
         .mul_mat(w, x, BufferUsage::Activations)
-        .expect("strided mmv mul_mat");
+        .expect("mmv view mul_mat");
     let outputs = bench.run(exec, out, &[out]);
-    let got = bytes_to_f32(&outputs[&out]);
-    let (want, mag) = quant_matmul_reference(rows, acts, k, m, ActFormat::F32);
+    bytes_to_f32(&outputs[&out])
+}
+
+fn quant_matmul_view_case(
+    exec: &CudaExecRuntime,
+    name: &str,
+    ty: TensorType,
+    rows: &[Vec<f32>],
+    weights: &[u8],
+    acts: &[f32],
+    shape: (usize, usize, usize),
+    view: (usize, usize),
+    fmt: ActFormat,
+    failures: &mut usize,
+) {
+    let got = run_quant_matmul_view(exec, ty, weights, acts, shape, view);
+    let (want, mag) = quant_matmul_reference(rows, acts, shape.0, shape.2, fmt);
     let budget: Vec<f32> = mag
         .iter()
-        .map(|value| dot_error_budget(ActFormat::F32, *value))
+        .map(|value| dot_error_budget(fmt, *value))
         .collect();
-    compare_budget(name, "f32-strided", &got, &want, &budget, failures);
+    compare_budget(name, fmt.label(), &got, &want, &budget, failures);
+}
+
+/// Two mat-vecs over one activation with a GEMM between them: the GEMM writes
+/// the scratch that holds the first one's quantized activations, and the second
+/// must not read that back as its own. It did, and Qwen3.5 9B, whose mixed
+/// weight types put such a node there, talked nonsense from its first tokens.
+fn quant_activation_reuse_canary(exec: &CudaExecRuntime, rng: &mut Rng, failures: &mut usize) {
+    let (k, n, ty) = (512usize, 33usize, TensorType::Q4K);
+    let fmt = route_act_format(quant_kind_of(ty), 1);
+    let first = quant_blocks(rng, ty, k, n);
+    let second = quant_blocks(rng, ty, k, n);
+    let row_bytes = second.len() / n;
+    let second_rows: Vec<Vec<f32>> = (0..n)
+        .map(|row| dequant_row(ty, &second[row * row_bytes..(row + 1) * row_bytes], k))
+        .collect();
+    let first_rows: Vec<Vec<f32>> = (0..n)
+        .map(|row| dequant_row(ty, &first[row * row_bytes..(row + 1) * row_bytes], k))
+        .collect();
+    let acts = f32s(rng, k);
+    let wide = f32s(rng, k * GEMM_CASE_WIDTH);
+    let mut bench = Bench::new(64 << 20);
+    let w1 = bench.tensor("w1", ty, &[k as i64, n as i64], &first);
+    let w2 = bench.tensor("w2", ty, &[k as i64, n as i64], &second);
+    let x = bench.tensor("x", TensorType::F32, &[k as i64, 1], &as_bytes_f32(&acts));
+    let xw = bench.tensor("xw", TensorType::F32, &[k as i64, GEMM_CASE_WIDTH as i64], &as_bytes_f32(&wide));
+    let before = bench.ctx.mul_mat(w1, x, BufferUsage::Activations).expect("mul_mat");
+    let between = bench.ctx.mul_mat(w1, xw, BufferUsage::Activations).expect("mul_mat");
+    let after = bench.ctx.mul_mat(w2, x, BufferUsage::Activations).expect("mul_mat");
+    let mut graph = Graph::new();
+    for root in [before, between, after] {
+        graph.build_forward_expand(&bench.ctx, root).expect("graph build");
+    }
+    let wanted = [before, between, after];
+    let outputs = exec
+        .execute_raw_graph(&bench.ctx, &graph, &wanted, &[], &wanted)
+        .expect("raw graph execution");
+    for (name, id, rows) in [("q81_reuse_before", before, &first_rows), ("q81_reuse_after", after, &second_rows)] {
+        let (want, mag) = quant_matmul_reference(rows, &acts, k, 1, fmt);
+        let budget: Vec<f32> = mag.iter().map(|g| dot_error_budget(fmt, *g)).collect();
+        compare_budget(name, fmt.label(), &bytes_to_f32(&outputs[&id]), &want, &budget, failures);
+    }
+}
+
+/// The source address itself changes between two mat-vecs of one shape: a copy
+/// into it, and then a fused FFN whose output the planner puts on the block of
+/// the activations it read. Either way the second mat-vec must quantize anew.
+fn quant_activation_source_overwrite_canary(exec: &CudaExecRuntime, rng: &mut Rng, failures: &mut usize) {
+    let (k, ty) = (512usize, TensorType::Q4K);
+    let fmt = route_act_format(quant_kind_of(ty), 1);
+    let weights: Vec<Vec<u8>> = (0..4).map(|_| quant_blocks(rng, ty, k, k)).collect();
+    let rows: Vec<Vec<Vec<f32>>> = weights
+        .iter()
+        .map(|w| w.chunks_exact(w.len() / k).map(|row| dequant_row(ty, row, k)).collect())
+        .collect();
+    let acts = f32s(rng, k);
+    let fresh = f32s(rng, k);
+
+    let mut bench = Bench::new(64 << 20);
+    let w0 = bench.tensor("w0", ty, &[k as i64, k as i64], &weights[0]);
+    let w1 = bench.tensor("w1", ty, &[k as i64, k as i64], &weights[1]);
+    let x = bench.tensor("x", TensorType::F32, &[k as i64, 1], &as_bytes_f32(&acts));
+    let y = bench.tensor("y", TensorType::F32, &[k as i64, 1], &as_bytes_f32(&fresh));
+    let before = bench.ctx.mul_mat(w0, x, BufferUsage::Activations).expect("mul_mat");
+    let copied = bench.ctx.cpy(y, x, BufferUsage::Activations).expect("cpy");
+    let after = bench.ctx.mul_mat(w1, copied, BufferUsage::Activations).expect("mul_mat");
+    let mut graph = Graph::new();
+    for root in [before, after] {
+        graph.build_forward_expand(&bench.ctx, root).expect("graph build");
+    }
+    let outputs = exec
+        .execute_raw_graph(&bench.ctx, &graph, &[before, after], &[], &[before, after])
+        .expect("raw graph execution");
+    let (want, mag) = quant_matmul_reference(&rows[1], &fresh, k, 1, fmt);
+    let budget: Vec<f32> = mag.iter().map(|g| dot_error_budget(fmt, *g)).collect();
+    compare_budget("q81_reuse_after_cpy", fmt.label(), &bytes_to_f32(&outputs[&after]), &want, &budget, failures);
+
+    let mut bench = Bench::new(64 << 20);
+    let gate_w = bench.tensor("gate", ty, &[k as i64, k as i64], &weights[0]);
+    let up_w = bench.tensor("up", ty, &[k as i64, k as i64], &weights[1]);
+    let down_w = bench.tensor("down", ty, &[k as i64, k as i64], &weights[2]);
+    let input = bench.tensor("input", TensorType::F32, &[k as i64, 1], &as_bytes_f32(&acts));
+    // Nodes without storage of their own: the planner lays them out, as for a model.
+    bench.ctx.set_no_alloc(true);
+    let x = bench.ctx.cont(input).expect("cont");
+    let g = bench.ctx.mul_mat(gate_w, x, BufferUsage::Activations).expect("mul_mat");
+    let u = bench.ctx.mul_mat(up_w, x, BufferUsage::Activations).expect("mul_mat");
+    let ffn = bench.ctx.glu_split(g, u, GluOp::Swiglu, BufferUsage::Activations).expect("swiglu");
+    let down = bench.ctx.mul_mat(down_w, ffn, BufferUsage::Activations).expect("mul_mat");
+    let outputs = bench.run(exec, down, &[down]);
+    let (gate, _) = quant_matmul_reference(&rows[0], &acts, k, 1, ActFormat::Q81);
+    let (up, _) = quant_matmul_reference(&rows[1], &acts, k, 1, ActFormat::Q81);
+    let swiglu: Vec<f32> = gate
+        .iter()
+        .zip(up.iter())
+        .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+        .collect();
+    let (want, _) = quant_matmul_reference(&rows[2], &swiglu, k, 1, fmt);
+    compare_tol("q81_reuse_after_ffn", bytes_to_f32(&outputs[&down]), want, 3e-3, 2e-4, failures);
 }
 
 /// The mat-vec and GEMM gates for every weight type decode reads.
@@ -2252,16 +2364,28 @@ fn quant_matmul_canary(exec: &CudaExecRuntime, rng: &mut Rng, failures: &mut usi
 
         let m = 5usize.min(MMV_MAX_COLUMNS);
         let acts = f32s(rng, k * m);
-        quant_matmul_strided_f32_fallback_case(
+        quant_matmul_view_case(
             exec,
             &format!("mmv_{tag}_f32_strided"),
             ty,
             &rows,
             &weights,
             &acts,
-            k,
-            n,
-            m,
+            (k, n, m),
+            (k + 3, 0),
+            ActFormat::F32,
+            failures,
+        );
+        quant_matmul_view_case(
+            exec,
+            &format!("mmv_{tag}_offset"),
+            ty,
+            &rows,
+            &weights,
+            &acts,
+            (k, n, m),
+            (k, 1),
+            route_act_format(kind, m),
             failures,
         );
 
@@ -2279,6 +2403,22 @@ fn quant_matmul_canary(exec: &CudaExecRuntime, rng: &mut Rng, failures: &mut usi
             n,
             m,
             fmt,
+            failures,
+        );
+
+        // A whole J=128 tile: the MMQ route, off an activation start that is
+        // only 4-byte aligned. Its numbers are the aligned run's, which the
+        // mmq canaries gate.
+        let m = 128usize;
+        let acts = f32s(rng, k * m);
+        let want = run_quant_matmul_view(exec, ty, &weights, &acts, (k, n, m), (k, 0));
+        let got = run_quant_matmul_view(exec, ty, &weights, &acts, (k, n, m), (k, 1));
+        compare_budget(
+            &format!("mmq_{tag}_offset"),
+            "same as aligned",
+            &got,
+            &want,
+            &vec![1e-6; want.len()],
             failures,
         );
 
@@ -3817,6 +3957,23 @@ fn opcheck_shared_cuda() -> i32 {
     if failures == 0 { 0 } else { 1 }
 }
 
+/// The one gate alone: `opcheck` runs it too.
+fn opcheck_activation_reuse() -> i32 {
+    let exec = match ExecRuntime::with_backend(ExecBackendKind::Cuda) {
+        Ok(ExecRuntime::Cuda(runtime)) => runtime,
+        Ok(_) => unreachable!(),
+        Err(err) => {
+            eprintln!("opcheck: CUDA runtime unavailable: {err:?}");
+            return 3;
+        }
+    };
+    let mut failures = 0usize;
+    quant_activation_reuse_canary(&exec, &mut Rng::new(1234), &mut failures);
+    quant_activation_source_overwrite_canary(&exec, &mut Rng::new(1234), &mut failures);
+    println!("activation reuse: {failures} failures");
+    if failures == 0 { 0 } else { 1 }
+}
+
 fn opcheck() -> i32 {
     let exec = match ExecRuntime::with_backend(ExecBackendKind::Cuda) {
         Ok(ExecRuntime::Cuda(runtime)) => runtime,
@@ -3830,6 +3987,8 @@ fn opcheck() -> i32 {
     let mut failures = 0usize;
     let mut rng = Rng::new(1234);
 
+    quant_activation_reuse_canary(&exec, &mut rng, &mut failures);
+    quant_activation_source_overwrite_canary(&exec, &mut rng, &mut failures);
     quant_matmul_canary(&exec, &mut rng, &mut failures);
 
     q4k_mmq_canary(&exec, &mut failures);

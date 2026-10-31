@@ -439,7 +439,7 @@ pub fn spec_or_generic(ty: &str, key: &str, value: Option<f64>) -> ParamSpec {
 
 /// Whether a node type is an instrument (has notes), an effect, or a loop.
 pub fn is_instrument(ty: &str) -> bool {
-    matches!(ty, "Synth" | "Drums" | "Sampler" | "Morph")
+    makepad_score_live::instruments::INSTRUMENT_TYPES.contains(&ty)
 }
 
 pub fn is_fx(ty: &str) -> bool {

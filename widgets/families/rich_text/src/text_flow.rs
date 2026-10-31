@@ -4073,9 +4073,8 @@ mod tests {
         let width = fresh_drawer.get_x_after(CJK_IN_BRACKETS, "\u{4E2D}") - 0.5;
         // We load the fonts of these styles first, so the CJK font is the only one that arrives next.
         drawer.draw("aaaa <b>bbbb</b> cc", width);
-        // It arrives while we measure what follows `(`, so the first draw keeps too little room for it.
-        let row_starts_without_font = drawer.get_row_starts(CJK_IN_BRACKETS, width);
-        assert_ne!(drawer.get_row_starts(CJK_IN_BRACKETS, width), row_starts_without_font);
+        // It arrives while we measure what follows `(`: the text is laid out again at once, so even
+        // the first draw keeps the room a drawer that already had the font keeps.
         for width in [width].into_iter().chain((60..300).step_by(5).map(f64::from)) {
             fresh_drawer.draw("x", width);
             assert_eq!(
@@ -4120,7 +4119,10 @@ mod tests {
         set_font_data(&drawer.cx, CxScriptResourceData::Loaded(font_data.clone()));
         fresh_drawer.draw("x", width);
         let row_starts = drawer.get_row_starts(CJK_IN_BRACKETS, width);
-        assert_ne!(row_starts, row_starts_without_font);
+        // (Windows lays CJK out with its system fonts while the download is on its way)
+        if cfg!(target_os = "linux") {
+            assert_ne!(row_starts, row_starts_without_font);
+        }
         assert_eq!(row_starts, fresh_drawer.get_row_starts(CJK_IN_BRACKETS, width));
     }
 

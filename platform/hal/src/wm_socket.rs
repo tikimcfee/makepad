@@ -22,6 +22,11 @@
 //!   `makepad-wm refused <reason>`: a toast in the WM's notification stack (devhub's "app
 //!   updated" after a sync, `makepad_app_registry::machine::request_notify`); `<action>` is what
 //!   clicking it does (`relaunch=<pid>`).
+//! - or client `makepad-wm activity`; server `makepad-wm activity {"input_ms":..,"seq":..,
+//!   "origin":..,"what":..}`: how long ago the WM's device readers took a person's input
+//!   ([`crate::user_input`]; `input_ms` null: none since the WM started). devhub's node hub
+//!   asks it to tell a person at the box from work running there
+//!   (`makepad_app_registry::machine::request_activity`).
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -345,6 +350,10 @@ impl WmSocket {
             (&stream).write_all(answer.as_bytes())?;
             return Ok(None);
         }
+        if line.strip_prefix(GREETING).is_some_and(|r| r.trim() == "activity") {
+            (&stream).write_all(format!("{GREETING} activity {}\n", activity_json(crate::user_input::last(), crate::clock_ns())).as_bytes())?;
+            return Ok(None);
+        }
         if let Some(text) = line.strip_prefix(GREETING).and_then(|r| r.strip_prefix(" notify ")) {
             let mut parts = text.splitn(3, '\t');
             let (title, body, action) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().map(str::trim).filter(|a| !a.is_empty()));
@@ -397,6 +406,14 @@ impl WmSocket {
 impl Drop for WmSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The `activity` answer: the last counted input, as ms before `now_ns`.
+pub fn activity_json(last: Option<crate::user_input::UserInput>, now_ns: u64) -> String {
+    match last {
+        Some(u) => format!("{{\"input_ms\":{},\"seq\":{},\"origin\":\"{}\",\"what\":\"{}\",\"viewers\":{}}}", now_ns.saturating_sub(u.at_ns) / 1_000_000, u.seq, u.origin.as_str(), u.what.as_str(), crate::user_input::viewers()),
+        None => format!("{{\"input_ms\":null,\"seq\":0,\"origin\":null,\"what\":null,\"viewers\":{}}}", crate::user_input::viewers()),
     }
 }
 
@@ -492,6 +509,31 @@ mod tests {
         assert_eq!(again.path, path);
         drop(again);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn activity_answers_the_last_device_input() {
+        let _turn = crate::user_input::TEST_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        crate::user_input::set_viewers(0);
+        assert_eq!(activity_json(None, 5), "{\"input_ms\":null,\"seq\":0,\"origin\":null,\"what\":null,\"viewers\":0}");
+        let dir = temp_dir("activity");
+        let socket = WmSocket::bind(&dir, 0).unwrap();
+        let path = socket.path.clone();
+        crate::user_input::note(crate::user_input::Origin::Device, crate::user_input::What::Key);
+        let server = thread::spawn(move || {
+            let (stream, _) = socket.listener.accept().unwrap();
+            WmSocket::serve(stream, 7, |_| Err("no".into()), |_| Err("no".into()), |_, _, _| Err("no".into())).unwrap();
+        });
+        let stream = UnixStream::connect(&path).unwrap();
+        (&stream).write_all(b"makepad-wm activity\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        server.join().unwrap();
+        let json = line.trim().strip_prefix("makepad-wm activity ").unwrap();
+        assert!(json.contains("\"origin\":\"device\"") && json.contains("\"what\":\"key\""), "{json}");
+        let ms: u64 = json.split("\"input_ms\":").nth(1).and_then(|r| r.split(',').next()).and_then(|n| n.parse().ok()).unwrap();
+        assert!(ms < 5_000, "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

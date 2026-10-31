@@ -421,6 +421,15 @@ impl Player {
         self.publish(frames);
     }
 
+    /// Every loop lets go of its notes (allocates nothing).
+    pub fn release_all(&mut self) {
+        for state in self.schedule.states.iter_mut() {
+            if let NodeState::Loop(this) = state {
+                this.engine.release_all();
+            }
+        }
+    }
+
     /// The pass's probes and a few streams' scopes, for the host.
     fn publish(&mut self, frames: usize) {
         let Some(meters) = &self.meters else { return };

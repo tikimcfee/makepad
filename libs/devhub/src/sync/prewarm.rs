@@ -36,22 +36,22 @@ pub const SMOKE: &[(&str, &str, &str, &[&str])] = &[
 
 /// The master's view: the last pre-warm record per node.
 pub struct Board {
-    path: PathBuf,
+    /// the master's one state document (its `prewarm` section)
+    store: std::sync::Arc<crate::state::Store>,
     last: Mutex<BTreeMap<String, (String, String, u64)>>,
 }
 
 impl Board {
     pub fn new(home: PathBuf) -> Board {
-        let path = home.join("prewarm.state");
+        let store = crate::state::Store::open_quiet(&home, "");
         let mut last = BTreeMap::new();
-        for line in std::fs::read_to_string(&path).unwrap_or_default().lines() {
-            let Ok(v) = makepad_strict_json::parse(line.as_bytes()) else { continue };
+        for v in store.read(|d| d.prewarm.clone()) {
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             if !s("node").is_empty() {
                 last.insert(s("node"), (s("sev"), s("line"), v.get("at_ms").and_then(|x| x.as_u64()).unwrap_or(0)));
             }
         }
-        Board { path, last: Mutex::new(last) }
+        Board { store, last: Mutex::new(last) }
     }
 
     /// Takes a node's `prewarm` record.
@@ -62,15 +62,9 @@ impl Board {
         let text = {
             let mut l = self.last.lock().unwrap();
             l.insert(r.machine.clone(), (r.sev.as_str().to_string(), r.line.clone(), r.at_ms));
-            l.iter().map(|(n, (s, line, at))| format!("{}\n", Self::json(n, s, line, *at))).collect::<String>()
+            l.iter().filter_map(|(n, (s, line, at))| makepad_strict_json::parse(Self::json(n, s, line, *at).as_bytes()).ok()).collect::<Vec<_>>()
         };
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = self.path.with_extension("state.new");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
+        self.store.update(|d| d.prewarm = text);
     }
 
     fn json(node: &str, sev: &str, line: &str, at: u64) -> String {

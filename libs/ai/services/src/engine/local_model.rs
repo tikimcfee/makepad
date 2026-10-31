@@ -12,7 +12,7 @@
 
 use crate::engine::{Model, ModelEvent, ModelImage, ToolDefinition};
 use crate::state::{ProviderChoice, ProviderRow, HUB_CLAUDE_MODEL};
-use makepad_ai_hub::hub::{AiHub, ChatConfig};
+use makepad_ai_hub::hub::REQUIRED_MODEL_ENV;
 use makepad_ai_hub::hub_chat::{ChatRoute, HubChatConfig, HubChatSession, HubOffer};
 use makepad_ai_hub::local_llm::{ChatEvent, LocalLlmConfig, ToolSpec};
 use makepad_ai_hub::providers::provider::ToolImage;
@@ -360,8 +360,7 @@ pub struct LocalModel {
     /// next user turn as an update block.
     pending_update: Option<String>,
     /// Results the engine still owes for the current round, in call order.
-    awaiting: usize,
-    results: Vec<(String, bool)>,
+    round: ToolRound,
     next_call: u64,
     label: String,
     queued: Vec<ModelEvent>,
@@ -377,8 +376,7 @@ impl LocalModel {
             system: String::new(),
             tools: Vec::new(),
             pending_update: None,
-            awaiting: 0,
-            results: Vec::new(),
+            round: ToolRound::default(),
             next_call: 0,
             label,
             queued: Vec::new(),
@@ -405,22 +403,33 @@ impl LocalModel {
             .map(|t| ToolSpec::new(t.name.clone(), t.description.clone(), t.parameters.clone()))
             .collect();
         let wake: Option<makepad_ai_hub::local_llm::WakeHook> = Some(Arc::new(SignalToUI::set_ui_signal));
-        self.session = Some(match &self.hub_model {
-            // The same session start_local_chat makes, pinned to the model.
-            Some(model) => HubChatSession::start(HubChatConfig {
-                llm,
-                preferred_model: Some(model.clone()),
-                max_tokens: Some(u32::MAX),
-                thinking: None,
-                system_prompt: self.system.clone(),
-                tools,
-                wake,
-            }),
-            None => AiHub::in_process().start_local_chat(ChatConfig { llm, system_prompt: self.system.clone(), tools, wake }),
-        });
-        self.awaiting = 0;
-        self.results.clear();
+        // The chat's turns are tool-driven, with the person waiting: the model
+        // goes by small steps instead of reasoning for minutes before the first.
+        let thinking = (self.hub_model.as_deref() != Some(crate::state::HUB_CLAUDE_MODEL)).then_some(false);
+        self.session = Some(HubChatSession::start(HubChatConfig {
+            llm,
+            // Exactly this model when one is named; else the machine's election.
+            preferred_model: self.hub_model.clone().or_else(|| std::env::var(REQUIRED_MODEL_ENV).ok().map(|m| m.trim().to_string()).filter(|m| !m.is_empty())),
+            max_tokens: Some(u32::MAX),
+            thinking,
+            system_prompt: self.system.clone(),
+            tools,
+            wake,
+        }));
+        self.round = ToolRound::default();
         self.pending_update = None;
+    }
+
+    /// Hand the session a tool round that is complete. A table that changed
+    /// while the calls ran rides in with the first result (the same block a
+    /// user turn would carry).
+    fn send_round(&mut self) {
+        let Some(mut results) = self.round.take_complete() else { return };
+        let Some(session) = &self.session else { return };
+        if let Some(first) = results.first_mut() {
+            first.0 = with_update(self.pending_update.take(), &first.0);
+        }
+        session.send_tool_results(results);
     }
 
     /// The update block a running session reads when the table changed:
@@ -440,6 +449,43 @@ impl LocalModel {
         }
         out.push_str("</tools>\n");
         out
+    }
+}
+
+/// The calls of one reply and their answers. The session takes the whole
+/// round at once, one response per call in call order, and only when the
+/// reply is over; a call runs as soon as it is read, so its answer may come
+/// before that, and calls may finish in any order.
+#[derive(Default)]
+struct ToolRound {
+    calls: Vec<(String, Option<(String, bool)>)>,
+    /// How many answers the session waits for; `None` while the model is still replying.
+    owed: Option<usize>,
+}
+
+impl ToolRound {
+    fn called(&mut self, call_id: &str) {
+        self.calls.push((call_id.to_string(), None));
+    }
+
+    fn owed(&mut self, tool_calls: usize) {
+        self.owed = Some(tool_calls);
+    }
+
+    /// An answer to a call of another round (a stopped turn's) is dropped.
+    fn answer(&mut self, call_id: &str, text: &str, is_error: bool) {
+        if let Some((_, slot)) = self.calls.iter_mut().find(|(id, _)| id == call_id) {
+            *slot = Some((text.to_string(), is_error));
+        }
+    }
+
+    /// The results in call order, once every call the reply made has one.
+    fn take_complete(&mut self) -> Option<Vec<(String, bool)>> {
+        let owed = self.owed.filter(|owed| *owed > 0)?;
+        if self.calls.len() < owed || self.calls.iter().any(|(_, answer)| answer.is_none()) {
+            return None;
+        }
+        Some(std::mem::take(self).calls.into_iter().filter_map(|(_, answer)| answer).collect())
     }
 }
 
@@ -502,8 +548,7 @@ impl Model for LocalModel {
             turn.push_str("\n\n");
         }
         turn.push_str(text);
-        self.awaiting = 0;
-        self.results.clear();
+        self.round = ToolRound::default();
         session.send_user_turn(turn);
     }
 
@@ -521,28 +566,16 @@ impl Model for LocalModel {
         )
     }
 
-    fn send_tool_result(&mut self, _call_id: &str, text: &str, is_error: bool) {
-        if self.awaiting == 0 {
-            return;
-        }
-        // A table that changed while the call ran rides in with its result
-        // (the same block a user turn would carry).
-        let text = with_update(self.pending_update.take(), text);
-        self.results.push((text, is_error));
-        if self.results.len() >= self.awaiting {
-            self.awaiting = 0;
-            if let Some(session) = &self.session {
-                session.send_tool_results(self.results.drain(..).collect());
-            }
-        }
+    fn send_tool_result(&mut self, call_id: &str, text: &str, is_error: bool) {
+        self.round.answer(call_id, text, is_error);
+        self.send_round();
     }
 
     fn cancel(&mut self) {
         if let Some(session) = &self.session {
             session.cancel();
         }
-        self.awaiting = 0;
-        self.results.clear();
+        self.round = ToolRound::default();
     }
 
     fn reset(&mut self) {
@@ -563,12 +596,15 @@ impl Model for LocalModel {
                 ChatEvent::Ready { .. } => out.push(ModelEvent::Ready),
                 ChatEvent::Failed(e) => out.push(ModelEvent::Error(e)),
                 ChatEvent::Delta(text) => out.push(ModelEvent::Delta(text)),
+                ChatEvent::Working(note) => out.push(ModelEvent::Working(note)),
                 ChatEvent::ToolCall { name, args } => {
                     self.next_call += 1;
-                    out.push(ModelEvent::ToolCall { call_id: format!("l{}", self.next_call), name, args: tool_args_json(args) });
+                    let call_id = format!("l{}", self.next_call);
+                    self.round.called(&call_id);
+                    out.push(ModelEvent::ToolCall { call_id, name, args: tool_args_json(args) });
                 }
                 ChatEvent::TurnDone { tool_calls, tokens, secs, .. } => {
-                    self.awaiting = tool_calls;
+                    self.round.owed(tool_calls);
                     if secs > 0.0 && tokens > 0 {
                         out.push(ModelEvent::Rate(tokens as f32 / secs as f32));
                     }
@@ -577,6 +613,8 @@ impl Model for LocalModel {
                 ChatEvent::ContextFull => out.push(ModelEvent::Error("the local context window is full — Clear starts a new conversation".into())),
             }
         }
+        // A fast tool may have answered before the reply ended.
+        self.send_round();
         out
     }
 }
@@ -599,6 +637,37 @@ fn tool_args_json(args: Vec<(String, String)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a fast tool answered before the reply's end was read, the
+    /// answer was dropped, the session waited for it for good and the chat
+    /// sat with no call running.
+    #[test]
+    fn a_tool_round_keeps_answers_that_come_before_the_reply_ends() {
+        let mut round = ToolRound::default();
+        round.called("l1");
+        round.answer("l1", "one", false);
+        round.called("l2");
+        assert_eq!(round.take_complete(), None, "the reply is still going");
+        round.owed(2);
+        assert_eq!(round.take_complete(), None, "l2 has no answer");
+        round.answer("l2", "two", true);
+        assert_eq!(round.take_complete(), Some(vec![("one".to_string(), false), ("two".to_string(), true)]));
+        assert_eq!(round.take_complete(), None, "a round goes out once");
+    }
+
+    /// The session pairs responses with calls by position.
+    #[test]
+    fn a_tool_round_answers_in_call_order() {
+        let mut round = ToolRound::default();
+        round.called("l1");
+        round.called("l2");
+        round.owed(2);
+        round.answer("l2", "second", false);
+        round.answer("old", "a stopped turn's", false);
+        assert_eq!(round.take_complete(), None);
+        round.answer("l1", "first", false);
+        assert_eq!(round.take_complete(), Some(vec![("first".to_string(), false), ("second".to_string(), false)]));
+    }
 
     #[test]
     fn local_tool_args_become_typed_json() {

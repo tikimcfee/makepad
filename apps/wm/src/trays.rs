@@ -47,6 +47,10 @@ impl Service {
                 let img = makepad_ai_hub_panel::tray_glyph::image(makepad_ai_hub_panel::tray_glyph::Glyph::Off);
                 makepad_shell_kit::ui::glyph_texture(cx, img.width, img.height, &img.alpha)
             }
+            // (no devhub on the web)
+            #[cfg(target_arch = "wasm32")]
+            Service::Devhub => makepad_shell_kit::ui::glyph_texture(cx, 0, 0, &[]),
+            #[cfg(not(target_arch = "wasm32"))]
             Service::Devhub => {
                 // the app's Off glyph (hollow pupil) at half strength: dim like the AI Hub's
                 use makepad_devhub::tray_glyph::{alpha, Glyph, SIZE};

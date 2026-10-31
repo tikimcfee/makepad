@@ -831,6 +831,9 @@ impl DrawTextMark {
     }
 }
 
+/// Caret phases (half a blink each) a focused field shows after its last input.
+const CARET_BLINKS: u32 = 20;
+
 #[derive(Script, Widget, Animator)]
 pub struct TextInput {
     #[uid]
@@ -952,6 +955,8 @@ pub struct TextInput {
     history: History,
     #[rust]
     blink_timer: Timer,
+    #[rust]
+    blinks: u32,
     #[rust]
     preserved_selection_cursor: Option<Cursor>,
     /// When true, the next draw will scroll to keep the cursor visible.
@@ -1297,6 +1302,7 @@ impl TextInput {
 
     pub fn reset_blink_timer(&mut self, cx: &mut Cx) {
         self.animator_cut(cx, ids!(blink.off));
+        self.blinks = 0;
         if !self.is_read_only {
             cx.stop_timer(self.blink_timer);
             self.blink_timer = cx.start_timeout(self.blink_speed)
@@ -3075,13 +3081,17 @@ impl Widget for TextInput {
         }
 
         if self.blink_timer.is_event(event).is_some() {
-            if self.animator_in_state(cx, ids!(blink.off)) {
-                self.animator_play(cx, ids!(blink.on));
+            self.blinks += 1;
+            let visible = self.animator_in_state(cx, ids!(blink.off));
+            if visible && self.blinks >= CARET_BLINKS {
+                // Left alone, the caret stays lit and a focused field draws
+                // nothing; input or a new focus starts it blinking again.
+                self.blink_timer = Timer::empty();
             } else {
-                self.animator_play(cx, ids!(blink.off));
+                self.animator_play(cx, if visible { ids!(blink.on) } else { ids!(blink.off) });
+                self.draw_cursor.redraw(cx);
+                self.blink_timer = cx.start_timeout(self.blink_speed)
             }
-            self.draw_cursor.redraw(cx);
-            self.blink_timer = cx.start_timeout(self.blink_speed)
         }
 
         let uid = self.widget_uid();

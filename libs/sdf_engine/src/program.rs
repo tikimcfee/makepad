@@ -239,6 +239,8 @@ impl Lower<'_> {
                 }
             }
             SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => self.node(of)?,
+            // thousands of tube loops (chains, chainmail): no program form; the part draws as its mesh
+            SdfNode::Links(_) => return Err(LowerError::Unsupported("links (a chain or chainmail)")),
             SdfNode::Deform { deform, lipschitz, of } => {
                 let (kind, rate, axis) = match *deform {
                     SdfDeform::Twist { rate } => (0.0, rate, 0),

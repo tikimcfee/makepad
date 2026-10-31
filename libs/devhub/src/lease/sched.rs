@@ -28,6 +28,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 /// No beat from the holder for this long: the lease expires (holders beat every 2 s; a holder
 /// on the master's machine is also watched by its pid, which ends its lease within a second).
 pub const BEAT_EXPIRY_MS: u64 = 10_000;
+/// How long a lease a restarted master took back waits for its holder's first beat.
+pub const RESTORE_GRACE_MS: u64 = 60_000;
 /// A waiting lease's priority improves by one per this much waiting (starvation guard).
 pub const AGE_STEP_MS: u64 = 600_000;
 /// A wait this long becomes a warn (once).
@@ -43,6 +45,9 @@ const STICKY_BONUS: f64 = 0.5;
 const TREE_BONUS: f64 = 2.0;
 /// Running leases per lane and kind.
 pub const LANE_CAP: u32 = 2;
+/// CI's lane has no such cap: its shards are small leases at background priority, held to N-2 boxes
+/// by [`crate::orch::leg`], and a cap of two per kind would leave the rest of the fleet idle.
+pub const CI_LANE: &str = "ci";
 /// A granted gate lease that runs nothing this long ends: an idle gate slot blocks landings.
 pub const GATE_IDLE_MS: u64 = 600_000;
 /// The lane whose gates are landings: first in line for the global gate cap.
@@ -206,6 +211,11 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// Waits on its own lane's cap: no free box would serve it now.
+    pub fn lane_capped(&self) -> bool {
+        self.state == State::Queued && self.reason.starts_with("lane cap")
+    }
+
     /// `L12 build@217` (the node once placed).
     pub fn tag(&self) -> String {
         match &self.node {
@@ -276,8 +286,8 @@ pub enum Action {
     Grant { id: String, node: String },
     /// tear it down on the node (`lease-end`) when `node` is set; write the ledger
     End { id: String, node: Option<String>, how: String },
-    /// the node is below its disk floor with a lease waiting: reclaim (`disk`)
-    Reclaim { node: String },
+    /// a lease waits for `need_gb` over the node's disk floor: reclaim that (`disk`)
+    Reclaim { node: String, need_gb: f64 },
     Event(Record),
 }
 
@@ -340,7 +350,7 @@ pub struct NodeView {
     pub caps: Option<Caps>,
     pub leases: usize,
     pub waiting: usize,
-    /// dev off with leases still running
+    /// dev off, or a person uses it, with leases still running
     pub draining: bool,
     /// a timed lease holds the node
     pub hold: Option<String>,
@@ -351,6 +361,11 @@ pub struct NodeView {
 impl NodeView {
     pub fn role(&self) -> Role {
         self.caps.as_ref().map_or(Role::Pool, |c| c.role())
+    }
+
+    /// A person uses the node ([`super::user`]): no new leases while dev is on.
+    pub fn user(&self) -> Option<&super::UserSense> {
+        self.caps.as_ref().and_then(|c| c.user.as_ref()).filter(|u| u.present)
     }
 
     /// `x86_64 linux · 16 cores · load 2.1 · 40/60 GB · disk 105 GB free (floor 25) · RTX 5090`.
@@ -371,16 +386,24 @@ impl NodeView {
         if !c.spec.is_empty() {
             s.push_str(&format!(" \u{b7} {}", c.spec));
         }
+        s.push_str(&format!(" \u{b7} hub {}", if c.hub_rev.is_empty() { "old" } else { &c.hub_rev[..c.hub_rev.len().min(10)] }));
         if let Some(d) = c.desk_link.as_ref().filter(|d| d.on) {
             s.push_str(&if d.port > 0 { format!(" \u{b7} desk link :{}", d.port) } else { " \u{b7} desk link waiting".to_string() });
         }
         s
     }
 
-    /// `dev on`, `dev off (user WM)`, `draining (2 leases)`, `held for timed L9`.
+    /// `dev on`, `dev off (user WM)`, `draining (2 leases)`, `user (key from its device 20 s
+    /// ago)`, `held for timed L9`.
     pub fn state_word(&self) -> String {
         let mut s = if !self.up {
             "down".to_string()
+        } else if let Some(u) = self.user().filter(|_| self.dev) {
+            if self.leases > 0 {
+                format!("{}, draining ({} leases)", u.line(), self.leases)
+            } else {
+                u.line()
+            }
         } else if self.draining {
             format!("draining ({} leases)", self.leases)
         } else if self.dev {
@@ -398,7 +421,7 @@ impl NodeView {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"node\":{},\"addr\":{},\"up\":{},\"dev\":{},\"dev_set\":{},\"role\":\"{}\",\"leases\":{},\"waiting\":{},\"draining\":{},\"hold\":{},\"state\":{},\"latency\":{},\"caps_line\":{},\"caps\":{}}}",
+            "{{\"node\":{},\"addr\":{},\"up\":{},\"dev\":{},\"dev_set\":{},\"role\":\"{}\",\"leases\":{},\"waiting\":{},\"draining\":{},\"user\":{},\"hold\":{},\"state\":{},\"latency\":{},\"caps_line\":{},\"caps\":{}}}",
             json_str(&self.name),
             json_str(&self.addr),
             self.up,
@@ -408,6 +431,7 @@ impl NodeView {
             self.leases,
             self.waiting,
             self.draining,
+            self.user().is_some(),
             self.hold.as_deref().map_or("null".to_string(), json_str),
             json_str(&self.state_word()),
             json_str(&self.latency),
@@ -428,6 +452,9 @@ enum Place {
 pub const CANCEL_EXCLUDE_MS: u64 = 30 * 60 * 1000;
 
 pub struct Sched {
+    /// until then a node not known yet may still be heard (a restarted master's links coming up):
+    /// a lease waits for it instead of being denied
+    pub nodes_settle_ms: u64,
     machine: String,
     nodes: BTreeMap<String, NodeSt>,
     /// queued and live
@@ -448,6 +475,8 @@ pub struct Sched {
     /// node -> the ended lease whose cleanup (its tree back on the shared commits) has not
     /// answered yet: the node is not free until [`Sched::cleaned`]
     restoring: HashMap<String, String>,
+    /// nodes the self-update drains: no new lease (node -> what it waits for)
+    pub updating: HashMap<String, String>,
     out: Vec<Action>,
     pub lane_cap: u32,
     /// lanes and agents the user evicted: no new leases until unblocked
@@ -506,6 +535,11 @@ fn meets(c: &Caps, k: &str, v: &str) -> bool {
             None => matches!(lv.as_str(), "0" | "no" | "off" | "false"),
         },
         "role" => c.role().as_str() == lv,
+        // this version or newer; a hub that does not say passes (it is told on its update)
+        "rustc" => {
+            let ver = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<u32>>();
+            c.rustc.is_empty() || ver(&c.rustc) >= ver(&lv)
+        }
         // a test lease that opens windows (GUI tests, hidden presents): only nodes that present,
         // i.e. take screen leases (106 is at slots.screen=0 while its presents time out)
         "gui" => slots(c, Kind::Screen) > 0 || matches!(lv.as_str(), "0" | "no" | "off" | "false"),
@@ -517,6 +551,7 @@ impl Sched {
     /// `machine`: the master's name (the records' machine); `next`: the first lease number.
     pub fn new(machine: &str, next: u64) -> Sched {
         Sched {
+            nodes_settle_ms: 0,
             machine: machine.to_string(),
             nodes: BTreeMap::new(),
             leases: Vec::new(),
@@ -530,6 +565,7 @@ impl Sched {
             warm: HashSet::new(),
             holds: HashMap::new(),
             restoring: HashMap::new(),
+            updating: HashMap::new(),
             out: Vec::new(),
             lane_cap: LANE_CAP,
             blocked: Vec::new(),
@@ -568,6 +604,11 @@ impl Sched {
     /// The node's dev switch (the user's, else on: every node, user WMs and devices included, defaults to dev on).
     pub fn dev(&self, name: &str) -> bool {
         self.nodes.get(name).is_some_and(|n| n.dev.unwrap_or(true))
+    }
+
+    /// A person uses the node (its caps' [`super::UserSense`]): it takes no new lease.
+    fn user_present(&self, name: &str) -> bool {
+        self.nodes.get(name).and_then(|n| n.caps.as_ref()).and_then(|c| c.user.as_ref()).is_some_and(|u| u.present)
     }
 
     /// The user switches a node; running leases are never ended (the node drains).
@@ -619,7 +660,7 @@ impl Sched {
             self.end_at(i, "denied", Sev::Warn, &format!("evicted by the user ({who} is blocked until `devhub unblock {who}`)"), now);
             return id;
         }
-        if l.req.kind != Kind::Inspect && running >= self.lane_cap {
+        if l.req.kind != Kind::Inspect && l.req.lane != CI_LANE && running >= self.lane_cap {
             self.event(Sev::Warn, format!("{} for {}: over the lane cap ({running}/{} running), queued", l.tag(), l.req.lane, self.lane_cap), Some(&l));
         }
         self.leases.push(l);
@@ -653,7 +694,7 @@ impl Sched {
         let line = match (how, held) {
             ("denied", _) => format!("{} for {} denied: {why}", l.tag(), l.req.lane),
             ("expired", _) => format!("{} of {} expired: no heartbeat for {} s{}", l.tag(), l.req.lane, BEAT_EXPIRY_MS / 1000, if node.is_some() { "; cleaning up" } else { " (was queued)" }),
-            ("cancelled", _) => format!("{} of {} cancelled by user{}", l.tag(), l.req.lane, if node.is_some() { "; cleaning up" } else { " (was queued)" }),
+            ("cancelled", _) => format!("{} of {} {why}{}", l.tag(), l.req.lane, if node.is_some() { "; cleaning up" } else { " (was queued)" }),
             ("evicted", _) => format!("{} of {} ended: evicted by the user{}", l.tag(), l.req.lane, if node.is_some() { "; cleaning up" } else { "" }),
             ("overridden", _) => format!("{} of {} ended: {why}{}", l.tag(), l.req.lane, if node.is_some() { "; cleaning up" } else { "" }),
             ("holder-dead", _) => format!("{} of {} released: its holder (pid {}) ended{}", l.tag(), l.req.lane, l.req.holder.unwrap_or(0), if node.is_some() { "; cleaning up" } else { " (was queued)" }),
@@ -681,12 +722,18 @@ impl Sched {
     /// a release), it ends as `cancelled`, and the lane is kept off that node for a while. A
     /// queued lease just leaves the queue. False: not live or queued.
     pub fn cancel(&mut self, id: &str, now: u64) -> bool {
+        self.cancel_by(id, "user", now)
+    }
+
+    /// As [`Self::cancel`], by whoever asked: only the user's keeps the lane off the node (a lane
+    /// or agent ending its own lease has said nothing about the node).
+    pub fn cancel_by(&mut self, id: &str, by: &str, now: u64) -> bool {
         let Some(i) = self.leases.iter().position(|l| l.id == id) else { return false };
         let (lane, node) = (self.leases[i].req.lane.clone(), if self.leases[i].state.live() { self.leases[i].node.clone() } else { None });
-        if let Some(n) = node {
+        if let (Some(n), "user") = (node, by) {
             self.excluded.insert((lane, n), now + CANCEL_EXCLUDE_MS);
         }
-        self.end_at(i, "cancelled", Sev::Warn, "cancelled by user", now);
+        self.end_at(i, "cancelled", Sev::Warn, &format!("cancelled by {by}"), now);
         true
     }
 
@@ -768,11 +815,42 @@ impl Sched {
         self.leases.iter().filter(|l| l.req.holder.is_some_and(|p| !alive(p))).map(|l| l.id.clone()).collect()
     }
 
+    /// The lease's box could not be reached when it was set up (its hub restarting for an update,
+    /// the box gone): the box counts as down until its caps answer again, and the lease goes back
+    /// to the queue, to the next box that fits, instead of failing.
+    pub fn unreachable(&mut self, id: &str, why: &str) {
+        let Some(l) = self.leases.iter_mut().find(|l| l.id == id && l.state == State::Starting) else { return };
+        let node = l.node.take().unwrap_or_default();
+        l.state = State::Queued;
+        l.granted_ms = None;
+        l.wait_ms = None;
+        l.reason = format!("{node} was unreachable; placed again");
+        let l = l.clone();
+        self.set_down(&node);
+        self.event(Sev::Warn, format!("{} of {}: {node} unreachable at its start ({why}); {node} counts as down until its hub reports in, the lease waits for the next box", l.tag(), l.req.lane), Some(&l));
+    }
+
+    /// The node's previous lease is still leaving its tree: the lease is placed again.
+    pub fn tree_busy(&mut self, id: &str, why: &str) {
+        let Some(l) = self.leases.iter_mut().find(|l| l.id == id && l.state == State::Starting) else { return };
+        let node = l.node.take().unwrap_or_default();
+        l.state = State::Queued;
+        l.granted_ms = None;
+        l.wait_ms = None;
+        l.reason = format!("{node}: {why}; placed again");
+    }
+
     /// The node set the lease up: `answer` is its `lease-start` line.
-    pub fn started(&mut self, id: &str, answer: &str) {
-        if let Some(l) = self.leases.iter_mut().find(|l| l.id == id && l.state == State::Starting) {
-            l.state = State::Granted;
-            l.start = answer.to_string();
+    /// False: the lease ended while its `lease-start` was on its way, and that end reached the node
+    /// first; what the start set up there is nobody's.
+    pub fn started(&mut self, id: &str, answer: &str) -> bool {
+        match self.leases.iter_mut().find(|l| l.id == id && l.state == State::Starting) {
+            Some(l) => {
+                l.state = State::Granted;
+                l.start = answer.to_string();
+                true
+            }
+            None => false,
         }
     }
 
@@ -786,8 +864,9 @@ impl Sched {
             .collect()
     }
 
-    /// Takes back a lease a previous master granted ([`Sched::live_lines`]); its holder has the
-    /// usual 30 s to beat again from `now`.
+    /// Takes back a lease a previous master granted ([`Sched::live_lines`]). Its holder has
+    /// [`RESTORE_GRACE_MS`] to beat again (a lane's holder re-attaches, the master's own work goes
+    /// on while its node links come up).
     pub fn restore(&mut self, line: &str, now: u64) -> Option<String> {
         let v = makepad_strict_json::parse(line.as_bytes()).ok()?;
         let id = v.get("id")?.as_str()?.to_string();
@@ -804,7 +883,7 @@ impl Sched {
             asked_ms: now,
             granted_ms: v.get("granted_ms").and_then(super::num).map(|x| x as u64),
             ended_ms: None,
-            beat_ms: now,
+            beat_ms: now + RESTORE_GRACE_MS,
             pos: 0,
             reason: String::new(),
             warned: false,
@@ -902,7 +981,7 @@ impl Sched {
                     caps: n.caps.clone(),
                     leases,
                     waiting,
-                    draining: !dev && leases > 0,
+                    draining: (!dev || self.user_present(name)) && leases > 0,
                     hold: self.holds.get(name).cloned(),
                     latency: n.lat.line(),
                 }
@@ -925,6 +1004,11 @@ impl Sched {
         }
         if k.writes() && c.role().users() && !self.dev(name) {
             return Err(format!("{}: dev off", if c.role() == Role::Device { "device" } else { "user WM" }));
+        }
+        // the user's own desktop: a lease that does not name it would run (and inject input) under
+        // the person, sensed or not (J305 on 103, 2026-10-30); a soft pin's fallback does not name it
+        if k.writes() && c.role() == Role::UserWm && l.req.node.as_deref() != Some(name) {
+            return Err("the user's WM: only a lease that names it".into());
         }
         for (key, v) in &l.req.needs {
             if !meets(c, key, v) {
@@ -964,12 +1048,24 @@ impl Sched {
         if !self.dev(name) {
             return Err(("node off".into(), false));
         }
+        // a person at the box: what runs finishes, nothing new starts until they leave
+        if let Some(u) = c.user.as_ref().filter(|u| u.present) {
+            return Err((format!("{} (back after {} min without input)", u.line(), u.idle_min), false));
+        }
         // one box per lease: the node is free or it is not
         if let Some(h) = holds.get(name).filter(|h| **h != l.id) {
             return Err((if k == Kind::Timed { format!("behind timed {h}") } else { format!("hold for timed {h}") }, false));
         }
         if let Some(r) = self.restoring.get(name) {
             return Err((format!("restoring its tree after {r}"), false));
+        }
+        if let Some(why) = self.updating.get(name) {
+            return Err((format!("self-update: {why}"), false));
+        }
+        // a hub of an older protocol (0: from before the self-update, no ship-done) gets no
+        // leases: a job's snapshot cannot ship to it; it waits for its update
+        if c.hub_proto < super::HUB_PROTO {
+            return Err((format!("its hub speaks protocol {} (< {}): waits for its update{}", c.hub_proto, super::HUB_PROTO, if c.hub_proto == 0 { " (one restart by hand)" } else { "" }), false));
         }
         if let Some(r) = self.live_on_node(name, &l.id).find(|r| r.req.kind != Kind::Inspect) {
             return Err((format!("held by {} ({} of {})", r.id, r.req.kind.as_str(), r.req.lane), false));
@@ -990,13 +1086,13 @@ impl Sched {
     /// running, off or down?
     fn long_wait(&self, name: &str, id: &str, holds: &HashMap<String, String>) -> bool {
         let n = &self.nodes[name];
-        !n.up || !self.dev(name) || holds.get(name).is_some_and(|h| h != id) || self.restoring.contains_key(name) || self.live_on_node(name, id).any(|r| r.req.kind != Kind::Inspect)
+        !n.up || !self.dev(name) || self.user_present(name) || holds.get(name).is_some_and(|h| h != id) || self.restoring.contains_key(name) || self.updating.contains_key(name) || self.live_on_node(name, id).any(|r| r.req.kind != Kind::Inspect)
     }
 
     fn place(&self, l: &Lease, holds: &HashMap<String, String>) -> Place {
         let k = l.req.kind;
         let live = |f: &dyn Fn(&Lease) -> bool| self.leases.iter().filter(|x| x.state.live() && f(x)).count() as u32;
-        if k != Kind::Inspect {
+        if k != Kind::Inspect && l.req.lane != CI_LANE {
             let n = live(&|x| x.req.kind == k && x.req.lane == l.req.lane);
             if n >= self.lane_cap {
                 return Place::Wait(format!("lane cap {n}/{}", self.lane_cap), None, None);
@@ -1017,6 +1113,7 @@ impl Sched {
                     }
                     v
                 }
+                None if self.clock < self.nodes_settle_ms => return Place::Wait(format!("node {n} not heard yet"), None, None),
                 None => return Place::Deny(format!("no node {n}")),
             },
             None => {
@@ -1044,6 +1141,7 @@ impl Sched {
         }
         if fit.is_empty() {
             return match (unknown, &l.req.node) {
+                (0, _) if never.is_empty() && self.clock < self.nodes_settle_ms => Place::Wait("no node heard yet".into(), None, None),
                 (0, _) if never.is_empty() => Place::Deny("no nodes".into()),
                 (0, _) => Place::Deny(never.join("; ")),
                 (_, Some(n)) => Place::Wait(format!("node {n} down"), None, None),
@@ -1119,7 +1217,7 @@ impl Sched {
             let l = &self.leases[i];
             let aged = l.req.prio as i64 - (now.saturating_sub(l.asked_ms) / AGE_STEP_MS) as i64;
             // landings' gates first, then priority; never granted sorts before a grant at time 0
-            let landing = l.req.kind == Kind::Gate && l.req.lane == LANDING_LANE;
+            let landing = l.req.kind == Kind::Gate && (l.req.lane == LANDING_LANE || l.req.lane.starts_with("landq"));
             (!landing, aged, self.last_grant.get(&l.req.lane).map_or(0, |t| t + 1), l.asked_ms, l.seq)
         });
         let mut holds: HashMap<String, String> = HashMap::new();
@@ -1161,9 +1259,10 @@ impl Sched {
                         let due = self.nodes.get(&n).is_some_and(|s| s.reclaim_ms.is_none_or(|t| now.saturating_sub(t) >= RECLAIM_EVERY_MS));
                         if due {
                             self.nodes.get_mut(&n).unwrap().reclaim_ms = Some(now);
-                            let line = format!("node {n} below its disk floor with {} waiting: asked to reclaim", self.leases[i].id);
+                            let need_gb = self.leases[i].cost.disk_gb;
+                            let line = format!("node {n} short of disk for {} ({need_gb:.0} GB over its floor): asked to reclaim", self.leases[i].id);
                             self.event(Sev::Info, line, None);
-                            self.out.push(Action::Reclaim { node: n });
+                            self.out.push(Action::Reclaim { node: n, need_gb });
                         }
                     }
                     waits.push((i, reason));
@@ -1215,6 +1314,7 @@ mod tests {
 
     fn caps(cores: u32, ram: f64, role: Role) -> Caps {
         Caps {
+            hub_proto: super::super::HUB_PROTO,
             node: String::new(),
             arch: "x86_64".into(),
             os: "linux".into(),
@@ -1306,6 +1406,19 @@ mod tests {
     /// An ended lease's node is not free until its cleanup answered (the tree is back on the
     /// shared commits): no lease starts on a box still on the last lane's commits.
     #[test]
+    fn a_restarted_master_waits_for_its_nodes_before_denying() {
+        let mut s = Sched::new("mac", 1);
+        s.nodes_settle_ms = 60_000;
+        let mut pinned = Req::new("a", Kind::Test);
+        pinned.node = Some("n1".into());
+        let (any, pin) = (s.request(Req::new("a", Kind::Test), 1), s.request(pinned, 1));
+        s.tick(1);
+        assert!(s.get(&any).is_some_and(|l| l.state == State::Queued) && s.get(&pin).is_some_and(|l| l.state == State::Queued));
+        s.tick(60_001);
+        assert!(s.get(&any).is_some_and(|l| matches!(l.state, State::Ended(_))) && s.get(&pin).is_some_and(|l| matches!(l.state, State::Ended(_))));
+    }
+
+    #[test]
     fn a_box_is_free_only_after_its_tree_is_restored() {
         let mut s = sched(&[("a", caps(16, 64.0, Role::Pool))]);
         let x = s.request(req("x", Kind::Test, None), 0);
@@ -1363,12 +1476,22 @@ mod tests {
         assert_eq!(grants(&s.tick(2)), vec![by_os]);
     }
     #[test]
+    fn ci_lane_has_no_lane_cap() {
+        let mut s = sched(&[("a", caps(64, 256.0, Role::Pool)), ("b", caps(64, 256.0, Role::Pool)), ("c", caps(64, 256.0, Role::Pool))]);
+        for _ in 0..3 {
+            s.request(req(CI_LANE, Kind::Build, None), 0);
+        }
+        assert_eq!(grants(&s.tick(0)).len(), 3);
+    }
+
+    #[test]
     fn lane_cap_queues_with_a_warning() {
         let mut s = sched(&[("a", caps(64, 256.0, Role::Pool)), ("b", caps(64, 256.0, Role::Pool))]);
         let ids: Vec<String> = (0..3).map(|_| s.request(req("gapx", Kind::Build, None), 0)).collect();
         let a = s.tick(0);
         assert_eq!(grants(&a).len(), 2);
         assert_eq!(state(&s, &ids[2]).1, "lane cap 2/2");
+        assert_eq!(s.leases.iter().map(|l| l.lane_capped()).collect::<Vec<_>>(), vec![false, false, true]);
         assert!(a.iter().any(|a| matches!(a, Action::Event(r) if r.line.contains("1st in queue (lane cap 2/2)"))));
         // asking past the cap while at it is a warn
         s.request(req("gapx", Kind::Build, None), 1);
@@ -1448,7 +1571,7 @@ mod tests {
         let b = s.request(req("x", Kind::Build, None), 0);
         let a = s.tick(0);
         assert_eq!(state(&s, &b).1, "disk floor: 31 GB free, needs 20, floor 25");
-        assert!(a.iter().any(|a| matches!(a, Action::Reclaim { node } if node == "a")));
+        assert!(a.iter().any(|a| matches!(a, Action::Reclaim { node, need_gb } if node == "a" && *need_gb == 20.0)));
         // asked once, not every tick
         assert!(!s.tick(1).iter().any(|a| matches!(a, Action::Reclaim { .. })));
         c.disk_free_gb = 80.0;
@@ -1501,6 +1624,29 @@ mod tests {
         assert_eq!(state(&s, &plain).0, "starting");
         let lit = caps(16, 64.0, Role::Pool);
         assert!(meets(&lit, "gui", "1") && meets(&lit, "gui", "") && !meets(&dark, "gui", "yes") && meets(&dark, "gui", "0"));
+    }
+
+    /// A user's WM takes only what names it: no unpinned lease, no soft pin's fallback.
+    #[test]
+    fn a_user_wm_takes_only_leases_that_name_it() {
+        let mut s = sched(&[("wm", caps(64, 256.0, Role::UserWm)), ("p", caps(64, 256.0, Role::Pool))]);
+        let mut held = req("h", Kind::Test, Some("p"));
+        held.only = true;
+        let held = s.request(held, 0);
+        s.tick(0);
+        assert_eq!(node_of(&s, &held).as_deref(), Some("p"));
+        // the pool is full and the WM idle: an unpinned lease and a soft pin to the pool wait
+        let mut any = req("a", Kind::Test, None);
+        any.needs = parse_needs("os=linux");
+        let any = s.request(any, 1);
+        let soft = s.request(req("b", Kind::Test, Some("p")), 1);
+        s.tick(1 + PIN_GRACE_MS);
+        assert_eq!(node_of(&s, &any), None);
+        assert_eq!(node_of(&s, &soft), None);
+        // one that names it goes there
+        let named = s.request(req("c", Kind::Test, Some("wm")), 2 + PIN_GRACE_MS);
+        s.tick(2 + PIN_GRACE_MS);
+        assert_eq!(node_of(&s, &named).as_deref(), Some("wm"));
     }
 
     #[test]
@@ -1584,6 +1730,45 @@ mod tests {
         release_clean(&mut s, &b, 3);
         beat_all(&mut s, 3);
         assert_eq!(grants(&s.tick(3)), vec![w]);
+    }
+
+    #[test]
+    fn a_person_at_the_box_drains_it_and_their_switch_wins() {
+        let user = |present: bool| Some(crate::lease::UserSense { present, idle_ms: Some(if present { 5_000 } else { 200_000 }), what: "key from its device".into(), idle_min: 3 });
+        let mut s = sched(&[("a", caps(64, 256.0, Role::UserWm))]);
+        let b = s.request(req("x", Kind::Build, Some("a")), 0);
+        s.tick(0);
+        // the person arrives: the running lease is never ended, nothing new starts
+        s.set_caps("a", Caps { user: user(true), ..caps(64, 256.0, Role::UserWm) }, 1);
+        let a = s.tick(1);
+        assert!(!a.iter().any(|a| matches!(a, Action::End { .. })));
+        let v = &s.node_view()[0];
+        assert!(v.draining && v.dev && v.state_word() == "user (key from its device 5 s ago), draining (1 leases)", "{}", v.state_word());
+        assert!(v.to_json().contains("\"user\":true"));
+        let w = s.request(req("y", Kind::Build, Some("a")), 2);
+        let i = s.request(req("z", Kind::Inspect, Some("a")), 2);
+        release_clean(&mut s, &b, 2);
+        beat_all(&mut s, 2);
+        // inspect stays (it writes nothing); a build waits for the person to leave
+        assert_eq!(grants(&s.tick(2)), vec![i.clone()]);
+        assert!(state(&s, &w).1.starts_with("user (key from its device 5 s ago)"), "{:?}", state(&s, &w));
+        s.release(&i, "released", 2);
+        assert_eq!(s.node_view()[0].state_word(), "user (key from its device 5 s ago)");
+        // they leave: it takes work again
+        s.set_caps("a", Caps { user: user(false), ..caps(64, 256.0, Role::UserWm) }, 3);
+        beat_all(&mut s, 3);
+        assert_eq!(grants(&s.tick(3)), vec![w.clone()]);
+        // the user's own off wins: an idle person never turns a node on
+        let mut s = sched(&[("a", caps(64, 256.0, Role::UserWm))]);
+        s.set_dev("a", false, 0).unwrap();
+        s.set_caps("a", Caps { user: user(false), ..caps(64, 256.0, Role::UserWm) }, 1);
+        let w = s.request(req("y", Kind::Build, Some("a")), 1);
+        s.tick(1);
+        assert!(!s.dev("a") && s.node_view()[0].state_word() == "dev off (user WM)");
+        assert_ne!(state(&s, &w).0, "starting");
+        // nor does a person's presence show over it
+        s.set_caps("a", Caps { user: user(true), ..caps(64, 256.0, Role::UserWm) }, 2);
+        assert_eq!(s.node_view()[0].state_word(), "dev off (user WM)");
     }
 
     #[test]

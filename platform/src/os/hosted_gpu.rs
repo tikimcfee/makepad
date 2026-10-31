@@ -9,7 +9,18 @@ use crate::{
 };
 use makepad_hal::{dmabuf::DmaBuf, hosted_ipc::{self, ClientEndpoint}};
 use makepad_studio_protocol::{NativeAppEvent, NativeAppRequest, PresentableImageId, SharedSwapchain};
-use makepad_hal::hosted_native::{Incoming, Outgoing};
+use std::os::fd::OwnedFd;
+
+/// A native-layer message from the WM with its descriptors, read on the worker.
+struct Incoming {
+    event: NativeAppEvent,
+    fds: Vec<OwnedFd>,
+}
+/// A native-layer request of the HAL's for the WM (`HostedNativeOut`) and its release fence.
+pub(crate) struct Outgoing {
+    pub request: NativeAppRequest,
+    pub fence: Option<OwnedFd>,
+}
 use crate::makepad_network::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::{
     collections::VecDeque,
@@ -62,6 +73,8 @@ pub(crate) struct GpuInbox {
     failed: Option<String>,
     reported: bool,
     backlogged: bool,
+    /// Native-layer messages from the WM for the HAL, encoded (`take_native`).
+    native_in: Vec<Vec<u8>>,
     _worker: TaskHandle<()>,
 }
 
@@ -147,6 +160,7 @@ impl GpuInbox {
             failed: None,
             reported: false,
             backlogged: false,
+            native_in: Vec::new(),
             _worker: worker,
         })
     }
@@ -156,6 +170,8 @@ impl GpuInbox {
     }
     pub fn native(&mut self, event: NativeAppEvent) -> Result<(), String> { self.queue(Request::Native(event)) }
     pub fn send_native(&mut self, request: Outgoing) -> Result<(), String> { self.queue(Request::Send(request)) }
+    /// The native-layer messages `poll` received since the last call, as `HostedNativeIn` payloads.
+    pub fn take_native(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.native_in) }
     fn queue(&mut self, request: Request) -> Result<(), String> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
@@ -231,7 +247,18 @@ impl GpuInbox {
         {
             match reply {
                 Reply::Loaded(batch) => loaded.push(batch),
-                Reply::Native(incoming) => makepad_hal::hosted_native::receive(incoming),
+                Reply::Native(Incoming { event, fds }) => {
+                    // for the HAL (`HostedNativeIn`): the descriptor count, the descriptors (given
+                    // up here), the event
+                    use crate::makepad_micro_serde::SerBin;
+                    use std::os::fd::IntoRawFd;
+                    let mut bytes = (fds.len() as i32).to_le_bytes().to_vec();
+                    for fd in fds {
+                        bytes.extend(fd.into_raw_fd().to_le_bytes());
+                    }
+                    bytes.extend(event.serialize_bin());
+                    self.native_in.push(bytes);
+                }
                 Reply::Sent(request) => crate::Cx::send_studio_message(makepad_studio_protocol::AppToStudio::NativeApp(request)),
                 Reply::Failed(error) => self.fail(error),
             }

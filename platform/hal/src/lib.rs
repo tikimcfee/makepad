@@ -37,6 +37,7 @@ pub mod fake_camera;
 pub mod clipboard;
 pub mod drag_promise;
 pub mod direct;
+pub mod user_input;
 #[cfg(target_os = "linux")]
 pub mod wide_desktop;
 #[cfg(target_os = "linux")]
@@ -729,6 +730,8 @@ impl Hal {
                 if let Some((_, b)) = st.backend.as_mut() {
                     b.step(&mut st.world, sid);
                     xr_remote::drain_events(sid, &mut st.world);
+                    #[cfg(target_os = "linux")]
+                    hosted_native::drain_events(sid, &mut st.world);
                     // glyphs the font workers finished go to the atlas and to the sessions
                     if let Some(gpu) = b.host_gpu() {
                         font::service(gpu, &mut st.world);

@@ -204,6 +204,7 @@ fn instrument_label(doc: &ScoreDoc, source: &str, outline: &Outline, name: &str,
     match doc.inst(name).map(|i| &i.kind) {
         Some(InstKind::Synth { .. }) => preset().unwrap_or_else(|| "own synth".into()),
         Some(InstKind::Morph { .. }) => preset().unwrap_or_else(|| "init".into()),
+        Some(InstKind::Tandem { patch, .. }) => patch.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("init").to_string(),
         Some(InstKind::Drums { kit, .. }) => kit.replace('_', " "),
         Some(InstKind::Ironfish { program, .. }) => makepad_score_player::presets::IRON_PROGRAMS.get(*program).copied().unwrap_or("init").to_string(),
         Some(InstKind::Shader { shader, .. }) => shader.lib.clone().unwrap_or_else(|| "own code".into()).replace('_', " "),

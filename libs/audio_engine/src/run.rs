@@ -110,16 +110,32 @@ pub fn run<X, Y, B>(schedule: &mut Schedule<X, Y, B>, frames: usize, sink: &mut 
             Op::Transport { state, clock, bpm, playing, probe, mapped } => {
                 let NodeState::Transport(this) = &mut states[*state as usize] else { continue };
                 let bpm_control = *bpm;
-                let bpm = controls.get(*bpm);
                 let playing = controls.get(*playing) >= 0.5;
                 if let Some(feed) = &mut this.feed {
                     while let Some(event) = feed.pop() {
+                        if event.locate {
+                            this.pending.clear();
+                            this.ramp = None;
+                            this.beat = 0.0;
+                            this.anchor = 0.0;
+                            this.anchor_frame = this.frames as f64;
+                            this.located = this.located.wrapping_add(1);
+                            if event.bpm > 0.0 {
+                                // As the map's tempo: shown on the control, not a new setting.
+                                this.tempo = event.bpm.clamp(crate::feed::TEMPO_MIN, crate::feed::TEMPO_MAX);
+                                this.bpm = this.tempo as f32;
+                                this.mapped = true;
+                                controls.set_manual(bpm_control, this.bpm);
+                            }
+                            continue;
+                        }
                         if this.pending.len() < this.pending.capacity() {
                             let at = this.pending.partition_point(|p| p.beat <= event.beat);
                             this.pending.insert(at, event);
                         }
                     }
                 }
+                let bpm = controls.get(bpm_control);
                 let origin = this.frames as f64;
                 // The control (or starting and stopping) re-anchors at the
                 // beat reached; a changed control sets the tempo.
@@ -190,7 +206,7 @@ pub fn run<X, Y, B>(schedule: &mut Schedule<X, Y, B>, frames: usize, sink: &mut 
                     }
                 }
                 let per_frame = per(this.tempo);
-                clocks[*clock as usize] = ClockChunk { start: this.beat, per_frame: tempo.per_frame, playing, bpm: this.tempo as f32, tempo };
+                clocks[*clock as usize] = ClockChunk { start: this.beat, per_frame: tempo.per_frame, playing, bpm: this.tempo as f32, tempo, located: this.located };
                 this.frames += frames as u64;
                 this.beat = this.anchor + (this.frames as f64 - this.anchor_frame) * per_frame;
                 probes[*probe as usize] = this.beat as f32;

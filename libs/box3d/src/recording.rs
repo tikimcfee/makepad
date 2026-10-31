@@ -701,6 +701,7 @@ pub enum RecOp {
     CreateHeightFieldShape = 0x44,
     CreateCompoundShape = 0x45,
     DestroyShape = 0x46,
+    CreateTubeShape = 0x47,
 
     ShapeSetDensity = 0x50,
     ShapeSetFriction = 0x51,
@@ -947,6 +948,14 @@ impl RecBuffer {
         self.w_vec3(c.center1);
         self.w_vec3(c.center2);
         self.w_f32(c.radius);
+    }
+
+    pub fn w_tube(&mut self, tube: &crate::types::Tube) {
+        self.w_i32(tube.points.len() as i32);
+        for &point in &tube.points {
+            self.w_vec3(point);
+        }
+        self.w_f32(tube.radius);
     }
 
     /// C: b3RecW_GEOMID

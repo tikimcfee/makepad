@@ -41,7 +41,7 @@ mod collected;
 pub use collected::{CollectedCache, CollectedDest, CollectedRecord, CollectedWritten};
 mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
-pub(crate) use image::{complete_identities_unit, ids_report_unit, image_broken_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
+pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
 mod deps;
 mod demand;
@@ -433,17 +433,13 @@ pub struct CacheStats {
     pub prelink_syms_ns: u64,
     /// data objects placed from the image (place_data)
     pub prelink_data: u64,
-    /// the image slots' identities decoded after the prelink (`complete_identities`): decoded,
-    /// of them a key an earlier slot already had (the slot stays, unmapped), keys that did not
-    /// decode, and the wall ns it took (in the background and on the thread that finished it)
+    /// the image slots' identities decoded in the prelink (`decode_identities`): decoded, of them
+    /// a key an earlier slot already had (the slot stays, unmapped), keys that did not decode
+    /// (what names them stays lazy), and the wall ns it took
     pub ids_decoded: u64,
     pub ids_dup: u64,
     pub ids_failed: u64,
     pub ids_ns: u64,
-    pub ids_bg: u64,
-    /// of them, decoded in the prelink because their keys name a changed crate, and its wall ns
-    pub ids_unsure: u64,
-    pub ids_unsure_ns: u64,
 }
 
 /// Interior storage for the cache installed in a Unit. The owner thread protects
@@ -675,10 +671,6 @@ pub struct Cache {
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
-    /// code reached a slot of the loaded image without an identity (`image_broken`): the
-    /// manifest carries no image from now on (written at once, at exit too), so no later run
-    /// starts from it
-    image_bad: bool,
     /// the root crate whose manifest load_manifest read
     manifest_root: Option<u32>,
     /// slot -> the code entry its code was linked from this run (lazily or prelinked): the next
@@ -954,7 +946,6 @@ impl Cache {
             image_slots: 0,
             image_stale: 0,
             rec_tier: HashMap::new(),
-            image_bad: false,
             manifest_root: None,
             linked_key: HashMap::new(),
             slot_keys: HashMap::new(),
@@ -1204,6 +1195,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front");
         h.u32(crate::image::VERSION);
+        h.u128(crate::codegen_id::front_id());
         h.str(path);
         h.u128(source_hash);
         h.finish128()
@@ -1213,6 +1205,7 @@ impl Cache {
         let mut h = Sip128::new();
         h.str("front-part");
         h.u32(crate::image::VERSION);
+        h.u128(crate::codegen_id::front_id());
         h.str(path);
         h.u128(source_hash);
         h.finish128()
@@ -2011,8 +2004,8 @@ impl Cache {
                 let pk = u.fns[parent as usize].key.clone();
                 self.enc_fnkey(u, &pk, e, crates, depth + 1)
             }
-            // a startup image slot whose identity is still encoded (image.rs): no key yet, and
-            // none remembered
+            // the slot of a startup image key that did not decode (image.rs): no key, and none
+            // remembered
             FnKey::Glue(crate::jit::GLUE_UNNAMED, _) => {
                 self.key_waits = true;
                 None
@@ -3455,7 +3448,7 @@ impl Cache {
         // keeps the image (a rewrite there covers only the slots already keyed, and the
         // next start would prelink a few dozen slots instead of ~20,000). Slots whose entry
         // an O2/O3 build replaced since stay lazy at the next start (image.rs img_live).
-        if self.manifest_done && crate::preempt::is_stopped() && !self.image_bad {
+        if self.manifest_done && crate::preempt::is_stopped() {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; self.manifest_len = order.len(); return true };
@@ -3497,7 +3490,7 @@ impl Cache {
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
         }
         crate::run::yield_section("manifest image");
-        let img = if self.mode != Mode::Verify && !self.image_bad {
+        let img = if self.mode != Mode::Verify {
             match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
         } else { None };
         // at exit no key can be made any more (slot_key): slots no lookup or record keyed this
@@ -3507,7 +3500,7 @@ impl Cache {
         crate::run::yield_section("manifest tail");
         if stop() { return false; }
         let n_img = img.as_ref().map_or(0, |i| i.1 as usize);
-        if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 && !self.image_bad {
+        if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 {
             if self.verbose {
                 eprintln!("makepad-run cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
             }
@@ -4611,6 +4604,7 @@ fn front_crate_key(name: &str, root: &str) -> u128 {
     let mut h = Sip128::new();
     h.str("front-crate");
     h.u32(crate::crate_image::VERSION);
+    h.u128(crate::codegen_id::front_id());
     h.str(name);
     h.str(root);
     h.finish128()
@@ -6721,7 +6715,7 @@ mod data_tests {
             let mut bytes = E::default();
             let mut crates = vec![];
             assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut crates, 0).is_some());
-            // the image's walk of a key finds the crates its encoder named (prelink's key_ok)
+            // the image's walk of a key finds the crates its encoder named (Img::key_ok)
             crates.sort_unstable();
             crates.dedup();
             assert_eq!(cache.key_crates(&u, &bytes.0), Some(crates));

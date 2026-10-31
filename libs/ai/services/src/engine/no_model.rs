@@ -7,7 +7,10 @@ use crate::engine::{Model, ModelEvent, ToolDefinition};
 
 /// Nothing answers. Sends fail at once with a plain message; the tool
 /// console still works because it never touches the model.
-pub struct NoModel;
+#[derive(Default)]
+pub struct NoModel {
+    queued: Vec<ModelEvent>,
+}
 
 impl Model for NoModel {
     fn label(&self) -> String {
@@ -16,12 +19,14 @@ impl Model for NoModel {
     fn configure(&mut self, _system: &str, _tools: &[ToolDefinition]) -> Result<(), String> {
         Ok(())
     }
-    fn send_user(&mut self, _text: &str, _dynamic_context: &str) {}
+    fn send_user(&mut self, _text: &str, _dynamic_context: &str) {
+        self.queued.push(ModelEvent::Error("no model is picked for this chat: choose one in its menu. The tools still work from the console: /name {json}".into()));
+    }
     fn send_tool_result(&mut self, _call_id: &str, _text: &str, _is_error: bool) {}
     fn cancel(&mut self) {}
     fn reset(&mut self) {}
     fn poll(&mut self) -> Vec<ModelEvent> {
-        Vec::new()
+        std::mem::take(&mut self.queued)
     }
 }
 
@@ -91,5 +96,19 @@ impl Model for ClaudeDesktopModel {
     fn reset(&mut self) {}
     fn poll(&mut self) -> Vec<ModelEvent> {
         std::mem::take(&mut self.queued)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a line to no model sat on "Thinking" for good.
+    #[test]
+    fn a_line_to_no_model_fails_at_once() {
+        let mut model = NoModel::default();
+        model.send_user("hello", "");
+        assert!(matches!(&model.poll()[..], [ModelEvent::Error(_)]));
+        assert!(model.poll().is_empty());
     }
 }

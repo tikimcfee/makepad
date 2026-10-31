@@ -58,7 +58,7 @@ pub fn project(doc: &ScoreDoc) -> ScoreGraph {
     for (name, ty) in &doc.order {
         let (role, inputs, outputs) = match ty.as_str() {
             "Clock" => ("clock", vec![], vec![port("clock", "clock", false)]),
-            "Synth" | "Drums" | "Sampler" | "Ironfish" | "Morph" | "Shader" | "Voice" | "Instrument" => ("inst", vec![], vec![port("inst", "inst", false)]),
+            t if crate::instruments::INSTRUMENT_TYPES.contains(&t) => ("inst", vec![], vec![port("inst", "inst", false)]),
             "Loop" | "Stinger" => ("loop", vec![port("play", "inst", false), port("in", "notes", false)], vec![port("audio", "audio", false)]),
             "Section" => ("section", vec![], vec![]),
             "MidiIn" => ("stream", vec![], vec![port("notes", "notes", false)]),

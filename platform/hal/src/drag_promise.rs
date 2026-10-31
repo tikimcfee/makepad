@@ -75,7 +75,8 @@ pub fn deliver(src: &Path, dest: &Path) -> Result<(), String> {
     let part = part_path(dest);
     let result = (|| {
         let copied = std::fs::copy(src, &part).map_err(|e| format!("copying to {}: {e}", dest.display()))?;
-        let file = std::fs::File::open(&part).map_err(|e| format!("opening {}: {e}", part.display()))?;
+        // write access: Windows flushes a file only through a handle that may write it
+        let file = std::fs::OpenOptions::new().write(true).open(&part).map_err(|e| format!("opening {}: {e}", part.display()))?;
         file.sync_all().map_err(|e| format!("syncing {}: {e}", part.display()))?;
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         if len == 0 || len != copied {

@@ -3368,6 +3368,25 @@ fn ms(t0: Instant) -> f64 {
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A restart is due (an edit needs one); the program polls this at its safe point.
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The app is pinned: the live watch stands still and a rebuilt makepad waits.
+static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Unpinned: the watch's next round looks at every file.
+static CATCH_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `inspect pin on|off`: while on, no edit or landing reaches the running app and it does not
+/// restart; off, it catches up (patches, or the rebuilt makepad that waited). Returns the state.
+pub(crate) fn set_pinned(on: bool) -> bool {
+    let was = PINNED.swap(on, std::sync::atomic::Ordering::AcqRel);
+    if was && !on {
+        CATCH_UP.store(true, std::sync::atomic::Ordering::Release);
+        host::unpinned();
+    }
+    on
+}
+
+pub(crate) fn pinned() -> bool {
+    PINNED.load(std::sync::atomic::Ordering::Acquire)
+}
 static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
@@ -3747,21 +3766,9 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
     back
 }
 
-/// An edit the patcher cannot absorb lands by restarting the program in place, at once
-/// (restart_in_place). Only where that is impossible does it wait for `session relaunch`.
+/// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
 fn restart_for_edit(what: &str, lines: &[String]) {
-    let why = format!("{}: {}", what, lines.first().cloned().unwrap_or_default());
-    if dock_app() {
-        // a dock app restarts when the person says so (the WM's toast, or `session relaunch`)
-        return offer_restart(&why);
-    }
-    match restart_in_place(why.clone()) {
-        Ok(how) => eprintln!("makepad live: {what}: restarting in place to apply it ({how}); reasons below"),
-        Err(e) => {
-            note_restart_pending(&why);
-            eprintln!("makepad live: {what}: restart to apply (reasons below); the app keeps running the previous code -- `makepad inspect <app> session relaunch` applies it ({e})");
-        }
-    }
+    offer_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()));
 }
 
 /// How long a patch's old code may stay on a program thread's stack before the edit counts as
@@ -3897,18 +3904,11 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
-/// A WM dock app (`MAKEPAD_RUN_DOCK_REVISION`): its changes come from devhub syncs of landed
-/// work, and a restart they need is offered to the person (the WM's toast says "restart to
-/// apply", and its Restart is `session relaunch`), never done unasked.
-pub(crate) fn dock_app() -> bool {
-    std::env::var_os("MAKEPAD_RUN_DOCK_REVISION").is_some_and(|p| !p.is_empty())
-}
-
-/// A restart is ready for a dock app: noted for `session relaunch`, and in the live log for the
-/// toast (devhub follows it).
+/// A restart is ready: noted for `session relaunch` (the JIT ring's Update ready notice, a click
+/// on it asks for it), and in the live log for the WM's toast (devhub follows it).
 pub(crate) fn offer_restart(why: &str) {
     note_restart_pending(why);
-    eprintln!("makepad live: {why}: a restart applies it; offered (the WM's toast, or `makepad inspect <app> session relaunch`); the app keeps running meanwhile");
+    eprintln!("makepad live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `makepad inspect <app> session relaunch`); the app keeps running meanwhile");
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
 
@@ -4025,7 +4025,8 @@ static SESSION: relax_session::sync::Mutex<Vec<(&'static str, f64)>> = relax_ses
 /// One edit's record. `saved`: the newest edited file's modification time (the save).
 fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
     if crate::run_state::observed() {
-        let applied = o.rung == Rung::Patch && !o.pending
+        // an edit waiting for a restart is no failure: the app runs on, the restart is offered
+        let applied = o.rung == Rung::Restart || o.rung == Rung::Patch && !o.pending
             && !o.lines.iter().any(|l| l.starts_with("incomplete:"));
         let records = if applied { Vec::new() } else {
             o.lines.iter().map(|line| crate::diag::from_legacy(line, "typeck")).collect()
@@ -4384,7 +4385,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
-        crate::owner::call_quick(crate::owner::Class::Program, || {
+        crate::owner::call(crate::owner::Class::Program, || {
             let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
             let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
             for (p, i) in loaded {
@@ -4415,7 +4416,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
-        let dir = crate::owner::call_quick(crate::owner::Class::Program, || {
+        let dir = crate::owner::call(crate::owner::Class::Program, || {
             let u = &*up;
             let root = crate::layout::root_crate() as usize;
             u.prog.crates.get(root).and_then(|c| u.prog.mods.get(c.root_mod as usize)).and_then(|m| u.prog.file_paths.get(m.file as usize)).and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
@@ -4438,6 +4439,12 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut restart_required = false;
     let mut revision = 0;
     loop {
+        // pinned (`inspect pin on`, an operation runs on this app): no edit or landing reaches it
+        // and it does not restart; on unpin one whole scan catches up
+        if PINNED.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
         // native file events: sleep on them while nothing else is in flight (startup, a domain
         // loading, verdicts pending, a refused edit to retry, an open stream); else the 5 ms
         // poll. Other inputs wake it (watch_events::kick); one look a second regardless.
@@ -4459,7 +4466,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 inputs = next;
                 inputs.add_runner();
             }
-            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
+            let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {
                 if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
@@ -4492,7 +4499,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if loads != loads_seen || rewatched {
             loads_seen = loads;
             let t_own = Instant::now();
-            let loaded = crate::owner::call_quick(crate::owner::Class::Program, || own_files(&*up));
+            let loaded = crate::owner::call(crate::owner::Class::Program, || own_files(&*up));
             if std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_some() { eprintln!("makepad live: rewatch (loads {loads}, startup scan {rewatched}): own files in {:.1} ms at t={:.0} ms", t_own.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start()); }
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
@@ -4577,7 +4584,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         // a sync moved the dock app's checkout: every file is compared with what runs
         let synced = dock.as_mut().is_some_and(DockGate::synced);
-        let all = lost || rewatched || synced || (events.is_none() && tick % 20 == 0);
+        let caught_up = CATCH_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let all = lost || rewatched || synced || caught_up || (events.is_none() && tick % 20 == 0);
         let t_round = std::time::Instant::now();
         let mut changed: Vec<usize> = Vec::new();
         let mut scanned = 0;
@@ -4659,6 +4667,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 break;
             }
         }
+        // A moved lockfile or manifest (any landing moves the checkout's) is this app's only when
+        // its own resolved graph moved; else there is nothing to rebuild or restart.
+        let manifests: Vec<usize> = changed.iter().copied().filter(|&k| inputs.is_manifest(&files[k].0)).collect();
+        if !manifests.is_empty() && !inputs.graph_moved(&(*up).prog.session) {
+            eprintln!("makepad live: {} manifest(s) changed, this app's Cargo graph did not", manifests.len());
+            for &k in &manifests { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+            changed.retain(|k| !manifests.contains(k));
+            if changed.is_empty() {
+                continue;
+            }
+        }
         if synced {
             // A devhub sync of landed work: one whole tree, so no part of it is a half-done
             // checkout. What makepad itself is built from (provided crates, std, the Cargo graph,
@@ -4685,11 +4704,23 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 continue;
             }
         }
-        let reason = if synced { None } else { inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())).or_else(|| {
-            changed.iter().any(|&k| files[k].1 == u32::MAX && !crate::native_macros::owns_path(&files[k].0))
-                .then_some("sources outside the loaded program changed")
-        }) };
+        // sources the program has not loaded are read when it loads them (another OS's: never)
+        if !synced {
+            let (unloaded, rest): (Vec<usize>, Vec<usize>) = changed.iter().partition(|&&k| files[k].1 == u32::MAX && !inputs.process_input(&files[k].0) && !inputs.is_manifest(&files[k].0) && !crate::native_macros::owns_path(&files[k].0));
+            for &k in &unloaded { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+            changed = rest;
+            if changed.is_empty() {
+                continue;
+            }
+        }
+        let reason = if synced { None } else { inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())) };
         if let Some(reason) = reason {
+            // nothing of makepad's own moved (a bulk change of the program's sources): no rebuild
+            if !changed.iter().any(|&k| inputs.process_input(&files[k].0)) {
+                offer_restart(&format!("{} files changed: {reason}", changed.len()));
+                for &k in &changed { files[k].2 = stamp(&files[k].0); stalled.remove(&k); }
+                continue;
+            }
             // a change the running process cannot take: makepad rebuilds itself in the background
             // and restarts into the new binary; the app keeps running (and patching) meanwhile
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
@@ -4767,7 +4798,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         trace_input(watch_ms, ms(read_started), scanned);
-        let o = apply(up, edits);
+        let mut o = apply(up, edits);
+        // landed code the patcher refuses is nobody's error here: a restart takes it
+        if synced && o.rung == Rung::Refuse { o.rung = Rung::Restart; }
         let incomplete = o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:"));
         if incomplete {
             for (&k, src) in which.iter().zip(originals) { stalled.insert(k, (Instant::now(), src, if o.rung == Rung::Refuse { o.lines.clone() } else { Vec::new() })); }

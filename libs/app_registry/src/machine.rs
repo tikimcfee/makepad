@@ -167,6 +167,19 @@ pub fn request_notify(path: &std::path::Path, title: &str, body: &str, action: O
     }
 }
 
+/// Asks the WM at `path` how long ago a person used this machine (`makepad-wm activity`): its
+/// answer's JSON (`input_ms`, `seq`, `origin`, `what`; `makepad_hal::wm_socket`).
+#[cfg(unix)]
+pub fn request_activity(path: &std::path::Path) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    (&stream).write_all(b"makepad-wm activity\n").map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::BufReader::new(&stream).read_line(&mut line).map_err(|e| format!("the WM did not answer: {e}"))?;
+    line.trim().strip_prefix("makepad-wm activity ").map(str::to_string).ok_or_else(|| format!("unexpected answer {:?} (a WM from before `activity`)", line.trim()))
+}
+
 /// Unsaved work of the apps running on this machine (Unix), as `(pid, app, what)`: what each
 /// app's platform publishes in `$XDG_RUNTIME_DIR/makepad-unsaved/<pid>`
 /// (`makepad_platform::restart::set_unsaved`), for live processes only. A whole-session restart

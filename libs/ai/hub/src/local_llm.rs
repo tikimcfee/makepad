@@ -90,6 +90,33 @@ impl LocalLlmConfig {
     }
 }
 
+/// The line for what a reply writes that is not shown, so a long tool call
+/// or a long reasoning reads as work, not as a chat that sits there.
+#[derive(Default)]
+pub(crate) struct HiddenWork {
+    in_call: bool,
+    bytes: usize,
+    shown: Option<(bool, usize)>,
+}
+
+impl HiddenWork {
+    /// `bytes` more were written out of sight; the new line, when it changed.
+    pub(crate) fn wrote(&mut self, in_call: bool, bytes: usize) -> Option<String> {
+        if in_call != self.in_call {
+            self.in_call = in_call;
+            self.bytes = 0;
+        }
+        self.bytes += bytes;
+        let kb = self.bytes / 1024;
+        if self.shown == Some((in_call, kb)) {
+            return None;
+        }
+        self.shown = Some((in_call, kb));
+        let what = if in_call { "Writing a tool call" } else { "Reasoning" };
+        Some(if kb == 0 { what.to_string() } else { format!("{what} · {kb} KB") })
+    }
+}
+
 /// What the worker has to say. Everything a chat panel shows comes from here.
 #[derive(Debug)]
 pub enum ChatEvent {
@@ -101,6 +128,9 @@ pub enum ChatEvent {
     Failed(String),
     /// A piece of the answer being written.
     Delta(String),
+    /// What the model is writing out of sight (its reasoning, a tool call's
+    /// arguments): `Writing a tool call · 12 KB`, each time the line changes.
+    Working(String),
     /// The model wants a tool run. The consumer owes exactly one result per call.
     ToolCall {
         name: String,

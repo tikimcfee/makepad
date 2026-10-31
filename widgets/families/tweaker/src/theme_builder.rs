@@ -7229,6 +7229,7 @@ mod theme_builder_tests {
     /// Seen failing with the two word draws made first, where every one of
     /// the three moved.
     #[test]
+    #[cfg_attr(windows, ignore = "the rolls differ on Windows, under rustc and the JIT alike: its C runtime's math is not these pins' (seeds do not carry across to it)")]
     fn every_seed_still_rolls_the_theme_it_rolled_before_the_words() {
         // Re-pinned after the merge into work. The free-draw and light-page
         // numbers pinned at the merge never matched the tree they came with:

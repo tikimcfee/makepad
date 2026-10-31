@@ -44,6 +44,56 @@ const BH: usize = 2160;
 const XW: usize = 1680;
 const XH: usize = 1760;
 const IPD: f32 = 3.0;
+/// The headset check's eye (a Quest 3's), its CPU cast every `XK`-th pixel, and the left eye's
+/// field of view (a Quest 3's: asymmetric, the right eye mirrored), the HAL's eye near/far.
+const QW: usize = 2016;
+const QH: usize = 2112;
+const XK: usize = 8;
+const QUEST_FOV: [f32; 4] = [-0.94, 0.72, 0.84, -0.96];
+const XR_NEAR: f32 = 0.05;
+const XR_FAR: f32 = 2000.0;
+/// The headset check's world (metres) from the scene (mm).
+const XR_SCALE: f32 = 0.001;
+
+/// A headset's eye of the headset check: its view (world, metres), projection and the field
+/// of view it was made from (tangent angles: left, right, up, down).
+struct XrEyeCam {
+    view: Mat4f,
+    proj: Mat4f,
+    fov: [f32; 4],
+    /// The eye and its basis (side, up, forward), in the scene frame (mm).
+    eye: Vec3f,
+    basis: [Vec3f; 3],
+}
+
+/// Both eyes of the headset check: the march camera at three times its distance, in metres
+/// (the scene placed at `XR_SCALE`), eyes 64 mm apart, Quest 3 fields of view.
+fn xr_eyes(scene: &str) -> [XrEyeCam; 2] {
+    let (view, _) = march_camera(scene);
+    let inv = view.invert();
+    let eye = vec3f(inv.v[12], inv.v[13], inv.v[14]);
+    let target = match scene {
+        "vase" => vec3f(0.0, 36.0, 0.0),
+        "lattice" => vec3f(0.0, 12.0, 0.0),
+        _ => vec3f(0.0, 2.0, 0.0),
+    };
+    let eye = target + (eye - target).scale(3.0);
+    let forward = (target - eye).normalize();
+    let side = Vec3f::cross(forward, vec3f(0.0, 1.0, 0.0)).normalize();
+    let up = Vec3f::cross(side, forward);
+    [0, 1].map(|e| {
+        let fov = if e == 0 { QUEST_FOV } else { [-QUEST_FOV[1], -QUEST_FOV[0], QUEST_FOV[2], QUEST_FOV[3]] };
+        let at = eye + side.scale(if e == 0 { -32.0 } else { 32.0 });
+        let view = Mat4f::look_at(at.scale(XR_SCALE), (at + forward).scale(XR_SCALE), vec3f(0.0, 1.0, 0.0));
+        let [angle_left, angle_right, angle_up, angle_down] = fov;
+        let proj = Mat4f::from_camera_fov(&CameraFov { angle_left, angle_right, angle_up, angle_down }, XR_NEAR, XR_FAR);
+        XrEyeCam { view, proj, fov, eye: at, basis: [side, up, forward] }
+    })
+}
+
+fn xr_world_from_obj() -> Mat4f {
+    Mat4f { v: [XR_SCALE, 0.0, 0.0, 0.0, 0.0, XR_SCALE, 0.0, 0.0, 0.0, 0.0, XR_SCALE, 0.0, 0.0, 0.0, 0.0, 1.0] }
+}
 
 /// The right eye of `view`: the camera moved `IPD` along its x.
 fn right_eye(view: Mat4f) -> Mat4f {
@@ -605,6 +655,80 @@ fn check_eye(sc: &Scene, vol: &Volume, view: Mat4f, proj: Mat4f, w: usize, h: us
     (checked, hits, mask_bad, depth_bad, max_dt)
 }
 
+/// One eye of the headset check against an exact CPU cast (rays straight from the eye's field
+/// of view, not from the matrices the march inverts), every `XK`-th pixel: the hit masks (the
+/// silhouette: pixels whose grid neighbours agree) and the hits' distances to the surface.
+/// Returns (checked, hits, mask_bad, depth_bad, rows of the first mask misses).
+fn check_xr_eye(sc: &Scene, vol: &Volume, cam: &XrEyeCam, px: &[u8], stride: usize, x0: usize) -> (usize, usize, usize, usize, String) {
+    let prog = lower_with(&sc.before, &vol.kernels, vol.kernel_scale).unwrap();
+    let [tl, tr, tu, td] = cam.fov.map(f32::tan);
+    let pix_angle = (tu - td) / QH as f32;
+    // the march's rays start where ndc z = 0 is (view distance 2 f n / (f + n)), in mm
+    let z0 = 2.0 * XR_FAR * XR_NEAR / (XR_FAR + XR_NEAR) / XR_SCALE;
+    let (gw, gh) = (QW / XK, QH / XK);
+    let at = |gx: usize, gy: usize| (gx * XK + XK / 2, gy * XK + XK / 2);
+    let gpu_t = |x: usize, y: usize| { let i = (y * stride + x0 + x) * 16; f32::from_le_bytes([px[i], px[i + 1], px[i + 2], px[i + 3]]) };
+    let mut cpu_hit = vec![None; gw * gh];
+    let mut rays = vec![(0f32, [0f32; 3]); gw * gh];
+    let [side, up, forward] = cam.basis;
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let (x, y) = at(gx, gy);
+            let (u, v) = ((x as f32 + 0.5) / QW as f32, (y as f32 + 0.5) / QH as f32);
+            let d = side.scale(tl + (tr - tl) * u) + up.scale(tu - (tu - td) * v) + forward;
+            let rd = d.normalize();
+            let rd = [rd.x, rd.y, rd.z];
+            let ro = [cam.eye.x, cam.eye.y, cam.eye.z];
+            rays[gy * gw + gx] = (z0 * d.length(), rd);
+            let mut t = 0.0f32;
+            for _ in 0..2000 {
+                let p = [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
+                let (dist, _) = twin::eval_with(&prog.texels, p, &vol.kernels);
+                if dist < (CELL * 0.02).max(t * pix_angle) {
+                    cpu_hit[gy * gw + gx] = Some(t);
+                    break;
+                }
+                t += dist.max(0.01);
+                if t > 2000.0 {
+                    break;
+                }
+            }
+        }
+    }
+    let (mut checked, mut mask_bad, mut depth_bad, mut hits) = (0usize, 0usize, 0usize, 0usize);
+    let mut rows = String::new();
+    for gy in 1..gh - 1 {
+        for gx in 1..gw - 1 {
+            let c = cpu_hit[gy * gw + gx].is_some();
+            if !(0..9).all(|k| cpu_hit[(gy + k / 3 - 1) * gw + gx + k % 3 - 1].is_some() == c) {
+                continue;
+            }
+            checked += 1;
+            let (x, y) = at(gx, gy);
+            let gt = gpu_t(x, y);
+            if (gt >= 0.0) != c {
+                if mask_bad < 4 {
+                    rows += &format!(" ({x},{y}) gpu_t={gt} cpu_t={:?}", cpu_hit[gy * gw + gx]);
+                }
+                mask_bad += 1;
+                continue;
+            }
+            if c {
+                hits += 1;
+                let (t_start, rd) = rays[gy * gw + gx];
+                let t = t_start + gt;
+                let p = [cam.eye.x + rd[0] * t, cam.eye.y + rd[1] * t, cam.eye.z + rd[2] * t];
+                let (dist, _) = twin::eval_with(&prog.texels, p, &vol.kernels);
+                let eps = (CELL * 0.02).max(t * pix_angle);
+                if dist > 2.0 * eps + 0.01 || dist < -(eps + 0.05) {
+                    depth_bad += 1;
+                }
+            }
+        }
+    }
+    (checked, hits, mask_bad, depth_bad, rows)
+}
+
 // ---------------------------------------------------------------------------
 // The view: bakes each scene, then its edit, reads the atlases back.
 // ---------------------------------------------------------------------------
@@ -629,6 +753,12 @@ enum Step {
     Stereo,
     StereoWait(u64),
     StereoRead,
+    /// Both eyes of a headset (Quest 3 eye size and asymmetric fields of view, metres, the XR
+    /// step budget and the coarse pass, as Fab marches them): each eye's silhouette against a
+    /// CPU cast straight from its field of view.
+    Xr,
+    XrWait(u64),
+    XrRead,
     /// The edit: re-build the changed blocks, re-bake.
     Edit,
     Done,
@@ -767,6 +897,10 @@ impl SdfBakeView {
                 self.record_march(cx);
                 self.step = Step::StereoWait(cx.cx.repaint_id());
             }
+            Step::Xr => {
+                self.record_march(cx);
+                self.step = Step::XrWait(cx.cx.repaint_id());
+            }
             Step::MarchBench(phase) => {
                 // phases: 0 the full march, 1 coarse + march, 2 + shade; each
                 // runs until 40 timed frames (a new pipeline compiles first)
@@ -797,7 +931,7 @@ impl SdfBakeView {
                     self.step = if phase >= 3 { Step::Edit } else { Step::MarchBench(phase + 1) };
                 }
             }
-            Step::MarchWait(serial) | Step::StereoWait(serial) => {
+            Step::MarchWait(serial) | Step::StereoWait(serial) | Step::XrWait(serial) => {
                 let (pass, ..) = self.march_pass.as_ref().unwrap();
                 cx.make_child_pass(pass);
                 if pass.painted_whole_since(cx.cx, serial) {
@@ -808,10 +942,14 @@ impl SdfBakeView {
                         println!("SDFBAKE-FAIL march readback request: {e:?}");
                         std::process::exit(1);
                     }
-                    self.step = if matches!(self.step, Step::StereoWait(_)) { Step::StereoRead } else { Step::MarchRead };
+                    self.step = match self.step {
+                        Step::StereoWait(_) => Step::StereoRead,
+                        Step::XrWait(_) => Step::XrRead,
+                        _ => Step::MarchRead,
+                    };
                 }
             }
-            Step::MarchRead | Step::StereoRead => {
+            Step::MarchRead | Step::StereoRead | Step::XrRead => {
                 let (pass, ..) = self.march_pass.as_ref().unwrap();
                 cx.make_child_pass(pass);
             }
@@ -899,8 +1037,9 @@ impl SdfBakeView {
 
     fn record_march(&mut self, cx: &mut Cx2d) {
         let stereo_bench = matches!(self.step, Step::MarchBench(3));
-        let stereo = stereo_bench || matches!(self.step, Step::Stereo | Step::StereoWait(_) | Step::StereoRead);
-        let (ew, eh) = if stereo_bench { (XW, XH) } else if matches!(self.step, Step::MarchBench(_)) { (BW, BH) } else { (MW, MH) };
+        let xr = matches!(self.step, Step::Xr | Step::XrWait(_) | Step::XrRead);
+        let stereo = stereo_bench || xr || matches!(self.step, Step::Stereo | Step::StereoWait(_) | Step::StereoRead);
+        let (ew, eh) = if xr { (QW, QH) } else if stereo_bench { (XW, XH) } else if matches!(self.step, Step::MarchBench(_)) { (BW, BH) } else { (MW, MH) };
         let (w, h) = if stereo { (2 * ew, eh) } else { (ew, eh) };
         let size = dvec2(w as f64, h as f64);
         if self.march_pass.as_ref().is_some_and(|m| m.4 != (w, h)) {
@@ -926,7 +1065,13 @@ impl SdfBakeView {
         // the stereo pair (the check: the full step budget and the march's
         // own field of view, so the left eye is the march bit for bit)
         let eye_size = dvec2(ew as f64, eh as f64);
+        let world_from_obj = if xr { xr_world_from_obj() } else { Mat4f::identity() };
+        let xr_cams = xr.then(|| xr_eyes(&self.scenes[self.scene].name));
         let eyes = |scale: f64| {
+            if let Some(cams) = &xr_cams {
+                // as Fab's headset passes: the eyes' own matrices, the XR step budget
+                return cams.iter().enumerate().map(|(e, c)| MarchView::eye(c.view, c.proj, eye_size, e, scale)).collect::<Vec<_>>();
+            }
             [view, right_eye(view)].into_iter().enumerate().map(|(e, v)| {
                 let mut m = MarchView::eye(v, proj, eye_size, e, scale);
                 if !stereo_bench {
@@ -995,7 +1140,7 @@ impl SdfBakeView {
             cx.begin_root_turtle(csize, Layout::flow_overlay());
             if stereo {
                 for cmv in eyes(0.5) {
-                    coarse_object(cx, &mut self.coarse, cmv.rect(), &cmv, Mat4f::identity(), self.vol.as_ref().unwrap(), self.baker.as_ref().unwrap());
+                    coarse_object(cx, &mut self.coarse, cmv.rect(), &cmv, world_from_obj, self.vol.as_ref().unwrap(), self.baker.as_ref().unwrap());
                 }
             } else {
                 let cmv = MarchView::new(view, proj, csize, FOV_Y.to_radians());
@@ -1013,7 +1158,7 @@ impl SdfBakeView {
         let coarse = if use_coarse { self.coarse_pass.as_ref().map(|c| c.2.clone()) } else { None };
         if stereo {
             for ev in eyes(1.0) {
-                draw_object(cx, &mut self.march, ev.rect(), &ev, Mat4f::identity(), self.vol.as_ref().unwrap(), self.baker.as_mut().unwrap(), out, &[], coarse.as_ref(), true);
+                draw_object(cx, &mut self.march, ev.rect(), &ev, world_from_obj, self.vol.as_ref().unwrap(), self.baker.as_mut().unwrap(), out, &[], coarse.as_ref(), true);
             }
         } else {
             draw_object(cx, &mut self.march, full, &mv, Mat4f::identity(), self.vol.as_ref().unwrap(), self.baker.as_mut().unwrap(), out, &[], coarse.as_ref(), true);
@@ -1101,6 +1246,33 @@ impl SdfBakeView {
         if left_bad != 0 || hits == 0 || mask_bad * 1000 > checked || depth_bad * 1000 > hits.max(1) {
             self.fails.push(format!("{}-stereo", sc.name));
         }
+        self.step = Step::Xr;
+    }
+
+    /// The headset pair: both eyes' silhouettes against the CPU cast.
+    fn check_xr(&mut self) {
+        let got = {
+            let r = self.readbacks.lock().unwrap();
+            if r.is_empty() {
+                return;
+            }
+            r.clone()
+        };
+        let sc = &self.scenes[self.scene];
+        let Some((_, Ok((w, _, px)))) = got.first().cloned() else {
+            self.fails.push(format!("{}-xr-readback", sc.name));
+            self.step = Step::Edit;
+            return;
+        };
+        let vol = self.vol.as_ref().unwrap();
+        for (e, cam) in xr_eyes(&sc.name).iter().enumerate() {
+            let (checked, hits, mask_bad, depth_bad, rows) = check_xr_eye(sc, vol, cam, &px, w, e * QW);
+            let eye = ["left", "right"][e];
+            println!("SDFBAKE scene={} xr {eye} eye {QW}x{QH} (every {XK}th px) checked={checked} hits={hits} mask_bad={mask_bad} depth_bad={depth_bad}{rows}", sc.name);
+            if hits == 0 || mask_bad * 1000 > checked || depth_bad * 1000 > hits.max(1) {
+                self.fails.push(format!("{}-xr-{eye}", sc.name));
+            }
+        }
         self.step = if bench() { Step::MarchBench(0) } else { Step::Edit };
     }
 
@@ -1152,6 +1324,9 @@ impl Widget for SdfBakeView {
                 }
                 if self.step == Step::StereoRead {
                     self.check_stereo();
+                }
+                if self.step == Step::XrRead {
+                    self.check_xr();
                 }
                 if bench() {
                     self.take_prof();

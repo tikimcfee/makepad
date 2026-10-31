@@ -585,6 +585,8 @@ pub mod input {
     pub const MOD_CONTROL: u32 = 2;
     pub const MOD_ALT: u32 = 4;
     pub const MOD_LOGO: u32 = 8;
+    /// On a pointer event: the remote endpoint fed it, no person did.
+    pub const MOD_INJECTED: u32 = 1 << 31;
 
     // `MouseDown` / `MouseUp` `button` is the bit mask Cx's `MouseButton` uses (primary 1,
     // secondary 2, middle 4, back 8, forward 16). A key event's `key` is the index of the key in
@@ -786,6 +788,8 @@ pub mod window_style {
     pub const EXACT_SIZE: u32 = 1 << 19;
     /// a badge (`window_kind::BADGE`) that sees the pointer hover over its rect (never input)
     pub const BADGE_HOVER: u32 = 1 << 20;
+    /// With `BADGE_HOVER`: a press on the badge is session 0's (an event of the badge), not the window's.
+    pub const BADGE_PRESS: u32 = 1 << 21;
 }
 
 /// Window states (`WindowState`).

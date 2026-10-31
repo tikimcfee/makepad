@@ -818,6 +818,21 @@ struct Scanned {
 }
 
 /// The bindings of a `use` tree in tokens `lo..hi` (after `use`, before `;`) under `prefix`.
+/// The `;` of the `use` item at `toks[at]`; None when what follows is no use tree.
+fn use_item_end(toks: &[Tok], at: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    for (j, t) in toks.iter().enumerate().skip(at + 1) {
+        match t.kind {
+            T::Semi => return (depth == 0).then_some(j),
+            T::OpenBrace => depth += 1,
+            T::CloseBrace => depth = depth.checked_sub(1)?,
+            T::Ident | T::RawIdent | T::PathSep | T::Comma | T::Star | T::KwAs | T::KwCrate | T::KwSelfValue | T::KwSuper => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn use_tree(text: &dyn Fn(usize) -> String, toks: &[Tok], lo: usize, hi: usize, prefix: &[String], module: &str, is_pub: bool, out: &mut Vec<crate::macros::UseItem>) {
     let mut path: Vec<String> = prefix.to_vec();
     let mut i = lo;
@@ -1050,10 +1065,13 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                 // crate as alias -> (first path segment, original name); the parser consults it
                 // when no macro has the name. The import's `#[cfg]` is evaluated.
                 T::KwUse => {
-                    let mut j = i + 1;
-                    while j < toks.len() && toks[j].kind != T::Semi {
-                        j += 1;
-                    }
+                    // Only the word goes when this is no Rust import: a macro's tokens can say
+                    // `use` in their own language (Splash's `use mod.widgets.*`, no `;`), and the
+                    // next `;` lies past the braces it sits in.
+                    let Some(j) = use_item_end(&toks, i) else {
+                        i += 1;
+                        continue;
+                    };
                     // Demand discovery extracts module bindings in Names::scan;
                     // it never consumes this macro prescan's imports or aliases.
                     if !macro_surface { i = j + 1; continue; }
@@ -1743,6 +1761,19 @@ mod cold_tests {
 #[cfg(test)]
 mod lowered_scope_tests {
     use super::*;
+
+    /// Splash's `use` in a macro's tokens has no `;`: the scan must not skip the braces around it,
+    /// or the next inline module nests in the one before and its imports go missing.
+    #[test]
+    fn a_use_in_a_macros_tokens_leaves_the_module_nesting_alone() {
+        let source = "mod a { fn f() { m!(vm, {use mod.widgets.* Thing{}}); } }\nmod b { use super::*; use std::{fmt as f, io::*}; }\n";
+        let sess = Arc::new(crate::Session::default());
+        let cfg = CfgSet::host(&sess, &[]);
+        let context = crate::source_context::Context::new("t.rs", Default::default(), &sess);
+        let scan = scan_text_mode("t.rs", ".", "t", "t", 2021, &cfg, source.as_bytes().to_vec().into(), &context, false).unwrap();
+        assert!(scan.mods.iter().any(|m| m == "t::b"), "{:?}", scan.mods);
+        assert_eq!(scan.uses.iter().filter(|u| u.module == "t::b").count(), 3);
+    }
 
     #[test]
     fn cfg_macro_imports_use_configured_attributes() {

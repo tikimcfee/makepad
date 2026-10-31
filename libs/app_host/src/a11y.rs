@@ -1,6 +1,6 @@
 //! A hosted child's semantic endpoint. Clone `RemoteUi` onto a remote worker and call `dispatch`
 //! there. The UI thread only applies messages and drains the outbound queue (via HostedApp).
-use makepad_platform::{a11y_tree::{self as a11y, mirror::Mirror, ActionRequest, ActionResult}, makepad_hal::a11y::remote::{self, Backend, Trees}};
+use makepad_platform::{a11y_tree::{self as a11y, mirror::Mirror, ActionRequest, ActionResult}, makepad_hal::a11y::remote::{self, Backend, PointerEvent, Trees}};
 use makepad_remote::{Req, Out};
 use makepad_studio_protocol::{AppToStudio, StudioToApp};
 use std::{collections::HashMap, sync::{Arc, Condvar, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -153,5 +153,12 @@ impl Backend for RemoteUi {
     fn type_text(&self, _window: u64, text: &str) -> Result<(),String> {
         self.send(StudioToApp::A11yType { text: text.into() });
         Ok(())
+    }
+    fn pointer(&self, _window: u64, _event: PointerEvent, _x: f64, _y: f64, _button: u32, _mods: u32) -> Result<(),String> {
+        Err("a paced pointer sequence goes through the app's own window queue: ask the app's ui endpoint".into())
+    }
+    fn frames(&self, _window: u64) -> u64 { 0 }
+    fn os_selfcheck(&self, _window: u64, _act: bool) -> Result<String,String> {
+        Err("oscheck walks the OS tree of the app's own process: ask the app's ui endpoint".into())
     }
 }

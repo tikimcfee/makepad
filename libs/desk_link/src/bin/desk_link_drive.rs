@@ -13,6 +13,7 @@
 //! - `info`: the desktop, its stream size and screens, whether input is injected
 //! - `shot PATH [X,Y,W,H] [/N]`: the current picture as a PNG, optionally a crop of the stream
 //!   picture and scaled down N times (default: N so the PNG is at most 1920 wide/high)
+//! - `cursor`: where the desktop's pointer is and its shape (what hovering there asks for)
 //! - `move X Y`, `click X Y [left|right|middle] [double]`, `drag X1 Y1 X2 Y2 [left|right]`
 //! - `scroll NOTCHES [X Y]`: + scrolls the content up (wheel away from the user)
 //! - `type TEXT`: US-layout keys, Shift where needed (`\n` Enter, `\t` Tab)
@@ -97,6 +98,7 @@ fn main() {
 
 enum Step {
     Info,
+    Cursor,
     Shot { path: String, crop: Option<[u32; 4]>, scale: Option<u32> },
     Move { x: u32, y: u32 },
     Click { x: u32, y: u32, button: u8, double: bool },
@@ -157,6 +159,7 @@ impl Step {
     fn name(&self) -> &'static str {
         match self {
             Step::Info => "info",
+            Step::Cursor => "cursor",
             Step::Shot { .. } => "shot",
             Step::Move { .. } => "move",
             Step::Click { .. } => "click",
@@ -173,6 +176,7 @@ impl Step {
     fn parse(a: &[String]) -> Result<Step, String> {
         Ok(match a[0].as_str() {
             "info" => Step::Info,
+            "cursor" => Step::Cursor,
             "shot" => {
                 let path = a.get(1).ok_or("shot needs a PATH")?.clone();
                 let (mut crop, mut scale) = (None, None);
@@ -260,6 +264,7 @@ struct Link {
     host_status: String,
     welcome: Option<(Vec<proto::ScreenInfo>, u32, [u32; 2], bool, String)>,
     cursor: Option<(u16, u16)>,
+    cursor_shape: u8,
     /// The encoder streams a picture is cut into (`Rate`).
     streams: usize,
     decoders: Vec<Option<Decoder>>,
@@ -348,6 +353,7 @@ impl Link {
             host_status: String::new(),
             welcome: None,
             cursor: None,
+            cursor_shape: 1,
             streams: 0,
             decoders: Vec::new(),
             canvas: Vec::new(),
@@ -431,7 +437,10 @@ impl Link {
                 }
                 self.host_status = status;
             }
-            ServerMsg::Cursor { x, y, .. } => self.cursor = Some((x, y)),
+            ServerMsg::Cursor { x, y, shape, .. } => {
+                self.cursor = Some((x, y));
+                self.cursor_shape = shape;
+            }
             ServerMsg::Video { key, data, stream, frame, x0, y0, codec, built_ns, encoded_ns, sent_ns, .. } => {
                 if let Some(r) = self.record.as_mut() {
                     // as it came: no decoding, so no backlog and no key frames asked for a decoder
@@ -597,11 +606,15 @@ impl Link {
     }
 
     fn run(&mut self, step: &Step) -> Result<String, String> {
-        let input = !matches!(step, Step::Info | Step::Shot { .. } | Step::Wait { .. } | Step::WaitChange { .. } | Step::Record { .. });
+        let input = !matches!(step, Step::Info | Step::Cursor | Step::Shot { .. } | Step::Wait { .. } | Step::WaitChange { .. } | Step::Record { .. });
         if input && self.before.is_none() && !self.paused && self.composed > 0 {
             self.before = Some(self.canvas.clone());
         }
         match step {
+            Step::Cursor => {
+                self.pump(Duration::from_millis(30))?;
+                Ok(format!("cursor {} {}", self.cursor_px(), proto::CURSOR_SHAPES.get(self.cursor_shape as usize).copied().unwrap_or("Default")))
+            }
             Step::Info => {
                 let (screens, screen, stream, input, note) = self.welcome.clone().unwrap();
                 let list: Vec<String> = screens.iter().enumerate().map(|(i, s)| format!("{i}:{}x{}@{},{}", s.width, s.height, s.x, s.y)).collect();

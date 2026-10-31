@@ -128,6 +128,23 @@ hal_commands! {
     /// Geometry supplied by the compositor of a HOSTED window. The client consumes the
     /// host's geometry event itself; this updates HAL state without an OS request or echo.
     WindowHostedGeom = 23, window_hosted_geom { id: obj, geom: rect, dpi: f32 };
+    /// Where a HOSTED window's origin is on the host's screen (`has` false: unknown), for the
+    /// accessibility tree's screen coordinates.
+    WindowScreenOrigin = 28, window_screen_origin { id: obj, origin: v2, has: bool };
+    /// A HOSTED window gained or lost the host's focus, for the accessibility tree (`id`: its
+    /// index; the generation is not read).
+    WindowA11yActive = 36, window_a11y_active { id: obj, active: bool };
+    /// A HOSTED window's frame reached the WM's screen (the WM's native layers pace on it).
+    HostedPresented = 29, hosted_presented { id: obj, frame: u64 };
+    /// This session (a Cx the WM hosts over its socket) relays native-layer messages itself:
+    /// the HAL's requests come back as `HostedNativeOut` events.
+    HostedNativeBridge = 33, hosted_native_bridge {};
+    /// A native-layer message from the WM: the descriptor count, the descriptors (raw fds the
+    /// HAL then owns), the `NativeAppEvent` (SerBin).
+    HostedNativeIn = 34, hosted_native_in { bytes: rng };
+    /// The GPU profiler for an app's own readout: starts a recording kept `keep_s` seconds when
+    /// none runs, else answers `GpuProfRecording` with the busiest session's recording so far.
+    GpuProfQuery = 35, gpu_prof_query { keep_s: u32 };
     /// Centers the native window buttons `y_center` points below the window's top edge.
     /// AppKit retains the center across geometry changes; other backends ignore it.
     WindowButtonsCenter = 24, window_buttons_center { id: obj, y_center: f32 };
@@ -137,10 +154,11 @@ hal_commands! {
     /// session 0 (BGRA8, the window's pixel size): the window layer -- the borrower's frames
     /// go to the retained app image instead of the window, session 0's frame is the window
     /// (it starts with the app image copied into `layer`, to sample) and input stays with the
-    /// borrower; `rect` is ignored. Needs `info_flags::WINDOW_LAYERS`; it may be enabled on an
+    /// borrower unless `input` gives it to session 0 (a view the person acts on over a paused
+    /// app, which reads no input); `rect` is ignored. Needs `info_flags::WINDOW_LAYERS`; it may be enabled on an
     /// adoptable window before it is lent (so no borrower frame reaches the window first).
     /// Disabling restores the retained app image.
-    WindowOverlay = 25, window_overlay { id: obj, on: bool, rect: rect, layer: id };
+    WindowOverlay = 25, window_overlay { id: obj, on: bool, rect: rect, layer: id, input: bool };
 
     /// Whether the window draws its own caption, for an embedding parent.
     WindowChrome = 26, window_chrome { id: obj, own: bool };

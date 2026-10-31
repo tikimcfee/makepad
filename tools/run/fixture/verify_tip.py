@@ -128,7 +128,7 @@ class Verifier:
             ("full-a", "timed", "arch=x64,os=linux,role=pool", "NODEGATE", ["bash", "tools/run/fixture/land_gate.sh", "full-a"]),
             ("full-b", "timed", "arch=x64,os=linux,role=pool", "NODEGATE", ["bash", "tools/run/fixture/land_gate.sh", "full-b"]),
             ("platforms", "build", "arch=arm64,os=macos", "PLATFORMS", ["bash", "tools/run/fixture/check_platforms.sh"]),
-            ("arm64", "timed", "arch=arm64,os=macos", "ARM64", ["bash", "tools/run/fixture/arm64_leg.sh", "--diff-fast"]),
+            ("arm64", "timed", "arch=arm64,os=macos,rustc=1.97", "ARM64", ["bash", "tools/run/fixture/arm64_leg.sh", "--diff-fast"]),
         )
         # the diff leg diffs only when the JIT, platform or the diff programs changed since the last verified tip
         # (--nightly: always all); fuzz rotates its 500-program window with the tip (land_gate.sh)

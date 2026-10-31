@@ -167,9 +167,6 @@ fn not_now() -> Option<String> {
     if RELOADING.load(Ordering::Acquire) > 0 {
         return Some("a reload is in progress".into());
     }
-    if IDS_PENDING.load(Ordering::Acquire) {
-        return Some("startup identities are still encoded".into());
-    }
     if crate::pmhost::world_alive() {
         return Some("the proc-macro world is alive".into());
     }

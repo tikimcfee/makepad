@@ -10,6 +10,11 @@ pub struct ClosureStorage {
     pub roots: Vec<u32>,
     pub by_value: Vec<bool>,
     pub owned_fields: Vec<Option<Vec<u32>>>,
+    /// Per root: its field is a `&mut T` the closure only reads through (every capture is a
+    /// shared borrow of a place behind it). rustc's capture there is a `&` of that place, which
+    /// is Copy: a clone of the closure copies the pointer (the field keeps the `&mut T` value
+    /// for the root-slot ABI above, and a `&mut` is never Clone itself).
+    pub shared_reborrow: Vec<bool>,
     pub drop_flags: bool,
 }
 
@@ -36,6 +41,7 @@ impl ClosureStorage {
             .filter(|root| captures.iter().any(|c| c.place.root == *root))
             .collect();
         let mut by_value = Vec::new();
+        let mut shared_reborrow = Vec::new();
         let mut fields = Vec::new();
         let mut upvars = Vec::new();
         for &root in &roots {
@@ -58,6 +64,8 @@ impl ClosureStorage {
                 )
             });
             by_value.push(value);
+            shared_reborrow.push(deref_shared && matches!(tcx.tys.kind(ty), TyKind::Ref(true, ..))
+                && cs.iter().all(|c| c.info.kind == crate::upvar::CaptureKind::ByRef(BorrowKind::Imm)));
             upvars.push(if value {
                 ty
             } else {
@@ -88,6 +96,6 @@ impl ClosureStorage {
             upvars.push(tcx.tys.prim(if states <= 1 << 8 { crate::program::Prim::U8 }
                 else if states <= 1 << 16 { crate::program::Prim::U16 } else { crate::program::Prim::U32 }));
         }
-        Self { fields: upvars, roots, by_value, owned_fields: fields, drop_flags }
+        Self { fields: upvars, roots, by_value, owned_fields: fields, shared_reborrow, drop_flags }
     }
 }

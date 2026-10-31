@@ -119,8 +119,6 @@ struct Req {
     ctx: *const (),
     /// the requester's compile record (jit::main_rec)
     rec: *const (),
-    /// reads no slot identity (the startup image's identities stay encoded: jit::ids_on_serve)
-    quick: bool,
     state: AtomicU8,
     panic: Cell<Option<Box<dyn Any + Send>>>,
     /// false: posted (heap, nobody waits); the owner frees it
@@ -611,7 +609,7 @@ pub fn bailing() -> bool {
 /// an install. `f` may not run what `forbid_in_publish` guards; doing so panics.
 #[track_caller]
 pub fn publish<R>(f: impl FnOnce() -> R) -> R {
-    request(std::panic::Location::caller(), Class::Publish, false, None, move || {
+    request(std::panic::Location::caller(), Class::Publish, None, move || {
         let _p = Publishing::enter(PUB_STRICT);
         f()
     })
@@ -638,7 +636,7 @@ pub fn publish_or_bail<R>(f: impl FnOnce() -> R) -> Result<R, PublishBail> {
     }
     let site = std::panic::Location::caller();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        request(site, Class::Publish, false, None, move || {
+        request(site, Class::Publish, None, move || {
             let _p = Publishing::enter(PUB_BAIL);
             let _ = take_needs();
             let _clear = ClearNeeds;
@@ -845,13 +843,7 @@ pub fn start() {
 /// waits, so `f` may borrow its locals (as `std::thread::scope`'s threads do).
 #[track_caller]
 pub fn call<R>(class: Class, f: impl FnOnce() -> R) -> R {
-    request(std::panic::Location::caller(), class, false, None, f).unwrap()
-}
-
-/// `call` for work that reads no slot identity (the startup identities stay encoded).
-#[track_caller]
-pub fn call_quick<R>(class: Class, f: impl FnOnce() -> R) -> R {
-    request(std::panic::Location::caller(), class, true, None, f).unwrap()
+    request(std::panic::Location::caller(), class, None, f).unwrap()
 }
 
 /// `call`, unless the owner has not started it within `ms`: then it is withdrawn (None).
@@ -859,10 +851,10 @@ pub fn call_quick<R>(class: Class, f: impl FnOnce() -> R) -> R {
 pub fn call_within<R>(class: Class, ms: u64, f: impl FnOnce() -> R) -> Option<R> {
     // (at least 2 ms: an idle owner picks a request up in microseconds; 0 means "only if the
     // owner is free now")
-    request(std::panic::Location::caller(), class, false, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), f)
+    request(std::panic::Location::caller(), class, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), f)
 }
 
-fn request<R>(site: &'static std::panic::Location<'static>, class: Class, quick: bool, deadline: Option<std::time::Instant>, f: impl FnOnce() -> R) -> Option<R> {
+fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, f: impl FnOnce() -> R) -> Option<R> {
     forbid_in_publish("a request", u32::MAX);
     debug_assert!(!NO_WAIT.try_with(|n| n.get()).unwrap_or(false), "makepad: a request to the compiler's owner on a JIT call's path (rule I-CALL: rt_hot waits for nothing)");
     if is_owner() || CHILD.load(Ordering::Relaxed) {
@@ -898,7 +890,6 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, quick:
         bg: is_background_request(class),
         ctx: crate::query::context_ptr(),
         rec: crate::jit::main_rec_target(),
-        quick,
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
         waited: true,
@@ -1022,7 +1013,6 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         bg: is_background_request(class),
         ctx: std::ptr::null(),
         rec: std::ptr::null(),
-        quick: false,
         state: AtomicU8::new(QUEUED),
         panic: Cell::new(None),
         waited: false,
@@ -1200,9 +1190,6 @@ fn serve(r: usize) {
         crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, crate::inspect::pstream::SITE | (req.site as *const std::panic::Location<'static> as u64));
     }
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if !req.quick {
-            crate::jit::ids_on_serve();
-        }
         unsafe { (*req.run)() }
     }));
     let busy = crate::jit::frame_leave(frame);

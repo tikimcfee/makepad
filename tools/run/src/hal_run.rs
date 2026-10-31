@@ -59,6 +59,8 @@ enum Work {
         choice: String,
         value: String,
     },
+    /// The person asked for the restart that waits (the JIT ring's Update ready notice).
+    Relaunch,
 }
 
 static RUN: Mutex<Option<Run>> = Mutex::new(None);
@@ -839,6 +841,10 @@ fn work(rx: std::sync::mpsc::Receiver<Work>, package_dir: PathBuf, document: Doc
                     eprintln!("makepad: cannot remember {}: {e}", path.display());
                 }
             }
+            Work::Relaunch => match relax_compiler::reload::relaunch_pending() {
+                Ok(_) => relax_compiler::reload::clear_restart_pending(),
+                Err(e) => post(Update::Message(e)),
+            },
             Work::OpenFile { file, line, col } => {
                 if let Err(error) = editor.open_file(file, line, col) {
                     post(Update::Message(error));
@@ -929,6 +935,7 @@ impl Work {
             Work::Save(path, _) => format!("a save of {}", path.display()),
             Work::OpenFile { .. } => "an open-file request".into(),
             Work::Resume { .. } => "a resume".into(),
+            Work::Relaunch => "a restart".into(),
         }
     }
 }
@@ -948,7 +955,7 @@ fn enqueue(queue: &mut VecDeque<Work>, work: Work) {
                 }
             }
         }
-        Work::Resume { .. } | Work::OpenFile { .. } => {}
+        Work::Resume { .. } | Work::OpenFile { .. } | Work::Relaunch => {}
     }
     queue.push_back(work);
 }
@@ -1038,7 +1045,7 @@ fn pump(
         if pending {
             let mut cmd = CmdWriter::new(HOST);
             if !window.is_none() {
-                cmd.window_overlay(window, false, [0.0; 4], Id::NONE);
+                cmd.window_overlay(window, false, [0.0; 4], Id::NONE, false);
             }
             cmd.domain_relaunch(domain);
             hal.submit(&cmd.buf());
@@ -1300,12 +1307,15 @@ fn pump(
                 dirty = true;
             }
         }
+        // the view over an app whose UI thread is parked stays: nothing else answers its window
+        let ui_parked = data.parked.as_ref().is_some_and(|p| p.thread == "main");
         match relax_compiler::inspect::run_view::take() {
             Some(true) => {
                 inspect_open = true;
                 overlay_dismissed = false;
                 dirty = true;
             }
+            Some(false) if ui_parked => {}
             Some(false) => {
                 overlay_dismissed = true;
                 if std::mem::take(&mut inspect_open) && data.domain.starts_with("JIT · ") {
@@ -1373,6 +1383,7 @@ fn pump(
                 host.raise();
             }
             match why {
+                Some(why) if ui_parked => eprintln!("makepad-run: the run's view is over the app: {why}; its UI thread is parked, so the view stays until a choice is made"),
                 Some(why) => eprintln!(
                     "makepad-run: the run's view is over the app: {why}; Esc or `makepad inspect {} session view dismiss` dismisses it",
                     std::process::id()
@@ -1448,7 +1459,8 @@ fn pump(
             .parked
             .as_ref()
             .map(|p| if p.stale { RingAlert::Stale } else { RingAlert::Panic })
-            .or_else(|| rebuild_failed().then_some(RingAlert::RebuildFailed));
+            .or_else(|| rebuild_failed().then_some(RingAlert::RebuildFailed))
+            .or_else(|| (!relax_compiler::reload::restart_pending().is_empty()).then_some(RingAlert::UpdateReady));
         if running && host.badges() {
             let want = watch.look(host.dump_ms()).filter(|_| data.parked.is_none());
             if inspect_open {
@@ -1559,6 +1571,10 @@ fn pump(
         let mut close = false;
         for event in host.events() {
             let action = match event {
+                BootEvent::RestartAsked => {
+                    enqueue(&mut work_pending, Work::Relaunch);
+                    None
+                }
                 BootEvent::DocumentErrors(errors) => {
                     if !errors.is_empty() {
                         overlay_dismissed = false;
@@ -1692,7 +1708,7 @@ fn pump(
                         );
                     }
                 }
-                Some(Action::Dismiss) if overlay => {
+                Some(Action::Dismiss) if overlay && !data.parked.as_ref().is_some_and(|p| p.thread == "main") => {
                     overlay_dismissed = true;
                     if std::mem::take(&mut inspect_open) && data.domain.starts_with("JIT · ") {
                         data.domain = "Running".into();

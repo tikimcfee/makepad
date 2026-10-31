@@ -17,7 +17,7 @@ use makepad_box3d::joint::*;
 use makepad_box3d::math_functions::{make_quat_from_axis_angle, to_pos, to_vec3, vec3, Matrix3, Quat, Transform, Vec3, WorldTransform};
 use makepad_box3d::physics_world::*;
 use makepad_box3d::revolute_joint::*;
-use makepad_box3d::shape::{create_hull_shape, shape_get_body};
+use makepad_box3d::shape::{create_hull_shape, create_tube_shape, shape_get_body};
 use makepad_box3d::spherical_joint::*;
 use makepad_box3d::types::*;
 
@@ -38,6 +38,8 @@ pub struct BodySpec {
     pub mass: MassProps,
     /// Convex point clouds (model frame) for collision.
     pub hulls: Vec<Vec<P3>>,
+    /// Closed tubes (model frame: centreline loop, radius) for collision: the exact solid of a link.
+    pub tubes: Vec<(Vec<P3>, f64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +85,22 @@ pub struct Assembly {
     pub anchors: Vec<AnchorSpec>,
     /// Print up (model frame).
     pub up: P3,
+    /// Bodies resting below this speed (mm/s) fall asleep (0: never; a weave of many links sleeps).
+    pub sleep: f64,
+    /// Solver threads (0 or 1: one, the deterministic default for joints; results match across counts).
+    pub workers: u32,
+    /// Contacts are made this close (mm; 0: box3d's default). Thin fast links need about their bar
+    /// diameter, or they pass through each other between steps.
+    pub contact_margin: f64,
+    /// Speed cap, mm/s (0: none).
+    pub max_speed: f64,
+    /// Contact stiffness, Hz (0: box3d's default 30, capped at 1/8 of the substep rate; set: capped at 1/4). Stacked loads (a
+    /// cloth hanging from its top row) sink into soft contacts by about load / stiffness.
+    pub contact_hertz: f64,
+    /// Substeps per step (0: 4).
+    pub substeps: u32,
+    /// A fixed ball (centre, radius) to drape over.
+    pub ball: Option<(P3, f64)>,
 }
 
 impl Assembly {
@@ -177,6 +195,12 @@ impl Pose {
         let q = Quat { v: vec3(self.rot[0] as f32, self.rot[1] as f32, self.rot[2] as f32), s: self.rot[3] as f32 };
         add(self.com, pf(makepad_box3d::math_functions::rotate_vector(q, vf(sub(p, rest_com)))))
     }
+
+    /// A model-frame direction seen from the body as built (its rotation undone).
+    pub fn unrotate(&self, d: P3) -> P3 {
+        let q = Quat { v: vec3(self.rot[0] as f32, self.rot[1] as f32, self.rot[2] as f32), s: self.rot[3] as f32 };
+        pf(makepad_box3d::math_functions::inv_rotate_vector(q, vf(d)))
+    }
 }
 
 struct Grab {
@@ -197,15 +221,22 @@ pub struct MechWorld {
     pub gravity: P3,
     time: f64,
     ground_pose: (P3, f64),
+    substeps: i32,
 }
 
 impl MechWorld {
     pub fn new(asm: &Assembly, gravity: P3, floor: Option<f64>) -> MechWorld {
         let mut def = default_world_def();
         def.gravity = vf(gravity);
-        def.maximum_linear_speed = 400_000.0;
+        def.maximum_linear_speed = if asm.max_speed > 0.0 { asm.max_speed as f32 } else { 400_000.0 };
+        def.speculative_distance = asm.contact_margin as f32;
+        if asm.contact_hertz > 0.0 {
+            // a stiffness asked for holds up to a quarter of the substep rate
+            def.contact_hertz = asm.contact_hertz as f32;
+            def.contact_hertz_ratio = 0.25;
+        }
         def.contact_speed = 3000.0;
-        def.worker_count = 1;
+        def.worker_count = asm.workers.max(1);
         let mut world = create_world(&def);
         let mut gd = default_body_def();
         gd.body_type = BodyType::Kinematic;
@@ -216,7 +247,8 @@ impl MechWorld {
             let mut bd = default_body_def();
             bd.body_type = BodyType::Dynamic;
             bd.position = to_pos(vf(b.mass.com));
-            bd.enable_sleep = false;
+            bd.enable_sleep = asm.sleep > 0.0;
+            bd.sleep_threshold = asm.sleep as f32;
             let id = create_body(&mut world, &bd);
             let mut sd = default_shape_def();
             sd.base_material.friction = 0.35;
@@ -229,6 +261,10 @@ impl MechWorld {
                 if let Some(hull) = create_hull(&pts, 64) {
                     create_hull_shape(&mut world, id, &sd, &hull);
                 }
+            }
+            for (pts, r) in &b.tubes {
+                let tube = Tube { points: pts.iter().map(|p| vf(sub(*p, b.mass.com))).collect(), radius: *r as f32 };
+                create_tube_shape(&mut world, id, &sd, &tube);
             }
             let m = &b.mass;
             let inertia = Matrix3 {
@@ -306,16 +342,20 @@ impl MechWorld {
             create_hull_shape(&mut world, id, &sd, &makepad_box3d::hull::make_box_hull(2000.0, 2000.0, 5.0));
             id
         });
-        MechWorld { world, ground, bodies, joints, rest, grab: None, floor: floor_id, gravity, time: 0.0, ground_pose: ([0.0; 3], 0.0) }
+        let mut mw = MechWorld { world, ground, bodies, joints, rest, grab: None, floor: floor_id, gravity, time: 0.0, ground_pose: ([0.0; 3], 0.0), substeps: if asm.substeps > 0 { asm.substeps as i32 } else { 4 } };
+        if let Some((c, r)) = asm.ball {
+            mw.add_ball(c, r);
+        }
+        mw
     }
 
     pub fn time(&self) -> f64 {
         self.time
     }
 
-    /// One fixed step (`dt` seconds, 4 substeps).
+    /// One fixed step (`dt` seconds).
     pub fn step(&mut self, dt: f64) {
-        world_step(&mut self.world, dt as f32, 4);
+        world_step(&mut self.world, dt as f32, self.substeps);
         self.time += dt;
     }
 
@@ -434,6 +474,39 @@ impl MechWorld {
             return None;
         }
         self.bodies.iter().position(|b| *b == id)
+    }
+
+    /// The fastest part, mm/s.
+    pub fn max_speed(&self) -> f64 {
+        self.bodies
+            .iter()
+            .map(|b| {
+                let v = body_get_linear_velocity(&self.world, *b);
+                ((v.x * v.x + v.y * v.y + v.z * v.z) as f64).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// A fixed ball (a 40-point hull: box3d hulls hold at most 255 half edges; contacts are made early like the links') to drape things over.
+    pub fn add_ball(&mut self, centre: P3, radius: f64) {
+        let mut bd = default_body_def();
+        bd.position = to_pos(vf(centre));
+        let id = create_body(&mut self.world, &bd);
+        let mut pts = Vec::new();
+        // a Fibonacci sphere
+        let n = 40;
+        for i in 0..n {
+            let y = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+            let rr = (1.0 - y * y).sqrt();
+            let a = i as f64 * 2.399963229728653;
+            pts.push(vec3((radius * rr * a.cos()) as f32, (radius * y) as f32, (radius * rr * a.sin()) as f32));
+        }
+        let mut sd = default_shape_def();
+        sd.base_material.friction = 0.4;
+        sd.user_data = u64::MAX;
+        if let Some(hull) = create_hull(&pts, 64) {
+            create_hull_shape(&mut self.world, id, &sd, &hull);
+        }
     }
 
     pub fn max_angular_speed(&self) -> f64 {

@@ -361,6 +361,7 @@ impl Evaluator {
                 nonempty(makepad_csg_sdf::mesh_field(shape.field(), min, max, cell, shape.lipschitz()), "shape (nothing inside its surface)")
             }
             Op::Mesh { mesh } => Ok((**mesh).clone()),
+            Op::Links { links, sides, .. } => nonempty(links.mesh(*sides), "links (no link has three points)"),
         }
     }
 }

@@ -39,7 +39,7 @@
 use crate::chat_wire::{ChatMessage, ChatRole, ProviderAvailability};
 #[cfg(feature = "llm")]
 use crate::local_llm::build_prefix;
-use crate::local_llm::{parse_tool_call, system_text, ChatEvent, LocalLlmConfig, ToolSpec, WakeHook};
+use crate::local_llm::{parse_tool_call, system_text, ChatEvent, HiddenWork, LocalLlmConfig, ToolSpec, WakeHook};
 #[cfg(feature = "llm")]
 use crate::machine::Claim;
 use crate::machine::{self, ResidencyState};
@@ -208,6 +208,84 @@ enum ProxyExit {
     Reelect(WorkerMsg),
 }
 
+/// The model a person is told to pick when theirs cannot call tools.
+const PREFERRED_TOOL_MODEL: &str = "qwen3.8-27b";
+/// A tool call for the check fits well inside this.
+const TOOL_CHECK_TOKENS: u32 = 128;
+
+/// Whether the elected models can call tools, found by asking each one once:
+/// the served model itself is the only thing that knows (its weights, its
+/// template, its runtime), and a model that cannot writes plausible chat.
+#[derive(Default)]
+struct ToolCheck {
+    passed: Vec<String>,
+    failed: Vec<String>,
+    warned: Vec<String>,
+}
+
+impl ToolCheck {
+    /// `None`: no verdict (the node failed, or the person stopped): nothing is
+    /// held against the model.
+    fn judge(&mut self, base: &str, model: &str, thinking: Option<bool>, cancel: &Arc<AtomicBool>, send: &impl Fn(ChatEvent)) -> Option<bool> {
+        if model == crate::claude_cli::MODEL_ID || self.passed.iter().any(|m| m == model) {
+            return Some(true);
+        }
+        if self.failed.iter().any(|m| m == model) {
+            return Some(false);
+        }
+        send(ChatEvent::Loading { phase: format!("checking that {model} can call tools"), fraction: 0.0 });
+        let mut provider = FleetQwenChatProvider::new(HttpFleetTransport, vec![base.to_string()])
+            .with_preferred_model(Some(model.to_string()))
+            .with_max_tokens(Some(TOOL_CHECK_TOKENS))
+            .with_thinking(thinking)
+            .with_cancel_signal(cancel.clone());
+        let tool = ToolSpec::new("add", "Add two numbers.", r#"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}"#);
+        let system = system_text("Answer by calling the tool.", &[tool]);
+        let input = TurnInput::new(system, vec![ChatMessage::new(ChatRole::User, "What is 17 + 25?")]);
+        provider.begin_turn(&input).ok()?;
+        let mut reply = String::new();
+        let verdict = loop {
+            if cancel.load(Ordering::Relaxed) {
+                provider.cancel();
+                return None;
+            }
+            for event in provider.poll() {
+                match event {
+                    ProviderEvent::Delta(text) => reply.push_str(&text),
+                    ProviderEvent::Done { .. } => return Some(self.record(model, calls_the_check_tool(&reply))),
+                    ProviderEvent::Error(_) => return None,
+                    _ => {}
+                }
+            }
+            if reply.len() > TOOL_CHECK_TOKENS as usize * 32 {
+                break calls_the_check_tool(&reply);
+            }
+            std::thread::sleep(POLL);
+        };
+        provider.cancel();
+        Some(self.record(model, verdict))
+    }
+
+    fn record(&mut self, model: &str, passed: bool) -> bool {
+        if passed { &mut self.passed } else { &mut self.failed }.push(model.to_string());
+        passed
+    }
+}
+
+/// Whether a reply is a well-formed call of the check's `add` tool.
+fn calls_the_check_tool(reply: &str) -> bool {
+    let mut splitter = MarkupSplitter::default();
+    splitter.push(reply);
+    let (_, bodies) = splitter.finish();
+    bodies.iter().any(|body| {
+        let calls = match parse_tool_call(body) {
+            Ok(call) => vec![call],
+            Err(_) => contract_calls(body).unwrap_or_default(),
+        };
+        calls.iter().any(|(name, args)| name == "add" && args.len() == 2)
+    })
+}
+
 fn elect_and_run(
     config: HubChatConfig,
     msg_rx: Receiver<WorkerMsg>,
@@ -233,6 +311,8 @@ fn elect_and_run(
     // The conversation outlives a route: a node that failed a turn is
     // re-elected (or replaced) with everything said so far.
     let mut history: Vec<ChatMessage> = Vec::new();
+    let mut tool_check = ToolCheck::default();
+    let mut nothing_passed = false;
     loop {
         set_route(None);
 
@@ -261,14 +341,33 @@ fn elect_and_run(
             }
         }
 
-        // 2. A fleet chat node on the LAN.
+        // 2. A fleet chat node on the LAN: one whose model can call tools, when
+        // this chat has tools and any can.
+        let excluded = if nothing_passed { Vec::new() } else { tool_check.failed.clone() };
         let fleet_reason = match fleet_provider(
             &send,
             config.preferred_model.as_deref(),
             config.max_tokens,
             config.thinking,
+            excluded,
         ) {
             Ok((provider, route)) => {
+                if let (false, ChatRoute::Fleet { base, model }) = (config.tools.is_empty(), &route) {
+                    if tool_check.judge(base, model, config.thinking, &cancel, &send) == Some(false) {
+                        if config.preferred_model.is_none() && !nothing_passed {
+                            continue;
+                        }
+                        // Named, or the only one there is: it answers, and the
+                        // person is told what it cannot do and what to pick.
+                        if tool_check.warned.iter().all(|warned| warned != model) {
+                            tool_check.warned.push(model.clone());
+                            send(ChatEvent::Delta(format!(
+                                "{model} did not pass the tool check: it can talk, but it cannot use this app's tools. \
+                                 Choose {PREFERRED_TOOL_MODEL} or Claude Code in the chat's model menu.\n\n"
+                            )));
+                        }
+                    }
+                }
                 set_route(Some(route.clone()));
                 match run_proxy(provider, &config, first.take(), &msg_rx, &mut images, &mut history, &send, &cancel, route) {
                     ProxyExit::Ended => return,
@@ -277,6 +376,11 @@ fn elect_and_run(
                         continue;
                     }
                 }
+            }
+            // Every model failed: the best of them answers, with the warning.
+            Err(_) if !tool_check.failed.is_empty() && !nothing_passed => {
+                nothing_passed = true;
+                continue;
             }
             Err(reason) => reason,
         };
@@ -385,6 +489,7 @@ fn fleet_provider(
     preferred_model: Option<&str>,
     max_tokens: Option<u32>,
     thinking: Option<bool>,
+    excluded: Vec<String>,
 ) -> Result<(FleetQwenChatProvider<HttpFleetTransport>, ChatRoute), String> {
     let discovery = crate::discovery::start_listener();
     fleet_provider_with(
@@ -392,6 +497,7 @@ fn fleet_provider(
         preferred_model,
         max_tokens,
         thinking,
+        excluded,
         || chat_bases(&discovery),
         || HttpFleetTransport,
         FLEET_PATIENCE,
@@ -491,6 +597,7 @@ fn fleet_provider_with<T: FleetTransport>(
     preferred_model: Option<&str>,
     max_tokens: Option<u32>,
     thinking: Option<bool>,
+    excluded: Vec<String>,
     mut discovered_bases: impl FnMut() -> Vec<String>,
     mut transport: impl FnMut() -> T,
     patience: Duration,
@@ -509,7 +616,8 @@ fn fleet_provider_with<T: FleetTransport>(
             let mut provider = FleetQwenChatProvider::new(transport(), bases.clone())
                 .with_preferred_model(preferred_model.map(str::to_string))
                 .with_max_tokens(max_tokens)
-                .with_thinking(thinking);
+                .with_thinking(thinking)
+                .with_excluded_models(excluded.clone());
             match provider.availability() {
                 ProviderAvailability::Available { model, detail } => {
                     let route = ChatRoute::Fleet { base: detail, model: model.clone() };
@@ -735,6 +843,7 @@ fn run_proxy<T: FleetTransport>(
             let mut gen_tokens = 0u32;
             let mut pending_visible = String::new();
             let mut has_visible_text = false;
+            let mut hidden = HiddenWork::default();
             let mut last_progress = Instant::now();
             let mut last_note = String::from("submitted");
             'turn: loop {
@@ -784,6 +893,11 @@ fn run_proxy<T: FleetTransport>(
                 match event {
                     ProviderEvent::Delta(text) => {
                         let visible = splitter.push(&text);
+                        if let Some(in_call) = splitter.hidden() {
+                            if let Some(note) = hidden.wrote(in_call, text.len()) {
+                                send(ChatEvent::Working(note));
+                            }
+                        }
                         if !visible.is_empty() {
                             if has_visible_text {
                                 send(ChatEvent::Delta(visible));
@@ -884,6 +998,19 @@ fn run_proxy<T: FleetTransport>(
                         done = true;
                     }
                     ProviderEvent::Error(error) => {
+                        // The desktop needs the GPU right now. The turn is not
+                        // lost: it waits, saying so, until the model fits or
+                        // the person stops it.
+                        if is_ui_priority_refusal(&error) {
+                            send(ChatEvent::Loading { phase: format!("waiting for GPU memory ({error})"), fraction: 0.0 });
+                            let mut waited = Duration::ZERO;
+                            while waited < UI_PRIORITY_RETRY && !cancel.load(Ordering::Relaxed) {
+                                std::thread::sleep(POLL);
+                                waited += POLL;
+                            }
+                            retry = true;
+                            break 'attempt;
+                        }
                         if !compacted {
                             if let Some((need, max)) = context_overflow(&error) {
                                 compacted = true;
@@ -922,6 +1049,14 @@ fn run_proxy<T: FleetTransport>(
 /// a turn waiting in the hub's queue (behind a long image or music job) is
 /// not stalled.
 const STALL: Duration = Duration::from_secs(60);
+
+/// How often a turn the desktop's GPU use refused asks again.
+const UI_PRIORITY_RETRY: Duration = Duration::from_secs(5);
+
+/// A node's "not enough GPU memory ..., UI has priority" (`gpu_yield`).
+fn is_ui_priority_refusal(error: &str) -> bool {
+    error.contains("UI has priority")
+}
 
 /// Tokens kept free for the answer when a conversation is fitted to a node.
 const ANSWER_ROOM: usize = 4096;
@@ -1020,6 +1155,12 @@ impl MarkupSplitter {
         visible
     }
 
+    /// What the reply is writing out of sight right now: `Some(true)` a tool
+    /// call, `Some(false)` its reasoning, `None` the visible answer.
+    pub(crate) fn hidden(&self) -> Option<bool> {
+        if self.in_tool { Some(true) } else if self.in_think { Some(false) } else { None }
+    }
+
     /// The body of a `<tool_call>` that was opened and never closed.
     pub(crate) fn unfinished_call(&self) -> Option<String> {
         self.in_tool.then(|| format!("{}{}", self.tool_body, self.pending))
@@ -1067,6 +1208,22 @@ mod tests {
     use super::*;
     use makepad_strict_json::{self as json, Value};
     use std::collections::VecDeque;
+
+    #[test]
+    fn the_tool_check_wants_a_well_formed_call() {
+        assert!(calls_the_check_tool("<tool_call>{\"name\": \"add\", \"arguments\": {\"a\": 17, \"b\": 25}}</tool_call>"));
+        assert!(calls_the_check_tool("<think>\nadd them\n</think>\n<tool_call>\n<function=add>\n<parameter=a>\n17\n</parameter>\n<parameter=b>\n25\n</parameter>\n</function>\n</tool_call>"));
+        // What the broken 9B wrote.
+        assert!(!calls_the_check_tool("I'll make a new scorecard for each part of the next step"));
+        assert!(!calls_the_check_tool("17 + 25 is 42."));
+        assert!(!calls_the_check_tool("<tool_call>{\"name\": \"other\", \"arguments\": {}}</tool_call>"));
+    }
+
+    #[test]
+    fn a_gpu_refusal_is_told_apart_from_a_failure() {
+        assert!(is_ui_priority_refusal("qwen3.8-27b on 10.0.0.101: model unavailable: not enough GPU memory for qwen3.8-27b, UI has priority: it needs 17994 MB, 19198 MB are free and the UI keeps 2048 MB"));
+        assert!(!is_ui_priority_refusal("empty completion"));
+    }
 
     #[test]
     fn a_context_overflow_elides_the_oldest_tool_results_but_the_newest_two() {
@@ -1506,6 +1663,7 @@ mod tests {
             Some("qwen3.6-27b"),
             None,
             None,
+            Vec::new(),
             || {
                 let call = calls.get();
                 calls.set(call + 1);
@@ -1539,6 +1697,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             || vec!["http://127.0.0.1:8123".into(), "http://10.0.0.235:8123".into(), "http://127.0.0.1:8123".into()],
             || DelayedModels,
             Duration::from_secs(1),
@@ -1555,6 +1714,7 @@ mod tests {
             Some("qwen3.8-27b"),
             None,
             None,
+            Vec::new(),
             || vec!["http://n1:1".into()],
             || DelayedModels,
             Duration::from_millis(50),

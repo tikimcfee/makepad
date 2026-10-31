@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 struct Log(Arc<Mutex<Vec<String>>>);
 
 impl Input for Log {
-    fn pointer(&mut self, _x: u16, _y: u16) {}
+    fn pointer(&mut self, _x: u16, _y: u16) {
+        self.0.lock().unwrap().push("pointer".into());
+    }
     fn button(&mut self, down: bool, button: u8) {
         self.0.lock().unwrap().push(format!("button {button} {}", if down { "down" } else { "up" }));
     }
@@ -97,6 +99,19 @@ fn a_gone_viewer_lets_go_of_what_it_held() {
     let got = wait_for(&log, &all, Duration::from_secs(12));
     assert_eq!(got, all);
     assert!(started.elapsed() >= Duration::from_secs(5), "released only once silent");
+
+    // a drag: press, moves and release reach the input in the order they were sent, none coalesced
+    log.lock().unwrap().clear();
+    let drag = [
+        ClientMsg::Pointer { x: 100, y: 100 },
+        ClientMsg::Button { down: true, button: 0 },
+        ClientMsg::Pointer { x: 200, y: 150 },
+        ClientMsg::Pointer { x: 300, y: 200 },
+        ClientMsg::Button { down: false, button: 0 },
+    ];
+    let order = ["pointer", "button 0 down", "pointer", "pointer", "button 0 up"];
+    let _stream = session(&drag);
+    assert_eq!(wait_for(&log, &order, Duration::from_secs(5)), order);
     while server.rx.try_recv().is_ok() {}
     let _ = std::fs::remove_dir_all(&dir);
 }

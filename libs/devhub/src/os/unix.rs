@@ -183,6 +183,58 @@ pub fn group_alive(pid: u32, start: u64, _hold: &Hold) -> bool {
     false
 }
 
+/// TERM (`hard`: KILL) one process.
+pub fn signal_one(pid: u32, hard: bool) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe {
+        kill(pid as i32, if hard { 9 } else { 15 });
+    }
+}
+
+/// The live processes of this user whose environment has `marker` (`NAME=value`), whatever session
+/// or process group they moved to.
+#[cfg(target_os = "linux")]
+pub fn with_env(marker: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if std::fs::read(e.path().join("environ")).is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == marker.as_bytes())) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// As on Linux: the environment comes with a process's arguments (KERN_PROCARGS2).
+#[cfg(target_os = "macos")]
+pub fn with_env(marker: &str) -> Vec<u32> {
+    extern "C" {
+        fn proc_listallpids(buffer: *mut core::ffi::c_void, size: i32) -> i32;
+        fn sysctl(name: *const i32, namelen: u32, oldp: *mut u8, oldlenp: *mut usize, newp: *const u8, newlen: usize) -> i32;
+    }
+    const CTL_KERN: i32 = 1;
+    const KERN_PROCARGS2: i32 = 49;
+    let mut pids = vec![0i32; 8192];
+    let n = unsafe { proc_listallpids(pids.as_mut_ptr() as *mut _, (pids.len() * 4) as i32) };
+    let mut buf = vec![0u8; 1 << 20];
+    let mut out = Vec::new();
+    for &pid in pids.iter().take(n.max(0) as usize).filter(|p| **p > 0) {
+        let mib = [CTL_KERN, KERN_PROCARGS2, pid];
+        let mut len = buf.len();
+        if unsafe { sysctl(mib.as_ptr(), 3, buf.as_mut_ptr(), &mut len, std::ptr::null(), 0) } == 0 && buf[..len].split(|b| *b == 0).any(|v| v == marker.as_bytes()) {
+            out.push(pid as u32);
+        }
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn with_env(_marker: &str) -> Vec<u32> {
+    Vec::new()
+}
+
 /// TERM (`hard`: KILL) the run's process group.
 pub fn signal_group(pid: u32, hard: bool, _hold: &Hold) {
     makepad_remote::group::signal(pid, hard);

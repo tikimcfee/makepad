@@ -84,6 +84,24 @@ pub fn ensure_rev(control: &makepad_remote::Client, node: &str, repo: &str, dir:
     cli::ensure_rev(control, node, repo, dir, branch, sha)
 }
 
+/// Whether the master's auto-sync follows `node` (its `nodes` list, all when it has none).
+#[cfg(feature = "checkout")]
+pub fn autosync_covers(home: &std::path::Path, node: &str) -> bool {
+    let text = std::fs::read_to_string(home.join("autosync.conf")).unwrap_or_default();
+    let c = autosync::AutoConf::parse(&text, &makepad_app_registry::repo_root().unwrap_or_default());
+    c.enabled && c.nodes.as_ref().is_none_or(|n| n.iter().any(|x| x == node))
+}
+
+/// Moves `node`'s tree to the tips of work and commercial main, with no build and no restart (a
+/// node the auto-sync does not follow: the self-update brings its code itself). Returns the exit
+/// code and the node's lines.
+#[cfg(feature = "checkout")]
+pub fn push_tree(control: &makepad_remote::Client, repo: &std::path::Path, node: &str) -> (i32, Vec<String>) {
+    let mut lines = Vec::new();
+    let code = cli::push_and_apply(control, repo, "work", Some("main"), &[node.to_string()], "off", "none", false, "", &mut |n, l| lines.push(format!("{n} {l}")));
+    (code, lines)
+}
+
 /// The node's bare store of `repo` (`~/devhub/git/<repo>.git`): where lease worktrees come from.
 #[cfg(feature = "checkout")]
 pub fn store_dir(repo: &str) -> std::path::PathBuf {
@@ -110,6 +128,12 @@ pub fn register_control(ep: &Endpoint, _hub: &makepad_remote::hub::Hub) {
     );
     #[cfg(not(feature = "checkout"))]
     let _ = ep;
+}
+
+/// A landing happened (`landed_ms`): the master's auto-sync starts a round now.
+#[cfg(feature = "checkout")]
+pub fn kick_autosync(landed_ms: u64) {
+    autosync::kick(landed_ms);
 }
 
 /// A control service as a call: (line, out).

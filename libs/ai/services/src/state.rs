@@ -18,7 +18,8 @@ pub enum Status {
     Thinking,
     /// The model is writing.
     Streaming,
-    /// A tool is running and the model waits for it.
+    /// A named tool is running or asking the person, and the model waits
+    /// for it. Once none is, the model has the turn again: [`Status::Thinking`].
     WaitingForTool,
     /// Something the person must read; the next send clears it.
     Error(String),
@@ -26,7 +27,7 @@ pub enum Status {
 
 impl Status {
     pub fn is_busy(&self) -> bool {
-        matches!(self, Status::Thinking | Status::Streaming | Status::WaitingForTool)
+        matches!(self, Status::Loading { .. } | Status::Thinking | Status::Streaming | Status::WaitingForTool)
     }
 }
 
@@ -242,6 +243,12 @@ pub struct EngineState {
     /// The model's own reasoning text while it thinks, bounded; empty
     /// when the provider shows none.
     pub thinking: String,
+    /// What the model is writing out of sight (`Writing a tool call · 12 KB`);
+    /// empty when it is not.
+    pub model_note: String,
+    /// How long the model has had the turn without a word, in whole seconds:
+    /// a model may reason for minutes and show nothing.
+    pub model_secs: u64,
     pub provider: ProviderChoice,
     pub provider_label: String,
     pub providers: Vec<ProviderRow>,

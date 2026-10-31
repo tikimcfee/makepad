@@ -20,7 +20,11 @@ use std::time::{Duration, Instant};
 /// sends poses for n seconds and then none (linked, idle: taken off, asleep), and
 /// `MAKEPAD_XR_REMOTE_SELFTEST_LINK_S=m` ends the session after m seconds (gone). Its eyes are
 /// 1680x1760 px unless `MAKEPAD_XR_REMOTE_SELFTEST_EYE=<w>x<h>` says (a Quest 3: 2016x2112), its
-/// display rate 72 Hz unless `MAKEPAD_XR_REMOTE_SELFTEST_HZ=<hz>` says.
+/// display rate 72 Hz unless `MAKEPAD_XR_REMOTE_SELFTEST_HZ=<hz>` says. Its fields of view are
+/// ±45° unless `MAKEPAD_XR_REMOTE_SELFTEST_FOV=<left>,<right>,<up>,<down>` (the left eye's
+/// tangent angles, radians; the right eye mirrored) says (a Quest 3: `-0.94,0.72,0.84,-0.96`),
+/// `MAKEPAD_XR_REMOTE_SELFTEST_STILL=1` keeps the head from turning (pictures to compare) and
+/// `MAKEPAD_XR_REMOTE_SELFTEST_PITCH=<radians>` tilts it (negative: looking down).
 pub(crate) fn selftest(shared: Arc<ServerShared>, eye: [u32; 2], stop: Arc<AtomicBool>) {
     let log = shared.log.clone();
     use makepad_hal::{buffers::Wire, XrEye, XrFrame, XrPose};
@@ -36,6 +40,17 @@ pub(crate) fn selftest(shared: Arc<ServerShared>, eye: [u32; 2], stop: Arc<Atomi
     *shared.live_headset.lock().unwrap() = Some(super::LiveHeadset { instance: 0, name: "Selftest headset".into(), session: 0 });
     let secs = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok()).map(Duration::from_secs_f64);
     let (poses_for, link_for) = (secs("MAKEPAD_XR_REMOTE_SELFTEST_POSES_S"), secs("MAKEPAD_XR_REMOTE_SELFTEST_LINK_S"));
+    let fov = std::env::var("MAKEPAD_XR_REMOTE_SELFTEST_FOV").ok().and_then(|v| {
+        let a: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (a.len() == 4).then(|| [a[0], a[1], a[2], a[3]])
+    });
+    let fov_l = fov.unwrap_or([-0.785, 0.785, 0.785, -0.785]);
+    let fov_r = [-fov_l[1], -fov_l[0], fov_l[2], fov_l[3]];
+    let still = std::env::var("MAKEPAD_XR_REMOTE_SELFTEST_STILL").as_deref() == Ok("1");
+    let pitch: f32 = std::env::var("MAKEPAD_XR_REMOTE_SELFTEST_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    if fov.is_some() || still || pitch != 0.0 {
+        log(&format!("xr selftest: left eye fov {fov_l:?}, right {fov_r:?}{}, pitch {pitch}", if still { ", the head still" } else { "" }));
+    }
     let _ = std::thread::Builder::new().name("xr-selftest".into()).spawn(move || {
         let start = Instant::now();
         let mut seq = 0u64;
@@ -59,12 +74,13 @@ pub(crate) fn selftest(shared: Arc<ServerShared>, eye: [u32; 2], stop: Arc<Atomi
             }
             seq += 1;
             let t = start.elapsed().as_secs_f32();
-            let yaw = (t * 0.5).sin() * 0.6;
-            let q = [0.0, (yaw * 0.5).sin(), 0.0, (yaw * 0.5).cos()];
+            let yaw = if still { 0.0 } else { (t * 0.5).sin() * 0.6 };
+            // the turn about y after the tilt about x
+            let (sy, cy, sx, cx) = ((yaw * 0.5).sin(), (yaw * 0.5).cos(), (pitch * 0.5).sin(), (pitch * 0.5).cos());
+            let q = [cy * sx, sy * cx, -sy * sx, cy * cx];
             let right = [yaw.cos(), 0.0, -yaw.sin()];
             let at = |s: f32| XrPose { orientation: q, position: [right[0] * s * 0.032, 1.6, right[2] * s * 0.032] };
-            let fov = [-0.785, 0.785, 0.785, -0.785];
-            let frame = XrFrame { head: at(0.0), eyes: [XrEye { pose: at(-1.0), fov }, XrEye { pose: at(1.0), fov }], ..Default::default() };
+            let frame = XrFrame { head: at(0.0), eyes: [XrEye { pose: at(-1.0), fov: fov_l }, XrEye { pose: at(1.0), fov: fov_r }], ..Default::default() };
             let mut wire = Vec::with_capacity(<XrFrame as Wire>::SIZE);
             frame.write(&mut wire);
             stats.poses += 1;

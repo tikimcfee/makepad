@@ -569,6 +569,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                     if let Ok(p) = s.windows.get_mut(HOST, parent) {
                         p.val.badge_hover = Some((id, geom));
                         p.val.badge_hovered = false;
+                        p.val.badge_press = kind & window_style::BADGE_PRESS != 0;
                     }
                 }
                 // the HAL's own object: no window system surface
@@ -769,7 +770,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             }
             return;
         }
-        HalCmd::WindowOverlay { id, on, rect, layer } => {
+        HalCmd::WindowOverlay { id, on, rect, layer, input } => {
             if sid != HOST { deny(world, sid); return; }
             let Some(s) = world.session_mut(HOST) else { return };
             let layer_ok = layer.is_none() || s.textures.get(HOST, layer).is_ok();
@@ -794,9 +795,12 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 return;
             }
             let next = on.then_some((rect, layer));
-            if w.val.overlay.as_ref().map(|o| (o.rect, o.layer)) == next { return; }
+            if w.val.overlay.as_ref().map(|o| (o.rect, o.layer)) == next {
+                if let Some(o) = w.val.overlay.as_mut() { o.input = input; }
+                return;
+            }
             let was_composed = w.val.overlay.as_ref().is_some_and(|o| o.composed);
-            w.val.overlay = next.map(|(rect, layer)| WindowOverlay { rect, frame: None, layer, composed: on && composed });
+            w.val.overlay = next.map(|(rect, layer)| WindowOverlay { rect, frame: None, layer, input, composed: on && composed });
             gpu.window_overlay(s, id, on.then_some(rect), layer, now);
             if was_composed || composed {
                 sync_layer(gpu, world, id);
@@ -1063,6 +1067,36 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
         | HalCmd::GlyphRequest { .. }
         | HalCmd::GlyphRelease { .. }
         | HalCmd::GlyphTouch { .. } => unreachable!("handled above"),
+        HalCmd::GpuProfQuery { keep_s } => {
+            if !crate::gpu_prof::recording() {
+                crate::gpu_prof::start(crate::gpu_prof::StartOptions { keep_s: keep_s as u64, split_every: 0, ..Default::default() });
+            } else if let Some(rec) = crate::gpu_prof::recording_of(None) {
+                let bytes = rec.encode();
+                s.events.gpu_prof_recording(&bytes);
+            }
+        }
+        HalCmd::WindowScreenOrigin { id, origin, has } => {
+            crate::a11y::set_screen_origin(crate::a11y::window_key(sid, id.index), has.then_some((origin[0], origin[1])));
+        }
+        HalCmd::WindowA11yActive { id, active } => {
+            crate::a11y::set_window_active(crate::a11y::window_key(sid, id.index), active);
+        }
+        HalCmd::HostedPresented { id, frame } => {
+            #[cfg(target_os = "linux")]
+            crate::hosted_native::presented(sid, id, frame);
+            #[cfg(not(target_os = "linux"))]
+            let _ = (id, frame);
+        }
+        HalCmd::HostedNativeBridge {} => {
+            #[cfg(target_os = "linux")]
+            crate::hosted_native::enable_bridge(sid);
+        }
+        HalCmd::HostedNativeIn { bytes } => {
+            #[cfg(target_os = "linux")]
+            crate::hosted_native::receive_bytes(bytes);
+            #[cfg(not(target_os = "linux"))]
+            let _ = bytes;
+        }
         HalCmd::WindowHostedGeom { id, geom, dpi } => match s.windows.get_mut(sid, id) {
             Ok(e) if e.val.is_hosted() && dpi.is_finite() && dpi > 0.0
                 && geom.iter().all(|v| v.is_finite()) && geom[2] >= 0.0 && geom[3] >= 0.0 => {

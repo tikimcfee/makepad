@@ -135,7 +135,7 @@ pub fn build_model(choice: &ProviderChoice, local_only: bool) -> Result<Box<dyn 
         // The hub's Claude runs at Anthropic: refused under the lock.
         ProviderChoice::Hub(_) if local_only && choice.is_cloud() => Err("local AI only".into()),
         ProviderChoice::Hub(model) => Ok(Box::new(LocalModel::for_hub_model(model))),
-        ProviderChoice::Cloud(slug) if slug == "none" => Ok(Box::new(NoModel)),
+        ProviderChoice::Cloud(slug) if slug == "none" => Ok(Box::new(NoModel::default())),
         ProviderChoice::Cloud(_) if local_only => Err("local AI only".into()),
         ProviderChoice::Cloud(slug) if slug == CLAUDE_DESKTOP => {
             if crate::mcp::mcpb::claude_desktop_installed() {

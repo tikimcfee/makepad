@@ -2,19 +2,19 @@
 //! holds (replacing the manager's waiter scripts). Waiters are state: they survive a master
 //! restart, and each one fires once.
 //!
-//! Conditions: `landed <branch>` (in makepad `work`, or commercial `main` for a commercial
-//! branch; the branch may be deleted after landing: its last seen tip counts), `free <node>` (up,
+//! Conditions: `landed <branch>` (its own commits in makepad `work`, and the commercial branch of
+//! the same name, if any, in `main`; the merge bot's "Merge work (<sha>) into <branch>" commits are
+//! not the branch's own and never move what it waits for; the branch may be deleted after
+//! landing: its last seen own commit counts; new commits of its own move it, said as an event), `free <node>` (up,
 //! on for dev, no lease held or waiting), `verified [<commit|branch>]` (a verify passes after the
 //! waiter was added; with a commit: a verified pair that contains it).
 //!
-//! Actions are devhub words: `launch mac <package> [args]` (the user's Mac: the master's own
-//! launch, `cargo run --profile host -p makepad-run --bin makepad -- run <package>` in the
-//! checkout), or any other `makepad devhub` command (`launch <node> ...`, `verify kick`, ...).
+//! Actions are devhub words: any `makepad devhub` command (`verify kick`, `job submit ...`);
+//! `launch mac <app>` is a show on the Mac (`devhub show`, watched for failures).
 
 use super::{git, is_ancestor, Ctx};
 use crate::proto::{wall_ms, Sev};
 use crate::state::{Cond, Waiter};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,11 @@ fn tick(ctx: &Arc<Ctx>) {
     let waiting: Vec<Waiter> = ctx.store.read(|d| d.after.iter().filter(|w| w.state == "waiting").cloned().collect());
     for w in waiting {
         let (met, cond) = check(ctx, &w);
+        if let (Cond::Landed { branch, sha: old, .. }, Cond::Landed { sha: new, .. }) = (&w.cond, &cond) {
+            if old != new {
+                ctx.store.event("after", Sev::Info, format!("after {}: {branch} has new commits of its own: it now waits for {} (was {})", w.id, super::short(new), super::short(old)), None);
+            }
+        }
         if cond != w.cond {
             ctx.store.update(|d| {
                 if let Some(x) = d.after.iter_mut().find(|x| x.id == w.id) {
@@ -74,28 +79,63 @@ fn tick(ctx: &Arc<Ctx>) {
 /// Whether the condition holds (`Some(what met it)`), and the condition with what it learned (a
 /// branch's newest tip).
 fn check(ctx: &Ctx, w: &Waiter) -> (Option<String>, Cond) {
-    match &w.cond {
+    cond_met(ctx, &w.cond, w.added_ms)
+}
+
+/// Whether `cond` holds now (`added_ms`: when it was asked for), and the condition with what it
+/// learned (a branch's newest tip). Shared with `devhub show --after`.
+pub fn cond_met(ctx: &Ctx, cond: &Cond, added_ms: u64) -> (Option<String>, Cond) {
+    match cond {
         Cond::Landed { branch, repo, sha } => {
-            let (dir, target) = if repo == "commercial" { (ctx.commercial(), "refs/heads/main") } else { (ctx.repo.clone(), "refs/heads/work") };
-            let tip = git(&dir, &["rev-parse", "-q", "--verify", &format!("refs/heads/{branch}^{{commit}}")]).unwrap_or_else(|_| sha.clone());
-            let cond = Cond::Landed { branch: branch.clone(), repo: repo.clone(), sha: tip.clone() };
-            let met = (!tip.is_empty() && is_ancestor(&dir, &tip, target)).then(|| format!("{branch}@{} is in {}", super::short(&tip), if repo == "commercial" { "main" } else { "work" }));
-            (met, cond)
+            let (dir, tip_name) = if repo == "commercial" { (ctx.commercial(), "main") } else { (ctx.repo.clone(), "work") };
+            // the newest commit of the branch's own (deleted after landing: the last one seen)
+            let own = own_tip(&dir, branch, tip_name).unwrap_or_else(|| sha.clone());
+            let cond = Cond::Landed { branch: branch.clone(), repo: repo.clone(), sha: own.clone() };
+            let mut met = !own.is_empty() && is_ancestor(&dir, &own, &format!("refs/heads/{tip_name}"));
+            // the lane's other half (the commercial branch of a makepad lane, by the same name)
+            let other = (repo != "commercial").then(|| ctx.commercial());
+            let mut what = format!("{branch}@{} is in {tip_name}", super::short(&own));
+            if let (true, Some(cdir)) = (met, other) {
+                if let Some(c) = own_tip(&cdir, branch, "main") {
+                    met = is_ancestor(&cdir, &c, "refs/heads/main");
+                    what = format!("{what}, its commercial half @{} in main", super::short(&c));
+                }
+            }
+            (met.then_some(what), cond)
         }
         Cond::Free { node } => {
             let met = ctx.leases.nodes().into_iter().find(|n| &n.name == node).filter(|n| n.up && n.dev && n.leases == 0 && n.waiting == 0 && n.hold.is_none()).map(|_| format!("{node} is free"));
-            (met, w.cond.clone())
+            (met, cond.clone())
         }
         Cond::Verified { contains } => {
-            let tips: Vec<crate::state::Tip> = ctx.store.read(|d| d.verify.verified.iter().filter(|t| t.at_ms >= w.added_ms).cloned().collect());
+            let tips: Vec<crate::state::Tip> = ctx.store.read(|d| d.verify.verified.iter().filter(|t| t.at_ms >= added_ms).cloned().collect());
             let hit = tips.iter().rev().find(|t| match contains {
                 None => true,
                 Some(c) => is_ancestor(&ctx.repo, c, &t.pair.work) || is_ancestor(&ctx.commercial(), c, &t.pair.main),
             });
-            (hit.map(|t| format!("verified {}", t.pair.short())), w.cond.clone())
+            (hit.map(|t| format!("verified {}", t.pair.short())), cond.clone())
+        }
+        Cond::Shown { app, device } => {
+            let hit = ctx.store.read(|d| d.shows.iter().any(|x| &x.app == app && &x.device == device && x.state == "running" && x.started_ms >= added_ms));
+            (hit.then(|| format!("{app} runs on {device}")), cond.clone())
         }
         Cond::None => (None, Cond::None),
     }
+}
+
+/// The newest commit on `branch`'s first-parent line that is its own: past the merge bot's
+/// "Merge <tip> (<sha>) into <branch>" commits (they never land). None: no such branch.
+pub fn own_tip(dir: &std::path::Path, branch: &str, tip_name: &str) -> Option<String> {
+    let log = git(dir, &["log", "--first-parent", "-n", "200", "--format=%H%x09%s", &format!("refs/heads/{branch}"), "--"]).ok()?;
+    let (pre, post) = (format!("Merge {tip_name} ("), format!(") into {branch}"));
+    let mut last = None;
+    for (h, subject) in log.lines().filter_map(|l| l.split_once('\t')) {
+        last = Some(h.to_string());
+        if !(subject.starts_with(&pre) && subject.ends_with(&post)) {
+            return last;
+        }
+    }
+    last
 }
 
 /// Runs the waiter's words; its exit and log are state.
@@ -103,8 +143,12 @@ fn act(ctx: &Ctx, w: &Waiter) {
     let dir = ctx.logs("after");
     let _ = std::fs::create_dir_all(&dir);
     let log = dir.join(format!("{}.log", w.id));
+    // `launch mac <app>`: a show, watched like one (its failures are `show_failed` events)
     let r = match w.cmd.as_slice() {
-        [launch, node, rest @ ..] if launch == "launch" && is_mac(ctx, node) => mac_launch(ctx, rest, &log),
+        [launch, dev, app, ..] if launch == "launch" && super::show::device(ctx, dev).is_ok_and(|d| d == "mac") => match super::ctx() {
+            Some(c) => super::show::serve(&c, &format!("show add {{\"app\":{},\"on\":\"mac\",\"by\":{}}}", makepad_remote::json_str(app), makepad_remote::json_str(&format!("after {}", w.id)))).map(|a| (0, a)),
+            None => Err("no master".into()),
+        },
         words => devhub(ctx, words, &w.id, &log),
     };
     let (state, exit, note, sev) = match r {
@@ -121,49 +165,6 @@ fn act(ctx: &Ctx, w: &Waiter) {
         }
     });
     ctx.store.event("after", sev, format!("after {} {state}: {} (exit {}){}", w.id, w.cmd.join(" "), exit.map_or("-".into(), |c| c.to_string()), if note.is_empty() { String::new() } else { format!(": {note}") }), None);
-}
-
-/// The user's Mac: `mac`, `local` or the master's own name.
-fn is_mac(ctx: &Ctx, node: &str) -> bool {
-    matches!(node, "mac" | "local") || node == ctx.machine
-}
-
-fn cargo() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    let c = home.join(".cargo/bin/cargo");
-    if c.exists() {
-        c
-    } else {
-        PathBuf::from("cargo")
-    }
-}
-
-/// The master's own launch: the package under the JIT from the checkout (as the Dock launchers
-/// do), detached, its output in `~/Library/Logs/makepad/<package>.log`; the launch's pid.
-fn mac_launch(ctx: &Ctx, words: &[String], log: &std::path::Path) -> Result<(i32, String), String> {
-    let (pkg, args) = words.split_first().ok_or("launch mac <package> [args...]")?;
-    if pkg.is_empty() || !pkg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return Err(format!("launch mac: `{pkg}` is not a package name"));
-    }
-    let logs = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join("Library/Logs/makepad");
-    let _ = std::fs::create_dir_all(&logs);
-    let app_log = logs.join(format!("{pkg}.log"));
-    let out = std::fs::OpenOptions::new().create(true).append(true).open(&app_log).map_err(|e| format!("{}: {e}", app_log.display()))?;
-    let err = out.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = makepad_remote::group::command(cargo());
-    cmd.args(["run", "--profile", "host", "-p", "makepad-run", "--bin", "makepad", "--", "run", pkg]).args(args).current_dir(&ctx.repo).env("CARGO_INCREMENTAL", "0").stdin(std::process::Stdio::null()).stdout(out).stderr(err);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd.spawn().map_err(|e| format!("cargo: {e}"))?;
-    let pid = child.id();
-    let _ = std::fs::write(log, format!("launch mac {pkg}: pid {pid}, log {}\n", app_log.display()));
-    // reaped when it ends (said on the stream)
-    let (store, pkg2) = (ctx.store.clone(), pkg.clone());
-    let _ = std::thread::Builder::new().name("devhub-after-launch".into()).spawn(move || {
-        let st = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-        store.event("after", if st == 0 { Sev::Info } else { Sev::Warn }, format!("launch mac {pkg2}#{pid} ended (exit {st})"), None);
-    });
-    Ok((0, format!("{pkg} launched on the Mac as pid {pid} (log {})", app_log.display())))
 }
 
 /// `makepad devhub <words>` with the master's own binary, in the checkout.
@@ -196,9 +197,11 @@ pub fn parse_cond(ctx: &Ctx, words: &[&str]) -> Result<Cond, String> {
             }
             let has = |dir: &std::path::Path| git(dir, &["rev-parse", "-q", "--verify", &format!("refs/heads/{branch}^{{commit}}")]).ok();
             if let Some(sha) = has(&ctx.repo) {
+                let sha = own_tip(&ctx.repo, branch, "work").unwrap_or(sha);
                 return Ok(Cond::Landed { branch: branch.to_string(), repo: "makepad".into(), sha });
             }
             if let Some(sha) = has(&ctx.commercial()) {
+                let sha = own_tip(&ctx.commercial(), branch, "main").unwrap_or(sha);
                 return Ok(Cond::Landed { branch: branch.to_string(), repo: "commercial".into(), sha });
             }
             Err(format!("no branch {branch} in {} or its apps/commercial", ctx.repo.display()))
@@ -209,12 +212,13 @@ pub fn parse_cond(ctx: &Ctx, words: &[&str]) -> Result<Cond, String> {
             }
             Ok(Cond::Free { node: node.to_string() })
         }
+        ["shown", app, device] => Ok(Cond::Shown { app: app.to_string(), device: super::show::device(ctx, device)? }),
         ["verified"] => Ok(Cond::Verified { contains: None }),
         ["verified", rev] => {
             let sha = git(&ctx.repo, &["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")]).or_else(|_| git(&ctx.commercial(), &["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")])).map_err(|_| format!("no commit {rev}"))?;
             Ok(Cond::Verified { contains: Some(sha) })
         }
-        _ => Err("conditions: landed <branch> | free <node> | verified [<commit|branch>]".into()),
+        _ => Err("conditions: landed <branch> | free <node> | verified [<commit|branch>] | shown <app> <device>".into()),
     }
 }
 
@@ -303,5 +307,47 @@ mod tests {
         assert_eq!(serve(&c, "after list").unwrap(), "[]");
         assert!(serve(&c, "after list all").unwrap().contains("cancelled"));
         let _ = std::fs::remove_file(c.repo.join("state.json"));
+    }
+
+    fn g(dir: &std::path::Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// A branch that landed and then got work merged in by the bot is landed: the bot's merge is
+    /// not its own (it never lands) and does not move what the waiter waits for.
+    #[test]
+    fn landed_ignores_the_merge_bots_merges() {
+        let base = std::env::temp_dir().join(format!("devhub-after-landed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut c = ctx("landed");
+        c.repo = base.join("makepad");
+        std::fs::create_dir_all(&c.repo).unwrap();
+        g(&c.repo, &["init", "-q", "-b", "work"]);
+        std::fs::write(c.repo.join("a.txt"), "a").unwrap();
+        g(&c.repo, &["add", "."]);
+        g(&c.repo, &["commit", "-q", "-m", "base"]);
+        g(&c.repo, &["checkout", "-q", "-b", "rc-x"]);
+        std::fs::write(c.repo.join("x.txt"), "x").unwrap();
+        g(&c.repo, &["add", "."]);
+        g(&c.repo, &["commit", "-q", "-m", "lane work"]);
+        let own = g(&c.repo, &["rev-parse", "HEAD"]);
+        let w = Waiter { id: "A1".into(), cond: parse_cond(&c, &["landed", "rc-x"]).unwrap(), ..Default::default() };
+        assert_eq!(check(&c, &w).0, None);
+        // it lands; work moves on; the bot merges work into the lane
+        g(&c.repo, &["checkout", "-q", "work"]);
+        g(&c.repo, &["merge", "-q", "--no-ff", "-m", "land x", "rc-x"]);
+        std::fs::write(c.repo.join("b.txt"), "b").unwrap();
+        g(&c.repo, &["add", "."]);
+        g(&c.repo, &["commit", "-q", "-m", "more work"]);
+        let work = g(&c.repo, &["rev-parse", "HEAD"]);
+        g(&c.repo, &["checkout", "-q", "rc-x"]);
+        g(&c.repo, &["merge", "-q", "--no-ff", "-m", &format!("Merge work ({}) into rc-x", &work[..10]), "work"]);
+        let (met, cond) = check(&c, &w);
+        assert!(met.is_some_and(|m| m.contains(&own[..10])), "{cond:?}");
+        assert_eq!(cond, Cond::Landed { branch: "rc-x".into(), repo: "makepad".into(), sha: own });
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(c.home.join("state.json"));
     }
 }

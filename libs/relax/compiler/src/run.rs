@@ -349,6 +349,7 @@ pub(crate) fn resolve_package(
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
+    let resolved_units = units.clone();
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
@@ -376,7 +377,11 @@ pub(crate) fn resolve_package(
         .collect();
     let watches = boot || matches!(who, ResolveFor::Domain(id) if app_domain() == Some(id));
     let t_inputs = Instant::now();
-    let live_inputs = (watches && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
+    let live_inputs = (watches && options.live).then(|| {
+        let mut inputs = crate::reload::Inputs::collect(&g, std_dir, workspace);
+        inputs.set_graph(workspace, package, cargo_flags, &resolved_units);
+        inputs
+    });
     let t_subst = Instant::now();
     // Validate native macros before any overlapping provided-crate identity error.
     crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;
@@ -545,7 +550,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test <package>` (lib.rs): the program is the package's test harness, not its main
     let mut harness = false;
     let mut plain_test: Option<String> = None;
-    let mut no_fail_fast = false;
     let mut cargo_flags = Vec::new();
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
@@ -573,7 +577,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 // a test whose code Relax cannot compile fails as that test; the others still run
                 jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
             }
-            "--no-fail-fast" => no_fail_fast = true,
+            "--no-fail-fast" => {}
             // `makepad test`'s run of one `harness = false` target (test_pkg.rs): cargo builds it
             // with `--cfg test` but no `--test` and runs it as a plain program, its exit status
             // the verdict; the value is the target's source path
@@ -1337,7 +1341,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let up: *mut Unit = &mut *u;
             let (rep, violations) = {
                 let _job = jit::compile_job();
-                crate::owner::call(crate::owner::Class::Program, || crate::boundary::run(up))
+                crate::owner::call(crate::owner::Class::Program, || crate::boundary::run(up, root))
             };
             print!("{}", rep);
             std::mem::forget(u);
@@ -1779,7 +1783,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
         groups.sort();
-        let code = crate::harness::run(&mut u, up, &groups, no_fail_fast);
+        let code = crate::harness::run(&mut u, up, &groups);
         flush_errors(true);
         std::mem::forget(u);
         return code;

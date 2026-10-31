@@ -145,6 +145,15 @@ impl Sync {
     /// checkouts, follow the JITs' patches, prebuild, restart.
     fn apply(self: &Arc<Self>, o: &Order, out: &mut Vec<String>) {
         let Ok(_busy) = self.busy.try_lock() else { return out.push(err_line("an apply is running on this node")) };
+        // its hub does not restart under it (the build would start over, 10-30)
+        APPLYING.store(true, std::sync::atomic::Ordering::Release);
+        struct Applying;
+        impl Drop for Applying {
+            fn drop(&mut self) {
+                APPLYING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _applying = Applying;
         let t0 = Instant::now();
         let mut plan: Vec<(&str, Store, Option<String>, String)> = Vec::new();
         for repo in ["makepad", "commercial"] {
@@ -327,6 +336,8 @@ impl Sync {
         if o.get("prewarm") == Some("on") {
             let why_not = if !crate::lease::exec::writes_allowed() {
                 Some("dev off")
+            } else if crate::lease::exec::user_present() {
+                Some("a person uses it")
             } else if !crate::lease::exec::held().is_empty() {
                 Some("a lease holds the node")
             } else if !built_ok {
@@ -600,17 +611,33 @@ impl Sync {
     }
 }
 
+/// An apply (its tree's move, its build) runs on this node.
+static APPLYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn applying() -> bool {
+    APPLYING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A WM restart is waiting on this node (`Sync::wm_restart`).
 static WM_RESTART_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// What a WM restart would cost now: the gate leases on this node (landings) and the unsaved
-/// work of its apps. Empty: it may restart.
+/// What a WM restart would cost now: the gate leases on this node (landings), a user at the node,
+/// the unsaved work of its apps ([`crate::lease::exec::user_blockers`]), a viewer watching and any
+/// user app running. Empty: it may restart.
 fn restart_blockers() -> Vec<String> {
     let why = crate::lease::exec::held().into_iter().filter(|(_, lane, kind)| *kind == "gate" || lane.starts_with("land")).map(|(id, lane, kind)| format!("{kind} lease {id} of {lane}"));
-    #[cfg(unix)]
-    let why = why.chain(makepad_app_registry::machine::unsaved_work().into_iter().map(|(pid, app, what)| format!("unsaved work in {app} (pid {pid}): {what}")));
-    why.collect()
+    let mut out: Vec<String> = why.chain(crate::lease::exec::user_blockers()).collect();
+    if crate::lease::exec::user_watching() {
+        out.push("a Desk Link viewer is attached".to_string());
+    }
+    // a WM restart ends every app in its session: it never takes a user's app with it (it
+    // killed Fab on 103, 3 min after the last input, 2026-10-30)
+    out.extend(super::jits::list().into_iter().filter(|j| !WM_SERVICES.iter().any(|s| j.app == *s || j.app == format!("makepad-app-{s}"))).map(|j| format!("{} runs (pid {}): close it to let the WM update", j.app, j.pid)));
+    out
 }
+
+/// What the WM's session runs by itself: not a user's apps.
+const WM_SERVICES: [&str; 4] = ["wm", "aichat", "aihub", "devhub"];
 
 /// A makepad checkout dir that holds only the nested commercial checkout (a fresh tree whose
 /// commercial side came first).

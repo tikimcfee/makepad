@@ -2,6 +2,7 @@
 //! resolution, snapshots and answers; only transport and waiting differ.
 use super::*;
 use makepad_a11y::{query::Query, render, ActionArg, Actions, Node, NodeId, States};
+use crate::input;
 use makepad_remote::{json_str, Out, Req};
 
 pub type Trees = Vec<(u64, Tree)>;
@@ -15,6 +16,21 @@ pub trait Backend {
     fn present(&self, window: u64, timeout: Duration) -> Result<(), String>;
     fn type_text(&self, window: u64, text: &str) -> Result<(), String>;
     fn user_seq(&self, window: u64) -> Result<u64, String>;
+    /// Feeds a pointer event into the window's input queue, where the OS's arrive (`mods` marks
+    /// it injected, so it is not taken for the person).
+    fn pointer(&self, window: u64, event: PointerEvent, x: f64, y: f64, button: u32, mods: u32) -> Result<(), String>;
+    /// Frames the window's session has presented so far.
+    fn frames(&self, window: u64) -> u64;
+    /// The OS adapter's self-check of `window` ([`super::OsSelfCheck`]): the process's own
+    /// windows only (the HAL's adapter walks them in place).
+    fn os_selfcheck(&self, window: u64, act: bool) -> Result<String, String>;
+}
+
+#[derive(Clone, Copy)]
+pub enum PointerEvent {
+    Move,
+    Down,
+    Up,
 }
 
 pub fn versions(trees: &Trees) -> Vec<(u64, u64)> {
@@ -120,6 +136,63 @@ fn argument(req: &Req, action: Actions, node: &Node) -> Result<ActionArg, String
     })
 }
 
+/// `ui act ... drag`: a pointer drag at a set rate on this consumer thread, one event at a time
+/// on its due time whatever the app is doing, the way a mouse keeps reporting while the app
+/// stalls. `legs` traversals of `dx,dy` (even: back at the start) over `ms`; the press is at
+/// `x,y` from the node's top-left (default its centre). The answer gives the frames presented
+/// meanwhile: the fewest in any 2 s window (`per_2s_min`, runs of 2 s or more) and the gaps.
+fn paced_drag(req: &Req, backend: &dyn Backend, key: u64, node: &Node) -> Result<String, String> {
+    let (dx, dy) = (number(req, "dx", 0.0f64)?, number(req, "dy", 0.0f64)?);
+    if dx == 0.0 && dy == 0.0 { return Err("drag needs dx= and/or dy=".into()); }
+    let (ms, hz) = (number(req, "ms", 1000.0f64)?, number(req, "hz", 120.0f64)?);
+    if !(ms >= 1.0 && hz >= 1.0 && hz <= 8000.0) { return Err("drag wants ms>=1 and hz in 1..=8000".into()); }
+    let legs = number(req, "legs", 1u32)?.max(1);
+    let button = 1u32 << number(req, "b", 0u32)?.min(31);
+    let mods = crate::automation::modifiers(&[req.get("mods").unwrap_or("").to_string()])? | input::MOD_INJECTED;
+    let b = node.bounds;
+    let x0 = b.x as f64 + number(req, "x", b.w as f64 * 0.5)?;
+    let y0 = b.y as f64 + number(req, "y", b.h as f64 * 0.5)?;
+    backend.pointer(key, PointerEvent::Move, x0, y0, 0, mods)?;
+    backend.pointer(key, PointerEvent::Down, x0, y0, button, mods)?;
+    let events = ((ms * hz / 1000.0).ceil() as u64).max(1);
+    let start = Instant::now();
+    let first_frames = backend.frames(key);
+    let (mut seen, mut frame_ms) = (first_frames, Vec::new());
+    let (mut sent, mut late_ms, mut end) = (0u64, 0.0f64, (x0, y0));
+    while sent < events {
+        let due = (sent + 1) as f64 * 1000.0 / hz;
+        let now = start.elapsed().as_secs_f64() * 1000.0;
+        let frames = backend.frames(key);
+        frame_ms.extend((seen..frames).map(|_| now));
+        seen = frames;
+        if now < due {
+            // short sleeps: the frame clock is read between events too
+            std::thread::sleep(Duration::from_secs_f64(((due - now) / 1000.0).min(0.001)));
+            continue;
+        }
+        late_ms = late_ms.max(now - due);
+        sent += 1;
+        let along = sent as f64 / events as f64 * legs as f64;
+        let leg = along.floor() as u32;
+        let part = if leg >= legs { if legs % 2 == 0 { 0.0 } else { 1.0 } } else if leg % 2 == 0 { along.fract() } else { 1.0 - along.fract() };
+        end = (x0 + dx * part, y0 + dy * part);
+        // a closed window ends the run with what it measured
+        if backend.pointer(key, PointerEvent::Move, end.0, end.1, 0, mods).is_err() { break; }
+    }
+    let took = start.elapsed().as_secs_f64() * 1000.0;
+    let _ = backend.pointer(key, PointerEvent::Up, end.0, end.1, button, mods);
+    let mut gaps: Vec<f64> = frame_ms.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_by(f64::total_cmp);
+    let pick = |q: f64| gaps.get(((gaps.len() as f64 * q) as usize).min(gaps.len().saturating_sub(1))).copied().unwrap_or(0.0);
+    // the thinnest 2 s windows start right after a frame
+    let in_2s = |t: f64| frame_ms.partition_point(|f| *f < t + 2000.0) - frame_ms.partition_point(|f| *f < t);
+    let per_2s = std::iter::once(0.0).chain(frame_ms.iter().map(|f| f + 0.001)).filter(|t| t + 2000.0 <= took).map(in_2s).min();
+    Ok(format!(
+        "\"events\":{sent},\"ms\":{took:.0},\"late_ms_max\":{late_ms:.1},\"frames\":{},\"per_2s_min\":{},\"gap_ms\":{{\"median\":{:.1},\"p90\":{:.1},\"p99\":{:.1},\"max\":{:.1}}}",
+        frame_ms.len(), per_2s.map_or("null".to_string(), |n| n.to_string()), pick(0.5), pick(0.9), pick(0.99), pick(1.0),
+    ))
+}
+
 /// Shared command interpreter. All waits and action acknowledgements happen on its caller's
 /// consumer thread, never in a widget draw or event handler.
 pub fn dispatch(req: &Req, out: &mut Out, backend: &dyn Backend, snapshots: &Snapshots) {
@@ -182,6 +255,15 @@ fn run(req: &Req, out: &mut Out, backend: &dyn Backend, snapshots: &Snapshots) -
                 if !matches!(result, ActionResult::Handled | ActionResult::Fallback) { return Err(format!("#{}: {}", node.id.short(), result.short())); }
                 Ok(result)
             };
+            if verb == "act" && req.pos.get(1).map(String::as_str).or(req.get("action")) == Some("drag") {
+                let measured = paced_drag(req, backend, key, &node)?;
+                // the person's input during it invalidates the numbers, the way it does a sequence's
+                if backend.user_seq(key)? != seq { return Err(format!("user_intervened: the drag ran, its numbers are not evidence: {{{measured}}}")); }
+                let rows = find(&selected(req, backend.trees())?, &Query::parse(&format!("id={}", node.id.short()))?).into_iter().filter(|(k,_)| *k == key).collect::<Vec<_>>();
+                if json { out.line(&format!("{{\"result\":\"dragged\",{measured}}}")); }
+                else { out.line(&format!("dragged: {{{measured}}} {}", rows.first().map(|(_,n)| render::node_line(n)).unwrap_or_else(|| format!("#{} removed", node.id.short())))); }
+                return Ok(());
+            }
             let result = if verb == "type" {
                 let text = req.get("t").ok_or("ui type needs t=TEXT")?;
                 invoke(Actions::FOCUS, ActionArg::None)?;
@@ -272,8 +354,8 @@ fn run(req: &Req, out: &mut Out, backend: &dyn Backend, snapshots: &Snapshots) -
         }
         "oscheck" => {
             let key = trees.first().ok_or("no window with a tree")?.0;
-            let check = os_selfcheck().get().ok_or("this backend has no OS accessibility adapter")?;
-            text_result(out, json, "oscheck", &check(key, req.get("act") == Some("1")));
+            let text = backend.os_selfcheck(key, req.get("act") == Some("1"))?;
+            text_result(out, json, "oscheck", &text);
         }
         _ => return Err("ui: find, act, type, wait, snap, diff, speak, lint, oscheck (help lists arguments)".into()),
     }

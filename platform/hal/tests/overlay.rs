@@ -41,7 +41,7 @@ fn frame(hal: &Hal, sid: u32, window: Id, serial: u64, kind: u32) {
 
 fn overlay(hal: &Hal, sid: u32, on: bool) {
     let mut cmd = CmdWriter::new(sid);
-    cmd.window_overlay(HOST_WINDOW, on, PANEL, Id::NONE);
+    cmd.window_overlay(HOST_WINDOW, on, PANEL, Id::NONE, false);
     hal.submit(&cmd.buf());
 }
 
@@ -300,9 +300,9 @@ fn releasing_the_borrower_clears_overlay_ownership_before_readoption() {
 fn invalid_overlay_rectangles_leave_app_input_and_composition_intact() {
     let (hal, sid) = setup();
     let mut cmd = CmdWriter::new(HOST);
-    cmd.window_overlay(HOST_WINDOW, true, [0.0, 0.0, 0.0, 40.0], Id::NONE);
-    cmd.window_overlay(HOST_WINDOW, true, [f32::NAN, 0.0, 40.0, 40.0], Id::NONE);
-    cmd.window_overlay(Id::new(HOST_WINDOW.index, 2), true, PANEL, Id::NONE);
+    cmd.window_overlay(HOST_WINDOW, true, [0.0, 0.0, 0.0, 40.0], Id::NONE, false);
+    cmd.window_overlay(HOST_WINDOW, true, [f32::NAN, 0.0, 40.0, 40.0], Id::NONE, false);
+    cmd.window_overlay(Id::new(HOST_WINDOW.index, 2), true, PANEL, Id::NONE, false);
     hal.submit(&cmd.buf());
     hal.with_world(|w| {
         let host = w.session(HOST).unwrap();
@@ -323,9 +323,9 @@ fn a_window_layer_leaves_input_with_the_app_and_needs_its_texture() {
     const LAYER: Id = Id::new(20, 1);
     let mut cmd = CmdWriter::new(HOST);
     // no such texture yet: refused
-    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER);
+    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER, false);
     cmd.texture_create(LAYER, usage::RENDER_TARGET | usage::SAMPLED, format::BGRA8, 2000, 1400, [1, 1], Attr::default());
-    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER);
+    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER, false);
     hal.submit(&cmd.buf());
     hal.with_world(|w| {
         let host = w.session(HOST).unwrap();
@@ -339,6 +339,36 @@ fn a_window_layer_leaves_input_with_the_app_and_needs_its_texture() {
     frame(&hal, HOST, HOST_WINDOW, 101, target::WINDOW);
     frame(&hal, sid, APP_WINDOW, 12, target::WINDOW);
     assert_eq!(last(&hal).layers, [(sid, APP_WINDOW, 12), (HOST, HOST_WINDOW, 101)]);
+    // the paused view: the same layer takes the window's input, its close and the system's quit
+    // (the app may read none of them); given back, they are the app's again
+    let mut cmd = CmdWriter::new(HOST);
+    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER, true);
+    hal.submit(&cmd.buf());
+    hal.with_world(|w| {
+        w.window_event(sid, RawEvent::close_requested(APP_WINDOW), &[]);
+        w.window_event(sid, RawEvent::lifecycle(lifecycle::QUIT_REQUESTED), &[]);
+    });
+    let tags: Vec<_> = take(&hal, HOST).iter().map(|e| e.0.tag).collect();
+    assert_eq!(tags.iter().filter(|t| **t == tag::CloseRequested || **t == tag::Lifecycle).count(), 2);
+    assert!(take(&hal, sid).iter().all(|e| e.0.tag != tag::CloseRequested && e.0.tag != tag::Lifecycle));
+    let mut cmd = CmdWriter::new(HOST);
+    cmd.window_overlay(HOST_WINDOW, true, [0.0; 4], LAYER, false);
+    hal.submit(&cmd.buf());
+    hal.with_world(|w| w.window_event(sid, RawEvent::close_requested(APP_WINDOW), &[]));
+    assert!(take(&hal, sid).iter().any(|e| e.0.tag == tag::CloseRequested));
+    // a badge that takes presses (the JIT ring's Update ready): a press on it is session 0's, a
+    // press beside it the app's
+    const BADGE: Id = Id::new(9, 1);
+    hal.with_world(|w| {
+        let host = w.session_mut(HOST).unwrap().windows.get_mut(HOST, HOST_WINDOW).unwrap();
+        host.val.badge_hover = Some((BADGE, [960.0, 2.0, 24.0, 24.0]));
+        host.val.badge_press = true;
+        w.window_event(sid, RawEvent::mouse_down(APP_WINDOW, 970.0, 12.0, 1, 0), &[]);
+    });
+    assert!(take(&hal, HOST).iter().any(|e| e.0.tag == tag::MouseDown && e.0.window == BADGE));
+    assert!(take(&hal, sid).iter().all(|e| e.0.tag != tag::MouseDown));
+    hal.with_world(|w| w.window_event(sid, RawEvent::mouse_down(APP_WINDOW, 100.0, 12.0, 1, 0), &[]));
+    assert!(take(&hal, sid).iter().any(|e| e.0.tag == tag::MouseDown));
 }
 
 #[test]

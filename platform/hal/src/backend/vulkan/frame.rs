@@ -266,6 +266,10 @@ impl Vulkan {
         if let Some(em) = s.windows.get(s.id, id).ok().and_then(|w| w.val.embedded) { return self.resolve(s, em.tex); }
         let (sid, id) = self.window_key(s.id, id);
         if let Some(last) = self.badged.get(&id.index).filter(|_| sid == HOST).and_then(|b| b.last.clone()) { return Some(last); }
+        // the newest frame went straight to the shell's target: a read of this frame takes it from there
+        if sid == HOST && self.retained_stale.contains(&id.index) {
+            if let Some(direct) = self.direct_frame.get(&id.index) { return Some(direct.clone()); }
+        }
         self.win.get(&(sid, id.index)).filter(|t| t.gen == id.gen).map(|t| t.image.clone())
     }
 
@@ -582,12 +586,12 @@ impl Vulkan {
                         None if layered => { self.retained_stale.remove(&key.1.index); self.offscreen(s, target, size, now)? }
                         // a multiview window: the shell's own target (a layer per view), or its own image
                         None if views > 1 => match self.windows.source.target(key.0, key.1, size) {
-                            Some(image) => { if key.0 == HOST { self.retained_stale.insert(key.1.index); } image }
+                            Some(image) => { if key.0 == HOST { self.retained_stale.insert(key.1.index); self.direct_frame.insert(key.1.index, image.clone()); } image }
                             None => self.offscreen_layers(s, target, size, views as u32, now)?,
                         },
                         None => match self.windows.source.target(key.0, key.1, size) {
                             // the retained image no longer holds the newest frame
-                            Some(image) => { if key.0 == HOST { self.retained_stale.insert(key.1.index); } image }
+                            Some(image) => { if key.0 == HOST { self.retained_stale.insert(key.1.index); self.direct_frame.insert(key.1.index, image.clone()); } image }
                             None => { self.retained_stale.remove(&key.1.index); self.offscreen(s, target, size, now)? }
                         },
                     }

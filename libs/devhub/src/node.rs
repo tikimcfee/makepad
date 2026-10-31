@@ -175,6 +175,8 @@ pub fn listen_control(ep: &Endpoint) -> Result<PathBuf, String> {
 impl Node {
     /// Starts the node: local JITs, the control socket, and the LAN listener when `trust` allows it.
     pub fn start(conf: NodeConf, trust: Option<Arc<dyn Trust>>, log: crate::trust::Log) -> Result<Node, String> {
+        // now, the commit it was built at: a lease this hub takes back moves the tree to its pin
+        let _ = crate::lease::caps::hub_rev();
         crate::os::raise_fd_limit();
         let peers = Arc::new(Mutex::new(Peers::default()));
         let sink_slot: Arc<Mutex<Option<makepad_remote::watch::WatchSink>>> = Arc::new(Mutex::new(None));

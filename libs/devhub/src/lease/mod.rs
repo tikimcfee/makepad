@@ -14,6 +14,7 @@ pub mod sched;
 pub mod ship;
 #[cfg(feature = "checkout")]
 pub mod tree;
+pub mod user;
 pub mod wt;
 
 use makepad_remote::json_str;
@@ -161,7 +162,68 @@ pub struct Caps {
     /// the commits the node's one tree holds (`<makepad sha>[,<commercial sha>]`, [`tree::Pin`];
     /// empty: unknown): the scheduler prefers a node already there for a lease of those commits
     pub tree: String,
+    /// the commit the node's hub was started from (empty: a hub from before it said so)
+    pub hub_rev: String,
+    /// the node's rustc (`1.97.1`; empty: not known)
+    pub rustc: String,
+    /// the master-node protocol the hub speaks ([`HUB_PROTO`]; 0: an older hub)
+    pub hub_proto: u32,
+    /// the services the node's WM supervises (`~/.makepad/wm/<name>.state`): name, start wall ms
+    pub services: Vec<(String, u64)>,
+    /// a person at the node, as its WM saw their input ([`UserSense`]); None: no WM of ours
+    /// runs there (the Macs, Windows): the dev switch alone decides
+    pub user: Option<UserSense>,
 }
+
+/// A person using a node with our WM: the node hub asks the WM (`makepad-wm activity`) how long
+/// ago its device readers took input from a physical device or the user's Desk Link viewer
+/// (never injected or agent input, never what runs). Input within `idle_min` minutes: the node
+/// drains on its own (no new lease, no network writes; running leases finish) until that long
+/// without input. The user's own dev switch stays as it is: auto-sensing never turns on a node
+/// the user switched off.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct UserSense {
+    pub present: bool,
+    /// ms since the last input (None: none seen since the hub started)
+    pub idle_ms: Option<u64>,
+    /// the last input: `key`, `pointer` or `gamepad`, from its `device` or `desk link`
+    pub what: String,
+    /// minutes without input before the node takes work again (`lease.conf user_idle_min`)
+    pub idle_min: u32,
+}
+
+impl UserSense {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"present\":{},\"idle_ms\":{},\"what\":{},\"idle_min\":{}}}",
+            self.present,
+            self.idle_ms.map_or("null".to_string(), |m| m.to_string()),
+            json_str(&self.what),
+            self.idle_min
+        )
+    }
+
+    pub fn parse(v: &makepad_strict_json::Value) -> Option<UserSense> {
+        v.get("present")?;
+        Some(UserSense {
+            present: v.get("present").and_then(|x| x.as_bool()).unwrap_or(false),
+            idle_ms: v.get("idle_ms").and_then(num).map(|m| m as u64),
+            what: v.get("what").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            idle_min: v.get("idle_min").and_then(num).unwrap_or(0.0) as u32,
+        })
+    }
+
+    /// `user (key from its device 40 s ago)`.
+    pub fn line(&self) -> String {
+        let ago = self.idle_ms.map_or(String::new(), |m| format!(" {} ago", if m >= 60_000 { format!("{} min", m / 60_000) } else { format!("{} s", m / 1000) }));
+        format!("user ({}{ago})", if self.what.is_empty() { "input" } else { &self.what })
+    }
+}
+
+/// The master-node protocol this build speaks: raised when the master starts sending a node word
+/// older hubs lack (ship-done, lease-owns, hub-restart: 1). A hub that reports an older one gets
+/// no leases until the self-update restarts it.
+pub const HUB_PROTO: u32 = 1;
 
 impl Caps {
     pub fn role(&self) -> Role {
@@ -184,7 +246,8 @@ impl Caps {
             .collect();
         let slots: Vec<String> = self.slots.iter().map(|(k, n)| format!("\"{}\":{n}", k.as_str())).collect();
         format!(
-            "{{\"node\":{},\"arch\":{},\"os\":{},\"cpu\":{},\"cores\":{},\"cpu_pct\":{},\"load1\":{:.2},\"ram_gb\":{:.1},\"ram_avail_gb\":{:.1},\"disk_free_gb\":{:.1},\"disk_total_gb\":{:.1},\"gpus\":[{}],\"display\":{},\"battery\":{},\"role\":\"{}\",\"spec\":{},\"slots\":{{{}}},\"disk_floor_gb\":{:.0},\"disk_warn_gb\":{:.0},\"timed\":{},\"apply\":{},\"desk_link\":{},\"dev_req\":{},\"tree\":{}}}",
+            "{{\"rustc\":{},\"node\":{},\"arch\":{},\"os\":{},\"cpu\":{},\"cores\":{},\"cpu_pct\":{},\"load1\":{:.2},\"ram_gb\":{:.1},\"ram_avail_gb\":{:.1},\"disk_free_gb\":{:.1},\"disk_total_gb\":{:.1},\"gpus\":[{}],\"display\":{},\"battery\":{},\"role\":\"{}\",\"spec\":{},\"slots\":{{{}}},\"disk_floor_gb\":{:.0},\"disk_warn_gb\":{:.0},\"timed\":{},\"apply\":{},\"desk_link\":{},\"dev_req\":{},\"tree\":{},\"hub_rev\":{},\"hub_proto\":{},\"services\":{{{}}},\"user\":{}}}",
+            json_str(&self.rustc),
             json_str(&self.node),
             json_str(&self.arch),
             json_str(&self.os),
@@ -209,6 +272,10 @@ impl Caps {
             self.desk_link.as_ref().map_or("null".to_string(), |d| d.to_json()),
             match self.dev_req { Some(true) => "true", Some(false) => "false", None => "null" },
             json_str(&self.tree),
+            json_str(&self.hub_rev),
+            self.hub_proto,
+            self.services.iter().map(|(n, t)| format!("{}:{t}", json_str(n))).collect::<Vec<_>>().join(","),
+            self.user.as_ref().map_or("null".to_string(), |u| u.to_json()),
         )
     }
 
@@ -238,6 +305,14 @@ impl Caps {
             desk_link: v.get("desk_link").and_then(crate::embed::DeskLinkState::parse),
             dev_req: v.get("dev_req").and_then(|x| x.as_bool()),
             tree: s("tree"),
+            hub_rev: s("hub_rev"),
+            rustc: s("rustc"),
+            hub_proto: f("hub_proto") as u32,
+            services: match v.get("services") {
+                Some(makepad_strict_json::Value::Obj(o)) => o.iter().filter_map(|(k, x)| num(x).map(|t| (k.clone(), t as u64))).collect(),
+                _ => Vec::new(),
+            },
+            user: v.get("user").and_then(UserSense::parse),
             ..Default::default()
         };
         if let Some(a) = v.get("gpus").and_then(|x| x.as_arr()) {
@@ -425,9 +500,14 @@ mod tests {
             desk_link: Some(crate::embed::DeskLinkState { on: true, port: 8790, note: "listens on 10.0.0.201:8790".into() }),
             dev_req: Some(true),
             tree: format!("{},{}", "a".repeat(40), "c".repeat(40)),
+            rustc: "1.97.1".into(),
+            hub_rev: "b".repeat(40),
+            hub_proto: HUB_PROTO,
+            services: vec![("ai-hub".into(), 1_700_000_000_000)],
+            user: Some(UserSense { present: true, idle_ms: Some(42_000), what: "key from its device".into(), idle_min: 3 }),
         };
         assert_eq!(Caps::parse(&c.to_json()), Some(c.clone()));
-        let none = Caps { desk_link: None, ..c };
+        let none = Caps { desk_link: None, user: None, ..c };
         assert_eq!(Caps::parse(&none.to_json()), Some(none));
     }
 }

@@ -9,6 +9,7 @@ use crate::library::{self, Document};
 use makepad_score_live::{source, templates, tools, NoSamples, RenderOpts};
 use makepad_strict_json::{self as json, Value as Json};
 use makepad_widgets::*;
+use makepad_widgets::makepad_platform::thread::SignalToUI;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -58,6 +59,33 @@ pub struct Jobs {
     loaded: usize,
 }
 
+/// A job's way back to its call. A job that never gets to answer (its
+/// thread did not start, its work panicked) answers that when this drops,
+/// so the call does not wait for ever.
+struct JobAnswer {
+    id: u64,
+    tx: Option<Sender<(u64, JobResult)>>,
+}
+
+impl JobAnswer {
+    fn send(mut self, result: JobResult) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send((self.id, result));
+            // The app may be asleep, with nothing else to wake it.
+            SignalToUI::set_ui_signal();
+        }
+    }
+}
+
+impl Drop for JobAnswer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send((self.id, Err("the job stopped before it had an answer".into())));
+            SignalToUI::set_ui_signal();
+        }
+    }
+}
+
 impl Jobs {
     pub fn spawn(&mut self, work: impl FnOnce() -> JobResult + Send + 'static) -> u64 {
         if self.tx.is_none() {
@@ -69,13 +97,8 @@ impl Jobs {
         let id = self.next;
         let Some(tx) = self.tx.clone() else { return id };
         self.running.push(id);
-        let spawned = std::thread::Builder::new().name("synth-job".into()).spawn(move || {
-            let _ = tx.send((id, work()));
-        });
-        if spawned.is_err() {
-            self.running.retain(|r| *r != id);
-            self.done.insert(id, Err("no thread for the job".into()));
-        }
+        let answer = JobAnswer { id, tx: Some(tx) };
+        std::thread::Builder::new().name("synth-job".into()).spawn(move || answer.send(work())).ok();
         id
     }
 
@@ -407,6 +430,11 @@ impl Desk {
                 self.transport(play);
                 self.frame = cx.new_next_frame();
                 ok(json::obj(vec![("playing", Json::Bool(play))]))
+            }
+            "score_rewind" => {
+                self.rewind();
+                self.frame = cx.new_next_frame();
+                ok(json::obj(vec![("playing", Json::Bool(self.engine.playing())), ("beat", Json::Int(0))]))
             }
             "score_status" => {
                 use makepad_score_player::Meters;

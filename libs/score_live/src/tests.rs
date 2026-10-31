@@ -1543,3 +1543,191 @@ fn a_keyboard_plays_its_loop_while_the_transport_is_stopped_and_the_pedal_holds(
     assert!(peak(&up[2_000..]) < 1e-3, "the pedal up lets it go");
     makepad_audio_engine::feed::forget_instance(&instance.name);
 }
+
+/// A rewind is a first start: through a host root like the apps', with the
+/// composer on the root's clock, what plays after it (running or stopped) is
+/// what played from the first start, sample for sample, though the old run
+/// left voices, echoes and a later beat behind.
+#[test]
+fn a_rewind_sounds_as_the_first_start() {
+    use crate::live::{ClockSource, LiveConfig, LiveScore};
+    use crate::player::live_node;
+    use makepad_audio_engine::nodes::descriptor;
+    use makepad_audio_engine::schedule::{compile, AudioBudget, ClockChunk, Schedule};
+    use makepad_flow::live::plan::OwnerSlice;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Clock {
+        chunk: Mutex<ClockChunk>,
+        beat: Mutex<f64>,
+    }
+    impl ClockSource for Clock {
+        fn now(&self) -> Option<(f64, f64, bool)> {
+            let chunk = *self.chunk.lock().unwrap();
+            Some((*self.beat.lock().unwrap(), if chunk.bpm > 0.0 { chunk.bpm as f64 } else { 120.0 }, chunk.playing))
+        }
+        fn located(&self) -> u64 {
+            self.chunk.lock().unwrap().located as u64
+        }
+    }
+
+    const SLOT: &str = "rewind_test";
+    const TRANSPORT: &str = "rewind_test_transport";
+    const SCORE: &str = "rewind_test_score";
+    let source = crate::templates::template("techno").unwrap();
+    let doc = model::load(source).unwrap().doc;
+    let mut registry = makepad_flow::document::Registry::with_builtins();
+    makepad_audio_engine::nodes::register_nodes(&mut registry).unwrap();
+    crate::node::register(&mut registry).unwrap();
+    let transport = live_node(descriptor("Transport").unwrap(), TRANSPORT.into(), &[("bpm", Literal::Num(transport_bpm(&doc))), ("playing", Literal::Num(0.0))], &[]);
+    let score = live_node(&crate::node::descriptor(), SCORE.into(), &[("score", Literal::Str(SLOT.into()))], &[("clock", vec![(TRANSPORT.to_string(), "clock")])]);
+    let out = live_node(descriptor("AudioOutput").unwrap(), "out".into(), &[("enabled", Literal::Num(1.0))], &[("audio", vec![(SCORE.to_string(), "audio")])]);
+    let slice = OwnerSlice { owner: makepad_audio_engine::OWNER.into(), nodes: vec![transport, score, out] };
+    let compiled = compile::<NoExt, ()>(&slice, 1, 1, (1u64 << 32) | 48_000, None, &Arc::new(AudioBudget::default())).unwrap();
+    let clock_index = *compiled.layout.transports.get(TRANSPORT).unwrap() as usize;
+    let playing = compiled.layout.controls.get(&format!("{TRANSPORT}.playing")).unwrap().0;
+    let mut root: Box<Schedule<(), ()>> = compiled.schedule;
+    let slot = crate::node::slot(SLOT);
+    slot.set_doc(doc).unwrap();
+    let clock = Arc::new(Clock::default());
+    let live = LiveScore::new_pumped(LiveConfig { instance: SLOT.into(), lookahead: 0.15, clock: clock.clone() }, TRANSPORT);
+    live.set_source(source);
+    live.pump();
+    let set_playing = |root: &mut Schedule<(), ()>, on: bool| {
+        root.controls.set_manual(playing, if on { 1.0 } else { 0.0 });
+        clock.chunk.lock().unwrap().playing = on;
+    };
+    let pass = |root: &mut Schedule<(), ()>, out: &mut Vec<f32>| {
+        live.pump();
+        slot.pump().unwrap();
+        run(root, CHUNK, &mut |cue, l, _| {
+            if !cue {
+                out.extend_from_slice(&l[..CHUNK]);
+            }
+        }, &mut NoExt);
+        let chunk = root.clocks[clock_index];
+        *clock.beat.lock().unwrap() = chunk.tempo.end_beat(CHUNK);
+        *clock.chunk.lock().unwrap() = chunk;
+    };
+    let passes = 3 * 48_000 / CHUNK;
+
+    // The first start.
+    set_playing(&mut root, true);
+    let mut first = Vec::new();
+    for _ in 0..passes {
+        pass(&mut root, &mut first);
+    }
+    let end = *clock.beat.lock().unwrap();
+    let loudest = first.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+    assert!(loudest > 0.05, "the score is silent ({loudest})");
+    // From the second pass: the root's output gate opens over its first.
+    let same = |what: &str, again: &[f32], from: usize| {
+        assert_eq!(first.len(), again.len());
+        let apart = first.iter().zip(again).enumerate().skip(from).find(|(_, (x, y))| (*x - *y).abs() >= 1e-6);
+        assert!(apart.is_none(), "{what}: at (frame, (first start, now)) {apart:?}");
+        assert!((*clock.beat.lock().unwrap() - end).abs() < 1e-6, "{what}: the beat counts from 0");
+    };
+
+    // Rewound while it plays, well into the piece.
+    let mut scratch = Vec::new();
+    for _ in 0..passes {
+        pass(&mut root, &mut scratch);
+    }
+    let located = clock.located();
+    live.rewind(TRANSPORT);
+    let mut again = Vec::new();
+    for _ in 0..passes {
+        pass(&mut root, &mut again);
+    }
+    assert_eq!(clock.located(), located + 1);
+    same("rewound playing", &again, CHUNK);
+
+    // Rewound stopped: it stays stopped at 0, and the next play is the first start.
+    set_playing(&mut root, false);
+    for _ in 0..8 {
+        pass(&mut root, &mut scratch);
+    }
+    live.rewind(TRANSPORT);
+    for _ in 0..8 {
+        pass(&mut root, &mut scratch);
+        assert!(!clock.chunk.lock().unwrap().playing);
+    }
+    assert_eq!(*clock.beat.lock().unwrap(), 0.0, "stopped at the top");
+    live.pump();
+    assert_eq!(live.status().beat, 0.0);
+    set_playing(&mut root, true);
+    let mut again = Vec::new();
+    for _ in 0..passes {
+        pass(&mut root, &mut again);
+    }
+    // Its gain stages opened while it stood, as before a first play in an
+    // app; the first start above opened them as it began.
+    same("rewound stopped", &again, 8 * CHUNK);
+}
+
+/// A score playing `ctor` as `inst` (`code` its loop's).
+fn plays(ctor: &str, code: &str) -> String {
+    format!("use mod.score.*\nlet clock = Clock{{bpm: 120}}\nlet inst = {ctor}\nlet line = Loop{{play: inst beats: 4 code: fn(i) {{ {code} }}}}\nScore{{clock inst line}}\n")
+}
+
+const A_NOTE: &str = "play(@c4, {dur: 0.5}) sleep(1)";
+
+#[test]
+fn every_node_type_a_score_reads_is_defined() {
+    let fx = ["Lowpass", "Highpass", "Bandpass", "Delay", "Reverb", "Drive", "Crush", "Chorus", "Comp", "Duck", "Bus", "Limiter", "Eq", "Width", "Isolator", "DjFilter"];
+    for ty in crate::instruments::INSTRUMENT_TYPES.iter().chain(&model::STREAM_TYPES).chain(&fx) {
+        assert!(crate::vm::NODE_TYPES.contains(ty), "`{ty}` is not defined in a score");
+        assert!(!crate::assist::fields_of(ty).is_empty() || matches!(*ty, "Bus"), "`{ty}` lists no fields");
+    }
+}
+
+#[test]
+fn every_instrument_type_loads_and_plays() {
+    use crate::instruments::INSTRUMENT_TYPES;
+    use makepad_score_player::Sample;
+    use std::sync::Arc;
+    struct Tone;
+    impl crate::build::Samples for Tone {
+        fn sample(&self, _asset: &model::AssetRef) -> Option<Arc<Sample>> {
+            let left: Vec<f32> = (0..24_000).map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()).collect();
+            Some(Arc::new(Sample::new(left.into(), None, 48_000.0)))
+        }
+    }
+    for ty in INSTRUMENT_TYPES {
+        let ctor = match ty {
+            "Synth" => "Synth{preset: @pluck}",
+            "Drums" => "Drums{kit: @analog_hybrid}",
+            "Sampler" => "Sampler{src: asset(\"tone\", \"1\") root: @a4}",
+            "Ironfish" => "Ironfish{}",
+            "Morph" => "Morph{}",
+            "Tandem" => "Tandem{}",
+            "Shader" => "Shader{lib: @supersaw}",
+            "Voice" => "Voice{profile: @alto}",
+            "Instrument" => "Instrument{kind: @piano}",
+            other => panic!("`{other}`: an instrument type this test does not play yet"),
+        };
+        let code = match ty {
+            "Voice" => "sleep(sing([@c4 @e4], \"la la\", {dur: 0.5}))",
+            "Drums" => "hit(@kick) sleep(1)",
+            _ => A_NOTE,
+        };
+        let src = plays(ctor, code);
+        let doc = model::ScoreDoc::load(&src).unwrap_or_else(|d| panic!("{ty}: {d:?}"));
+        assert_eq!(crate::graph::project(&doc).nodes.iter().find(|n| n.id == "inst").map(|n| n.role), Some("inst"), "{ty}");
+        let opts = RenderOpts { seconds: Some(2.0), seed: Some(1), ..RenderOpts::default() };
+        let rendered = render(&src, &opts, &Tone).unwrap_or_else(|d| panic!("{ty}: {d:?}"));
+        assert!(peak(&rendered.left).max(peak(&rendered.right)) > 0.001, "{ty} is silent");
+    }
+}
+
+#[test]
+fn a_library_patch_plays_or_says_the_library_is_missing() {
+    let src = plays("Tandem{patch: \"FX/Rather Low\"}", A_NOTE);
+    let doc = model::ScoreDoc::load(&src).unwrap_or_else(|d| panic!("{d:?}"));
+    let installed = crate::tandem_library::active().is_some();
+    assert_eq!(doc.lacks_patch_library(), !installed, "the desk's install message follows the library");
+    let opts = RenderOpts { seconds: Some(2.0), seed: Some(1), ..RenderOpts::default() };
+    let rendered = render(&src, &opts, &NoSamples).unwrap_or_else(|d| panic!("{d:?}"));
+    assert!(peak(&rendered.left).max(peak(&rendered.right)) > 0.001, "silent (library installed: {installed})");
+}

@@ -174,6 +174,8 @@ pub struct ClockChunk {
     pub bpm: f32,
     /// The pass's beats exactly, tempo changes inside it included.
     pub tempo: makepad_score_player::Tempo,
+    /// Locates the transport has done (it changes on the pass of one).
+    pub located: u32,
 }
 
 /// `X` is an extension's node state (the decks of Stage's audio owner).
@@ -283,6 +285,8 @@ pub struct TransportState {
     /// The tempo playing came from the map (not the bpm control): the
     /// control is written back so a host reading it sees the tempo.
     pub mapped: bool,
+    /// Locates done (`TempoEvent::locate`).
+    pub located: u32,
 }
 
 impl LoopState {
@@ -704,7 +708,7 @@ pub fn compile<E: Ext, B: Default>(slice: &OwnerSlice, generation: u64, incarnat
                     // A transport that carries its state over keeps its feed.
                     feed: (!base.filter(|base| base.rate == rate).is_some_and(|base| base.nodes.iter().any(|old| old.id == node.id && old.type_name == "Transport")))
                         .then(|| crate::feed::tempo_feed(&node.id).fresh()),
-                    pending: Vec::with_capacity(crate::feed::TEMPO_EVENTS), ramp: None, mapped: false,
+                    pending: Vec::with_capacity(crate::feed::TEMPO_EVENTS), ramp: None, mapped: false, located: 0,
                 })));
                 ops.push(Op::Transport { state, clock, bpm, playing, probe, mapped });
             }

@@ -200,10 +200,20 @@ pub struct WindowOverlay {
     pub frame: Option<u64>,
     /// the window layer's texture (NONE: an opaque panel)
     pub layer: Id,
+    /// a window layer that takes the window's input from the borrower (a panel always does)
+    pub input: bool,
     /// The executor composes this opaque panel as the window's layer (`Gpu::overlays` false: the
     /// backend draws no panels itself): while it is up the borrower's frames render into the
     /// window's retained image and never reach the window; only the panel's frames present.
     pub composed: bool,
+}
+
+impl WindowObj {
+    /// Whether session 0 gets the input of this lent window: the borrower has not presented yet,
+    /// or a panel or a layer that takes input is over it.
+    fn host_has_input(&self) -> bool {
+        !self.borrower_presented || self.overlay.as_ref().is_some_and(|o| o.layer.is_none() || o.input)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -247,6 +257,8 @@ pub struct WindowObj {
     /// and the badge's rect (window points), and whether the pointer is over it.
     pub badge_hover: Option<(Id, [f32; 4])>,
     pub badge_hovered: bool,
+    /// That badge takes a press (`window_style::BADGE_PRESS`).
+    pub badge_press: bool,
     /// Session 0's window: its badge layer (`target::BADGES`), drawn over every frame it presents.
     pub badges: Option<std::sync::Arc<KeptFrame>>,
     /// Session 0's window: the backend has its layer on (`Gpu::badge_layer`) for its badges or a
@@ -384,6 +396,9 @@ pub struct Stats {
     /// (`exec::clamped_pass`; a pass is sized as its target, so any is a caller's bug)
     pub clamped_passes: u64,
     pub frames: u64,
+    /// frames of this session that reached one of its windows, and the newest
+    pub window_frames: u64,
+    pub last_window_frame: u64,
     /// a control command from a session that may not use it, or about a session that is not its
     /// child (rejected)
     pub denied: u64,
@@ -884,7 +899,14 @@ impl World {
 
     /// A physical window actually received this frame. A skipped drawable or a texture-only
     /// packet may complete GPU work, but must not open the host's first-presentation gate.
-    pub fn window_presented(&mut self, sid: u32, target: Id, _frame: u64, _gpu_ns: u64, _present_ns: u64) {
+    pub fn window_presented(&mut self, sid: u32, target: Id, frame: u64, _gpu_ns: u64, _present_ns: u64) {
+        if let Some(stats) = self.sessions.get_mut(&sid).map(|s| &mut s.stats) {
+            // a backend reports a frame on its completion and on its present, in any order
+            if frame > stats.last_window_frame {
+                stats.last_window_frame = frame;
+                stats.window_frames += 1;
+            }
+        }
         let wid = if sid == HOST { Some(target) } else {
             self.session(sid).and_then(|s| s.windows.get(sid, target).ok()).and_then(|w| w.val.alias_of)
         };
@@ -1373,6 +1395,9 @@ impl World {
         }
         if let Some(hid) = alias {
             self.badge_hover(hid, &event, payload);
+            if self.badge_pressed(hid, &event, payload) {
+                return;
+            }
         }
         use crate::events::event_tag as tag;
         let input = matches!(event.tag, tag::MouseDown | tag::MouseMove | tag::MouseUp | tag::MouseLeave
@@ -1380,13 +1405,35 @@ impl World {
             | tag::Focus | tag::CloseRequested | tag::PopupDismissed
             | tag::DragQuery | tag::DragOver | tag::DragDrop);
         let host = alias.filter(|_| input).filter(|id| self.session(HOST)
-                .and_then(|s| s.windows.get(HOST, *id).ok()).is_some_and(|w|
-                    !w.val.borrower_presented || w.val.overlay.as_ref().is_some_and(|o| o.layer.is_none())));
-        let recipient = if let Some(id) = host { event.window = id; HOST } else { sid };
+                .and_then(|s| s.windows.get(HOST, *id).ok()).is_some_and(|w| w.val.host_has_input()));
+        // the system's quit has no window: session 0 answers it for a borrower its view is over
+        let quit = matches!(event.decode(payload), Some(crate::HalEvent::Lifecycle { kind: crate::types::lifecycle::QUIT_REQUESTED }))
+            && sid != HOST && self.session(HOST).is_some_and(|h| h.windows.keys_of(HOST).into_iter()
+                .any(|id| h.windows.get(HOST, id).is_ok_and(|w| w.lent_to == sid && w.val.host_has_input())));
+        let recipient = if let Some(id) = host { event.window = id; HOST } else if quit { HOST } else { sid };
         self.to_session(recipient, |q| {
             event.data = q.put_bytes(payload);
             q.push(event);
         });
+    }
+
+    /// A press on lent window `hid`'s badge that takes presses (`window_style::BADGE_PRESS`): it
+    /// goes to session 0 as an event of the badge. True: it is not the window owner's.
+    fn badge_pressed(&mut self, hid: Id, event: &RawEvent, payload: &[u8]) -> bool {
+        let Some(crate::HalEvent::MouseDown { x, y, .. }) = event.decode(payload) else { return false };
+        let Some(w) = self.session(HOST).and_then(|s| s.windows.get(HOST, hid).ok()) else { return false };
+        let Some((badge, [bx, by, bw, bh])) = w.val.badge_hover.filter(|_| w.val.badge_press) else { return false };
+        let (fx, fy) = (x as f32, y as f32);
+        if !(fx >= bx && fy >= by && fx < bx + bw && fy < by + bh) {
+            return false;
+        }
+        let mut copy = *event;
+        copy.window = badge;
+        self.to_session(HOST, |q| {
+            copy.data = q.put_bytes(payload);
+            q.push(copy);
+        });
+        true
     }
 
     /// The pointer over lent window `hid`'s hover badge (`window_style::BADGE_HOVER`): session 0

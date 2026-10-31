@@ -1454,6 +1454,7 @@ fn shape_geo_kind(geom: &ShapeGeometry) -> i32 {
         ShapeGeometry::Hull(_) => 3,
         ShapeGeometry::Mesh(_) => 4,
         ShapeGeometry::Sphere(_) => 5,
+        ShapeGeometry::Tube(_) => 6,
     }
 }
 
@@ -1515,6 +1516,7 @@ fn ser_shapes(buf: &mut RecBuffer, world: &World, rec: &mut Recording) {
                 buf.w_vec3(capsule.center2);
                 buf.w_f32(capsule.radius);
             }
+            ShapeGeometry::Tube(tube) => buf.w_tube(tube),
             ShapeGeometry::Hull(hull) => {
                 let gid = rec_intern_hull(rec, hull);
                 buf.w_u32(gid);
@@ -1612,6 +1614,13 @@ fn des_shapes(r: &mut RecCursor, world: &mut World, rdr: &RecReader) {
                 let center2 = r.r_vec3();
                 let radius = r.r_f32();
                 shape.geom = ShapeGeometry::Capsule(crate::types::Capsule { center1, center2, radius });
+            }
+            6 => {
+                let tube = r.r_tube();
+                if !r.ok {
+                    break;
+                }
+                shape.geom = ShapeGeometry::Tube(Arc::new(tube));
             }
             3 => {
                 // hull: cloned into the world DB via the registry slot

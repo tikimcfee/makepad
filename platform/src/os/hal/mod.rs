@@ -169,6 +169,8 @@ pub struct HalClient {
     pub(crate) focused: Option<WindowId>,
     /// frames the HAL answered with `FrameDone`
     pub(crate) frames_done: u64,
+    /// the GPU profiler's last answer (`Cx::gpu_prof_recording`)
+    pub(crate) gpu_prof: Option<makepad_gpu_trace::Recording>,
     /// file dialogs the HAL was asked for and has not answered: request id -> what to post
     pub(crate) dialogs: HashMap<u32, PendingDialog>,
     pub(crate) next_dialog: u32,
@@ -242,6 +244,7 @@ impl Default for HalClient {
             wake: false,
             focused: None,
             frames_done: 0,
+            gpu_prof: None,
             dialogs: HashMap::new(),
             next_dialog: 0,
             next_domain_request: 0,

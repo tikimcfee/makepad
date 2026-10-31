@@ -79,8 +79,8 @@ impl f64 {
     pub fn hypot(self, other: f64) -> f64 { unsafe { libm::hypot(self, other) } }
     pub fn log(self, base: f64) -> f64 { self.ln() / base.ln() }
     pub fn sin_cos(self) -> (f64, f64) { (self.sin(), self.cos()) }
-    pub fn asinh(self) -> f64 { let ax = self.abs(); let ix = 1.0 / ax; (ax + (ax / ((1.0 as f64).hypot(ix) + ix))).ln_1p().copysign(self) }
-    pub fn acosh(self) -> f64 { if self < 1.0 { f64::NAN } else { (self + ((self - 1.0).sqrt() * (self + 1.0).sqrt())).ln() } }
+    pub fn asinh(self) -> f64 { unsafe { libm::asinh(self) } }
+    pub fn acosh(self) -> f64 { unsafe { libm::acosh(self) } }
     pub fn atanh(self) -> f64 { 0.5 * ((2.0 * self) / (1.0 - self)).ln_1p() }
     pub const fn to_degrees(self) -> f64 { self * (180.0f64 / crate::f64::consts::PI) }
     pub const fn to_radians(self) -> f64 { self * (crate::f64::consts::PI / 180.0) }
@@ -168,8 +168,8 @@ impl f32 {
     pub fn hypot(self, other: f32) -> f32 { unsafe { libm::hypotf(self, other) } }
     pub fn log(self, base: f32) -> f32 { self.ln() / base.ln() }
     pub fn sin_cos(self) -> (f32, f32) { (self.sin(), self.cos()) }
-    pub fn asinh(self) -> f32 { let ax = self.abs(); let ix = 1.0 / ax; (ax + (ax / ((1.0 as f32).hypot(ix) + ix))).ln_1p().copysign(self) }
-    pub fn acosh(self) -> f32 { if self < 1.0 { f32::NAN } else { (self + ((self - 1.0).sqrt() * (self + 1.0).sqrt())).ln() } }
+    pub fn asinh(self) -> f32 { unsafe { libm::asinhf(self) } }
+    pub fn acosh(self) -> f32 { unsafe { libm::acoshf(self) } }
     pub fn atanh(self) -> f32 { 0.5 * ((2.0 * self) / (1.0 - self)).ln_1p() }
     pub const fn to_degrees(self) -> f32 { const PIS_IN_180: f32 = 57.2957795130823208767981548141051703_f32; self * PIS_IN_180 }
     pub const fn to_radians(self) -> f32 { self * (crate::f32::consts::PI / 180.0f32) }

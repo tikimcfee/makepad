@@ -20,8 +20,11 @@ extern "C" {
     pub fn log2(x: f64) -> f64;
     pub fn log10(x: f64) -> f64;
     pub fn log1p(x: f64) -> f64;
-    pub fn pow(x: f64, y: f64) -> f64;
+    #[cfg(not(target_os = "linux"))]
     pub fn cbrt(x: f64) -> f64;
+    pub fn pow(x: f64, y: f64) -> f64;
+    pub fn asinh(x: f64) -> f64;
+    pub fn acosh(x: f64) -> f64;
     #[cfg(not(windows))]
     pub fn hypot(x: f64, y: f64) -> f64;
     // the Universal C Runtime names them _hypot / _hypotf (real std's cmath.rs on msvc)
@@ -50,6 +53,8 @@ extern "C" {
     pub fn log1pf(x: f32) -> f32;
     pub fn powf(x: f32, y: f32) -> f32;
     pub fn cbrtf(x: f32) -> f32;
+    pub fn asinhf(x: f32) -> f32;
+    pub fn acoshf(x: f32) -> f32;
     #[cfg(not(windows))]
     pub fn hypotf(x: f32, y: f32) -> f32;
     #[cfg(windows)]
@@ -60,8 +65,12 @@ extern "C" {
     pub fn fmodf(x: f32, y: f32) -> f32;
 }
 
-#[cfg(relax_web)]
+#[cfg(any(relax_web, target_os = "linux"))]
 mod math;
+// a rustc build's `cbrt` on Linux is this one's bits, not glibc's (a few ulps apart, measured
+// against 1.98); on a Mac it is the platform's
+#[cfg(all(not(relax_web), target_os = "linux"))]
+pub use self::math::cbrt;
 #[cfg(relax_web)]
 pub use self::math::{
     sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, exp, exp2, expm1, log, log2, log10, log1p, pow, cbrt, hypot, round, fma, fmod, sinf, cosf, tanf, asinf, acosf, atanf, atan2f, sinhf, coshf, tanhf, expf, exp2f, expm1f, logf, log2f, log10f, log1pf, powf, cbrtf, hypotf, roundf, fmaf, fmodf

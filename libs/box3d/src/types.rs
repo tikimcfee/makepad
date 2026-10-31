@@ -72,6 +72,14 @@ pub struct WorldDef {
     /// Maximum linear speed. Usually meters per second.
     pub maximum_linear_speed: f32,
 
+    /// Contact points are made for shapes closer than this (length units); 0 = the default 4 * linear slop.
+    /// Raise it for small fast bodies (a larger value costs more contact points, never correctness).
+    pub speculative_distance: f32,
+
+    /// Contact stiffness is capped at this fraction of the substep rate (0 = the default 1/8). Stiff stacks
+    /// of light bodies (hanging chainmail) hold with up to 1/4.
+    pub contact_hertz_ratio: f32,
+
     /// Optional mixing callback for friction. The default uses sqrt(frictionA * frictionB).
     pub friction_callback: Option<FrictionCallback>,
 
@@ -150,6 +158,8 @@ pub fn default_world_def() -> WorldDef {
         contact_damping_ratio: 10.0,
         // 400 meters per second, faster than the speed of sound
         maximum_linear_speed: 400.0 * length_units,
+        speculative_distance: 0.0,
+        contact_hertz_ratio: 0.0,
         friction_callback: None,
         restitution_callback: None,
         enable_sleep: true,
@@ -348,10 +358,12 @@ pub enum ShapeType {
     Mesh = 4,
     /// A sphere with an offset
     Sphere = 5,
+    /// A closed polyline swept by a sphere.
+    Tube = 6,
 }
 
 /// The number of shape types.
-pub const SHAPE_TYPE_COUNT: usize = 6;
+pub const SHAPE_TYPE_COUNT: usize = 7;
 
 /// Used to create a shape.
 #[derive(Clone, Debug)]
@@ -1493,6 +1505,27 @@ pub struct Capsule {
     pub radius: f32,
 }
 
+/// A closed polyline swept by a sphere, with 3 to 64 local points.
+/// Segment i joins points[i] to points[(i + 1) % points.len()].
+/// Mass properties sum the segment capsules, ignoring overlap at the joints.
+#[derive(Clone, Debug, Default)]
+pub struct Tube {
+    /// The vertices of the closed loop; do not repeat the first point at the end.
+    pub points: Vec<Vec3>,
+    /// The radius of every segment capsule.
+    pub radius: f32,
+}
+
+impl Tube {
+    pub(crate) fn segment(&self, i: usize) -> Capsule {
+        Capsule {
+            center1: self.points[i],
+            center2: self.points[(i + 1) % self.points.len()],
+            radius: self.radius,
+        }
+    }
+}
+
 /// A hull vertex. Identified by a half-edge with this vertex as its tail.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HullVertex {
@@ -2011,7 +2044,7 @@ pub struct ManifoldPoint {
     /// Uniquely identifies a contact point between two shapes.
     pub feature_id: u32,
 
-    /// Triangle index if one of the shapes is a mesh or height field.
+    /// Triangle index for mesh/height contacts, or segment-pair key for tube contacts.
     pub triangle_index: i32,
 
     /// Did this contact point exist in the previous step?

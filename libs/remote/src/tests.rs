@@ -279,6 +279,9 @@ fn resume_replays_the_ring_with_a_drop_marker() {
     assert_eq!(u64::from_le_bytes(next[..8].try_into().unwrap()), 45);
 }
 
+/// The tests that emit on [`shared`]'s watch and read its feed take turns: one sees the other's records.
+pub(crate) static WATCH_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     static S: OnceLock<(Endpoint, crate::watch::WatchSink)> = OnceLock::new();
     S.get_or_init(|| {
@@ -294,6 +297,7 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
 
 #[test]
 fn unix_end_to_end_with_discovery_and_reconnect() {
+    let _turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let me = std::process::id();
     let app = crate::discovery::find(&me.to_string()).expect("discovery file");
@@ -311,7 +315,8 @@ fn unix_end_to_end_with_discovery_and_reconnect() {
     }
     // a feed continues after the link is dropped: nothing lost, nothing twice
     let mut feed = client.watch();
-    assert!(feed.next(Duration::from_millis(100), 3).unwrap().is_none());
+    let nothing = feed.next(Duration::from_millis(100), 3).unwrap();
+    assert!(nothing.is_none(), "{nothing:?}");
     watch.emit("{\"event\":\"a\"}");
     watch.emit("{\"event\":\"b\"}");
     let a = feed.next(WAIT, 3).unwrap().unwrap();

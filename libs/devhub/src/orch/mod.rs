@@ -5,6 +5,9 @@
 //! - [`verify`]: the rolling full verifier of the newest landed work + main pair;
 //! - [`allapps`]: `makepad check` of every app, example and WM package, hourly when idle;
 //! - [`push`]: the collapsed push of the newest verified tip to origin/work, only when asked;
+//! - [`live`]: a long-running app on a box that the worktree's edits hot-patch into;
+//! - [`roll`]: the self-update of the hubs, the WM-supervised services and the master itself;
+//! - [`show`]: the latest landed build of an app on one of the user's display devices, tracked;
 //! - [`after`]: `devhub after <condition> -- <cmd>`, run once the condition holds;
 //!
 //! Their state is [`crate::state`] (shared with `devhub land` and `lanes`); every change is an
@@ -18,9 +21,14 @@ pub mod ci_status;
 pub mod cli;
 pub mod job;
 pub mod lane;
+pub mod live;
 pub mod push;
+pub mod roll;
+pub mod show;
 pub mod leg;
 pub mod verify;
+#[cfg(all(test, unix))]
+mod restart_tests;
 
 use crate::lease::master::LeaseMaster;
 use crate::state::{Pair, Store};
@@ -30,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The control services of the jobs (`cli` talks to them).
-pub const SERVICES: [&str; 8] = ["lane", "job", "verify", "after", "allapps", "push", "state", "ci"];
+pub const SERVICES: [&str; 10] = ["lane", "job", "live", "show", "verify", "after", "allapps", "push", "state", "ci"];
 
 /// What every job has: the state, the leases, the checkout the master serves.
 pub struct Ctx {
@@ -59,6 +67,10 @@ impl Ctx {
 
 /// The checkout this master was built from: the one it serves.
 pub fn repo() -> PathBuf {
+    #[cfg(test)]
+    if let Some(r) = std::env::var_os("DEVHUB_TEST_REPO") {
+        return r.into();
+    }
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
@@ -75,7 +87,13 @@ pub fn start(ep: &makepad_remote::Endpoint, machine: &str, leases: Arc<LeaseMast
         let c = ctx.clone();
         ep.register(svc, 1, makepad_remote::lines::service(svc, Arc::new(move |line, out| serve(&c, svc, line, out))));
     }
-    let _ = CTX.set(ctx.clone());
+    let _ = CTX.set(ctx);
+}
+
+/// Starts the workflow threads, once the control socket listens: they ask for leases on it, and a
+/// job that asked before it was there failed for good (J389-J393, 2026-10-31).
+pub fn go() {
+    let Some(ctx) = ctx().cloned() else { return };
     let c = ctx.clone();
     let _ = std::thread::Builder::new().name("devhub-preempt".into()).spawn(move || {
         let mut last = 0;
@@ -86,6 +104,12 @@ pub fn start(ep: &makepad_remote::Endpoint, machine: &str, leases: Arc<LeaseMast
     });
     lane::start(ctx.clone());
     job::start(ctx.clone());
+    show::start(ctx.clone());
+    // the commit this master runs, read at its start (the checkout moves on)
+    let _ = crate::lease::caps::hub_rev();
+    roll::start(ctx.clone());
+    live::start(ctx.clone());
+    ci::start(&ctx);
     verify::start(ctx.clone());
     ci_status::start(ctx.clone());
     after::start(ctx.clone());
@@ -108,7 +132,7 @@ pub fn leases() -> Option<Arc<LeaseMaster>> {
 pub const PREEMPT_AFTER_MS: u64 = 30_000;
 
 /// The arch and os a lease's needs ask for, in caps' words (`x64` is `x86_64`).
-fn fits(needs: &[(String, String)], caps: Option<&crate::lease::Caps>) -> bool {
+pub(crate) fn fits(needs: &[(String, String)], caps: Option<&crate::lease::Caps>) -> bool {
     let Some(c) = caps else { return false };
     needs.iter().all(|(k, v)| match k.as_str() {
         "arch" => {
@@ -129,15 +153,21 @@ fn fits(needs: &[(String, String)], caps: Option<&crate::lease::Caps>) -> bool {
 pub fn preempt(ctx: &Ctx, last: &mut u64) {
     use crate::lease::sched::State;
     let now = crate::proto::wall_ms();
-    if now.saturating_sub(*last) < PREEMPT_AFTER_MS {
-        return;
-    }
     let view = ctx.leases.view();
-    let Some(starved) = view.iter().filter(|l| l.state == State::Queued && l.req.prio < leg::BACKGROUND_PRIO && now.saturating_sub(l.asked_ms) > PREEMPT_AFTER_MS).min_by_key(|l| l.asked_ms) else { return };
+    // a show someone waits for does not wait out the 30 s
+    let show = |l: &crate::lease::sched::Lease| l.req.agent.as_deref() == Some("devhub-show");
+    let starved = view.iter().filter(|l| l.state == State::Queued && show(l)).min_by_key(|l| l.asked_ms);
+    let starved = match starved {
+        Some(s) => Some(s),
+        None if now.saturating_sub(*last) < PREEMPT_AFTER_MS => return,
+        None => view.iter().filter(|l| l.state == State::Queued && !leg::is_background(l) && now.saturating_sub(l.asked_ms) > PREEMPT_AFTER_MS).min_by_key(|l| l.asked_ms),
+    };
+    let Some(starved) = starved else { return };
     let nodes = ctx.leases.nodes();
     let victim = view
         .iter()
         .filter(|l| matches!(l.state, State::Granted | State::Starting) && l.req.prio >= leg::BACKGROUND_PRIO)
+        // owed background work (it asked at OWED_PRIO) keeps its box
         .filter(|l| l.node.as_ref().is_some_and(|n| nodes.iter().any(|x| &x.name == n && fits(&starved.req.needs, x.caps.as_ref()))))
         .max_by_key(|l| l.granted_ms.unwrap_or(0));
     let Some(v) = victim else { return };
@@ -157,6 +187,8 @@ pub fn preempt(ctx: &Ctx, last: &mut u64) {
 pub fn on_record(r: &crate::proto::Record) {
     if let Some(ctx) = CTX.get() {
         job::on_record(ctx, r);
+        show::on_record(ctx, r);
+        live::on_record(ctx, r);
     }
 }
 
@@ -164,6 +196,8 @@ fn serve(ctx: &Arc<Ctx>, svc: &str, line: &str, out: &mut Vec<String>) {
     let r = match svc {
         "lane" => lane::serve(ctx, line),
         "job" => job::serve(ctx, line),
+        "show" => show::serve(ctx, line),
+        "live" => live::serve(ctx, line),
         "verify" => verify::serve(ctx, line),
         "after" => after::serve(ctx, line),
         "allapps" => allapps::serve(ctx, line),

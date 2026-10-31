@@ -813,7 +813,16 @@ impl LlamaSession {
     ) -> Result<Vec<f32>> {
         // A pure-text lane ropes at its within-slot index, so this is the
         // no-override case and produces exactly the layout it always did.
-        self.prefill_slot_chunk_at_rope(lane, kv_base, state_row, start, start as i64, tokens)
+        match self.prefill_slot_chunk_at_rope(lane, kv_base, state_row, start, start as i64, tokens) {
+            // A chunk's graph grows with the context behind it (tokens x keys);
+            // nothing ran yet: two smaller chunks fit where this one did not.
+            Err(error) if tokens.len() > 1 && should_retry_graph_reserve(&error) => {
+                let (head, tail) = tokens.split_at(tokens.len() / 2);
+                self.prefill_slot_chunk(lane, kv_base, state_row, start, head)?;
+                self.prefill_slot_chunk(lane, kv_base, state_row, start + head.len(), tail)
+            }
+            result => result,
+        }
     }
 
     /// [`prefill_slot_chunk`](Self::prefill_slot_chunk) for a lane whose
@@ -1397,12 +1406,20 @@ impl LlamaSession {
             return Ok(());
         }
         self.ensure_capacity(token_ids.len())?;
-        let prefill_batch_size = self.config.prefill_batch_size.max(1);
+        let mut prefill_batch_size = self.config.prefill_batch_size.max(1);
         let mut offset = 0;
         progress(0, token_ids.len());
         while offset < token_ids.len() {
             let batch_size = (token_ids.len() - offset).min(prefill_batch_size);
-            self.append_token_batch(&token_ids[offset..offset + batch_size])?;
+            match self.append_token_batch(&token_ids[offset..offset + batch_size]) {
+                // A chunk's graph grows with the context behind it (tokens x
+                // keys); nothing ran yet: smaller chunks fit where this did not.
+                Err(error) if batch_size > 1 && should_retry_graph_reserve(&error) => {
+                    prefill_batch_size = batch_size / 2;
+                    continue;
+                }
+                result => result?,
+            }
             offset += batch_size;
             progress(offset, token_ids.len());
         }

@@ -16,13 +16,45 @@ pub(super) enum Kind {
     Runner,
 }
 
+/// How the app's Cargo graph was resolved at boot, and what it resolved to.
+#[derive(Clone)]
+struct ResolvedGraph {
+    workspace: String,
+    package: String,
+    flags: Vec<String>,
+    shape: u64,
+}
+
 #[derive(Default, Clone)]
 pub struct Inputs {
     pub(super) paths: BTreeMap<String, (Stamp, Kind)>,
+    graph: Option<ResolvedGraph>,
+}
+
+/// Whether `path` lies in another OS's source tree (`src/backend/linux/..`, `src/os/windows/..`):
+/// such a file is no input of this app. Build scripts declare whole crates as their inputs, so
+/// cargo's dep-info lists these too; only the directory names tell them apart.
+fn other_os(path: &Path) -> bool {
+    const OURS: &[&str] = if cfg!(target_vendor = "apple") { &["apple", "macos", "ios"] }
+        else if cfg!(target_os = "windows") { &["windows"] }
+        else if cfg!(target_os = "android") { &["android", "linux"] }
+        else { &["linux"] };
+    path.iter().filter_map(|c| c.to_str()).skip_while(|c| *c != "src")
+        .any(|c| matches!(c, "apple" | "macos" | "ios" | "linux" | "windows" | "android") && !OURS.contains(&c))
+}
+
+/// What a resolved graph is: its units (packages with their versions, targets, features and
+/// dependency edges). A lockfile or manifest change that leaves this alone is not this app's.
+fn graph_shape(units: &crate::unitgraph::Units) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{units:?}").hash(&mut h);
+    h.finish()
 }
 
 impl Inputs {
     fn insert(&mut self, path: &Path, kind: Kind) {
+        if other_os(path) { return; }
         let path = path.to_string_lossy().into_owned();
         let stamp = super::stamp(&path);
         self.paths.insert(path, (stamp, kind));
@@ -82,6 +114,23 @@ impl Inputs {
         inputs
     }
 
+    /// The graph `units` the app was resolved to (`graph_moved` resolves it again).
+    pub fn set_graph(&mut self, workspace: &str, package: &str, flags: &[String], units: &crate::unitgraph::Units) {
+        self.graph = Some(ResolvedGraph { workspace: workspace.into(), package: package.into(), flags: flags.to_vec(), shape: graph_shape(units) });
+    }
+
+    /// Whether `path` is a manifest or lockfile of the app's graph.
+    pub(super) fn is_manifest(&self, path: &str) -> bool {
+        matches!(self.paths.get(path).map(|x| &x.1), Some(Kind::Manifest))
+    }
+
+    /// Whether the app's resolved graph differs from the one it runs (resolved again from the
+    /// manifests and the lockfile as they are now; one that does not resolve differs).
+    pub(super) fn graph_moved(&self, sess: &std::sync::Arc<crate::Session>) -> bool {
+        let Some(g) = &self.graph else { return true };
+        crate::unitgraph::unit_graph(sess, &g.workspace, &g.package, &g.flags).map_or(true, |units| graph_shape(&units) != g.shape)
+    }
+
     /// The loader binary's own sources (cargo's dep-info `<exe>.d` next to it, which lists every
     /// file the binary was built from; none for a binary not built by cargo). Outside the
     /// target directory only. A file newer than the binary has no stamp: the binary is already
@@ -97,12 +146,16 @@ impl Inputs {
             let mut out = Vec::new();
             for path in dep_info_paths(&text) {
                 if target.as_ref().is_some_and(|t| Path::new(&path).starts_with(t)) { continue; }
+                // the devhub linked into the binary (its CLI) is no part of a running app: no
+                // "Update ready" on every app for a devhub landing
+                if path.contains("/libs/devhub/") { continue; }
                 let stamp = super::stamp(&path).filter(|s| built.is_none_or(|b| s.0 <= b));
                 out.push((path, stamp));
             }
             out
         });
         for (path, stamp) in runner {
+            if other_os(Path::new(path)) { continue; }
             self.paths.entry(path.clone()).or_insert((*stamp, Kind::Runner));
         }
     }

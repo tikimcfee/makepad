@@ -239,19 +239,31 @@ fn c_representable(s: &str) -> bool {
         || s.starts_with('&') && !s.starts_with("&dyn") && !s.starts_with("&other")
 }
 
-/// Lowers every JIT-side body reachable from the non-generic fns of crates other than the
-/// provided ones and std, to a fixpoint; then the report and the number of violations (bodies
-/// that reach into a provided crate the way JIT-compiled code cannot).
-pub fn run(up: *mut Unit) -> (String, usize) {
+/// Lowers every JIT-side body a run of package `root` reaches from its `main` (a library: from
+/// the non-generic fns of the crates JIT code is made of, the package and its dependencies, not
+/// entering a provided crate or std: a crate only a provided crate depends on, wayland-client
+/// under the HAL, is rustc's), to a fixpoint;
+/// then the report and the number of violations (bodies that reach into a provided crate the
+/// way JIT-compiled code cannot).
+pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
     AUDIT_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     let u = unsafe { &mut *up };
     let std_crates: Vec<u32> = ["core", "alloc", "std"].iter().filter_map(|n| u.prog.crates.iter().position(|c| u.prog.syms.str(c.name) == *n).map(|i| i as u32)).collect();
     // the audited crate(s) and every crate registered as provided (makepad-script's census)
     let mut provided_crates = AUDIT.lock().unwrap().as_ref().unwrap().crates.clone();
     provided_crates.extend(u.provided.iter().map(|(k, _)| *k).filter(|k| !provided_crates.contains(k)).collect::<Vec<_>>());
+    let mut jit_crates = vec![false; u.prog.crates.len()];
+    let mut stack = vec![root];
+    while let Some(c) = stack.pop() {
+        if jit_crates[c as usize] || std_crates.contains(&c) || provided_crates.contains(&c) {
+            continue;
+        }
+        jit_crates[c as usize] = true;
+        stack.extend(u.prog.crates[c as usize].deps.iter().map(|(_, d)| *d));
+    }
     let mut roots = Vec::new();
     for (di, d) in u.prog.defs.iter().enumerate() {
-        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn) || std_crates.contains(&d.krate) || provided_crates.contains(&d.krate) {
+        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn) || !jit_crates[d.krate as usize] {
             continue;
         }
         let it = u.prog.files[d.file as usize].ast.item(d.item);
@@ -266,6 +278,11 @@ pub fn run(up: *mut Unit) -> (String, usize) {
             roots.push(DefId(di as u32));
         }
     }
+    // a program: what its run reaches, from its `main` (calls, fn pointers, vtables, closures
+    // and drop glue are followed to the fixpoint); a library: every fn of the JIT-side crates
+    if let Some(main) = crate::run::find_main(&u.prog, root) {
+        roots = vec![main];
+    }
     let mut failed = 0usize;
     let mut fails: Vec<String> = Vec::new();
     for d in roots {
@@ -273,6 +290,9 @@ pub fn run(up: *mut Unit) -> (String, usize) {
     }
     let mut done = 0usize;
     let mut lowered = 0usize;
+    // the body whose lowering first made each slot: a violation row names the way JIT code
+    // got into the provided crate (the app's fn, then each provided fn compiled from source)
+    let mut made_by: Vec<u32> = vec![u32::MAX; u.fns.len()];
     loop {
         let n = u.fns.len();
         if done == n {
@@ -309,6 +329,10 @@ pub fn run(up: *mut Unit) -> (String, usize) {
             }
             lowered += 1;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::jit::lower_for_audit(up, id as u32) }));
+            let now = u.fns.len();
+            if made_by.len() < now {
+                made_by.resize(now, id as u32);
+            }
             if !matches!(r, Ok(Ok(()))) {
                 failed += 1;
                 let msg = match &r {
@@ -343,6 +367,19 @@ pub fn run(up: *mut Unit) -> (String, usize) {
     let _ = writeln!(out, "# provided-crate violations (JIT-compiled code reaching into a provided crate the way it cannot): {} in the audited crates, {} in others", failing, a.violations.len() - failing);
     for (k, body, e) in &a.violations {
         let _ = writeln!(out, "violation\t{}\t{}\t{}\t{}", if a.crates.contains(k) { "FAIL" } else { "other" }, crate_name(*k), body, e);
+        // the way in: from the app's body to this one, each a body compiled from source
+        if let Some(mut id) = (0..u.fns.len()).find(|i| *u.fns[*i].name == **body) {
+            let mut path = vec![u.fns[id].name.to_string()];
+            while let Some(&p) = made_by.get(id).filter(|p| **p != u32::MAX && path.len() < 24) {
+                path.push(u.fns[p as usize].name.to_string());
+                id = p as usize;
+                if !matches!(&u.fns[id].key, FnKey::Inst(d, _) if u.provided.iter().any(|(pk, _)| *pk == u.prog.def(*d).krate)) {
+                    break;
+                }
+            }
+            path.reverse();
+            let _ = writeln!(out, "  reached\t{}", path.join(" -> "));
+        }
     }
     // every `#[relax_api]` op names a fn of this source with the signature rustc built: an entry
     // whose key no fn has (Relax reads the item's path differently, or the source moved on) or

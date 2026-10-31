@@ -25,9 +25,9 @@ pub const GUIDE: ScoreToolDef = ScoreToolDef {
     name: "score.guide",
     api_name: "score_guide",
     description: "How to write a score: the document (Clock, instruments, Loops with code, FX, Sections, MIDI in from a keyboard through MidiIn, Arp, Chord, Transpose and Velocity nodes, Score{…}), the functions loop code calls, instrument presets and drum kits, genre templates, drum patterns and progressions, arrangement and mixing rules, how to fit a video or a game, and synth panels. Read it once before composing.",
-    input: r#"{"type": "object", "properties": {}}"#,
+    input: r#"{"type": "object", "properties": {"section": {"type": "string", "description": "one section by name (piano, composing, mixing...); without it: the start of the guide and the names of the sections"}}}"#,
     output: r#"{"type": "object", "additionalProperties": true, "properties": {"guide": {"type": "string", "description": "the composer guide"}}, "required": ["guide"]}"#,
-    args_doc: r#"{}"#,
+    args_doc: r#"{"section": "piano"}"#,
 };
 
 pub const CHECK: ScoreToolDef = ScoreToolDef {

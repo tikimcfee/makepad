@@ -151,6 +151,9 @@ pub enum Op {
     Field { shape: SdfShape, cell: Option<f64> },
     /// A mesh given as data (an import).
     Mesh { mesh: Arc<TriMesh> },
+    /// Separate links (chains, chainmail) as tubes of `sides` facets round; a link's slot indexes
+    /// `materials` as in an [`SdfShape`] (outside the key).
+    Links { links: Arc<makepad_csg_sdf::Links>, sides: u32, materials: Vec<makepad_csg_sdf::SdfMaterial> },
 }
 
 impl Op {
@@ -188,6 +191,7 @@ impl Op {
             Op::Transform { .. } => "transform",
             Op::Field { .. } => "sdf",
             Op::Mesh { .. } => "mesh",
+            Op::Links { .. } => "links",
         }
     }
 }
@@ -396,6 +400,10 @@ impl Graph {
             Op::Field { shape, cell } => {
                 h.bytes(&shape.key());
                 h.opt(*cell);
+            }
+            Op::Links { links, sides, .. } => {
+                h.bytes(&links.key());
+                h.u(*sides as u64);
             }
             Op::Mesh { mesh } => {
                 h.u(mesh.vertices.len() as u64);

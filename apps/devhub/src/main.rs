@@ -422,8 +422,9 @@ impl App {
     fn refresh(&mut self, cx: &mut Cx) {
         let glance = self.glance();
         let (g, status) = self.status(glance.as_ref());
-        let nodes: Vec<(String, bool)> = match &self.core {
-            Some(Core::Master(m)) => m.master.leases.nodes().into_iter().map(|n| (n.name, n.dev)).collect(),
+        // name, dev switch, a person at it (auto-drained: "user")
+        let nodes: Vec<(String, bool, bool)> = match &self.core {
+            Some(Core::Master(m)) => m.master.leases.nodes().into_iter().map(|n| (n.name.clone(), n.dev, n.user().is_some())).collect(),
             _ => Vec::new(),
         };
         let key = format!("{g:?}|{status}|{glance:?}|{:?}|{nodes:?}|{}", self.login, makepad_devhub::lease::exec::writes_allowed());
@@ -451,9 +452,10 @@ impl App {
                 }
                 if !nodes.is_empty() {
                     menu.push(TrayMenuItem::Line);
-                    self.dev_nodes = nodes.iter().map(|(n, _)| n.clone()).collect();
-                    for (i, (name, dev)) in nodes.iter().enumerate() {
-                        menu.push(TrayMenuItem::check(LiveId(DEV_BASE + i as u64), format!("Dev on {name}"), *dev));
+                    self.dev_nodes = nodes.iter().map(|(n, _, _)| n.clone()).collect();
+                    for (i, (name, dev, user)) in nodes.iter().enumerate() {
+                        let label = if *dev && *user { format!("Dev on {name} \u{b7} user") } else { format!("Dev on {name}") };
+                        menu.push(TrayMenuItem::check(LiveId(DEV_BASE + i as u64), label, *dev));
                     }
                     menu.push(TrayMenuItem::Line);
                 }
@@ -473,7 +475,7 @@ impl App {
         }
         if let Some(Core::Node(n)) = &self.core {
             if self.node_drop.is_open() {
-                let head = Head { name: n.node.conf.name.clone(), lan: n.lan(), dev: makepad_devhub::lease::exec::writes_allowed(), leases: makepad_devhub::lease::exec::held(), cache: n.cache.lock().unwrap().clone() };
+                let head = Head { name: n.node.conf.name.clone(), lan: n.lan(), dev: makepad_devhub::lease::exec::writes_allowed(), user: makepad_devhub::lease::exec::user_present(), leases: makepad_devhub::lease::exec::held(), cache: n.cache.lock().unwrap().clone() };
                 if let Some(mut v) = self.ui.widget(cx, ids!(tasks)).borrow_mut::<DevhubTasks>() {
                     v.head = head;
                     v.redraw(cx);

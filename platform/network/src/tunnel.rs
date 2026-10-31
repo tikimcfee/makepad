@@ -441,6 +441,10 @@ impl TunnelConn {
     pub fn set_write_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_write_timeout(t)
     }
+    /// A handle on the TCP socket under the connection (to wait for input on it).
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        self.stream.try_clone_tcp()
+    }
 }
 
 impl Read for TunnelConn {

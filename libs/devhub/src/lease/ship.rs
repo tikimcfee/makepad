@@ -4,8 +4,11 @@
 //! The client sends a manifest (`path \t size \t mtime µs \t x` lines, in batches) to
 //! `ship-have`; the node answers which entries it does not hold as they are (a regular file of
 //! that size and mtime, and on Unix that executable bit). The client sends each miss in chunks to
-//! `ship-put` (written to `<path>.devhub-part`, renamed into place with the source's mtime and
-//! mode after its last byte), and symlinks to `ship-link` (Unix nodes); then `ship-done` names
+//! `ship-put` (written to `<path>.devhub-part`, renamed into place with the source's mode after
+//! its last byte, and the NODE's time as its mtime, as a `git checkout` write: a source mtime
+//! older than the node's build artifacts made its cargo keep them, and build loaders from old
+//! sources). The node remembers the source's size and mtime of what it wrote, and the stat of the
+//! file it wrote, so `ship-have` still knows a file it holds as the source has it; and symlinks to `ship-link` (Unix nodes); then `ship-done` names
 //! what was shipped and deleted (the node undoes it at the lease's end). Up to [`WINDOW`] requests
 //! are in flight on one routed channel per service.
 
@@ -41,6 +44,11 @@ fn b64(b: &[u8]) -> String {
 fn unb64(s: &str) -> Option<Vec<u8>> {
     super::exec::b64_decode(s)
 }
+
+/// What the node wrote per work dir: path -> (source size, source mtime µs, source x, the
+/// written file's size and mtime µs). Memory only: a restarted hub ships each file once more.
+type Wrote = std::collections::HashMap<PathBuf, std::collections::HashMap<String, (u64, u64, bool, u64, u64)>>;
+static WROTE: std::sync::Mutex<Option<Wrote>> = std::sync::Mutex::new(None);
 
 fn mtime_us(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_micros() as u64)
@@ -105,7 +113,10 @@ pub fn have(work: &Path, manifest_b64: &str) -> Result<String, String> {
             Some(&"L") => std::fs::read_link(&p).is_ok_and(|t| Some(t.to_string_lossy().as_ref()) == f.get(2).copied()),
             _ => {
                 let (size, mtime, x) = (f.get(1).and_then(|v| v.parse::<u64>().ok()), f.get(2).and_then(|v| v.parse::<u64>().ok()), f.get(3) == Some(&"1"));
-                std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && Some(m.len()) == size && Some(mtime_us(&m)) == mtime && (cfg!(not(unix)) || is_exec(&m) == x))
+                // held: this node wrote it from a source of that size, mtime and mode, and it is
+                // still the file it wrote (a checkout, a restore or an edit since makes it a miss)
+                let rec = WROTE.lock().unwrap().as_ref().and_then(|w| w.get(work)).and_then(|m| m.get(*path)).copied();
+                rec.is_some_and(|(ss, sm, sx, ws, wm)| Some(ss) == size && Some(sm) == mtime && sx == x && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && m.len() == ws && mtime_us(&m) == wm && (cfg!(not(unix)) || is_exec(&m) == x)))
             }
         };
         if !held {
@@ -147,8 +158,7 @@ pub fn put(work: &Path, rest: &str) -> Result<String, String> {
     };
     f.seek(SeekFrom::Start(off)).and_then(|_| f.write_all(&data)).map_err(|e| format!("{}: {e}", part.display()))?;
     if off + data.len() as u64 == size {
-        let t = UNIX_EPOCH + std::time::Duration::from_micros(mtime);
-        f.set_modified(t).map_err(|e| format!("{}: {e}", part.display()))?;
+        // the node's own time stays the mtime (never the source's)
         drop(f);
         set_exec(&part, x == "1");
         if std::fs::symlink_metadata(&dst).is_ok_and(|m| m.is_dir()) {
@@ -156,6 +166,9 @@ pub fn put(work: &Path, rest: &str) -> Result<String, String> {
             return Err(format!("ship-put {rel}: a directory is in the way"));
         }
         std::fs::rename(&part, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        if let Ok(m) = std::fs::symlink_metadata(&dst) {
+            WROTE.lock().unwrap().get_or_insert_with(Default::default).entry(work.to_path_buf()).or_default().insert(rel, (size, mtime, x == "1", m.len(), mtime_us(&m)));
+        }
         return Ok("{\"done\":1}".into());
     }
     Ok(format!("{{\"off\":{}}}", off + data.len() as u64))
@@ -432,6 +445,38 @@ mod tests {
         assert_eq!(std::fs::read(work.join("e2")).unwrap(), b"");
         let r = link(&work, &format!("{} {}", b64(b"ln"), b64(b"a/b/one.txt"))).unwrap();
         assert!(r.contains("done") || r.contains("skipped"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A shipped file whose source mtime is older than the node's build artifacts must be rebuilt
+    /// by the node's cargo: the node writes it with its own time (JITPROV: loaders built from old
+    /// sources). The node still knows it holds that file as the source has it.
+    #[test]
+    fn a_shipped_file_older_than_the_artifacts_is_rebuilt() {
+        let base = std::env::temp_dir().join(format!("devhub-ship-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("Cargo.toml"), "[package]\nname = \"shipmtime\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n").unwrap();
+        std::fs::write(work.join("src/main.rs"), "fn main() { println!(\"old\"); }\n").unwrap();
+        let cargo = |args: &[&str]| std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())).args(args).current_dir(&work).env("CARGO_TARGET_DIR", work.join("target")).env_remove("RUSTFLAGS").output().unwrap();
+        assert!(cargo(&["build", "-q", "--offline"]).status.success());
+        // the source on the Mac: new text, saved a day before the node's build
+        let src = "fn main() { println!(\"new\"); }\n";
+        let old_us = (std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64).saturating_sub(86_400_000_000);
+        let before = std::time::SystemTime::now();
+        let r = put(&work, &format!("0 {} {old_us} 0 {} {}", src.len(), b64(b"src/main.rs"), b64(src.as_bytes()))).unwrap();
+        assert_eq!(r, r#"{"done":1}"#);
+        let m = std::fs::metadata(work.join("src/main.rs")).unwrap().modified().unwrap();
+        assert!(m >= before - std::time::Duration::from_secs(1), "written with the node's time, not the source's");
+        let out = cargo(&["run", "-q", "--offline"]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "new", "cargo rebuilt from the shipped source");
+        // the same source again is held: nothing ships
+        let man = b64(format!("src/main.rs\t{}\t{old_us}\t0", src.len()).as_bytes());
+        assert_eq!(have(&work, &man).unwrap(), r#"{"need":[]}"#);
+        // a restore of the file (a checkout writes it) makes it a miss again
+        std::fs::write(work.join("src/main.rs"), "fn main() { println!(\"old\"); }\n").unwrap();
+        assert_eq!(have(&work, &man).unwrap(), r#"{"need":[0]}"#);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

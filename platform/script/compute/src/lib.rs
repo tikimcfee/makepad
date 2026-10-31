@@ -44,6 +44,8 @@ pub mod rand;
 pub mod work;
 mod spmd;
 #[cfg(feature = "vm")]
+pub mod shader_route;
+#[cfg(feature = "vm")]
 pub mod vm_kernel;
 pub mod wasm;
 

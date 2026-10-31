@@ -20,7 +20,9 @@
 //!   extended the frame. The parts sum to `busy_ms` exactly.
 //!
 //! Passes of a repaint that never presented are folded into the next frame
-//! that did, named `unpresented <pass>`: the GPU spent that time too.
+//! that did, named `unpresented <pass>`: the GPU spent that time too. An
+//! offscreen XR pass (a remote headset's) closes its own frame: it never
+//! presents, and its frames are not the window's.
 //!
 //! Off until something calls [`set_enabled`]; disabled backends do no work.
 

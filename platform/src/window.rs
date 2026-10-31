@@ -1545,7 +1545,7 @@ mod tests {
 
             let cx = vm.cx_mut();
             let cx_window = &cx.windows[window_id];
-            assert_eq!(cx_window.create_title, "Floating Panel");
+            assert_eq!(cx_window.create_title, badge_window_title("Floating Panel".to_string()));
             assert_eq!(cx_window.create_app_id, "floating-panel");
             assert_eq!(cx_window.create_inner_size, Some(dvec2(320.0, 80.0)));
             assert_eq!(cx_window.create_position, Some(dvec2(40.0, 50.0)));

@@ -22,6 +22,11 @@ default = ["tweaker"]
 # builds; the Builder's releases build without it (--no-default-features).
 tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 
+[dev-dependencies]
+makepad-test = { path = "../../libs/makepad_test" }
+# The chat test's remote commands.
+makepad-remote = { path = "../../libs/remote" }
+
 [dependencies]
 makepad-widgets = { path = "../../widgets", default-features = false, features = ["fab", "pickers"] }
 makepad-widgets-tweaker = { path = "../../widgets/families/tweaker", optional = true }

@@ -44,22 +44,38 @@ pub struct Profile {
     pub cross_nozzle: bool,
     /// Print up in the model frame.
     pub up: P3,
+    /// Measured on this printer and filament (a calibration coupon): they replace the rules below.
+    pub measured: Measured,
+}
+
+/// Clearances and friction measured with calibration coupons (none: the first-principles rules).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Measured {
+    /// In-plane clearance that prints free, mm.
+    pub c_xy: Option<f64>,
+    /// Empty layers between parts across layers that print free.
+    pub c_z_layers: Option<u32>,
+    /// Joint friction coefficient.
+    pub mu: Option<f64>,
 }
 
 impl Default for Profile {
     fn default() -> Profile {
-        Profile { nozzle: 0.4, layer: 0.2, material: Material::named("PLA"), cross_nozzle: false, up: [0.0, 1.0, 0.0] }
+        Profile { nozzle: 0.4, layer: 0.2, material: Material::named("PLA"), cross_nozzle: false, up: [0.0, 1.0, 0.0], measured: Measured::default() }
     }
 }
 
 impl Profile {
-    /// In-plane clearance: the squish, motion, ooze and offset budget of a 2-wall gap.
+    /// In-plane clearance: the squish, motion, ooze and offset budget of a 2-wall gap, or as measured.
     pub fn c_xy(&self) -> f64 {
+        if let Some(c) = self.measured.c_xy {
+            return c + if self.cross_nozzle { 0.1 } else { 0.0 };
+        }
         (0.875 * self.nozzle).max(0.2) * self.material.gap_factor + if self.cross_nozzle { 0.1 } else { 0.0 }
     }
-    /// Clearance across layers: two whole empty layers (one layer tacks).
+    /// Clearance across layers: two whole empty layers (one layer tacks), or as measured.
     pub fn c_z(&self) -> f64 {
-        2.0 * self.layer
+        self.measured.c_z_layers.unwrap_or(2) as f64 * self.layer
     }
 }
 

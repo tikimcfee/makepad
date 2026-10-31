@@ -210,6 +210,13 @@ impl Hub {
         c.len()
     }
 
+    /// (kept, still open) clients, without pruning (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_clients(&self) -> (usize, usize) {
+        let c = self.0.clients.lock().unwrap();
+        (c.len(), c.iter().filter(|c| !c.is_closed()).count())
+    }
+
     /// The endpoint local clients talk to: `route` and `hosts`.
     pub fn client_endpoint(&self) -> Endpoint {
         let ep = Endpoint::new("makepad-run-hub");
@@ -217,7 +224,13 @@ impl Hub {
         let hub = self.clone();
         ep.register("hosts", 1, lines::service("hosts", Arc::new(move |_, out| hub.hosts_report(out))));
         let hub = self.clone();
-        ep.set_accept(Arc::new(move |conn| hub.0.clients.lock().unwrap().push(conn.clone())));
+        // the closed ones go as new ones come: a long-running hub (the devhub master: every CLI
+        // call and its own in-process asks are clients) otherwise kept each one's sockets open
+        ep.set_accept(Arc::new(move |conn| {
+            let mut c = hub.0.clients.lock().unwrap();
+            c.retain(|c| !c.is_closed());
+            c.push(conn.clone());
+        }));
         ep
     }
 

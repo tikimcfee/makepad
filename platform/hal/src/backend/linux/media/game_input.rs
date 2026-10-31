@@ -128,6 +128,9 @@ struct Pad {
     file: File,
     info: GameDevice,
     decoder: Decoder,
+    /// A button press on it is a person's input (`crate::user_input`): a physical pad or a
+    /// Desk Link viewer's; None for other virtual pads.
+    presence: Option<crate::user_input::Origin>,
 }
 impl Pad {
     fn open(path: PathBuf, id: u64) -> io::Result<Option<Self>> {
@@ -146,8 +149,9 @@ impl Pad {
         // A button already held when the pad (re)connects is not a press.
         decoder.resync(&mut &file)?;
         decoder.published = decoder.state.clone();
+        let presence = crate::user_input::origin_of(u16::from_ne_bytes([ids[0], ids[1]]), u16::from_ne_bytes([ids[2], ids[3]]));
         Ok(Some(Self {
-            path, file, decoder,
+            path, file, decoder, presence,
             info: GameDevice { id, name, announce: true, haptics: Default::default(),
                 vendor: u16::from_ne_bytes([ids[2], ids[3]]) as u32,
                 product: u16::from_ne_bytes([ids[4], ids[5]]) as u32, output: game_output::NONE },
@@ -165,6 +169,10 @@ impl Pad {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
+            // a button pressed, never a stick: a resting stick's noise is no person
+            if let Some(origin) = self.presence.filter(|_| events[..count].iter().any(|e| e.kind == 1 && e.value == 1)) {
+                crate::user_input::note(origin, crate::user_input::What::Gamepad);
+            }
             let fed = self.decoder.feed(&events[..count], &mut &self.file)?;
             if fed.overran {
                 eprintln!("[hal-gamepad] {} overran; resynchronizing at the next report", self.info.name);

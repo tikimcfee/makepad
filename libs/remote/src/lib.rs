@@ -43,6 +43,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod frames;
 pub mod group;
+pub mod procs;
 pub mod hello;
 pub mod hosts;
 pub mod hub;

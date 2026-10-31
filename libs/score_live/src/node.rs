@@ -97,6 +97,9 @@ struct Host {
     /// The players prepared and not yet replaced twice: the playing one is
     /// among them.
     watches: Vec<Watch>,
+    /// A fresh player is being filled ([`Slot::prepare_fresh`]): what is
+    /// pending waits for it.
+    fresh: bool,
 }
 
 /// A score the `Score` nodes named after it play.
@@ -116,7 +119,7 @@ impl Slot {
                 playing: AtomicU64::new(0),
                 wanted: AtomicBool::new(false),
             }),
-            host: Mutex::new(Host { doc: None, rate: None, generation: 0, base: None, pending: false, slice: None, watches: Vec::new() }),
+            host: Mutex::new(Host { doc: None, rate: None, generation: 0, base: None, pending: false, slice: None, watches: Vec::new(), fresh: false }),
         }
     }
 
@@ -177,10 +180,37 @@ impl Slot {
         self.prepare_due(&mut host)
     }
 
+    /// A player for the slot's score that carries nothing over from the one
+    /// playing: its nodes start as new and its loops' feeds are new rings
+    /// (what waited in the old ones is gone). Fill its feeds, then
+    /// [`Slot::post_fresh`] it. None before a node asked for a rate or the
+    /// slot has a score.
+    pub(crate) fn prepare_fresh(&self) -> Result<Option<Player>, Vec<Diag>> {
+        let mut host = self.lock();
+        let (Some(doc), Some(rate)) = (host.doc.as_ref(), host.rate) else { return Ok(None) };
+        let generation = host.generation + 1;
+        let slice = score_slice(doc, &self.name, ClockMode::Host);
+        let player = prepare_slice(doc, slice.clone(), rate as f32, &self.name, ClockMode::Host, None, generation)?;
+        host.generation = generation;
+        host.slice = Some(slice);
+        host.pending = false;
+        host.fresh = true;
+        Ok(Some(player))
+    }
+
+    /// The node takes `player` at its next pass; what became pending
+    /// meanwhile is prepared on it.
+    pub(crate) fn post_fresh(&self, player: Player) {
+        let mut host = self.lock();
+        host.fresh = false;
+        self.post(&mut host, player);
+        let _ = self.prepare_due(&mut host);
+    }
+
     /// Prepare the pending score when the mailbox is empty (so the base is
     /// the player the node plays).
     fn prepare_due(&self, host: &mut Host) -> Result<(), Vec<Diag>> {
-        if !host.pending || !self.shared.next.load(Ordering::Acquire).is_null() {
+        if host.fresh || !host.pending || !self.shared.next.load(Ordering::Acquire).is_null() {
             return Ok(());
         }
         let (Some(doc), Some(rate)) = (host.doc.as_ref(), host.rate) else { return Ok(()) };
@@ -328,6 +358,9 @@ impl ScoreNode {
                 for (from, to) in next.schedule.migrate.iter() {
                     migrate_state(&mut current.schedule.states[*from as usize], &mut next.schedule.states[*to as usize]);
                 }
+            } else {
+                // Nothing carries over: its notes on MIDI outputs end here.
+                current.release_all();
             }
         }
         self.shared.playing.store(next.schedule.generation, Ordering::Release);

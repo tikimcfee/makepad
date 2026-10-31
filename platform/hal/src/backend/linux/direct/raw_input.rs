@@ -162,6 +162,20 @@ fn wheel_follows_setting(id: &InputId) -> bool {
 
 const BUS_VIRTUAL: u16 = 0x06;
 
+/// One device report of a person's input (keys, buttons, motion, touch): noted for the WM's
+/// `activity` (`crate::user_input`); keyboard keys (below the button range 0x100..0x160) are
+/// keys, the rest pointer. Key repeats are the kernel's while a key is held: a person.
+fn note_presence(origin: crate::user_input::Origin, report: &[InputEvent]) {
+    use crate::user_input::What;
+    let key = report.iter().any(|e| e.ty == InputEventType::EV_KEY && (e.code < 0x100 || e.code >= 0x160));
+    let pointer = report.iter().any(|e| matches!(e.ty, InputEventType::EV_KEY | InputEventType::EV_REL | InputEventType::EV_ABS));
+    if key {
+        crate::user_input::note(origin, What::Key);
+    } else if pointer {
+        crate::user_input::note(origin, What::Pointer);
+    }
+}
+
 /// `struct input_id` (EVIOCGID).
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -483,6 +497,11 @@ impl Touchpad {
     }
 }
 
+/// The event stream's button bit of a pointer button (a touch is the primary button).
+fn button_mask(code: u16) -> u32 {
+    if code == EvKeyCodes::BTN_TOUCH { 1 } else { 1 << (code - EvKeyCodes::BTN_LEFT) }
+}
+
 fn pad_button_code(button: PadButton) -> u16 {
     EvKeyCodes::BTN_LEFT + button as u16
 }
@@ -504,6 +523,9 @@ struct InputDevice {
     absolute_mt: bool,
     /// Its wheel takes the mouse natural scrolling setting (`wheel_follows_setting`).
     wheel_natural_setting: bool,
+    /// Its reports are a person's input (`crate::user_input`): a physical device or Desk
+    /// Link's; None for other virtual devices and accelerometers.
+    presence: Option<crate::user_input::Origin>,
 }
 
 pub struct RawInput {
@@ -511,6 +533,11 @@ pub struct RawInput {
     devices: Vec<InputDevice>,
     next_device_id: u64,
     modifier_keys: HashSet<(u64, u16)>,
+    /// The pointer buttons down, by the device that pressed them. The event stream has one
+    /// pointer and a press holds it (`first_mouse_button` ignores other buttons until that one
+    /// goes up), so a button held on a device nobody is using (a wireless mouse that lost its
+    /// release, or one left under a book, while a Desk Link viewer drives) must not hold it.
+    held_buttons: Vec<(u64, u16)>,
     denied: HashSet<PathBuf>,
     /// Gamepads and joysticks: their buttons are not keys (each app reads
     /// them through its own gamepad reader), so they are never opened here.
@@ -531,14 +558,21 @@ pub struct RawInput {
 
 impl RawInput {
     pub fn new(width: f64, height: f64, dpi_factor: f64) -> Self {
+        let mut input = Self::without_devices(width, height, dpi_factor);
+        input.scan_devices();
+        input
+    }
+
+    fn without_devices(width: f64, height: f64, dpi_factor: f64) -> Self {
         // Guard like `set_bounds` does: a non-positive or non-finite factor
         // carries no usable information (a zeroed or corrupt state value),
         // and dividing by it later would poison every pointer coordinate.
         let dpi_factor = if dpi_factor.is_finite() && dpi_factor > 0.0 { dpi_factor } else { 1.0 };
-        let mut input = Self {
+        Self {
             devices: Vec::new(),
             next_device_id: 0,
             modifier_keys: HashSet::new(),
+            held_buttons: Vec::new(),
             denied: HashSet::new(),
             pads: HashSet::new(),
             next_scan: 1.0,
@@ -549,9 +583,7 @@ impl RawInput {
             screen_rects: Vec::new(),
             hires_wheels: HashSet::new(),
             modifiers: Default::default(),
-        };
-        input.scan_devices();
-        input
+        }
     }
 
     /// The pointer's clamp rectangle follows the wide desktop. Called when a
@@ -629,14 +661,17 @@ impl RawInput {
                             .filter(|(x, y)| x.maximum > x.minimum && y.maximum > y.minimum)
                             .map(|(x, y)| [x, y])
                     } else { None };
-                    let wheel_natural_setting = wheel_follows_setting(&input_id(&file));
+                    let id = input_id(&file);
+                    let wheel_natural_setting = wheel_follows_setting(&id);
+                    // INPUT_PROP_ACCELEROMETER (6): a sensor's stream is no person
+                    let presence = crate::user_input::origin_of(id.bustype, id.vendor).filter(|_| !has_bit(&props, 6));
                     eprintln!("Direct input: opened {}{}{}", path.display(),
                         if touchpad.is_some() { " (relative touchpad, two-finger scroll)" } else { "" },
                         if wheel_natural_setting { "" } else { " (Desk Link: wheel in the viewer's direction)" });
                     self.next_device_id += 1;
                     self.devices.push(InputDevice { id: self.next_device_id, path, file,
                         pending: Vec::new(), dropped: false, reported_input: false, touchpad, absolute_axes, absolute_mt,
-                        wheel_natural_setting });
+                        wheel_natural_setting, presence });
                 }
                 Err(error) => {
                     if self.denied.insert(path.clone()) {
@@ -707,6 +742,9 @@ impl RawInput {
                                     eprintln!("Direct input: receiving keyboard/pointer reports from {}", device.path.display());
                                     device.reported_input = true;
                                 }
+                                if let Some(origin) = device.presence {
+                                    note_presence(origin, &device.pending);
+                                }
                                 if let Some(pad) = device.touchpad.as_mut() {
                                     device.pending.retain_mut(|event| !pad.consume(event));
                                     let report_time = event.time.tv_sec as f64 + event.time.tv_usec as f64 * 1e-6;
@@ -749,6 +787,7 @@ impl RawInput {
         }
         self.modifier_keys.retain(|(id, _)| self.devices.iter().any(|device| device.id == *id));
         self.update_modifiers();
+        self.release_gone_devices(&mut dir_evts, window_id);
         self.process_event(&mut packets, &mut dir_evts, time, window_id);
         dir_evts
     }
@@ -781,9 +820,9 @@ impl RawInput {
                     continue;
                 }
                 DeviceEvent::Touchpad(PadOutput::Tap(button)) => {
-                    let mask = 1 << (pad_button_code(button) - EvKeyCodes::BTN_LEFT);
-                    dir_evts.mouse_down(window_id, self.abs.x, self.abs.y, mask, self.modifiers.bits());
-                    dir_evts.mouse_up(window_id, self.abs.x, self.abs.y, mask, self.modifiers.bits());
+                    let code = pad_button_code(button);
+                    self.button_down(device_id, code, dir_evts, window_id);
+                    self.button_up(device_id, code, dir_evts, window_id);
                     continue;
                 }
             };
@@ -863,8 +902,13 @@ impl RawInput {
         window_id: Id,
     ) {
         // Wheels, pedals and gamepad axes are not absolute pointing devices.
-        let Some((axes, mt)) = self.devices.iter().find(|device| device.id == device_id)
-            .and_then(|device| device.absolute_axes.map(|axes| (axes, device.absolute_mt))) else { return; };
+        let Some(device) = self.devices.iter().find(|device| device.id == device_id) else { return; };
+        let Some((axes, mt)) = device.absolute_axes.map(|axes| (axes, device.absolute_mt)) else { return; };
+        // The viewer drives the pointer now: hover and the cursor follow it, and they stand
+        // still while a button is down, so nothing another device holds outlives this motion.
+        if matches!(device.presence, Some(crate::user_input::Origin::DeskLink)) {
+            self.release_buttons(dir_evts, window_id, |held| held != device_id);
+        }
         let normalized = |axis: AbsInfo| {
             ((evt.value as f64 - axis.minimum as f64) / (axis.maximum as f64 - axis.minimum as f64)).clamp(0.0, 1.0)
         };
@@ -878,6 +922,40 @@ impl RawInput {
             _ => return (),
         }
         dir_evts.mouse_move(window_id, self.abs.x, self.abs.y, 0.0, 0.0, self.modifiers.bits())
+    }
+
+    /// A press: what another device holds goes up first, so this one is the pointer's only
+    /// button and the app sees a press it acts on.
+    fn button_down(&mut self, device_id: u64, code: u16, dir_evts: &mut EventQueue, window_id: Id) {
+        self.release_buttons(dir_evts, window_id, |held| held != device_id);
+        if !self.held_buttons.contains(&(device_id, code)) {
+            self.held_buttons.push((device_id, code));
+        }
+        dir_evts.mouse_down(window_id, self.abs.x, self.abs.y, button_mask(code), self.modifiers.bits())
+    }
+
+    /// A release: passed on only while its press stands (one a later press on another device
+    /// already let go, or from before this process opened the device, has no up to send).
+    fn button_up(&mut self, device_id: u64, code: u16, dir_evts: &mut EventQueue, window_id: Id) {
+        let Some(at) = self.held_buttons.iter().position(|held| *held == (device_id, code)) else { return };
+        self.held_buttons.remove(at);
+        dir_evts.mouse_up(window_id, self.abs.x, self.abs.y, button_mask(code), self.modifiers.bits())
+    }
+
+    /// A device that went away never sends its ups.
+    fn release_gone_devices(&mut self, dir_evts: &mut EventQueue, window_id: Id) {
+        let open: Vec<u64> = self.devices.iter().map(|device| device.id).collect();
+        self.release_buttons(dir_evts, window_id, |held| !open.contains(&held));
+    }
+
+    fn release_buttons(&mut self, dir_evts: &mut EventQueue, window_id: Id, of: impl Fn(u64) -> bool) {
+        let (x, y, mods) = (self.abs.x, self.abs.y, self.modifiers.bits());
+        self.held_buttons.retain(|(id, code)| {
+            if of(*id) {
+                dir_evts.mouse_up(window_id, x, y, button_mask(*code), mods);
+            }
+            !of(*id)
+        });
     }
 
     fn update_modifiers(&mut self) {
@@ -1027,12 +1105,8 @@ impl RawInput {
                     | EvKeyCodes::BTN_RIGHT
                     | EvKeyCodes::BTN_MIDDLE
                     | EvKeyCodes::BTN_SIDE
-                    | EvKeyCodes::BTN_EXTRA => {
-                        dir_evts.mouse_down(window_id, self.abs.x, self.abs.y, 1 << (evt.code - EvKeyCodes::BTN_LEFT), self.modifiers.bits())
-                    }
-                    EvKeyCodes::BTN_TOUCH => {
-                        dir_evts.mouse_down(window_id, self.abs.x, self.abs.y, 1, self.modifiers.bits())
-                    }
+                    | EvKeyCodes::BTN_EXTRA
+                    | EvKeyCodes::BTN_TOUCH => self.button_down(device_id, code, dir_evts, window_id),
                     _ => {
                         if !self.modifiers.control && !self.modifiers.alt && !self.modifiers.logo {
                             let uc = self.modifiers.shift;
@@ -1051,8 +1125,8 @@ impl RawInput {
                     | EvKeyCodes::BTN_RIGHT
                     | EvKeyCodes::BTN_MIDDLE
                     | EvKeyCodes::BTN_SIDE
-                    | EvKeyCodes::BTN_EXTRA => dir_evts.mouse_up(window_id, self.abs.x, self.abs.y, 1 << (evt.code - EvKeyCodes::BTN_LEFT), self.modifiers.bits()),
-                    EvKeyCodes::BTN_TOUCH => dir_evts.mouse_up(window_id, self.abs.x, self.abs.y, 1, self.modifiers.bits()),
+                    | EvKeyCodes::BTN_EXTRA
+                    | EvKeyCodes::BTN_TOUCH => self.button_up(device_id, code, dir_evts, window_id),
                     _ => dir_evts.key_up(window_id, key_code.to_index(), self.modifiers.bits()),
                 }
             }
@@ -1315,6 +1389,67 @@ mod tests {
 }
 
 #[cfg(test)]
+mod button_tests {
+    use super::*;
+    use crate::events::HalEvent;
+
+    const MOUSE: u64 = 1;
+    const VIEWER: u64 = 2;
+
+    fn key(input: &mut RawInput, device: u64, code: u16, value: i32, q: &mut EventQueue) {
+        let evt = InputEvent { ty: InputEventType::EV_KEY, code, value, ..Default::default() };
+        input.process_key_event(device, evt, q, 0.0, Default::default());
+    }
+
+    /// The buttons as they reach the app, in order: (down, mask).
+    fn seen(q: &mut EventQueue) -> Vec<(bool, u32)> {
+        let mut out = Vec::new();
+        q.drain_with(|e, payload| match e.decode(payload) {
+            Some(HalEvent::MouseDown { button, .. }) => out.push((true, button)),
+            Some(HalEvent::MouseUp { button, .. }) => out.push((false, button)),
+            _ => {}
+        });
+        out
+    }
+
+    #[test]
+    fn a_button_held_on_an_idle_device_does_not_hold_the_pointer() {
+        let (mut input, mut q) = (RawInput::without_devices(100.0, 100.0, 1.0), EventQueue::default());
+        key(&mut input, MOUSE, EvKeyCodes::BTN_RIGHT, 1, &mut q);
+        assert_eq!(seen(&mut q), [(true, 2)]);
+        // the viewer's drag: the right button goes up first, so the left is the first button
+        key(&mut input, VIEWER, EvKeyCodes::BTN_LEFT, 1, &mut q);
+        key(&mut input, VIEWER, EvKeyCodes::BTN_LEFT, 0, &mut q);
+        assert_eq!(seen(&mut q), [(false, 2), (true, 1), (false, 1)]);
+        // the mouse's late release has nothing left to end
+        key(&mut input, MOUSE, EvKeyCodes::BTN_RIGHT, 0, &mut q);
+        assert_eq!(seen(&mut q), []);
+    }
+
+    #[test]
+    fn one_device_chords_its_own_buttons() {
+        let (mut input, mut q) = (RawInput::without_devices(100.0, 100.0, 1.0), EventQueue::default());
+        key(&mut input, VIEWER, EvKeyCodes::BTN_LEFT, 1, &mut q);
+        key(&mut input, VIEWER, EvKeyCodes::BTN_RIGHT, 1, &mut q);
+        key(&mut input, VIEWER, EvKeyCodes::BTN_RIGHT, 0, &mut q);
+        key(&mut input, VIEWER, EvKeyCodes::BTN_LEFT, 0, &mut q);
+        assert_eq!(seen(&mut q), [(true, 1), (true, 2), (false, 2), (false, 1)]);
+    }
+
+    #[test]
+    fn a_device_that_goes_away_lets_its_buttons_go() {
+        let (mut input, mut q) = (RawInput::without_devices(100.0, 100.0, 1.0), EventQueue::default());
+        key(&mut input, MOUSE, EvKeyCodes::BTN_LEFT, 1, &mut q);
+        assert_eq!(seen(&mut q), [(true, 1)]);
+        // no devices are open here: the holder is gone (a VT switch comes back the same way)
+        input.release_gone_devices(&mut q, Default::default());
+        assert_eq!(seen(&mut q), [(false, 1)]);
+        input.release_gone_devices(&mut q, Default::default());
+        assert_eq!(seen(&mut q), []);
+    }
+}
+
+#[cfg(test)]
 mod wheel_tests {
     use super::{wheel_follows_setting, wheel_scroll, InputId, BUS_VIRTUAL};
     use crate::direct::{DESK_LINK_INPUT_VENDOR, DESK_LINK_POINTER_PRODUCT};
@@ -1333,6 +1468,24 @@ mod wheel_tests {
         assert_eq!(wheel_scroll(120, true, false, false), (0.0, -40.0));
         // the viewer's "view moves right" (wire dx = +120)
         assert_eq!(wheel_scroll(120, true, true, false), (40.0, 0.0));
+    }
+
+    #[test]
+    fn a_key_report_is_a_key_and_motion_a_pointer() {
+        use crate::user_input::{last, Origin, What};
+        let _turn = crate::user_input::TEST_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let ev = |ty: u16, code: u16, value: i32| super::InputEvent { ty, code, value, ..Default::default() };
+        super::note_presence(Origin::Device, &[ev(1, 30, 1)]);
+        assert_eq!(last().map(|l| (l.origin, l.what)), Some((Origin::Device, What::Key)));
+        super::note_presence(Origin::DeskLink, &[ev(2, 0, 3), ev(2, 1, -2)]);
+        assert_eq!(last().map(|l| (l.origin, l.what)), Some((Origin::DeskLink, What::Pointer)));
+        // a mouse button is the pointer's
+        super::note_presence(Origin::Device, &[ev(1, 0x110, 1)]);
+        assert_eq!(last().map(|l| l.what), Some(What::Pointer));
+        // a report with no input (a bare sync) notes nothing
+        let seq = last().unwrap().seq;
+        super::note_presence(Origin::Device, &[]);
+        assert_eq!(last().unwrap().seq, seq);
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub enum SdfNode {
     Kernel(SdfKernel),
     /// A triangle mesh's signed distance (its own frame; place it with a Transform).
     Mesh(Arc<crate::mesh_field::MeshField>),
+    /// Separate links (chains, chainmail): closed polylines swept by one radius, each in its own slot.
+    Links(Arc<crate::links::Links>),
     /// `of` in material `slot` of [`SdfShape::materials`] (0 is the default);
     /// the innermost Material wins. Slots through the other nodes: see
     /// [`distance_slot`].
@@ -422,6 +424,10 @@ impl Out {
                 self.u64(*id as u64);
                 self.node(of);
             }
+            SdfNode::Links(l) => {
+                self.u8(18);
+                l.key().iter().for_each(|b| self.u8(*b));
+            }
         }
     }
 }
@@ -661,6 +667,10 @@ fn slot_in(n: &SdfNode, p: Vec3d, inherit: u8) -> (f64, u8) {
             (d / lipschitz, s)
         }
         SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => slot_in(of, p, inherit),
+        SdfNode::Links(l) => {
+            let (d, s) = l.distance_slot(p);
+            (d, if s == 0 { inherit } else { s })
+        }
         leaf => (distance(leaf, p), inherit),
     }
 }
@@ -760,6 +770,7 @@ pub fn distance(n: &SdfNode, p: Vec3d) -> f64 {
         SdfNode::Transform { at, rotate, scale, of } => distance(of, transform_into(*at, *rotate, *scale, p)) * scale,
         SdfNode::Kernel(k) => k.field.distance(p),
         SdfNode::Mesh(m) => m.signed64(p),
+        SdfNode::Links(l) => l.distance(p),
         SdfNode::Material { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => distance(of, p),
         SdfNode::Instance { places, of } => places.iter().map(|pl| distance(of, v3(pl.into([p.x, p.y, p.z]))) * pl.scale).fold(f64::INFINITY, f64::min),
         SdfNode::Deform { deform, lipschitz, of } => distance(of, deform.warp(p)) / lipschitz,

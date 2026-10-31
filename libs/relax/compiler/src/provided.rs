@@ -657,7 +657,12 @@ pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool
 /// through bound fns, whose signatures are roots themselves. Every other type of a provided
 /// crate is made and laid out by JIT-compiled code alone (an inline shell's result, a type only
 /// generic or unbound code builds): no opaque layout, no field guard.
-pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(DefId) -> bool) -> std::collections::HashSet<TyId> {
+/// The walk does not enter an opaque handle's fields (`opaque`: rustc lays it out, Relax does not):
+/// JIT-compiled code never reaches them (a field read, a pattern or a value built of the handle
+/// is refused, lower.rs check_provided_*), so a type that lives only inside such a handle (the
+/// kernel compiler's `ir::Program` inside `KernelBody`) is not the crate's to share: JIT code that
+/// makes its own values of it lays them out itself.
+pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(DefId) -> bool, opaque: &dyn Fn(DefId) -> bool) -> std::collections::HashSet<TyId> {
     let mut out = std::collections::HashSet::new();
     let mut stack: Vec<TyId> = Vec::new();
     for (i, def) in prog.defs.iter().enumerate() {
@@ -681,6 +686,9 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
             TyKind::Adt(d, a, _) => {
                 let k = prog.def(*d).krate;
                 if krates.contains(&k) {
+                    if opaque(*d) {
+                        continue;
+                    }
                     if let Some(adt) = tcx.adts.get(d) {
                         for (vi, v) in adt.variants.iter().enumerate() {
                             for fi in 0..v.fields.len() {

@@ -545,6 +545,15 @@ impl SocketStream {
             SocketStream::Tls(stream) => stream.shutdown(),
         }
     }
+
+    /// A handle on the TCP socket under the stream: a reader thread waits on it (poll) for
+    /// input instead of sleeping in a timed read.
+    pub fn try_clone_tcp(&self) -> io::Result<TcpStream> {
+        match self {
+            SocketStream::Plain(stream) => stream.try_clone(),
+            SocketStream::Tls(stream) => stream.tcp_stream.try_clone(),
+        }
+    }
 }
 
 impl Read for SocketStream {

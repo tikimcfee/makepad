@@ -85,8 +85,8 @@ fn find_fn(u: &Unit, path: &str) -> Option<DefId> {
 
 /// Runs each crate's tests through the program's harness, crate after crate as cargo runs test
 /// binaries (`label`: what cargo's "Running" line names); the exit status (101 after a failing
-/// crate; without `no_fail_fast` the crates after it do not run).
-pub(crate) fn run(u: &mut Unit, up: *mut Unit, groups: &[(String, u32)], no_fail_fast: bool) -> i32 {
+/// crate; the crates after it still run).
+pub(crate) fn run(u: &mut Unit, up: *mut Unit, groups: &[(String, u32)]) -> i32 {
     let mut code = 0;
     for (label, krate) in groups {
         eprintln!("     Running {label}");
@@ -99,10 +99,6 @@ pub(crate) fn run(u: &mut Unit, up: *mut Unit, groups: &[(String, u32)], no_fail
         };
         if c != 0 {
             code = 101;
-            if !no_fail_fast {
-                eprintln!("error: test failed, to rerun pass `--no-fail-fast` to run the remaining targets");
-                break;
-            }
         }
     }
     code

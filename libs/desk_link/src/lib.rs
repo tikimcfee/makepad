@@ -14,6 +14,7 @@ pub mod server;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod rate;
+pub mod tile_plan;
 #[cfg(feature = "tiles")]
 pub mod tiles;
 pub mod xr;

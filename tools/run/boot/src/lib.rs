@@ -126,6 +126,8 @@ pub enum Event {
     Text(String),
     Input(RawEvent, Vec<u8>),
     DocumentErrors(Vec<Diagnostic>),
+    /// A click on the JIT ring's Update ready notice.
+    RestartAsked,
 }
 
 pub fn diagnostic_text(diagnostic: &Diagnostic) -> String {
@@ -241,6 +243,8 @@ pub struct Boot {
     badges: bool,
     /// the JIT ring in the running app's caption
     ring: ring::Ring,
+    /// the ring's badge takes a click (`window_style::BADGE_PRESS`)
+    ring_button: bool,
     /// the window's chrome as the platform reports it: the caption strip follows it
     chrome: caption::Chrome,
     /// the window has focus (the caption's traffic lights grey without it)
@@ -284,6 +288,7 @@ impl Boot {
             layers: info.flags & info_flags::WINDOW_LAYERS != 0,
             badges: info.flags & info_flags::WINDOW_BADGES != 0,
             ring: ring::Ring::new(),
+            ring_button: false,
             chrome: caption::Chrome {
                 client: info.flags & info_flags::CLIENT_CHROME != 0,
                 // under a makepad WM the window's controls are its family's, as the app's caption
@@ -676,7 +681,7 @@ impl Boot {
         }
         if let Some(window) = self.window {
             let mut writer = CmdWriter::new(HOST);
-            writer.window_overlay(window, rect.is_some(), rect.unwrap_or_default(), Id::NONE);
+            writer.window_overlay(window, rect.is_some(), rect.unwrap_or_default(), Id::NONE, false);
             if rect.is_some()
                 && self
                     .renderer
@@ -793,6 +798,9 @@ impl Boot {
                         }
                     }
                     self.events.push(Event::Input(raw, payload.to_vec()));
+                }
+                HalEvent::MouseDown { window, .. } if Some(window) == self.ring.window => {
+                    self.events.push(Event::RestartAsked)
                 }
                 HalEvent::MouseMove { window, .. } | HalEvent::MouseLeave { window, .. }
                     if Some(window) == self.ring.window =>
@@ -1282,7 +1290,8 @@ impl Boot {
             // the view just came on: drawn again
             renderer.redraw = true;
         }
-        if paused != renderer.layer.paused() {
+        let input_moved = paused != renderer.layer.paused();
+        if input_moved {
             renderer.dirty = true;
         }
         renderer.layer.set(want);
@@ -1295,7 +1304,7 @@ impl Boot {
         let Some(renderer) = &mut self.renderer else { return };
         match want {
             None if renderer.layer.on => {
-                writer.window_overlay(window, false, [0.0; 4], Id::NONE);
+                writer.window_overlay(window, false, [0.0; 4], Id::NONE, false);
                 layer_textures(&mut writer, &renderer.layer, None);
                 renderer.layer.on = false;
                 renderer.layer.size = [0; 2];
@@ -1313,9 +1322,15 @@ impl Boot {
                     true,
                     [0.0, 0.0, self.geometry[2], self.geometry[3]],
                     renderer.layer.texture(layer::APP),
+                    paused,
                 );
                 renderer.layer.on = true;
                 renderer.layer.blurred = None;
+            }
+            // the paused view acts on the window's input (the app may be parked); any other layer
+            // leaves it with the app
+            Some(_) if input_moved => {
+                writer.window_overlay(window, true, [0.0, 0.0, self.geometry[2], self.geometry[3]], renderer.layer.texture(layer::APP), paused);
             }
             _ => return,
         }
@@ -1376,6 +1391,16 @@ impl Boot {
             self.ring.hovered.get_or_insert_with(|| Instant::now() - Duration::from_secs(1));
         }
         self.ring.set(want.filter(|_| shows), alert.filter(|_| shows));
+        // the notice takes a click, any other ring leaves input with the app: its badge is made anew
+        let button = alert == Some(RingAlert::UpdateReady) && shows;
+        if let Some(badge) = self.ring.window.filter(|_| self.ring_button != button) {
+            let mut writer = CmdWriter::new(HOST);
+            writer.window_close(badge);
+            Hal::global().submit(&writer.buf());
+            self.ring.window = None;
+            self.ring.hovered = None;
+        }
+        self.ring_button = button;
         let size = [self.geometry[2], self.geometry[3]];
         let caption = self.app_caption();
         let place = ring::Ring::place(size, caption);
@@ -1408,7 +1433,7 @@ impl Boot {
             None if self.ring.wanted() => {
                 // the ring's place for the pointer's hover; its pixels are the window's badge layer
                 let badge = next_badge(&mut self.ring.slot);
-                writer.window_create(badge, window_kind::BADGE | window_style::BADGE_HOVER, window, place, false);
+                writer.window_create(badge, window_kind::BADGE | window_style::BADGE_HOVER | if button { window_style::BADGE_PRESS } else { 0 }, window, place, false);
                 self.ring.window = Some(badge);
                 self.ring.placed = place;
             }

@@ -65,11 +65,12 @@ is a quoted shell argument. There is no HTTP, no status code and no POST body.
 | `ui [q=QUERY] [depth=N] [node=ID] [w=]` | Semantic tree: role, name, value, states, bounds, actions |
 | `ui find [q=QUERY] [role=button] [name=Save] [nth=N] [w=]` | Matching nodes and count (nth is zero-based) |
 | `ui act node=ID\|q=QUERY ACTION [v=] [t=] [from= to=] [dx= dy=] [name=] [wait=1]` | Action result and resulting node; rejects missing, ambiguous, hidden or disabled targets |
+| `ui act node=ID\|q=QUERY drag dx= dy= [ms=1000] [hz=120] [legs=1] [x= y=] [b=0] [mods=shift+ctrl]` | A real pointer drag: press, one move every 1/hz through the window's input queue on time whatever the app is doing, release. `legs` traversals of `dx,dy` over `ms` (even: back at the start), press at `x,y` from the node's corner, default its centre. Answers `events`, `ms`, `late_ms_max`, `frames`, `per_2s_min` (fewest frames in any 2 s window) and `gap_ms`. |
 | `ui type node=ID\|q=QUERY t=TEXT [from= to=]` | Focus and replace the selection; default range is the caret/selection |
 | `ui wait q=QUERY [gone=1\|changed=1\|count=N] [timeout_ms=5000]` | Nodes and elapsed milliseconds once the condition holds |
 | `ui snap name=X` / `ui diff a=X [b=now\|Y]` | Save and compare semantic trees |
 | `ui speak [since=N] [node=ID]` / `ui lint` | Announcement stream or accessibility findings |
-| `mouse k=click x=X y=Y` | Mouse input; kinds also include move, down, up, scroll |
+| `mouse k=click x=X y=Y` | Mouse input; kinds also include move, down, up, scroll; `k=drag` sends its moves in one burst, which coalesce into one (a value field reads that as the start of a drag and does not change: use `ui act ... drag`) |
 | `click x=X y=Y` | Click alias |
 | `key k=press c=KeyA` | Key input; down/up are also supported |
 | `text t=TEXT`, `key t=TEXT` | Text/IME input |

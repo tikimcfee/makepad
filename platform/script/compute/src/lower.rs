@@ -10,7 +10,6 @@
 //! Helpers are inlined at every call (monomorphized per call site); a
 //! `return` inside one is a `Break` out of a one-iteration wrapper loop,
 //! which is dropped again when the helper has no early return.
-use makepad_relax_api::relax_api;
 
 use crate::ir::{self, Bin, Block, Cmp, Op, Program, Region, Stmt as IS, Ty, Un, Val, Var};
 
@@ -20,7 +19,6 @@ mod front;
 pub use front::{AirBuilder, MathFn};
 
 /// Which front end a program is lowered for.
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Domain {
@@ -93,7 +91,6 @@ pub const MAX_INIT_COST: u64 = 200_000_000;
 /// Worst-case AIR ops per frame.
 pub const MAX_COST_PER_FRAME: u64 = 4_000_000;
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
@@ -970,7 +967,6 @@ pub struct LiveLift {
 
 /// A literal a kernel reads from a hidden parameter: its source offset, its
 /// channel (a colour's), and the parameter.
-#[relax_api(plain)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveParam {
     pub offset: usize,

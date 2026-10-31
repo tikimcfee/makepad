@@ -107,6 +107,7 @@ pub fn node_bounds(n: &SdfNode) -> Option<Bounds> {
         SdfNode::Kernel(k) => return k.bounds,
         SdfNode::Gyroid { .. } => return None,
         SdfNode::Mesh(m) => (m.min.map(|x| x as f64), m.max.map(|x| x as f64)),
+        SdfNode::Links(l) => (l.min, l.max),
         SdfNode::Combine { op, blend, of } => {
             let b = match op {
                 // Each of the n - 1 smooth steps sags at most a blend reach.
@@ -240,6 +241,7 @@ pub fn same(a: &SdfNode, b: &SdfNode) -> bool {
         (Transform { at: a1, rotate: r1, scale: s1, of: x }, Transform { at: a2, rotate: r2, scale: s2, of: y }) => a1 == a2 && r1 == r2 && s1 == s2 && same(x, y),
         (Kernel(x), Kernel(y)) => x.key == y.key && x.bounds == y.bounds,
         (Mesh(x), Mesh(y)) => x.key() == y.key(),
+        (Links(x), Links(y)) => x.key() == y.key(),
         (Material { slot: s1, within: w1, of: x }, Material { slot: s2, within: w2, of: y }) => {
             s1 == s2 && same(x, y) && match (w1, w2) { (None, None) => true, (Some(a), Some(b)) => same(a, b), _ => false }
         }

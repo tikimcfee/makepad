@@ -110,13 +110,13 @@ const PREWARM_LOAD_PER_CORE: f64 = 1.25;
 const PREWARM_RAM_FREE: f64 = 0.15;
 
 /// A `nodes` line of a node that should pre-warm after its apply: up, dev on, no lease, not
-/// draining, under the pre-warm's load limits.
+/// draining, no person at it, under the pre-warm's load limits.
 pub fn prewarm_suits(v: &makepad_strict_json::Value) -> bool {
     let b = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     let leases = v.get("leases").and_then(|x| x.as_u64()).unwrap_or(1);
     let caps = v.get("caps").filter(|c| !matches!(c, makepad_strict_json::Value::Null)).and_then(|c| crate::lease::Caps::parse(&c.to_json())).filter(|c| c.cores > 0);
     let loaded = |c: &crate::lease::Caps| c.load1 > c.cores as f64 * PREWARM_LOAD_PER_CORE || (c.ram_gb > 0.0 && c.ram_avail_gb < c.ram_gb * PREWARM_RAM_FREE);
-    b("up") && b("dev") && !b("draining") && leases == 0 && caps.is_some_and(|c| !loaded(&c))
+    b("up") && b("dev") && !b("draining") && !b("user") && leases == 0 && caps.is_some_and(|c| !loaded(&c))
 }
 
 pub fn start(control_socket: PathBuf) {
@@ -175,10 +175,16 @@ pub fn start(control_socket: PathBuf) {
                 let mut trees = BTreeMap::<String, String>::new();
                 // the nodes a pre-warm suits: dev on, under their load limits
                 let mut idle = BTreeMap::<String, bool>::new();
+                // a person at the node: nothing moves its tree, builds or restarts its WM until
+                // they are idle (the landing reaches it then)
+                let mut present = std::collections::BTreeSet::<String>::new();
                 for line in ask_local(&c, "nodes", "nodes").unwrap_or_default() {
                     let Ok(v) = makepad_strict_json::parse(line.as_bytes()) else { continue };
                     if let Some(n) = v.get("node").and_then(|x| x.as_str()) {
                         idle.insert(n.to_string(), prewarm_suits(&v));
+                        if v.get("user").and_then(|x| x.as_bool()) == Some(true) {
+                            present.insert(n.to_string());
+                        }
                     }
                     if let (Some(n), Some(t)) = (v.get("node").and_then(|x| x.as_str()), v.get("caps").and_then(|c| c.get("tree")).and_then(|x| x.as_str())) {
                         trees.insert(n.to_string(), t.to_string());
@@ -213,6 +219,7 @@ pub fn start(control_socket: PathBuf) {
                     }
                     match held.get(node) {
                         Some(why) => report(node, why.clone()),
+                        None if present.contains(node) => report(node, "skip: a user is at it".to_string()),
                         None => todo.push(node.clone()),
                     }
                 }

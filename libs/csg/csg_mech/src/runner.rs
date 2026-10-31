@@ -242,6 +242,10 @@ fn run(asm: Assembly, gravity: P3, floor: Option<f64>, mut w: MechWorld, rx: Rec
             }
         }
         if steps > 0 || single || changed {
+            // every published snapshot has its own frame number (a view skips a frame it already shows)
+            if steps == 0 {
+                frame += 1;
+            }
             let snap = Arc::new(snapshot(&mut w, &asm, frame, running, speed));
             if let Ok(mut l) = latest.lock() {
                 *l = snap;

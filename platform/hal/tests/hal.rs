@@ -29,14 +29,16 @@ fn every_command_round_trips() {
     // (incl. DirectDisplayArrangement, DirectDisplayPacing, DirectTapToClick, DirectDisplayVirtual tag 153), 2 GL interop, 3 mobile system UI (MobileUi,
     // SelectionHandles, Haptic), 1 system back (BackUnhandled), 1 font touch (GlyphTouch, tag 150), 3 tray (TraySet,
     // TrayRemove, WindowAtTray tag 154), 3 XR frame (XrFrameEyes 155, XrPoseLead 156, XrRefreshRate 157),
-    // 2 accessibility (A11yUpdate 158, A11yActionDone 159), 1 XR haptic (XrHaptic 163).
+    // 2 accessibility (A11yUpdate 158, A11yActionDone 159), 1 XR haptic (XrHaptic 163), 4 hosted (WindowScreenOrigin 28,
+    // HostedPresented 29, HostedNativeBridge 33, HostedNativeIn 34), 1 GPU profiler readout (GpuProfQuery 35),
+    // 1 hosted focus for accessibility (WindowA11yActive 36).
     // The media section (tags 120-129, backend/apple/media) has its own budget.
     let media = CMD_TABLE.iter().filter(|t| (120..130).contains(&t.0)).count();
     let fonts = CMD_TABLE.iter().filter(|t| (130..133).contains(&t.0)).count();
     assert_eq!(media, 9);
     assert_eq!(fonts, 3);
     assert!(media <= 15, "the media section is budgeted at 15 commands, it has {media}");
-    assert_eq!(CMD_TABLE.len(), 57 + 6 + 4 + media + fonts + 9 + 2 + 4 + 1 + 3 + 3 + 2 + 3 + 1);
+    assert_eq!(CMD_TABLE.len(), 57 + 6 + 4 + media + fonts + 9 + 2 + 4 + 1 + 3 + 3 + 2 + 3 + 1 + 4 + 1 + 1);
     for ((cmd, want), (tag, name, _)) in w.cmds().iter().zip(&expected).zip(CMD_TABLE) {
         assert_eq!(cmd.tag, *tag, "{name}");
         let got = cmd.decode(w.arena()).unwrap_or_else(|| panic!("{name} does not decode"));
@@ -53,7 +55,7 @@ fn every_event_round_trips() {
     q.set_time(77);
     let expected = sample_events(&mut q);
     assert_eq!(expected.len(), EVENT_TABLE.len());
-    assert_eq!(EVENT_TABLE.len(), 102, "55 core (incl. Clipboard, GpuBudget, PayloadSize, MouseCancel, AppMessage, DeviceReset, GpuPressure, Redraw), 6 parent/child (85-90), 13 media, 4 font, 4 direct display/input 1 GL interop and 9 mobile (LongPress, ImeState, ImeAction, ImeResize, PhysicalKeyboard, SelectionHandle, TouchCancel, SafeArea, ImeAnimate) and 2 system back (BackGesture, BackPressed) and 2 tray (TrayMenu, TrayClick) and 2 XR (XrFrame, XrDepth) and 2 accessibility (A11yState, A11yAction) and 1 native layer events");
+    assert_eq!(EVENT_TABLE.len(), 104, "55 core (incl. Clipboard, GpuBudget, PayloadSize, MouseCancel, AppMessage, DeviceReset, GpuPressure, Redraw), 6 parent/child (85-90), 13 media, 4 font, 4 direct display/input 1 GL interop and 9 mobile (LongPress, ImeState, ImeAction, ImeResize, PhysicalKeyboard, SelectionHandle, TouchCancel, SafeArea, ImeAnimate) and 2 system back (BackGesture, BackPressed) and 2 tray (TrayMenu, TrayClick) and 2 XR (XrFrame, XrDepth) and 2 accessibility (A11yState, A11yAction) and 1 native layer events and 1 hosted native relay (HostedNativeOut) and 1 GPU profiler readout (GpuProfRecording)");
     assert_eq!(EVENT_TABLE.iter().filter(|t| (120..133).contains(&t.0)).count(), 13);
     assert_eq!(EVENT_TABLE.iter().filter(|t| (100..104).contains(&t.0)).count(), 4);
     let tags: std::collections::HashSet<u16> = EVENT_TABLE.iter().map(|t| t.0).collect();

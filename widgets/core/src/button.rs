@@ -1536,6 +1536,10 @@ pub struct Button {
     #[live]
     pub text: ArcStringMut,
 
+    /// What assistive technology calls a button that shows no text (an icon).
+    #[live]
+    a11y_name: ArcStringMut,
+
     #[live]
     on_click: ScriptFnRef,
 
@@ -1613,7 +1617,8 @@ impl Widget for Button {
 
     fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
         node.role = a11y_tree::Role::Button;
-        makepad_platform::a11y::set_string(&mut node.name, self.shown_label());
+        let name: &str = self.a11y_name.as_ref();
+        makepad_platform::a11y::set_string(&mut node.name, if name.is_empty() { self.shown_label() } else { name });
         node.actions = a11y_tree::Actions::PRESS | a11y_tree::Actions::FOCUS;
         node.states = a11y_tree::States::FOCUSABLE;
         node.states.set(

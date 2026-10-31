@@ -125,6 +125,7 @@ pub fn start(app: &str) {
 /// The commands: (name, arguments, what it answers).
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "view [open|dismiss]", "the run's view over the app (compile errors, a parked panic, the JIT's state): what it shows, or open / dismiss it (the caption's JIT ring is display only)"),
+    ("pin", "[on|off]", "pin the running app while an operation runs: no edit or landing reaches it and it does not restart; off: it catches up"),
     ("session", "relaunch", "apply the edits waiting for a restart: a hosted app relaunches its domain in this process (host window and GPU device kept); a program that restarts itself (std::relax::restart_supported) restarts with its state"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
@@ -229,6 +230,15 @@ fn dispatch_command(req: &Req, out: &mut Out) {
             },
             _ => out.err("session [pending] | session relaunch | session view [open|dismiss]"),
         },
+        "pin" => {
+            let on = match req.pos.first().map(String::as_str) {
+                Some("on") => crate::reload::set_pinned(true),
+                Some("off") => crate::reload::set_pinned(false),
+                None => crate::reload::pinned(),
+                Some(_) => return out.err("pin [on|off]"),
+            };
+            out.line(&format!("{{\"pinned\":{on}}}"));
+        }
         "help" => help(req, out),
         "pf" => out.err("pf is answered by the client: makepad inspect <app> pf <query> (it attaches to the app's prof stream)"),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),

@@ -54,7 +54,8 @@ impl CliKind {
 
     fn provider(self) -> Box<dyn ChatProvider + Send> {
         match self {
-            CliKind::ClaudeCode => Box::new(ClaudeCodeChatProvider::new(None)),
+            // The in-app chat's turns are tool-driven, with the person waiting.
+            CliKind::ClaudeCode => Box::new(ClaudeCodeChatProvider::new(None).effort("low")),
             CliKind::Codex => Box::new(CodexCliChatProvider::new(None)),
         }
     }
@@ -223,6 +224,8 @@ pub struct CliModel {
     cut: bool,
     /// Calls handed to the engine this turn.
     made: usize,
+    /// The size last said of the tool block being written, in KB.
+    writing_kb: Option<usize>,
     /// Inside a `<think>` block the CLI forwards its reasoning in.
     thinking: bool,
     /// Results the engine owes for the round: (call id, tool name).
@@ -247,6 +250,7 @@ impl CliModel {
             shown: 0,
             cut: false,
             made: 0,
+            writing_kb: None,
             thinking: false,
             awaiting: Vec::new(),
             results: Vec::new(),
@@ -262,6 +266,7 @@ impl CliModel {
         self.thinking = false;
         self.cut = false;
         self.made = 0;
+        self.writing_kb = None;
         let images: Vec<ToolImage> = std::mem::take(&mut self.images)
             .into_iter()
             .map(|i| ToolImage { label: i.label, png: i.png })
@@ -354,8 +359,17 @@ impl CliModel {
             let (body, used) = match tail[skip..].find(close) {
                 Some(end) => (&tail[skip..skip + end], skip + end + close.len()),
                 None if last || self.cut => (&tail[skip..], tail.len()),
-                None => return,
+                None => {
+                    // The block is still being written, out of sight: say so.
+                    let kb = (tail.len() - skip) / 1024;
+                    if self.writing_kb != Some(kb) {
+                        self.writing_kb = Some(kb);
+                        out.push(ModelEvent::Working(if kb == 0 { "Writing a tool call".to_string() } else { format!("Writing a tool call · {kb} KB") }));
+                    }
+                    return;
+                }
             };
+            self.writing_kb = None;
             let call = if skip > 0 { parse_call(body.trim()) } else { parse_invoke(body) };
             self.shown += used;
             if let Some(after) = self.raw[self.shown..limit].trim_start().strip_prefix("</function_calls>") {

@@ -1,5 +1,5 @@
 //! `makepad test [options] <package> [--lib] [--bins] [--bin <name>]... [--tests] [--test <name>]...
-//! [--no-fail-fast] [cargo feature flags] [-- <libtest args>]`: what `cargo test -p <package>` runs,
+//! [cargo feature flags] [-- <libtest args>]`: what `cargo test -p <package>` runs,
 //! under the JIT. The lib's unit tests (the lib built cfg(test)), the bins' unit tests, and the
 //! integration tests (the plain lib and every tests/ target) are separate programs, as under cargo;
 //! each is `makepad run --harness` in its own process (run.rs), one after the other. Without a
@@ -23,13 +23,12 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         i += 1;
     }
     let Some(package) = args.get(i).cloned() else {
-        eprintln!("usage: makepad test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [--no-fail-fast] [cargo flags] [-- <test args>]");
+        eprintln!("usage: makepad test <package> [--lib] [--bins] [--bin <name>] [--tests] [--test <name>] [cargo flags] [-- <test args>]");
         return 2;
     };
     let mut lib = false;
     let mut bins: Option<Vec<String>> = None;
     let mut tests: Option<Vec<String>> = None;
-    let mut no_fail_fast = false;
     let mut flags: Vec<String> = Vec::new();
     let mut prog: Vec<String> = Vec::new();
     let mut words = args[i + 1..].iter();
@@ -60,7 +59,8 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                     return 2;
                 }
             },
-            "--no-fail-fast" => no_fail_fast = true,
+            // every target runs anyway: one failing says nothing about the next
+            "--no-fail-fast" => {}
             "--release" => {}
             "--features" | "-F" | "--cfg" | "--domain" => {
                 flags.push(w.clone());
@@ -166,9 +166,6 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             }
             None => a.push("--harness".to_string()),
         }
-        if no_fail_fast {
-            a.push("--no-fail-fast".to_string());
-        }
         a.extend(pre.iter().cloned());
         a.push(package.clone());
         a.extend(flags.iter().cloned());
@@ -188,9 +185,6 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
                 eprintln!("error: test failed (harness = false target exited with status {c})");
             }
             code = 101;
-            if !no_fail_fast {
-                break;
-            }
         }
     }
     // cargo test's default selection also runs the lib's doc tests; makepad test does not: say

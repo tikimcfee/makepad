@@ -4283,9 +4283,10 @@ unsafe extern "system" fn life_span_on_before_close(
 ) {
     release_param(browser);
     if let Ok(runtime) = runtime() {
-        let _ = runtime.live_browsers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            Some(count.saturating_sub(1))
-        });
+        let mut count = runtime.live_browsers.load(Ordering::Acquire);
+        while let Err(now) = runtime.live_browsers.compare_exchange(count, count.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire) {
+            count = now;
+        }
     }
 }
 

@@ -266,6 +266,7 @@ pub(crate) fn worker_main(
             let mut tool_body = String::new();
             let mut tool_calls: Vec<(String, Vec<(String, String)>)> = Vec::new();
             let mut visible = LeadingVisible::default();
+            let mut hidden = HiddenWork::default();
             let mut interrupted = false;
             let sampling = LlamaSamplingParams {
                 seed: fresh_sample_seed(),
@@ -336,6 +337,11 @@ pub(crate) fn worker_main(
                     continue;
                 }
                 if let Some(text) = decoder.push_token(session.vocab(), token) {
+                    if in_tool_call || in_think {
+                        if let Some(note) = hidden.wrote(in_tool_call, text.len()) {
+                            send(ChatEvent::Working(note));
+                        }
+                    }
                     if in_tool_call {
                         tool_body.push_str(&text);
                     } else if !in_think {

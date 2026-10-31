@@ -24,6 +24,10 @@ use std::time::Duration;
 /// whether it plays (Stage's transport, a game's clock).
 pub trait ClockSource: Send + Sync {
     fn now(&self) -> Option<(f64, f64, bool)>;
+    /// The transport's locates so far, from the same pass as `now` or an
+    /// older one: a rewind waits for it to change before it believes the
+    /// clock again.
+    fn located(&self) -> u64;
 }
 
 pub enum Cmd {
@@ -44,6 +48,8 @@ pub enum Cmd {
     Seek { beat: f64, quant: f64 },
     /// Repeat song beats [from, to), or play on.
     Loop(Option<(f64, f64)>),
+    /// Start over from beat 0 on this transport ([`LiveScore::rewind`]).
+    Rewind(String),
     Quit,
 }
 
@@ -150,7 +156,7 @@ impl LiveScore {
         // Made where it runs: the composer's VM never moves between threads.
         let worker = {
             let status = status.clone();
-            move || Worker { config, rx, status, composer: None, source: String::new(), revision: 0, feeds: HashMap::new(), last_beat: None, dropped: 0, tempo, osc_in: None, osc_out: None, osc_pending: Vec::new(), seek_stopped: None, loop_range: None, steps: 0 }
+            move || Worker { config, rx, status, composer: None, source: String::new(), revision: 0, feeds: HashMap::new(), last_beat: None, dropped: 0, tempo, osc_in: None, osc_out: None, osc_pending: Vec::new(), seek_stopped: None, loop_range: None, steps: 0, locating: None, from_top: false }
         };
         if !threads_available() || pumped {
             return LiveScore { cmd: tx, status, thread: None, inline: Some(Mutex::new(worker())), instance };
@@ -215,6 +221,15 @@ impl LiveScore {
         self.send(Cmd::Loop(range));
     }
 
+    /// Start the score over from scratch at beat 0 of `transport`: the same
+    /// composer, player and tempo a first start has (every voice and tail
+    /// cut, params as written; the loop range stays). Playing, it goes on
+    /// from the top; stopped, it stays stopped at 0. For a score played from
+    /// its slot ([`crate::node`]).
+    pub fn rewind(&self, transport: &str) {
+        self.send(Cmd::Rewind(transport.to_string()));
+    }
+
     pub fn set_tempo(&self, bpm: f64, ramp: f64) {
         self.send(Cmd::Tempo { bpm, ramp });
     }
@@ -251,6 +266,12 @@ struct Worker {
     /// (kept across restarts).
     seek_stopped: Option<f64>,
     loop_range: Option<(f64, f64)>,
+    /// A rewind's locate is on its way: the transport's count before it.
+    /// Until it changes the clock still reads the old run.
+    locating: Option<u64>,
+    /// The composer stands at beat 0 from a rewind: the next start goes on
+    /// from there, not from the next bar.
+    from_top: bool,
     /// OSC: the socket listening on the Clock's `osc_in` port, the one
     /// sending, and what waits for its beat.
     osc_in: Option<(u16, std::net::UdpSocket)>,
@@ -371,7 +392,65 @@ impl Worker {
         self.composer = Some(fresh);
     }
 
+    /// The first start again: a new composer and player, the first events
+    /// in the player's feeds before the transport goes back, so the top
+    /// sounds on time. Only this thread sends, so nothing of the old run
+    /// reaches the new feeds, and the locate follows the old tempo changes
+    /// in theirs.
+    fn rewind(&mut self, transport: &str) {
+        self.seek_stopped = None;
+        self.osc_pending.clear();
+        self.dropped = 0;
+        self.last_beat = None;
+        self.from_top = true;
+        self.locating = Some(self.config.clock.located());
+        let clock = makepad_audio_engine::feed::tempo_feed(transport);
+        let locate = |bpm| makepad_audio_engine::feed::TempoEvent { beat: 0.0, bpm, ramp: 0.0, locate: true };
+        let Ok(loaded) = model::load(&self.source) else {
+            clock.send(locate(0.0));
+            return;
+        };
+        let mut composer = Composer::new(loaded);
+        composer.set_loop(self.loop_range);
+        let bpm = crate::render::transport_bpm(&composer.doc);
+        let slot = crate::node::slot(&self.config.instance);
+        let player = slot.prepare_fresh().unwrap_or_else(|diags| {
+            eprintln!("score: rewind: {}", diags.first().map_or("", |d| d.message.as_str()));
+            None
+        });
+        let playing = self.config.clock.now().is_some_and(|(.., playing)| playing);
+        let mut events = Vec::new();
+        if playing {
+            composer.pump(self.config.lookahead * bpm / 60.0, &mut events);
+        }
+        for (fx, event) in composer.automation_out.drain(..) {
+            makepad_audio_engine::feed::automation_feed(&format!("{}/{fx}", self.config.instance)).send(event);
+        }
+        let tempo: Vec<_> = composer.tempo_out.drain(..).collect();
+        self.composer = Some(composer);
+        self.feeds_for();
+        for event in events {
+            match self.feeds.get(&event.loop_key) {
+                Some(feed) if feed.send(event) => {}
+                _ => self.dropped += 1,
+            }
+        }
+        clock.send(locate(bpm));
+        if let Some(player) = player {
+            slot.post_fresh(player);
+        }
+        for change in tempo {
+            self.tempo.send(change);
+        }
+    }
+
     fn pump(&mut self) {
+        if let Some(before) = self.locating {
+            if self.config.clock.located() == before {
+                return;
+            }
+            self.locating = None;
+        }
         let Some((now, bpm, playing)) = self.config.clock.now() else { return };
         if self.composer.is_none() || !playing {
             self.last_beat = None;
@@ -379,10 +458,12 @@ impl Worker {
         }
         // The clock started, or jumped (a locate): begin on the next bar.
         match self.last_beat {
+            None if self.from_top && self.seek_stopped.is_none() => {}
             None => self.restart_at(now),
             Some(last) if now < last - 0.5 || now > last + 16.0 => self.restart_at(now),
             _ => {}
         }
+        self.from_top = false;
         self.last_beat = Some(now);
         let until = now + self.config.lookahead * bpm / 60.0;
         let mut events = Vec::new();
@@ -404,7 +485,8 @@ impl Worker {
     }
 
     fn command(&mut self, cmd: Cmd) {
-        let now = self.config.clock.now().map_or(0.0, |(beat, bpm, _)| beat + self.config.lookahead * bpm / 60.0);
+        let locating = self.locating.is_some();
+        let now = self.config.clock.now().map_or(0.0, |(beat, bpm, _)| if locating { 0.0 } else { beat } + self.config.lookahead * bpm / 60.0);
         match cmd {
             Cmd::Source(source) => self.load(source, now),
             Cmd::Param(name, value) => {
@@ -437,7 +519,7 @@ impl Worker {
                         current = Some(*change);
                     }
                     if let Some(change) = current {
-                        self.tempo.send(makepad_audio_engine::feed::TempoEvent { beat, bpm: change.bpm, ramp: 0.0 });
+                        self.tempo.send(makepad_audio_engine::feed::TempoEvent { beat, bpm: change.bpm, ramp: 0.0, locate: false });
                     }
                 }
             }
@@ -466,6 +548,7 @@ impl Worker {
                     }
                 }
             }
+            Cmd::Rewind(transport) => self.rewind(&transport),
             Cmd::Quit => {}
         }
     }
@@ -528,6 +611,9 @@ mod tests {
     impl ClockSource for Playing {
         fn now(&self) -> Option<(f64, f64, bool)> {
             Some((0.0, 120.0, true))
+        }
+        fn located(&self) -> u64 {
+            0
         }
     }
 

@@ -191,6 +191,10 @@ pub(crate) fn rewrite_caps(file: &std::path::Path, caps: &[String]) {
 /// (166, 2026-10-25). Linux (and other Unix with a session): `$XDG_RUNTIME_DIR`, the user's 0700
 /// runtime dir; elsewhere the temp dir (macOS's is per user already).
 pub fn registry_dir() -> std::path::PathBuf {
+    // a run whose TMPDIR is its own (a devhub lease on a Mac) still announces where its node's hub looks
+    if let Some(dir) = std::env::var_os("MAKEPAD_REMOTE_REGISTRY").map(std::path::PathBuf::from).filter(|d| d.is_absolute()) {
+        return dir;
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
         return dir;

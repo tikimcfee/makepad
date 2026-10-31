@@ -1,7 +1,6 @@
 //! The audio shader front end, part 1: lexing and parsing Splash syntax
 //! into an AST with byte spans (spans are relative to the shader's code
 //! string, so an editor can underline an error in place).
-use makepad_relax_api::relax_api;
 
 use crate::ShaderError;
 
@@ -192,7 +191,6 @@ fn int_is_method(b: &[u8], i: usize) -> bool {
 // AST
 // =========================================================================
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Span {
@@ -200,7 +198,6 @@ pub struct Span {
     pub end: usize,
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub enum TypeAnn {
@@ -243,7 +240,6 @@ pub struct FnDecl {
     pub span: Span,
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AssignOp {
@@ -268,7 +264,6 @@ pub enum Stmt {
     Return(Option<Expr>, Span),
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BinOp {
@@ -374,7 +369,6 @@ pub(crate) fn type_ann_named(name: &str) -> Option<TypeAnn> {
     })
 }
 
-#[relax_api(plain)]
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,

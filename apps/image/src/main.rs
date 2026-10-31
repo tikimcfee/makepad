@@ -6,7 +6,11 @@
 pub use makepad_widgets;
 use makepad_widgets::*;
 use makepad_app_image::preview::{PreviewAction, PreviewState};
-use makepad_app_image::widget::{MpImageAction, MpImageView};
+use makepad_app_image::widget::{MpImageAction, MpImageView, PICTURE_EXTENSIONS};
+use makepad_widgets::makepad_platform::file_dialogs::{FileDialog, FileDialogAction};
+use std::path::Path;
+
+const PICK_PICTURE: LiveId = live_id!(pick_picture);
 
 app_main!(App);
 
@@ -28,9 +32,33 @@ script_mod! {
                         spacing: 0
                         padding: 0
 
-                        viewer := MpImageView{
+                        picture := View{
                             width: Fill
                             height: Fill
+                            flow: Overlay
+
+                            viewer := MpImageView{
+                                width: Fill
+                                height: Fill
+                            }
+
+                            // What a window with no picture shows.
+                            empty := View{
+                                width: Fill
+                                height: Fill
+                                flow: Down
+                                spacing: 12
+                                align: Align{x: 0.5 y: 0.5}
+
+                                Label{
+                                    text: "No picture open"
+                                    draw_text +: {
+                                        color: theme.color_text
+                                        text_style: theme.font_regular{font_size: 14}
+                                    }
+                                }
+                                open_picture := ButtonFlat{text: "Open a Picture"}
+                            }
                         }
 
                         status_row := RectView{
@@ -86,6 +114,8 @@ impl MatchEvent for App {
         if let Some(mut viewer) = self.ui.widget(cx, ids!(viewer)).borrow_mut::<MpImageView>() {
             viewer.set_preview(preview);
         }
+        // A preview panel is never without its picture for long: no prompt in it.
+        self.ui.view(cx, ids!(empty)).set_visible(cx, !preview);
 
         self.set_title(cx);
         // A --stdin-loop child is tiled by the compositor, which owns the
@@ -98,7 +128,20 @@ impl MatchEvent for App {
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.ui.button(cx, ids!(open_picture)).clicked(actions) {
+            let dialog = FileDialog::new()
+                .set_id(PICK_PICTURE)
+                .set_title("Open a Picture".to_string())
+                .add_filter("Picture".to_string(), PICTURE_EXTENSIONS.iter().map(|e| e.to_string()).collect())
+                .add_filter("All Files".to_string(), vec!["*".to_string()]);
+            cx.open_select_file_dialog(dialog);
+        }
         for action in actions {
+            if let Some(picked) = action.downcast_ref::<FileDialogAction>().filter(|p| p.id() == PICK_PICTURE) {
+                if let Some(path) = picked.path() {
+                    self.show(cx, path);
+                }
+            }
             let Some(widget_action) = action.as_widget_action() else {
                 continue;
             };
@@ -112,6 +155,7 @@ impl MatchEvent for App {
                     format!("{}    loading\u{2026}", name)
                 };
                 self.ui.label(cx, ids!(status)).set_text(cx, &text);
+                self.ui.view(cx, ids!(empty)).set_visible(cx, name.is_empty());
             }
         }
     }
@@ -124,6 +168,10 @@ impl App {
         let Some(path) = event.paths().next() else {
             return;
         };
+        self.show(cx, path);
+    }
+
+    fn show(&mut self, cx: &mut Cx, path: &Path) {
         self.preview.show(path);
         if let Some(mut viewer) = self.ui.widget(cx, ids!(viewer)).borrow_mut::<MpImageView>() {
             viewer.open(cx, path);

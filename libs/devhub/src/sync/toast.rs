@@ -14,6 +14,7 @@ pub struct News {
     /// The landed commits' subjects, newest first (commercial before makepad), merges left out.
     pub subjects: Vec<String>,
     /// The landing's wall-clock ms (the master's kick), when the sync followed one.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub landed_ms: Option<u64>,
 }
 

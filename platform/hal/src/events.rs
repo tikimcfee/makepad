@@ -347,4 +347,9 @@ hal_events! {
     TrayClick = 149, tray_click { tray: u64, x: f64, y: f64, w: f64, h: f64, screen: rect };
     /// Native content's state (`native_layer::state`); strings and packed data use `data`.
     NativeLayerState = 152, native_layer_state { id: obj, what: u32, a: u64, b: u64, data: rng };
+    /// A native-layer request for the WM, to relay (the bridge session, `HostedNativeBridge`):
+    /// the fence fd (the receiver owns it) or -1, then the `NativeAppRequest` (SerBin).
+    HostedNativeOut = 156, hosted_native_out { bytes: rng };
+    /// The answer to `GpuProfQuery`: a recording (`makepad_gpu_trace::Recording::encode`).
+    GpuProfRecording = 157, gpu_prof_recording { bytes: rng };
 }

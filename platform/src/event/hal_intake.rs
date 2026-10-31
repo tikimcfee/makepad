@@ -92,6 +92,9 @@ impl Cx {
     /// Feeds one HAL event to Cx. Returns false when the app is done (the last window closed).
     pub(crate) fn hal_intake(&mut self, time_ns: u64, event: HalEvent<'_>) -> bool {
         let time = self.hal.secs(time_ns);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _origin = matches!(event, HalEvent::MouseDown { mods, .. } | HalEvent::MouseMove { mods, .. } | HalEvent::MouseUp { mods, .. } if mods & input::MOD_INJECTED != 0)
+            .then(|| crate::remote::remote_input_scope(self));
         if matches!(
             event,
             HalEvent::MouseDown { .. } | HalEvent::MouseMove { .. } | HalEvent::MouseUp { .. } | HalEvent::Scroll { .. } | HalEvent::Pinch { .. } | HalEvent::Touch { .. } | HalEvent::KeyDown { .. } | HalEvent::KeyUp { .. } | HalEvent::Text { .. } | HalEvent::Ime { .. }
@@ -112,6 +115,14 @@ impl Cx {
         }
         match event {
             HalEvent::NativeLayerState { id, what, a, b, data } => self.hal_native_layer_state(id, what, a, b, data),
+            HalEvent::GpuProfRecording { bytes } => match makepad_gpu_trace::Recording::decode(bytes) {
+                Ok(rec) => self.hal.gpu_prof = Some(rec),
+                Err(error) => crate::error!("hal gpu profile: {error}"),
+            },
+            #[cfg(target_os = "linux")]
+            HalEvent::HostedNativeOut { bytes } => self.hal_hosted_native_out(bytes),
+            #[cfg(not(target_os = "linux"))]
+            HalEvent::HostedNativeOut { .. } => {}
             // ---- pointer
             HalEvent::MouseDown { window, x, y, button, mods } => {
                 let window_id = window_id(window);
@@ -892,7 +903,7 @@ impl Cx {
                     Some(crate::os::hal::HostedDone::Publish(draw)) => {
                         if window_frame { crate::frame_trace::note_presented(); }
                         #[cfg(target_os = "linux")]
-                        makepad_hal::hosted_native::presented(self.hal.frames.w.session(), window, frame);
+                        self.hal.frames.w.hosted_presented(window, frame);
                         Self::send_studio_message(crate::studio::AppToStudio::DrawCompleteAndFlip(draw))
                     }
                     // a hosted frame the GPU dropped: nothing to publish, paint it again

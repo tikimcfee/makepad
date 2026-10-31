@@ -27,9 +27,8 @@
 //! with the desktop's fleet certificate, and only the admin (the Mac's device credential from
 //! its bound address) may view, loopback included.
 
-use std::net::IpAddr;
 #[cfg(not(target_arch = "wasm32"))]
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 /// How the streams of a GPU with several encode engines share the pictures.

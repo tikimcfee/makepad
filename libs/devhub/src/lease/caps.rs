@@ -3,7 +3,9 @@
 //!
 //! `lease.conf` is `key = value` lines: `role = pool|suite|bench|user-wm|device`, `slots.<kind> = 0|1` (whether it takes the kind; one lease runs at a time),
 //! `disk_floor_gb`, `disk_warn_gb`, `timed = on|off`, `spec = <text>`, `work = <dir>` (default
-//! `~/devhub`), and CPU pinning for leases (`cpus.shared = 8-15,24-31`, `cpus.timed = 0-7,16-23`).
+//! `~/devhub`), CPU pinning for leases (`cpus.shared = 8-15,24-31`, `cpus.timed = 0-7,16-23`) and
+//! `user_idle_min` (default 3: minutes without a person's input before a node with our WM
+//! takes work again, [`super::UserSense`]).
 
 use super::{Caps, Kind, Role};
 use std::path::{Path, PathBuf};
@@ -23,7 +25,12 @@ pub struct LeaseConf {
     /// taskset CPU lists for shared kinds and for `timed` (empty: no pinning)
     pub cpus_shared: String,
     pub cpus_timed: String,
+    /// minutes without a person's input before the node takes work again
+    pub user_idle_min: u32,
 }
+
+/// `user_idle_min`'s default.
+pub const USER_IDLE_MIN: u32 = 3;
 
 pub fn home_dir() -> PathBuf {
     crate::os::home_dir()
@@ -50,6 +57,7 @@ impl LeaseConf {
             work: home.join("devhub"),
             cpus_shared: String::new(),
             cpus_timed: String::new(),
+            user_idle_min: USER_IDLE_MIN,
         };
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -64,6 +72,7 @@ impl LeaseConf {
                 "work" => c.work = v.strip_prefix("~/").map_or_else(|| PathBuf::from(v), |r| home.join(r)),
                 "cpus.shared" if valid_cpus(v) => c.cpus_shared = v.to_string(),
                 "cpus.timed" if valid_cpus(v) => c.cpus_timed = v.to_string(),
+                "user_idle_min" => c.user_idle_min = v.parse().ok().filter(|m| *m >= 1).unwrap_or(c.user_idle_min),
                 _ => {
                     if let (Some(kind), Ok(n)) = (k.strip_prefix("slots.").and_then(Kind::parse), v.parse::<u32>()) {
                         c.slots.retain(|(x, _)| *x != kind);
@@ -94,9 +103,10 @@ pub fn settable(key: &str, value: &str) -> Result<(), String> {
         "timed" => matches!(value, "on" | "off").then_some(()).ok_or_else(|| "timed = on|off".to_string()),
         "spec" => (!value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_graphic())).then_some(()).ok_or_else(|| "spec: one word".to_string()),
         "cpus.shared" | "cpus.timed" => (value.is_empty() || valid_cpus(value)).then_some(()).ok_or_else(|| format!("{key}: a CPU list like 8-15,24-31")),
+        "user_idle_min" => value.parse::<u32>().ok().filter(|m| (1..=1440).contains(m)).map(|_| ()).ok_or_else(|| "user_idle_min: whole minutes, 1..1440".to_string()),
         k => match k.strip_prefix("slots.").and_then(Kind::parse) {
             Some(_) => value.parse::<u32>().map(|_| ()).map_err(|_| format!("{key} takes a count")),
-            None => Err(format!("`{key}` is not a lease.conf key the master sets (role, slots.<kind>, disk_floor_gb, disk_warn_gb, timed, spec, cpus.shared, cpus.timed)")),
+            None => Err(format!("`{key}` is not a lease.conf key the master sets (role, slots.<kind>, disk_floor_gb, disk_warn_gb, timed, spec, cpus.shared, cpus.timed, user_idle_min)")),
         },
     }
 }
@@ -124,6 +134,19 @@ fn valid_cpus(v: &str) -> bool {
 }
 
 /// Measures this machine now (`node`: its devhub name; `apply`: DEVHUB2's applier kind).
+/// The node's `rustc -V` version (`1.97.1`), looked at every 5 min (an update needs no hub restart).
+fn rustc_version() -> String {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, String)>> = std::sync::Mutex::new(None);
+    let mut g = LAST.lock().unwrap();
+    if let Some((t, v)) = g.as_ref().filter(|(t, _)| t.elapsed() < std::time::Duration::from_secs(300)) {
+        let _ = t;
+        return v.clone();
+    }
+    let v = std::process::Command::new("rustc").arg("-V").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1).unwrap_or("").to_string()).unwrap_or_default();
+    *g = Some((std::time::Instant::now(), v.clone()));
+    v
+}
+
 pub fn measure(node: &str, conf: &LeaseConf, apply: &str) -> Caps {
     let mut c = os::hardware();
     c.node = node.to_string();
@@ -137,7 +160,62 @@ pub fn measure(node: &str, conf: &LeaseConf, apply: &str) -> Caps {
     c.disk_warn_gb = conf.disk_warn_gb;
     c.timed = conf.timed;
     c.apply = apply.to_string();
+    c.hub_rev = hub_rev().to_string();
+    c.rustc = rustc_version();
+    c.hub_proto = super::HUB_PROTO;
+    c.services = services();
     c
+}
+
+/// The WM-supervised services of this node (`~/.makepad/wm/<name>.state`, written at each start):
+/// name and start time.
+pub fn services() -> Vec<(String, u64)> {
+    let dir = makepad_network::fleet::makepad_home().join("wm");
+    let mut out: Vec<(String, u64)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().strip_suffix(".state")?.to_string();
+            let t = e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+            Some((name, t))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The commit this hub's checkout held when the hub started (its code; read once, from the files
+/// under `.git`: the tree moves with leases later).
+pub fn hub_rev() -> &'static str {
+    static REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REV.get_or_init(|| {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // a tree a deploy script or sync wrote with no `.git` of its own (103) names its commit in
+        // FLEET-REVISION.txt
+        head_sha(&repo).or_else(|| {
+            let t = std::fs::read_to_string(repo.join("FLEET-REVISION.txt")).ok()?;
+            t.lines().find_map(|l| l.strip_prefix("makepad ").map(|s| s.trim().to_string())).filter(|s| s.len() == 40)
+        }).unwrap_or_default()
+    })
+}
+
+/// HEAD's commit of a checkout, from its files (a linked worktree's `.git` file, a loose ref or
+/// packed-refs).
+pub fn head_sha(tree: &std::path::Path) -> Option<String> {
+    let dot = tree.join(".git");
+    let dir = if dot.is_dir() { dot } else { tree.join(std::fs::read_to_string(&dot).ok()?.trim().strip_prefix("gitdir:")?.trim()) };
+    let common = std::fs::read_to_string(dir.join("commondir")).ok().map_or(dir.clone(), |c| dir.join(c.trim()));
+    let head = std::fs::read_to_string(dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(r) = head.strip_prefix("ref:").map(str::trim) else { return Some(head.to_string()) };
+    for base in [&dir, &common] {
+        if let Ok(s) = std::fs::read_to_string(base.join(r)) {
+            return Some(s.trim().to_string());
+        }
+    }
+    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+    packed.lines().find_map(|l| l.strip_suffix(r).map(str::trim).filter(|s| s.len() == 40)).map(str::to_string)
 }
 
 pub const GB: f64 = (1u64 << 30) as f64;

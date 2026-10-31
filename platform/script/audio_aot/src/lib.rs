@@ -172,7 +172,7 @@ pub(crate) fn compile_items(items: &[parse::Item], user_len: usize, backend: Bac
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             if native_ok {
-                if let Some(code) = native::compile(init) {
+                if let Some(code) = native::compile_with(init, 0) {
                     // SAFETY: `shared` is this init's own table vector.
                     unsafe { code.run(&mut ctx, &mut state, shared.as_mut_ptr(), [&zeros, &zeros], [&mut o0, &mut o1], 1) };
                 } else {
@@ -189,7 +189,7 @@ pub(crate) fn compile_items(items: &[parse::Item], user_len: usize, backend: Bac
         }
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    let native = if native_ok { native::compile(&lowered.render) } else { None };
+    let native = if native_ok { native::compile_with(&lowered.render, 0) } else { None };
     let (params, state_vars) = (lowered.params, lowered.state_vars);
     let state_init = lowered.state_init.into_boxed_slice();
     // SAFETY (all four views): the names and boxes they borrow belong to the

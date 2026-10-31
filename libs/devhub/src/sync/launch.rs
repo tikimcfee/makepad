@@ -275,10 +275,9 @@ pub fn service(conf: Arc<SyncConf>, publish: crate::local::Publish, machine: Str
                     Err(e) => err(out, &e),
                 }
             }
+            // the user's own dock app on their display (launch-or-focus): no dev work, so a node
+            // whose dev switch is off (the user's display node) shows it too
             ["show", app] => {
-                if !guard(out) {
-                    return;
-                }
                 match show(app) {
                     Ok(line) => {
                         publish(hub_record(&machine, app, 0, "launch", Sev::Info, format!("launch: showed the dock's {app}"), String::new()));

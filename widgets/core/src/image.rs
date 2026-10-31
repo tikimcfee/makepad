@@ -1231,6 +1231,8 @@ impl Image {
                 }
             }
             ImageFit::Stretch => {}
+            // (the window on a bitmap: a vector source is drawn whole, by its own call)
+            ImageFit::CropToFill if self.draw_svg.is_some() => {}
             ImageFit::CropToFill => {
                 self.set_crop_to_fill_transform(
                     width,

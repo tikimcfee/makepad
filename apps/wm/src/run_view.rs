@@ -417,6 +417,15 @@ impl MpRunView {
         self.redraw(cx);
     }
 
+    /// The tile's client announced its window again: a new image of its process (an exec into a
+    /// rebuilt makepad). The GPU descriptor channel died with the old image, and the new one has
+    /// none of its swapchain: a new channel and a new swapchain, as for a new client.
+    pub fn app_restarted(&mut self, cx: &mut Cx, client: ClientId, window_id: usize, hub_port: u16) {
+        self.hosted.clear_run_target(cx);
+        self.set_run_target(cx, client, window_id, hub_port);
+        self.app_ready(cx, client, window_id);
+    }
+
     pub fn clear_run_target(&mut self, cx: &mut Cx) {
         let had_target = self.hosted.client().is_some();
         if self.hosted.clear_run_target(cx) {

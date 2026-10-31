@@ -162,7 +162,8 @@ impl FilePromise {
 /// producer, not a file to hand over.
 #[cfg(not(target_arch = "wasm32"))]
 fn complete(part: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
-    let file = std::fs::File::open(part).map_err(|e| format!("the producer wrote no file: {e}"))?;
+    // write access: Windows flushes a file only through a handle that may write it
+    let file = std::fs::OpenOptions::new().write(true).open(part).map_err(|e| format!("the producer wrote no file: {e}"))?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
     if len == 0 {
         return Err("the producer wrote an empty file".into());

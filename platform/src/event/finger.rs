@@ -2755,10 +2755,7 @@ mod lock_nest_tests {
         assert!(!fingers.is_touch_drag_claimed(3));
     }
 
-    use crate::{
-        area::RectArea,
-        draw_list::{CxRectArea, DrawList},
-    };
+    use crate::draw_list::{CxRectArea, DrawList};
 
     const INNER: usize = 0;
     const OUTER: usize = 1;

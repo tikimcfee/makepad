@@ -107,7 +107,7 @@ impl MatchEvent for App {
         self.resources.handle_actions(cx, &ui, actions);
         about::handle_actions(cx, &ui, actions);
         let wants_resources = self.songs.handle_actions(cx, &ui, &mut self.desk, actions);
-        if wants_resources || ui.button(cx, ids!(score_resources)).clicked(actions) || ui.button(cx, ids!(score_gm_install)).clicked(actions) {
+        if wants_resources || ui.button(cx, ids!(score_resources)).clicked(actions) || ui.button(cx, ids!(score_gm_install)).clicked(actions) || ui.button(cx, ids!(score_patches_install)).clicked(actions) {
             self.resources.open(cx, &ui);
         }
     }

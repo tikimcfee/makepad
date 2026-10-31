@@ -277,7 +277,7 @@ impl Pty {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/zsh".to_owned());
 
-        let (master, slave) = unsafe { open_pty(cols, rows)? };
+        let (master, slave) = unsafe { open_pty(cols, rows) }.map_err(|e| io::Error::new(e.kind(), format!("openpty: {e}")))?;
         unsafe {
             set_cloexec(master);
             set_cloexec(slave);
@@ -331,7 +331,7 @@ impl Pty {
             cmd.stdin(Stdio::from(slave_file.try_clone()?));
             cmd.stdout(Stdio::from(slave_file.try_clone()?));
             cmd.stderr(Stdio::from(slave_file));
-            cmd.spawn()?
+            cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("{shell}{}: {e}", cwd.map_or(String::new(), |c| format!(" in {}", c.display())))))?
         };
 
         use std::os::fd::IntoRawFd;

@@ -37,33 +37,54 @@ fn event(ctx: &Ctx, sev: Sev, line: String, j: Option<&Job>) {
 }
 
 pub fn start(ctx: Arc<Ctx>) {
-    // what a previous master ran: its leases ended with it; those jobs are placed again from
-    // their snapshots (up to ATTEMPTS placements), jobs still waiting for a box ask again
-    let moved: Vec<Job> = ctx.store.update(|d| {
-        let mut out = Vec::new();
+    // what a previous master ran goes on: the run lives on its node, and the lease came back with
+    // the master. A job with no run yet (its lease going or its snapshot shipping) or whose lease
+    // ended meanwhile is placed again; one still waiting for a box asks again.
+    let held = |j: &Job| super::leg::lease_held(&ctx, &j.lease);
+    let (back, moved, stray): (Vec<Job>, Vec<Job>, Vec<String>) = ctx.store.update(|d| {
+        let (mut back, mut moved, mut stray) = (Vec::new(), Vec::new(), Vec::new());
         for j in d.jobs.iter_mut() {
             match j.state.as_str() {
-                "leasing" => j.state = "queued".into(),
+                "leasing" => {
+                    j.state = "queued".into();
+                    j.attempts = j.attempts.saturating_sub(1);
+                }
+                "running" | "paused" if j.run_n > 0 && held(j) => back.push(j.clone()),
                 "running" | "paused" => {
+                    if j.run_n == 0 {
+                        j.attempts = j.attempts.saturating_sub(1);
+                    }
+                    if held(j) {
+                        stray.push(j.lease.clone());
+                    }
                     if j.attempts < ATTEMPTS {
                         j.state = "queued".into();
-                        j.note = "the master restarted under it; placed again".into();
+                        j.note = "its lease did not outlive the master's restart; placed again".into();
                     } else {
                         j.state = "lost".into();
                         j.ended_ms = wall_ms();
-                        j.note = "the master restarted under it (no placements left)".into();
+                        j.note = "its lease did not outlive the master's restart (no placements left)".into();
                     }
                     j.lease.clear();
                     j.node.clear();
-                    out.push(j.clone());
+                    j.run_n = 0;
+                    moved.push(j.clone());
                 }
                 _ => {}
             }
         }
-        out
+        (back, moved, stray)
     });
+    for l in stray {
+        end_lease(&l);
+    }
     for j in moved {
         event(&ctx, Sev::Warn, format!("job {}: {}", j.id, j.note), Some(&j));
+    }
+    for j in back {
+        event(&ctx, Sev::Info, format!("job {}: the master restarted; its run on {} goes on", j.id, j.node), Some(&j));
+        let c = ctx.clone();
+        let _ = std::thread::Builder::new().name("devhub-job".into()).spawn(move || reattach(&c, &j));
     }
     prune_logs(&ctx);
     let _ = std::thread::Builder::new().name("devhub-jobs".into()).spawn(move || loop {
@@ -188,7 +209,7 @@ pub fn snap_dir(ctx: &Ctx, snap: &str) -> std::path::PathBuf {
 
 /// Ships the snapshot into the lease's tree (already at the snapshot's base commits): only the
 /// files the box lacks as they are go; then `ship-done` names them and the deletions.
-fn ship_snap(ctx: &Ctx, held: &Held, snap: &str) -> Result<usize, String> {
+pub(super) fn ship_snap(ctx: &Ctx, held: &Held, snap: &str) -> Result<usize, String> {
     let dir = snap_dir(ctx, snap);
     let text = std::fs::read_to_string(dir.join("manifest.json")).map_err(|e| format!("snapshot {snap}: {e}"))?;
     let v = makepad_strict_json::parse(text.as_bytes()).map_err(|_| format!("snapshot {snap}: bad manifest"))?;
@@ -218,15 +239,13 @@ fn run(ctx: &Arc<Ctx>, id: &str) {
     let dir = ctx.logs("jobs");
     let _ = std::fs::create_dir_all(&dir);
     let log = dir.join(format!("{id}.log"));
-    let file = match std::fs::File::create(&log) {
-        Ok(f) => f,
-        Err(e) => return finish(ctx, id, Err(format!("{}: {e}", log.display())), &log),
-    };
     let kind = Kind::parse(&j.kind).unwrap_or(Kind::Test);
-    let spec = Spec { lane: j.lane.clone(), agent: j.agent.clone(), kind, needs: j.needs.clone(), prio: j.prio, rev: j.rev.clone(), repo_dir: j.repo_dir.clone(), node: (!j.node_pref.is_empty()).then(|| j.node_pref.clone()) };
+    let spec = Spec { only: j.only, lane: j.lane.clone(), agent: j.agent.clone(), kind, needs: j.needs.clone(), prio: j.prio, rev: j.rev.clone(), repo_dir: j.repo_dir.clone(), node: (!j.node_pref.is_empty()).then(|| j.node_pref.clone()) };
     let cancelled = || get(ctx, id).is_none_or(|j| j.state == "cancelled");
     let held = match Held::acquire(&spec, &mut |_| {}, &cancelled) {
         Ok(h) => h,
+        // the master's socket or a box's link went away: no verdict on the job
+        Err(e) if crate::lease::master::unreachable(&e) && again(ctx, id, &format!("no lease ({})", crate::proto::clean(&e, 160))) => return,
         Err(e) => return finish(ctx, id, Err(e), &log),
     };
     let j = set(ctx, id, |j| {
@@ -238,6 +257,10 @@ fn run(ctx: &Arc<Ctx>, id: &str) {
             j.started_ms = j.granted_ms;
         }
     });
+    // a soft pin that fell to a twin says so: the job's artifacts and timing are that box's
+    if !spec.only && spec.node.as_deref().is_some_and(|n| n != held.node) {
+        event(ctx, Sev::Warn, format!("job {id}: --node {} was held, so it runs on {} (`--only {}` waits for it)", spec.node.as_deref().unwrap_or(""), held.node, spec.node.as_deref().unwrap_or("")), None);
+    }
     let Some(j) = j.filter(|j| j.state == "running") else {
         // cancelled while the grant came
         held.release(None);
@@ -246,33 +269,88 @@ fn run(ctx: &Arc<Ctx>, id: &str) {
     if !j.snap.is_empty() {
         if let Err(e) = ship_snap(ctx, &held, &j.snap) {
             held.release(None);
+            if crate::lease::master::unreachable(&e) && again(ctx, id, &format!("shipping to {} failed ({})", j.node, crate::proto::clean(&e, 160))) {
+                return;
+            }
             return finish(ctx, id, Err(format!("shipping {}: {e}", j.snap)), &log);
         }
     }
     let j = set(ctx, id, |j| j.shipped_ms = wall_ms()).unwrap_or(j);
     event(ctx, Sev::Info, format!("job {id} running on {} ({}{}): {}", held.node, held.id, if j.snap.is_empty() { String::new() } else { format!(", {} {} file(s)", j.snap, j.snap_files) }, crate::proto::clean(&spec_cmd(&j), 160)), Some(&j));
+    // (only now: an earlier placement's output stays until this one has its own)
+    let file = match std::fs::File::create(&log) {
+        Ok(f) => f,
+        Err(e) => {
+            held.release(None);
+            return finish(ctx, id, Err(format!("{}: {e}", log.display())), &log);
+        }
+    };
     let mut out = Out { file, first: Some(Box::new(|| {
         set(ctx, id, |j| j.first_out_ms = wall_ms());
     })) };
-    let r = held.run(&j.cmd, &mut out);
+    let r = held.run_noted(&j.cmd, &mut out, &mut |n| {
+        set(ctx, id, |j| j.run_n = n);
+    });
     drop(out);
+    ended(ctx, id, held, r, &log);
+}
+
+/// A previous master's job on the lease this master took back: its run followed from where the
+/// log stands, to the end.
+fn reattach(ctx: &Arc<Ctx>, j: &Job) {
+    let log = ctx.logs("jobs").join(format!("{}.log", j.id));
+    let off = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let held = Held::attach(&j.lease, &j.node);
+    let file = match std::fs::OpenOptions::new().append(true).create(true).open(&log) {
+        Ok(f) => f,
+        Err(e) => {
+            held.release(None);
+            return finish(ctx, &j.id, Err(format!("{}: {e}", log.display())), &log);
+        }
+    };
+    let id = j.id.as_str();
+    let first: Option<Box<dyn FnMut() + '_>> = (j.first_out_ms == 0).then(|| {
+        Box::new(move || {
+            set(ctx, id, |j| j.first_out_ms = wall_ms());
+        }) as Box<dyn FnMut() + '_>
+    });
+    let mut out = Out { file, first };
+    let r = held.follow(j.run_n, off, &mut out);
+    drop(out);
+    ended(ctx, id, held, r, &log);
+}
+
+/// A job's run is over: its lease goes, and it has its result, or (the box lost under it, no exit)
+/// it is placed again from its snapshot.
+fn ended(ctx: &Ctx, id: &str, held: Held, r: Result<i32, String>, log: &std::path::Path) {
     held.release(r.as_ref().ok().copied());
-    // the box was lost under it (no exit): placed again from its snapshot
     if let Err(e) = &r {
-        let again = set(ctx, id, |j| {
-            if j.state == "running" && j.attempts < ATTEMPTS {
-                j.state = "queued".into();
-                j.note = format!("box {} lost ({}); placed again", j.node, crate::proto::clean(e, 160));
-                j.lease.clear();
-                j.node.clear();
-            }
-        });
-        if let Some(j) = again.filter(|j| j.state == "queued") {
-            event(ctx, Sev::Warn, format!("job {id}: {}", j.note), Some(&j));
+        let node = get(ctx, id).map_or(String::new(), |j| j.node);
+        if again(ctx, id, &format!("box {node} lost ({})", crate::proto::clean(e, 160))) {
             return;
         }
     }
-    finish(ctx, id, r, &log);
+    finish(ctx, id, r, log);
+}
+
+/// Back to the queue, with what happened as its note, if it has placements left; whether it went.
+fn again(ctx: &Ctx, id: &str, why: &str) -> bool {
+    let j = set(ctx, id, |j| {
+        if matches!(j.state.as_str(), "leasing" | "running") && j.attempts < ATTEMPTS {
+            j.state = "queued".into();
+            j.note = format!("{why}; placed again");
+            j.lease.clear();
+            j.node.clear();
+            j.run_n = 0;
+        }
+    });
+    match j.filter(|j| j.state == "queued") {
+        Some(j) => {
+            event(ctx, Sev::Warn, format!("job {id}: {}", j.note), Some(&j));
+            true
+        }
+        None => false,
+    }
 }
 
 fn spec_cmd(j: &Job) -> String {
@@ -299,9 +377,8 @@ fn finish(ctx: &Ctx, id: &str, r: Result<i32, String>, log: &std::path::Path) {
             j.exit = Some(*code);
         }
         if let Err(e) = &r {
-            if j.note.is_empty() {
-                j.note = crate::proto::clean(e, 240);
-            }
+            // what ended it, also over what an earlier placement noted
+            j.note = crate::proto::clean(e, 240);
         }
     });
     let Some(j) = j else { return };
@@ -571,7 +648,7 @@ fn submit(ctx: &Ctx, json: &str) -> Result<String, String> {
             return Err(format!("job {}: lane `{lane}` is not a name", i + 1));
         }
         let prio = r.get("prio").and_then(|p| p.as_i64()).unwrap_or(crate::lease::sched::DEFAULT_PRIO as i64) as i32;
-        jobs.push(Job { kind, needs: s(r, "needs"), node_pref: s(r, "node"), prio, repo_dir: tree.to_string_lossy().into_owned(), lane, agent: s(r, "agent"), cmd, after: list(r, "after"), state: "queued".into(), ..Default::default() });
+        jobs.push(Job { kind, needs: s(r, "needs"), node_pref: s(r, "node"), only: r.get("only").and_then(|o| o.as_bool()).unwrap_or(false), prio, repo_dir: tree.to_string_lossy().into_owned(), lane, agent: s(r, "agent"), cmd, after: list(r, "after"), state: "queued".into(), ..Default::default() });
     }
     // the base and the snapshot: one for the whole request
     let lane = jobs[0].lane.clone();
@@ -628,7 +705,7 @@ fn rerun(ctx: &Ctx, id: &str) -> Result<String, String> {
     }
     let n = ctx.store.update(|d| {
         d.jobs_next += 1;
-        let n = Job { id: format!("J{}", d.jobs_next), kind: j.kind.clone(), needs: j.needs.clone(), node_pref: j.node_pref.clone(), prio: j.prio, rev: j.rev.clone(), repo_dir: j.repo_dir.clone(), snap: j.snap.clone(), snap_files: j.snap_files, lane: j.lane.clone(), agent: j.agent.clone(), cmd: j.cmd.clone(), state: "queued".into(), submitted_ms: wall_ms(), note: format!("rerun of {id}"), ..Default::default() };
+        let n = Job { id: format!("J{}", d.jobs_next), kind: j.kind.clone(), needs: j.needs.clone(), node_pref: j.node_pref.clone(), only: j.only, prio: j.prio, rev: j.rev.clone(), repo_dir: j.repo_dir.clone(), snap: j.snap.clone(), snap_files: j.snap_files, lane: j.lane.clone(), agent: j.agent.clone(), cmd: j.cmd.clone(), state: "queued".into(), submitted_ms: wall_ms(), note: format!("rerun of {id}"), ..Default::default() };
         d.jobs.push(n.clone());
         n
     });

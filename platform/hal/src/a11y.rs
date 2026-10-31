@@ -21,7 +21,7 @@ pub mod remote;
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("ui", "[q=QUERY] [node=ID] [depth=N] [w=SESSION:WINDOW] [json=1] [app=NAME_OR_ID] [machine=TAB]", "semantic tree: role, name, state, bounds and actions"),
     ("ui find", "[q=QUERY|role=ROLE name=NAME state=STATE path=PATH] [nth=N] [w=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "matching node lines and count; nth is zero-based"),
-    ("ui act", "node=ID|q=QUERY ACTION [v=VALUE] [t=TEXT] [from= to=] [dx= dy=] [name=CUSTOM] [nth=] [w=] [wait=1] [if_user_seq=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "action result and resulting node; wait=1 includes presentation"),
+    ("ui act", "node=ID|q=QUERY ACTION [v=VALUE] [t=TEXT] [from= to=] [dx= dy=] [ms=1000 hz=120 legs=1 x= y= b=0 mods=shift+ctrl] [name=CUSTOM] [nth=] [w=] [wait=1] [if_user_seq=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "action result and resulting node; wait=1 includes presentation; ACTION drag: a real pointer drag of dx,dy at hz over ms (legs traversals, press at x,y from the node's corner, default its centre), answering the frames presented meanwhile (per_2s_min, gap_ms)"),
     ("ui type", "node=ID|q=QUERY t=TEXT [from= to=] [nth=] [w=] [if_user_seq=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "focus then replace the selection; raw typing only for nodes without a text action"),
     ("ui wait", "q=QUERY [gone=1|changed=1|count=N] [timeout_ms=5000] [w=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "matching nodes and elapsed ms when the condition holds; timeout is an error"),
     ("ui snap", "name=NAME [w=] [json=1] [app=NAME_OR_ID] [machine=TAB]", "save a named semantic tree snapshot"),
@@ -294,9 +294,29 @@ impl remote::Backend for Native {
         if reply == b"ok" { Ok(()) } else { Err(String::from_utf8_lossy(&reply).into_owned()) }
     }
 
+    fn os_selfcheck(&self, window: u64, act: bool) -> Result<String, String> {
+        let check = os_selfcheck().get().ok_or("this backend has no OS accessibility adapter")?;
+        Ok(check(window, act))
+    }
+
     fn user_seq(&self, window: u64) -> Result<u64, String> {
         let reply = Hal::global().query((window >> 32) as u32, b"a11y_user_seq", Duration::from_secs(5)).ok_or("activity query timed out")?;
         String::from_utf8_lossy(&reply).parse().map_err(|_| "invalid activity counter".into())
+    }
+
+    fn pointer(&self, window: u64, event: remote::PointerEvent, x: f64, y: f64, button: u32, mods: u32) -> Result<(), String> {
+        let (hal, session) = (Hal::global(), (window >> 32) as u32);
+        let id = hal.with_world(|w| w.session(session).and_then(|s| s.windows.keys_of(session).into_iter().find(|id| id.index == window as u32))).ok_or("window closed")?;
+        hal.inject(session, match event {
+            remote::PointerEvent::Move => crate::RawEvent::mouse_move(id, x, y, 0.0, 0.0, mods),
+            remote::PointerEvent::Down => crate::RawEvent::mouse_down(id, x, y, button, mods),
+            remote::PointerEvent::Up => crate::RawEvent::mouse_up(id, x, y, button, mods),
+        });
+        Ok(())
+    }
+
+    fn frames(&self, window: u64) -> u64 {
+        Hal::global().with_world(|w| w.session((window >> 32) as u32).map_or(0, |s| s.stats.window_frames))
     }
 }
 

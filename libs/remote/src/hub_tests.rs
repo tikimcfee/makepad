@@ -217,6 +217,7 @@ fn session_launch_and_kill_only_own_pids() {
 
 #[test]
 fn a_dropped_link_resumes_the_watch_feed_with_a_gap_marker() {
+    let _turn = crate::tests::WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
     let (_, watch) = shared();
     let hub = Hub::new(&hosts());
     let relay_ep = relay_endpoint();
@@ -423,4 +424,29 @@ fn host_env_round_trips_in_hosts_toml() {
     assert!(env.contains(&("DISPLAY".to_string(), ":0".to_string())));
     assert_eq!(Hosts::parse(&h.to_text()).unwrap(), h);
     assert!(Hosts::parse("[host.d]\nvia = \"dial\"\nkey = \"00\"\nenv = { A = \"b\" }\n").is_err());
+}
+
+/// The hub keeps only its live clients: each closed one goes when a new one comes (the devhub
+/// master's control socket kept every CLI call's sockets open, ~13k after an hour, until git
+/// could no longer be spawned).
+#[test]
+fn closed_clients_are_let_go() {
+    let hub = Hub::new(&hosts());
+    let ep = hub.client_endpoint();
+    for _ in 0..5 {
+        let c = pair(&ep);
+        c.close("done");
+        c.wait_closed();
+    }
+    let t = std::time::Instant::now();
+    // the server side sees each close a moment later
+    while t.elapsed() < WAIT && hub.kept_clients().1 > 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _live = pair(&ep);
+    let t = std::time::Instant::now();
+    while t.elapsed() < WAIT && hub.kept_clients().1 == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(hub.kept_clients(), (1, 1));
 }

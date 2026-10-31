@@ -517,7 +517,7 @@ impl Composer {
     /// `ramp` beats (a game's mood, a tempo command).
     pub fn set_tempo(&mut self, bpm: f64, ramp: f64) {
         let beat = self.horizon.max(0.0).ceil();
-        self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat, bpm: bpm.clamp(20.0, 400.0), ramp: ramp.max(0.0) });
+        self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat, bpm: bpm.clamp(20.0, 400.0), ramp: ramp.max(0.0), locate: false });
     }
 
     fn push_tempo(&mut self, event: makepad_audio_engine::feed::TempoEvent) {
@@ -552,7 +552,7 @@ impl Composer {
             let (bpm, ramp, points) = (section.bpm, section.ramp, section.tempo.clone());
             if self.tempo_point == 0 {
                 if let Some(bpm) = bpm {
-                    self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat: start, bpm, ramp });
+                    self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat: start, bpm, ramp, locate: false });
                 }
                 self.tempo_point = 1;
             }
@@ -567,7 +567,7 @@ impl Composer {
                 if beat >= until {
                     return;
                 }
-                self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat, bpm, ramp: 0.0 });
+                self.push_tempo(makepad_audio_engine::feed::TempoEvent { beat, bpm, ramp: 0.0, locate: false });
                 self.tempo_point += 1;
             }
             self.tempo_sections += 1;

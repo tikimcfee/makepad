@@ -181,7 +181,7 @@ fn key_index(name: &str) -> Option<u32> {
     KEYCODE_VARIANTS.iter().position(|k| *k != KeyCode::Unknown && format!("{k:?}").to_ascii_lowercase() == alias).map(|i| i as u32)
 }
 
-fn modifiers(words: &[String]) -> Result<u32, String> {
+pub(crate) fn modifiers(words: &[String]) -> Result<u32, String> {
     let mut bits = 0;
     for w in words.iter().flat_map(|w| w.split('+')).filter(|w| !w.is_empty()) {
         bits |= match w.to_ascii_lowercase().as_str() {

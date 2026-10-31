@@ -66,7 +66,8 @@ pub fn transcript_json(state: &EngineState) -> String {
     let status = match &state.status {
         Status::Idle => "idle".to_string(),
         Status::Loading { phase, fraction } => format!("loading {phase} {:.0}%", fraction * 100.0),
-        Status::Thinking => "thinking".to_string(),
+        Status::Thinking if state.model_note.is_empty() => "thinking".to_string(),
+        Status::Thinking => format!("thinking: {}", state.model_note),
         Status::Streaming => "streaming".to_string(),
         Status::WaitingForTool => "waiting_for_tool".to_string(),
         Status::Error(e) => format!("error: {e}"),

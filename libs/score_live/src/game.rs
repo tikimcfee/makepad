@@ -86,6 +86,10 @@ impl Shared {
 struct Clock(Arc<Shared>);
 
 impl ClockSource for Clock {
+    fn located(&self) -> u64 {
+        0
+    }
+
     fn now(&self) -> Option<(f64, f64, bool)> {
         let s = &self.0;
         if !s.ready.load(Ordering::Acquire) {
@@ -238,7 +242,7 @@ impl GameMusic {
                 composer.seek(beat, now, quant);
             }
             Cmd::Loop(range) => composer.set_loop(range),
-            Cmd::Transport(_) | Cmd::Quit => {}
+            Cmd::Transport(_) | Cmd::Rewind(_) | Cmd::Quit => {}
         }
     }
 

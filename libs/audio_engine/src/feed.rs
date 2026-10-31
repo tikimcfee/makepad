@@ -21,12 +21,16 @@ pub const TEMPO_MIN: f64 = 4.0;
 pub const TEMPO_MAX: f64 = 400.0;
 
 /// A tempo change: from `beat`, `bpm`, reached over `ramp` beats (0: at
-/// once; a ramp moves in sixteenth-beat steps).
+/// once; a ramp moves in sixteenth-beat steps). With `locate` the transport
+/// goes back to beat 0 at `bpm` (0: its tempo as it is) as it reads this, and
+/// forgets the changes it held: what came before in the feed is gone, what
+/// comes after belongs to the new run.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TempoEvent {
     pub beat: f64,
     pub bpm: f64,
     pub ramp: f64,
+    pub locate: bool,
 }
 
 /// Seconds from beat 0 to `beat` on a transport that starts at `bpm` and

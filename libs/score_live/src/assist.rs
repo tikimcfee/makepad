@@ -184,6 +184,7 @@ pub fn fields_of(ty: &str) -> Vec<&'static str> {
         "Sampler" => SAMPLER_FIELDS.to_vec(),
         "Ironfish" => IRON_FIELDS.to_vec(),
         "Morph" => morph_fields(),
+        "Tandem" => tandem_fields(),
         "Instrument" => INSTRUMENT_FIELDS.to_vec(),
         "Voice" => VOICE_FIELDS.to_vec(),
         "Loop" | "Stinger" => LOOP_FIELDS.to_vec(),

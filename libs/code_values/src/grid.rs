@@ -10,6 +10,8 @@
 //! rows; twelve are shown); the list itself is read once per change.
 
 use crate::data::*;
+// by name: with the widgets' data family on (a build of several apps at once) `crate::*` has a `Table` too
+use crate::data::Table;
 use crate::*;
 
 pub(crate) const ROW_H: f64 = 20.0;

@@ -4,9 +4,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod client;
-mod procs;
 mod server;
 
+use makepad_remote::procs;
 use makepad_network::tunnel::*;
 
 fn print_usage() {

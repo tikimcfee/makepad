@@ -1572,6 +1572,13 @@ impl App {
         let mut latest: Vec<(ClientId, String, bool)> = Vec::new();
         if let Some(lines) = self.client_lines.as_ref() {
             while let Ok(line) = lines.rx.try_recv() {
+                // The app's own first frame: under the JIT the client's first frames are its
+                // load screen's (`note_first_frame`).
+                if matches!(&line.output, makepad_app_registry::ProcessOutput::Line(text) if text.contains(" first frame at ")) {
+                    if let Some(slot) = self.state.as_ref().and_then(|state| state.clients.get(&line.client)) {
+                        log!("wm: {} client {} app first frame", slot.app, line.client);
+                    }
+                }
                 let Some(launch) = self.state.as_mut()
                     .and_then(|state| state.clients.get_mut(&line.client))
                     .and_then(|slot| slot.launch.as_mut()) else { continue };
@@ -3541,10 +3548,12 @@ impl App {
                     if self.is_warm(client) {
                         self.warm_bootstrap(cx, client, window_id);
                     } else if self.ai_bus.is_pane(client) {
-                        self.with_pane_run_view(cx, |cx, v| v.app_ready(cx, client, window_id));
+                        let hub_port = self.state_mut().hub_port;
+                        self.with_pane_run_view(cx, |cx, v| if again { v.app_restarted(cx, client, window_id, hub_port) } else { v.app_ready(cx, client, window_id) });
                     } else {
+                        let hub_port = self.state_mut().hub_port;
                         self.desk(cx).borrow_mut::<WmDesk>().map(|mut d| {
-                            d.with_run_view(cx, client, |cx, v| v.app_ready(cx, client, window_id))
+                            d.with_run_view(cx, client, |cx, v| if again { v.app_restarted(cx, client, window_id, hub_port) } else { v.app_ready(cx, client, window_id) })
                         });
                     }
                     self.send_desktop_style(cx, client);
@@ -4504,6 +4513,7 @@ impl App {
 
     /// A restart toast was clicked: that JIT applies its waiting restart in place (the app may
     /// still postpone it for unsaved work: its caption then offers it).
+    #[cfg(not(target_arch = "wasm32"))]
     fn relaunch_jit(pid: u32) {
         let _ = std::thread::Builder::new().name("wm-relaunch".into()).spawn(move || {
             match makepad_remote::link::Client::connect(&pid.to_string()) {
@@ -4577,6 +4587,9 @@ impl App {
     /// and the panel. `changed`: who is connected changed, so the bar is laid out again.
     fn sync_desk_link(&mut self, cx: &mut Cx, changed: bool) {
         let viewers = self.desk_link.viewers();
+        // a viewer attached may be a person watching this node (`activity`, the node's hub)
+        #[cfg(not(target_arch = "wasm32"))]
+        makepad_hal::user_input::set_viewers(viewers.len());
         if changed {
             self.bar_sample.desk_link = viewers.iter().map(|v| (v.name.clone(), v.peer.clone())).collect();
         }
@@ -6582,6 +6595,7 @@ impl MatchEvent for App {
                     if let Some(at) = self.toast_relaunch.iter().position(|t| t.0 == id) {
                         let (_, pid) = self.toast_relaunch.remove(at);
                         log!("wm: restart toast clicked: pid {pid} restarts in place");
+                        #[cfg(not(target_arch = "wasm32"))]
                         Self::relaunch_jit(pid);
                     }
                 }
@@ -7392,6 +7406,8 @@ impl App {
                 cx.set_cursor(MouseCursor::Grabbing);
                 true
             }
+            // (no files to carry on the web)
+            #[cfg(not(target_arch = "wasm32"))]
             Event::MouseUp(e) => {
                 let Some((from, paths)) = self.file_carry.take() else { return false };
                 cx.set_cursor(MouseCursor::Default);

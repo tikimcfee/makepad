@@ -28,6 +28,8 @@ const HELP: &str = "makepad devhub (or observe): the local devhub (start it with
                                           hand in for landing (no args: this worktree's branch and its nested
                                           commercial branch); each pending hand-in is quick-gated on its own node
                                           on the current tips, the passing ones land in queue order
+  land [...] --show <app> [--on <device>] [-- <devhub words>]
+                                          the chain: when it lands, show the app there, then run the words
   land status [all|<branch>] [--json]     per hand-in: queued / gating on <node> / passed / failed + error lines /
                                           conflict + files / waiting / landed <shas>
   land wait <branch>                      until it lands, fails or conflicts; prints its status (exit 0 landed)
@@ -600,6 +602,29 @@ fn land(c: &Client, a: &[&str]) -> i32 {
             Err(code) => code,
         },
         _ => {
+            // the chain: `land [...] --show <app> [--on <device>] [-- <devhub words>]`: when this
+            // lands, show the app on the device, then run the words; one command, nobody polls
+            let (a, then) = match a.iter().position(|x| *x == "--") {
+                Some(i) => (&a[..i], &a[i + 1..]),
+                None => (a, &a[a.len()..]),
+            };
+            let flag = |w: &str| a.iter().position(|x| *x == w).and_then(|i| a.get(i + 1).copied());
+            let (chain_app, chain_on) = (flag("--show"), flag("--on").unwrap_or("mac"));
+            let mut plain: Vec<&str> = Vec::new();
+            let mut k = 0;
+            while k < a.len() {
+                if a[k] == "--show" || a[k] == "--on" {
+                    k += 2;
+                    continue;
+                }
+                plain.push(a[k]);
+                k += 1;
+            }
+            if chain_app.is_none() && !then.is_empty() {
+                eprintln!("makepad devhub land: `-- <words>` runs after a `--show <app>`");
+                return 2;
+            }
+            let a = plain.as_slice();
             // a hand-in: given, or this worktree's branch (+ its nested commercial branch when it is on one)
             let args: Vec<String> = if a.is_empty() {
                 let g = |dir: &str, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -629,7 +654,39 @@ fn land(c: &Client, a: &[&str]) -> i32 {
                     let n = |k: &str| v.as_ref().and_then(|v| v.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
                     let key = if args[0] == "-" { args.last().unwrap() } else { &args[0] };
                     println!("queued #{} {} ({} open; `makepad devhub land wait {key}`)", n("id"), args.join(" "), n("pos"));
-                    0
+                    let Some(app) = chain_app else { return 0 };
+                    let by = std::env::var("DEVHUB_AGENT").ok().filter(|x| !x.is_empty()).unwrap_or_else(|| key.to_string());
+                    let j = makepad_remote::json_str;
+                    let list = |w: &[&str]| w.iter().map(|x| j(x)).collect::<Vec<_>>().join(",");
+                    let shown = ask(c, None, "show", &format!("show add {{\"app\":{},\"on\":{},\"after\":[\"landed\",{}],\"replace\":false,\"by\":{}}}", j(app), j(chain_on), j(key), j(&by)));
+                    match &shown {
+                        Ok(l) if !l.iter().any(|x| x.starts_with("{\"err\"")) => println!("then: show {app} on {chain_on} when it lands"),
+                        Ok(l) => {
+                            eprintln!("makepad devhub land: the show was not queued: {}", l.join(" "));
+                            return 1;
+                        }
+                        Err(e) => {
+                            eprintln!("makepad devhub land: the show was not queued: {e}");
+                            return 1;
+                        }
+                    }
+                    if then.is_empty() {
+                        return 0;
+                    }
+                    match ask(c, None, "after", &format!("after add {{\"by\":{},\"cond\":[\"shown\",{},{}],\"cmd\":[{}]}}", j(&by), j(app), j(chain_on), list(then))) {
+                        Ok(l) if !l.iter().any(|x| x.starts_with("{\"err\"")) => {
+                            println!("then: `devhub {}` once it runs", then.join(" "));
+                            0
+                        }
+                        Ok(l) => {
+                            eprintln!("makepad devhub land: the action was not queued: {}", l.join(" "));
+                            1
+                        }
+                        Err(e) => {
+                            eprintln!("makepad devhub land: the action was not queued: {e}");
+                            1
+                        }
+                    }
                 }
                 Err(code) => code,
             }

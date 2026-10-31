@@ -179,10 +179,6 @@ extern "C" cudaError_t mkllm_device_info(
 // GGUF block stream directly (no dequant materialization).
 // ---------------------------------------------------------------------------
 
-static __device__ __forceinline__ float4 mkllm_ld_f4(const float * p) {
-    return *(const float4 *) p;
-}
-
 // Warp-per-row quantized mat-vec, bandwidth-shaped: the 128-byte nibble/int8
 // payload of each super-block is read as coalesced u32 words (one per lane),
 // sub-block scales are decoded once into registers, and for M > 1 the decoded
@@ -289,16 +285,12 @@ static __global__ void mkllm_mmv_qk_kernel(
             for (int c = 0; c < M_MAX; c++) {
                 if (c >= M) break;
                 const float * x = src1 + (size_t) c * src1_col_elems + xbase + l0;
-                const float4 x0 = mkllm_ld_f4(x);
-                const float4 x1 = mkllm_ld_f4(x + 4);
-                acc[c] += wv[0] * x0.x;
-                acc[c] += wv[1] * x0.y;
-                acc[c] += wv[2] * x0.z;
-                acc[c] += wv[3] * x0.w;
-                acc[c] += wv[4] * x1.x;
-                acc[c] += wv[5] * x1.y;
-                acc[c] += wv[6] * x1.z;
-                acc[c] += wv[7] * x1.w;
+                // Element reads: a strided or offset view's columns are only
+                // 4-byte aligned, and a float4 load faults on those.
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    acc[c] += wv[i] * x[i];
+                }
             }
         } else { // Q8_0 packed: 8 sub-blocks of 32 int8 + f16 d
             const int sub = lane >> 2;             // 0..7
@@ -2440,7 +2432,10 @@ static __global__ void mkllm_quantize_mmq_ds4_kernel(
     if (col >= m) {
         return;
     }
-    const float4 xi = ((const float4 *) (x + (size_t) col * (size_t) stride_col))[i0 / 4];
+    // Element reads: an activation view's start is only 4-byte aligned, and a
+    // float4 load faults on that.
+    const float * xp = x + (size_t) col * (size_t) stride_col + i0;
+    const float4 xi = make_float4(xp[0], xp[1], xp[2], xp[3]);
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -3002,7 +2997,10 @@ static __global__ void mkllm_quantize_mmq_d4_kernel(
     if (col >= m) {
         return;
     }
-    const float4 xi = ((const float4 *) (x + (size_t) col * (size_t) stride_col))[i0 / 4];
+    // Element reads: an activation view's start is only 4-byte aligned, and a
+    // float4 load faults on that.
+    const float * xp = x + (size_t) col * (size_t) stride_col + i0;
+    const float4 xi = make_float4(xp[0], xp[1], xp[2], xp[3]);
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));

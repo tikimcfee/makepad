@@ -380,7 +380,7 @@ impl DevhubView {
         if let Some(n) = &node {
             let dev_hit = Hit::Dev(mi);
             let r = rect(row.pos.x + row.size.x - 166.0, row.pos.y + 3.0, 84.0, 22.0);
-            self.d.button(cx, r, &tok, self.ctrl(&dev_hit, n.dev), None, if n.dev { "dev on" } else { "dev off" }, tok.font.caption, fg, true);
+            self.d.button(cx, r, &tok, self.ctrl(&dev_hit, n.dev), None, if n.dev && n.user().is_some() { "user" } else if n.dev { "dev on" } else { "dev off" }, tok.font.caption, fg, true);
             self.hits.push((dev_hit, r));
             if n.leases > 0 || n.dev {
                 self.small_button(cx, rect(row.pos.x, row.pos.y + 2.0, row.size.x, 24.0), 0.0, 76.0, Hit::Override(mi), "Take it");

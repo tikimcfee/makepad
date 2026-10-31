@@ -280,6 +280,7 @@ workspace.members = [
     "tools/service_host",
     "tools/agents",
     "tools/ci",
+    "tools/ci_leg",
     # === makepad run: the app-VM host (tools/run, package makepad-run, binary makepad)
     # and its host crates; Relax's Rust JIT library crates live in libs/relax ===
     "tools/run",

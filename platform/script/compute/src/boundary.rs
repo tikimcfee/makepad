@@ -157,6 +157,16 @@ pub struct CountView<'a> {
     pub records: &'a [&'a str],
 }
 
+/// A document number a lifted compile made a parameter, with the value the
+/// document gave it.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LiftedView<'a> {
+    pub name: &'a str,
+    pub value: f32,
+}
+
 /// Everything a compilation holds, borrowed from it: the kernel, the
 /// diagnostics (with their document places), what a kernel made from
 /// Splash values compiled in, and, for a prepared Kernel object, its
@@ -174,6 +184,8 @@ pub struct CompilationView<'a> {
     pub constants: &'a [&'a str],
     /// Names the compiled-in fns use without binding them.
     pub free: &'a [&'a str],
+    /// A lifted compile's parameters made from document numbers, in order.
+    pub lifted: &'a [LiftedView<'a>],
     #[cfg(feature = "vm")]
     pub per_frame: bool,
     #[cfg(feature = "vm")]
@@ -201,6 +213,8 @@ pub(crate) struct CompileData {
     /// editor's edit there changes only by compiling again.
     fn_places: Vec<(String, u32, u32, u32, u32)>,
     constants: Vec<String>,
+    /// A lifted compile's parameters made from document numbers.
+    lifted: Vec<(String, f32)>,
     #[cfg(feature = "vm")]
     object: Option<crate::object::ObjectData>,
     views: std::sync::OnceLock<Views>,
@@ -213,6 +227,7 @@ struct Views {
     fn_places: Vec<FnPlaceView<'static>>,
     constants: Vec<&'static str>,
     free: Vec<&'static str>,
+    lifted: Vec<LiftedView<'static>>,
     #[cfg(feature = "vm")]
     counts: Vec<CountView<'static>>,
     /// Owns the record names the counts borrow.
@@ -230,6 +245,7 @@ impl CompileData {
             free: Vec::new(),
             fn_places: Vec::new(),
             constants: Vec::new(),
+            lifted: Vec::new(),
             #[cfg(feature = "vm")]
             object: None,
             views: std::sync::OnceLock::new(),
@@ -256,6 +272,7 @@ impl CompileData {
                     fn_places: self.fn_places.iter().map(|(file, line, col, end_line, end_col)| FnPlaceView { file: forever(file.as_str()), line: *line, col: *col, end_line: *end_line, end_col: *end_col }).collect(),
                     constants: self.constants.iter().map(|c| forever(c.as_str())).collect(),
                     free: self.free.iter().map(|f| forever(f.as_str())).collect(),
+                    lifted: self.lifted.iter().map(|(name, value)| LiftedView { name: forever(name.as_str()), value: *value }).collect(),
                     #[cfg(feature = "vm")]
                     counts: self
                         .object
@@ -285,6 +302,7 @@ impl KernelCompilation {
             fn_places: &views.fn_places,
             constants: &views.constants,
             free: &views.free,
+            lifted: &views.lifted,
             #[cfg(feature = "vm")]
             per_frame: data.object.as_ref().is_some_and(|o| o.per_frame),
             #[cfg(feature = "vm")]
@@ -431,6 +449,11 @@ pub enum CompileReq<'a> {
     /// name the document place.
     #[cfg(feature = "vm")]
     Vm { vm: &'a makepad_script::ScriptVm<'a>, kernel: &'a VmKernelView<'a>, layouts: &'a [LayoutView<'a>], backend: Backend, modules: &'a [crate::module::Module<'a>] },
+    /// A kernel made from Splash values with up to `max` of the document's
+    /// plain numbers it reaches made parameters (`vm_kernel::compile_lifted`):
+    /// the compilation's `lifted` names them with the document's values.
+    #[cfg(feature = "vm")]
+    VmLifted { vm: &'a makepad_script::ScriptVm<'a>, kernel: &'a VmKernelView<'a>, backend: Backend, max: u32 },
     /// A VM Kernel object: its complete lexical closure, with the host's
     /// implicit parameters, and every scalar helper program prepared in one
     /// operation (compile the programs with `Prepared`).
@@ -467,7 +490,7 @@ impl Compiling {
         let kind = match req {
             CompileReq::Source { .. } => "source kernel".to_string(),
             #[cfg(feature = "vm")]
-            CompileReq::Vm { .. } => "splash kernel".to_string(),
+            CompileReq::Vm { .. } | CompileReq::VmLifted { .. } => "splash kernel".to_string(),
             #[cfg(feature = "vm")]
             CompileReq::Object { name, .. } => format!("kernel object {name}"),
             #[cfg(feature = "vm")]
@@ -495,6 +518,15 @@ pub fn kernel_compile(req: &CompileReq<'_>) -> KernelCompilation {
         CompileReq::Source { src, layouts, backend, modules, live } => compile_source(src, layouts, *backend, modules, *live),
         #[cfg(feature = "vm")]
         CompileReq::Vm { vm, kernel, layouts, backend, modules } => compile_vm(vm, kernel, layouts, *backend, modules),
+        #[cfg(feature = "vm")]
+        CompileReq::VmLifted { vm, kernel, backend, max } => match crate::vm_kernel::compile_lifted_impl(vm, &from_view(kernel), *backend, *max as usize) {
+            Ok((kernel, lifted)) => {
+                let mut data = CompileData::new(Some(kernel), Vec::new());
+                data.lifted = lifted;
+                data
+            }
+            Err(errors) => CompileData::new(None, errors),
+        },
         #[cfg(feature = "vm")]
         CompileReq::Object { vm, object, name, host_fields, implicit, dynamic_names, counts, math } => match crate::object::prepare(vm, *object, name, host_fields, implicit, dynamic_names, *counts, *math) {
             Ok(object) => {
@@ -529,6 +561,14 @@ pub unsafe fn compile_kernel(src: &str, layouts: &[LayoutView<'_>], backend: Bac
 #[inline(always)]
 pub fn compile_vm_kernel(vm: &makepad_script::ScriptVm<'_>, kernel: &VmKernelView<'_>, layouts: &[LayoutView<'_>], backend: Backend, modules: &[crate::module::Module<'_>]) -> KernelCompilation {
     kernel_compile(&CompileReq::Vm { vm, kernel, layouts, backend, modules })
+}
+
+/// [`compile_vm_kernel`] with up to `max` document numbers made parameters
+/// (the compilation's `lifted`).
+#[cfg(feature = "vm")]
+#[inline(always)]
+pub fn compile_vm_kernel_lifted(vm: &makepad_script::ScriptVm<'_>, kernel: &VmKernelView<'_>, backend: Backend, max: u32) -> KernelCompilation {
+    kernel_compile(&CompileReq::VmLifted { vm, kernel, backend, max })
 }
 
 fn compile_source(src: &str, layouts: &[LayoutView<'_>], backend: Backend, modules: &[crate::module::Module<'_>], live: LiveFilter) -> CompileData {

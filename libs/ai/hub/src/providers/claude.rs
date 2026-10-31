@@ -525,6 +525,10 @@ impl ChatProvider for ClaudeCodeChatProvider {
         }
         let mut prompt = render_prompt(input, self.resume.is_some());
         let mut args = build_args_with_mcp(&self.model, &self.resume, &input.system_with_dynamic(), self.mcp.as_ref());
+        if let Some(effort) = &self.effort {
+            args.push("--effort".into());
+            args.push(effort.clone());
+        }
         let images = std::mem::take(&mut self.images);
         if !images.is_empty() {
             // Images need the structured input: one user message whose

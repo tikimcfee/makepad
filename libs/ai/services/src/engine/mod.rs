@@ -67,6 +67,9 @@ pub enum ModelEvent {
     Delta(String),
     /// A piece of the model's reasoning, when the provider shows it.
     Thinking(String),
+    /// What the model is writing that the person does not see (its reasoning,
+    /// a tool call's arguments), for the line that says what the chat waits for.
+    Working(String),
     /// Whole JSON argument prefix for a preview, before the tool is dispatched.
     ToolCallPartial { call_id: String, name: String, partial_json: String },
     /// The model asks for a tool. `call_id` is the model's own id for the

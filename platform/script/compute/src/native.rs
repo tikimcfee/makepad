@@ -138,8 +138,18 @@ fn has_fma(b: &Block) -> bool {
 }
 
 /// Compiles an audio program or a table `init`.
+#[inline(always)]
 pub fn compile(p: &Program) -> Option<Code> {
-    compile_with(p, 0)
+    compile_words(&crate::ir::to_words(p), 0)
+}
+
+/// [`compile_with`] of the program `words` hold ([`crate::ir::to_words`]): how code Relax
+/// compiles (a program it built itself, laid out its own way) reaches the back end, whose
+/// options, kernel cache and code area are the compiler's. None: not a program, or no native
+/// code for it.
+#[relax_api]
+pub fn compile_words(words: &[u32], writable: u64) -> Option<Code> {
+    compile_with(&crate::ir::from_words(words)?, writable)
 }
 
 /// Compiles a kernel whose host buffers have write permission `writable` (bit k: buffer

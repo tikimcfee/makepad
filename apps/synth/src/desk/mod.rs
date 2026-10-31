@@ -105,6 +105,8 @@ script_mod! {
                 score_play := CapIcon{icon_walk: Walk{width: 10 height: Fit} draw_icon +: {svg: crate_resource("self:resources/icons/play.svg")}}}
             Tip{text: "Pause: the transport holds its position (Space)"
                 score_pause := CapIcon{visible: false icon_walk: Walk{width: 10 height: Fit} draw_icon +: {svg: crate_resource("self:resources/icons/pause.svg")}}}
+            Tip{text: "Rewind: start the piece over from the top, from scratch (Shift+Space)"
+                score_rewind := CapIcon{a11y_name: "Rewind" icon_walk: Walk{width: 11 height: Fit} draw_icon +: {svg: crate_resource("self:resources/icons/rewind.svg")}}}
             Tip{text: "Stop and return to the first bar"
                 score_stop := CapIcon{icon_walk: Walk{width: 9 height: Fit} draw_icon +: {svg: crate_resource("self:resources/icons/stop.svg")}}}
             RoundedView{width: Fit height: 22 flow: Right spacing: 8 margin: Inset{left: 6} padding: Inset{left: 10 right: 2} align: Align{y: 0.5} show_bg: true
@@ -150,6 +152,13 @@ script_mod! {
                     Label{width: Fill height: Fit text: "This score plays General MIDI instruments (a @soundfont with no src), and the GM SoundFont is not installed: they are silent until it is."
                         draw_text +: {color: stage.text_hi text_style: theme.font_regular{font_size: 9}}}
                     Tip{text: "Open Resources to download FluidR3 GM (MIT, 148 MB)" score_gm_install := Tool{text: "Install the GM SoundFont…"}}
+                }
+                // A score names patches of the library the machine does not have.
+                score_no_patches := View{visible: false width: Fill height: Fit flow: Right spacing: 8 padding: Inset{left: 12 right: 8 top: 6 bottom: 6} align: Align{y: 0.5}
+                    show_bg: true draw_bg +: {color: stage.well}
+                    Label{width: Fill height: Fit text: "This score plays patches from the patch library, which is not installed: until it is, they play a plain starting sound."
+                        draw_text +: {color: stage.text_hi text_style: theme.font_regular{font_size: 9}}}
+                    Tip{text: "Open Resources to download the patch library" score_patches_install := Tool{text: "Install the patch library…"}}
                 }
                 score_code := mod.widgets.ScoreEditor{}
               }
@@ -370,6 +379,9 @@ pub struct Desk {
     /// Whether the GM SoundFont is installed (asked once, again when
     /// Resources installs or removes it).
     gm_known: Option<bool>,
+    /// Whether the patch library is installed, as last asked (Resources
+    /// installs or removes it).
+    patches_known: Option<bool>,
     /// The side panel shows, on this tab.
     side_open: bool,
     side: Side,
@@ -383,7 +395,7 @@ impl Default for Desk {
             started: false, code_shown: 0, loops_shown: Vec::new(), folds: Folds::default(), menu: false, arrangement: transport::Arrangement::default(), arranged: 0, looping: None,
             bpm_written: None, bpm_shown: None, bpm_typed_at: f64::NEG_INFINITY, document: Document::default(), gesture: 0, panel: panel::ScorePanel::default(), vary: vary::VaryDesk::default(),
             vary_ai_made: None, batch: batch::BatchDesk::default(), tracker: Default::default(), preview_main: true, audition: None, auditioned: None, audition_rx: None, pad_audition: None, index_asked: false, browsers: Default::default(), library_ask: None, index_seen: 0,
-            jobs: run::Jobs::default(), lib: lib_pane::LibPane::default(), samples_asked: Default::default(), save_clean: None, gm_known: None,
+            jobs: run::Jobs::default(), lib: lib_pane::LibPane::default(), samples_asked: Default::default(), save_clean: None, gm_known: None, patches_known: None,
             side_open: true, side: Side::Chat,
         }
     }
@@ -543,6 +555,10 @@ impl Desk {
         }
         if ui.button(cx, ids!(score_pause)).clicked(actions) {
             self.transport(false);
+        }
+        if ui.button(cx, ids!(score_rewind)).clicked(actions) {
+            self.rewind();
+            self.frame = cx.new_next_frame();
         }
         if ui.button(cx, ids!(score_stop)).clicked(actions) {
             self.transport(false);
@@ -950,6 +966,7 @@ impl Desk {
     /// its Tandem patches are found.
     pub fn patches_changed(&mut self) {
         self.index_asked = false;
+        self.patches_known = None;
         if let (Some(live), false) = (&self.live, self.played.is_empty()) {
             live.set_source(self.played.clone());
         }
@@ -973,6 +990,11 @@ impl Desk {
         let missing = wants && !have;
         if ui.view(cx, ids!(score_gm)).visible() != missing {
             ui.view(cx, ids!(score_gm)).set_visible(cx, missing);
+        }
+        let have_patches = *self.patches_known.get_or_insert_with(|| makepad_score_live::tandem_library::active().is_some());
+        let no_patches = !have_patches && self.doc.as_ref().is_some_and(ScoreDoc::lacks_patch_library);
+        if ui.view(cx, ids!(score_no_patches)).visible() != no_patches {
+            ui.view(cx, ids!(score_no_patches)).set_visible(cx, no_patches);
         }
     }
 
@@ -1069,6 +1091,14 @@ impl Desk {
         self.engine.set_playing(play);
     }
 
+    /// Start the piece over from scratch at beat 0; playing or stopped it
+    /// stays so.
+    pub fn rewind(&mut self) {
+        if let Some(live) = &self.live {
+            live.rewind(audio::TRANSPORT);
+        }
+    }
+
     /// Play the arrangement from `beat` from the next `quant` boundary
     /// (stopped: the next play starts there).
     pub fn seek(&mut self, beat: f64, quant: f64) {
@@ -1109,6 +1139,18 @@ impl Desk {
             {
                 let play = !self.status.playing;
                 self.transport(play);
+                self.frame = cx.new_next_frame();
+            }
+            // Shift+Space rewinds, on the same terms.
+            Event::KeyDown(ke)
+                if ke.key_code == KeyCode::Space
+                    && !ke.is_repeat
+                    && ke.modifiers.shift
+                    && !(ke.modifiers.logo || ke.modifiers.control || ke.modifiers.alt)
+                    && !cx.text_input_has_focus()
+                    && !makepad_synth_panel::host::searching() =>
+            {
+                self.rewind();
                 self.frame = cx.new_next_frame();
             }
             // A press anywhere but the menu and ⋯ closes it.

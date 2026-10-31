@@ -60,6 +60,11 @@ impl SocketStream {
         self.inner.set_write_timeout(timeout)
     }
 
+    /// A handle on the TCP socket under the stream (to wait for input on it).
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        self.inner.try_clone_tcp()
+    }
+
     pub fn shutdown(&mut self) {
         self.inner.shutdown();
     }
@@ -141,6 +146,11 @@ impl SocketStream {
         self.inner.set_write_timeout(timeout)
     }
 
+    /// A handle on the TCP socket under the stream (to wait for input on it).
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        self.inner.try_clone_tcp()
+    }
+
     pub fn shutdown(&mut self) {
         self.inner.shutdown();
     }
@@ -220,6 +230,11 @@ impl SocketStream {
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.set_write_timeout(timeout)
+    }
+
+    /// A handle on the TCP socket under the stream (to wait for input on it): none here.
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no TCP socket handle on this platform"))
     }
 
     pub fn shutdown(&mut self) {
@@ -304,6 +319,11 @@ impl SocketStream {
         self.inner.set_write_timeout(timeout)
     }
 
+    /// A handle on the TCP socket under the stream (to wait for input on it): none here.
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no TCP socket handle on this platform"))
+    }
+
     pub fn shutdown(&mut self) {
         self.inner.shutdown();
     }
@@ -375,6 +395,11 @@ impl SocketStream {
 
     pub fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
         Ok(())
+    }
+
+    /// A handle on the TCP socket under the stream (to wait for input on it): none here.
+    pub fn try_clone_tcp(&self) -> io::Result<std::net::TcpStream> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no TCP socket handle on this platform"))
     }
 
     pub fn shutdown(&mut self) {}

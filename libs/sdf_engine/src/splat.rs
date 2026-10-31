@@ -64,10 +64,8 @@ script_mod! {
             // row 4: position, rotation, brightness, colour jitter
             let m4 = self.mat_row(slot, 4.0)
             let ov = self.override_tex.sample_nearest(vec2((slot + 0.5) / 256.0, 0.5))
-            var albedo = mix(m0.xyz, ov.xyz, ov.w)
-            if self.splat_ctl.y > 0.5 {
-                albedo = pow(albedo, vec3(2.2, 2.2, 2.2))
-            }
+            // linear, as the shade's
+            let albedo = mix(m0.xyz, ov.xyz, ov.w)
             var size = m3.x
             if size <= 0.0 { size = self.splat_ctl.x }
             size = size * (1.0 + m3.w * (self.hash(seed + 1.0) - 0.5))

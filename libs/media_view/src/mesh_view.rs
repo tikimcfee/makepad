@@ -718,10 +718,13 @@ pub struct MeshView {
     /// than the 12-tick seam/jump evidence spacing). Keep exactly one
     /// request in flight and hold its authored tick until the file lands.
     /// This is evidence-run state only; interactive play never enters it.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     #[rust]
     capture_pending: Option<String>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     #[rust(false)]
     capture_initialized: bool,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     #[rust]
     captures_taken: Vec<u64>,
     /// First-person walk of a World GLB (spawn sidecar). Identity transform,
@@ -878,6 +881,7 @@ fn capture_input(tick: u64) -> PlayInput {
 /// two successive wraps from a side-on view. Jump includes takeoff, apex and
 /// the first grounded/contact-corrected pose. Numeric all-key audits remain
 /// the hard gate, while these frames make gross visual regressions obvious.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const CAPTURES: [(u64, &str); 14] = [
     (60, "idle.png"),
     (150, "walk_a.png"),
@@ -1608,6 +1612,7 @@ impl MeshView {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     fn run_tick(&mut self, cx: &mut Cx) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(dir) = self.capture_dir.clone() {

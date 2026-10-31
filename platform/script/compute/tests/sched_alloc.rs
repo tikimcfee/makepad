@@ -49,11 +49,15 @@ fn steady_state_jobs_allocate_nothing() {
             std::thread::yield_now();
         }
     };
-    for f in 0..20 {
+    // past its warm-up: the kernel went hot in the first frames, and its eight-lane compile on a
+    // thread of its own allocates until it ends (how long depends on the box and the compiler)
+    let mut f = 0;
+    while f < 20 || k.wide_compiling() {
         frame(&mut stream, f);
+        f += 1;
     }
     let before = ALLOCS.load(Ordering::Relaxed);
-    for f in 20..120 {
+    for f in f..f + 100 {
         frame(&mut stream, f);
     }
     let stream_allocs = ALLOCS.load(Ordering::Relaxed) - before;

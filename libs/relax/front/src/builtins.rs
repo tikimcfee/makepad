@@ -280,7 +280,9 @@ pub fn payload_of(b: &[u8]) -> Option<std::sync::Arc<Vec<u8>>> {
     let rest = b.strip_prefix(b"\0relax-include:")?;
     let marker = String::from_utf8_lossy(rest);
     let fail = |why: &str| -> ! { panic!("relax internal error: include_bytes! payload `{marker}`: {why}") };
-    let (key, hex) = marker.split_once(':').unwrap_or_else(|| fail("no source path in the marker"));
+    // a marker always has its key and path: a literal holding only the prefix is plain data (this
+    // very function's, when the JIT checks relax-front)
+    let (key, hex) = marker.split_once(':')?;
     if let Some(x) = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(key)) {
         return Some(x.clone());
     }
@@ -2777,5 +2779,7 @@ mod payload_tests {
         let _ = std::fs::remove_dir(&dir);
         // a plain literal that only starts like a marker is not one
         assert!(payload_of(b"\0relax").is_none());
+        assert!(payload_of(b"\0relax-include:").is_none());
+        assert!(payload_of(b"\0relax-include:no key and path").is_none());
     }
 }

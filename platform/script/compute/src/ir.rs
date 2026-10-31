@@ -23,7 +23,6 @@
 //!   so backends are held BIT-IDENTICAL to [`run`], the reference.
 use makepad_relax_api::relax_api;
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Ty {
@@ -33,17 +32,14 @@ pub enum Ty {
     F64,
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct Val(pub u32);
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct Var(pub u32);
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Region {
@@ -60,7 +56,6 @@ pub enum Region {
     Buf(u8),
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Un {
@@ -104,7 +99,6 @@ pub enum Un {
     LoD,
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Bin {
@@ -145,7 +139,6 @@ pub enum Bin {
 }
 
 /// A fused multiply-add's form: one rounding of the exact result.
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Fma {
@@ -159,7 +152,6 @@ pub enum Fma {
     MulAddI,
 }
 
-#[relax_api(plain)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Cmp {
@@ -235,7 +227,6 @@ pub enum Stmt {
 
 /// A host call's buffer slice: host buffer `buf`, `len` words from word
 /// `off` (both clamped to the buffer at run time).
-#[relax_api(plain)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct SliceArg {
@@ -1641,5 +1632,293 @@ pub fn map_op(op: &Op, vmap: &[Val], rmap: &[Var]) -> Op {
         Op::Load { region, base, extent, off } => Op::Load { region, base, extent, off: off.map(v) },
         Op::In { ch, idx } => Op::In { ch, idx: v(idx) },
         op => op,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A program as words: how a program built by code Relax compiles reaches the
+// compiler (`native::compile_words`). Each side lays out its own `Program`; the
+// words are the same on both.
+// ---------------------------------------------------------------------------
+
+/// `p` as words ([`from_words`] reads them back).
+pub fn to_words(p: &Program) -> Vec<u32> {
+    let mut w = Vec::new();
+    put_program(&mut w, p);
+    w
+}
+
+fn put_program(w: &mut Vec<u32>, p: &Program) {
+    w.push(p.vals.len() as u32);
+    w.extend(p.vals.iter().map(|t| *t as u32));
+    w.push(p.vars.len() as u32);
+    w.extend(p.vars.iter().map(|t| *t as u32));
+    w.push(p.frame_words);
+    w.push(p.params.len() as u32);
+    w.extend(p.params.iter().map(|v| v.0));
+    w.push(p.results.len() as u32);
+    w.extend(p.results.iter().map(|v| v.0));
+    w.push(p.funcs.len() as u32);
+    for f in &p.funcs {
+        put_program(w, f);
+    }
+    put_block(w, &p.body);
+}
+
+fn put_vals(w: &mut Vec<u32>, vs: &[Val]) {
+    w.push(vs.len() as u32);
+    w.extend(vs.iter().map(|v| v.0));
+}
+
+fn put_opt(w: &mut Vec<u32>, v: Option<Val>) {
+    match v {
+        Some(v) => w.extend([1, v.0]),
+        None => w.extend([0, 0]),
+    }
+}
+
+fn region_word(r: Region) -> u32 {
+    match r {
+        Region::Ctx => 0,
+        Region::State => 1,
+        Region::Shared => 2,
+        Region::Frame => 3,
+        Region::Buf(b) => 0x100 | b as u32,
+    }
+}
+
+fn put_block(w: &mut Vec<u32>, b: &Block) {
+    w.push(b.len() as u32);
+    for s in b {
+        match s {
+            Stmt::Def(v, op) => {
+                w.extend([0, v.0]);
+                put_op(w, op);
+            }
+            Stmt::Set(x, v) => w.extend([1, x.0, v.0]),
+            Stmt::Store { region, base, extent, off, val } => {
+                w.extend([2, region_word(*region), *base, *extent]);
+                put_opt(w, *off);
+                w.push(val.0);
+            }
+            Stmt::Out { ch, idx, val } => w.extend([3, *ch as u32, idx.0, val.0]),
+            Stmt::If(c, t, e) => {
+                w.extend([4, c.0]);
+                put_block(w, t);
+                put_block(w, e);
+            }
+            Stmt::Loop { cap, body } => {
+                w.extend([5, *cap]);
+                put_block(w, body);
+            }
+            Stmt::Break(d) => w.extend([6, *d]),
+            Stmt::Continue(d) => w.extend([7, *d]),
+            Stmt::CallHost { f, args, slices, rets } => {
+                w.extend([8, *f as u32]);
+                put_vals(w, args);
+                w.push(slices.len() as u32);
+                for s in slices {
+                    w.extend([s.buf as u32, s.off.0, s.len.0]);
+                }
+                put_vals(w, rets);
+            }
+            Stmt::Call { f, args, rets } => {
+                w.extend([9, *f as u32]);
+                put_vals(w, args);
+                put_vals(w, rets);
+            }
+        }
+    }
+}
+
+fn put_op(w: &mut Vec<u32>, op: &Op) {
+    match *op {
+        Op::ConstF(x) => w.extend([0, x.to_bits()]),
+        Op::ConstD(x) => w.extend([1, x.to_bits() as u32, (x.to_bits() >> 32) as u32]),
+        Op::ConstI(x) => w.extend([2, x as u32]),
+        Op::ConstB(x) => w.extend([3, x as u32]),
+        Op::Get(x) => w.extend([4, x.0]),
+        Op::Un(u, a) => w.extend([5, u as u32, a.0]),
+        Op::Bin(b, x, y) => w.extend([6, b as u32, x.0, y.0]),
+        Op::CmpF(c, x, y) => w.extend([7, c as u32, x.0, y.0]),
+        Op::CmpI(c, x, y) => w.extend([8, c as u32, x.0, y.0]),
+        Op::CmpD(c, x, y) => w.extend([9, c as u32, x.0, y.0]),
+        Op::Sel(c, x, y) => w.extend([10, c.0, x.0, y.0]),
+        Op::Fma(f, a, b, c) => w.extend([11, f as u32, a.0, b.0, c.0]),
+        Op::Wrap(x, len) => w.extend([12, x.0, len]),
+        Op::Load { region, base, extent, off } => {
+            w.extend([13, region_word(region), base, extent]);
+            put_opt(w, off);
+        }
+        Op::In { ch, idx } => w.extend([14, ch as u32, idx.0]),
+        Op::FrameCount => w.push(15),
+        Op::BufLen(b) => w.extend([16, b as u32]),
+    }
+}
+
+/// The program [`to_words`] wrote; None when the words are not one.
+pub fn from_words(words: &[u32]) -> Option<Program> {
+    let mut r = Words { w: words, at: 0 };
+    let p = r.program(0)?;
+    (r.at == words.len()).then_some(p)
+}
+
+struct Words<'a> {
+    w: &'a [u32],
+    at: usize,
+}
+
+impl Words<'_> {
+    fn next(&mut self) -> Option<u32> {
+        let x = *self.w.get(self.at)?;
+        self.at += 1;
+        Some(x)
+    }
+    fn len(&mut self) -> Option<usize> {
+        let n = self.next()? as usize;
+        (n <= self.w.len() - self.at.min(self.w.len())).then_some(n)
+    }
+    fn val(&mut self) -> Option<Val> {
+        self.next().map(Val)
+    }
+    fn vals(&mut self) -> Option<Vec<Val>> {
+        let n = self.len()?;
+        (0..n).map(|_| self.val()).collect()
+    }
+    fn ty(&mut self) -> Option<Ty> {
+        Some(match self.next()? {
+            0 => Ty::F32,
+            1 => Ty::I32,
+            2 => Ty::Bool,
+            3 => Ty::F64,
+            _ => return None,
+        })
+    }
+    fn tys(&mut self) -> Option<Vec<Ty>> {
+        let n = self.len()?;
+        (0..n).map(|_| self.ty()).collect()
+    }
+    fn opt(&mut self) -> Option<Option<Val>> {
+        let (some, v) = (self.next()?, self.next()?);
+        Some((some != 0).then_some(Val(v)))
+    }
+    fn region(&mut self) -> Option<Region> {
+        Some(match self.next()? {
+            0 => Region::Ctx,
+            1 => Region::State,
+            2 => Region::Shared,
+            3 => Region::Frame,
+            x if x & !0xff == 0x100 => Region::Buf(x as u8),
+            _ => return None,
+        })
+    }
+    fn small(&mut self, last: u32) -> Option<u8> {
+        let x = self.next()?;
+        (x <= last).then_some(x as u8)
+    }
+    fn un(&mut self) -> Option<Un> {
+        // SAFETY: Un is repr(u8), its discriminants 0..=LoD
+        self.small(Un::LoD as u32).map(|x| unsafe { std::mem::transmute::<u8, Un>(x) })
+    }
+    fn bin(&mut self) -> Option<Bin> {
+        // SAFETY: Bin is repr(u8), its discriminants 0..=MakeD
+        self.small(Bin::MakeD as u32).map(|x| unsafe { std::mem::transmute::<u8, Bin>(x) })
+    }
+    fn cmp(&mut self) -> Option<Cmp> {
+        // SAFETY: Cmp is repr(u8), its discriminants 0..=Ne
+        self.small(Cmp::Ne as u32).map(|x| unsafe { std::mem::transmute::<u8, Cmp>(x) })
+    }
+    fn fma(&mut self) -> Option<Fma> {
+        // SAFETY: Fma is repr(u8), its discriminants 0..=MulAddI
+        self.small(Fma::MulAddI as u32).map(|x| unsafe { std::mem::transmute::<u8, Fma>(x) })
+    }
+    fn program(&mut self, depth: u32) -> Option<Program> {
+        if depth > 2 {
+            return None;
+        }
+        let vals = self.tys()?;
+        let vars = self.tys()?;
+        let frame_words = self.next()?;
+        let params = self.vals()?;
+        let results = self.vals()?;
+        let n = self.len()?;
+        let funcs = (0..n).map(|_| self.program(depth + 1)).collect::<Option<Vec<_>>>()?;
+        let body = self.block(0)?;
+        Some(Program { vals, vars, body, frame_words, params, results, funcs })
+    }
+    fn block(&mut self, depth: u32) -> Option<Block> {
+        if depth > 256 {
+            return None;
+        }
+        let n = self.len()?;
+        let mut b = Vec::with_capacity(n);
+        for _ in 0..n {
+            b.push(match self.next()? {
+                0 => {
+                    let v = self.val()?;
+                    Stmt::Def(v, self.op()?)
+                }
+                1 => Stmt::Set(Var(self.next()?), self.val()?),
+                2 => {
+                    let (region, base, extent) = (self.region()?, self.next()?, self.next()?);
+                    let off = self.opt()?;
+                    Stmt::Store { region, base, extent, off, val: self.val()? }
+                }
+                3 => Stmt::Out { ch: self.small(255)?, idx: self.val()?, val: self.val()? },
+                4 => {
+                    let c = self.val()?;
+                    let t = self.block(depth + 1)?;
+                    Stmt::If(c, t, self.block(depth + 1)?)
+                }
+                5 => {
+                    let cap = self.next()?;
+                    Stmt::Loop { cap, body: self.block(depth + 1)? }
+                }
+                6 => Stmt::Break(self.next()?),
+                7 => Stmt::Continue(self.next()?),
+                8 => {
+                    let f = self.next()? as u16;
+                    let args = self.vals()?;
+                    let n = self.len()?;
+                    let slices = (0..n).map(|_| Some(SliceArg { buf: self.small(255)?, off: self.val()?, len: self.val()? })).collect::<Option<Vec<_>>>()?;
+                    Stmt::CallHost { f, args, slices, rets: self.vals()? }
+                }
+                9 => {
+                    let f = self.next()? as u16;
+                    let args = self.vals()?;
+                    Stmt::Call { f, args, rets: self.vals()? }
+                }
+                _ => return None,
+            });
+        }
+        Some(b)
+    }
+    fn op(&mut self) -> Option<Op> {
+        Some(match self.next()? {
+            0 => Op::ConstF(f32::from_bits(self.next()?)),
+            1 => {
+                let (lo, hi) = (self.next()? as u64, self.next()? as u64);
+                Op::ConstD(f64::from_bits(lo | hi << 32))
+            }
+            2 => Op::ConstI(self.next()? as i32),
+            3 => Op::ConstB(self.next()? != 0),
+            4 => Op::Get(Var(self.next()?)),
+            5 => Op::Un(self.un()?, self.val()?),
+            6 => Op::Bin(self.bin()?, self.val()?, self.val()?),
+            7 => Op::CmpF(self.cmp()?, self.val()?, self.val()?),
+            8 => Op::CmpI(self.cmp()?, self.val()?, self.val()?),
+            9 => Op::CmpD(self.cmp()?, self.val()?, self.val()?),
+            10 => Op::Sel(self.val()?, self.val()?, self.val()?),
+            11 => Op::Fma(self.fma()?, self.val()?, self.val()?, self.val()?),
+            12 => Op::Wrap(self.val()?, self.next()?),
+            13 => {
+                let (region, base, extent) = (self.region()?, self.next()?, self.next()?);
+                Op::Load { region, base, extent, off: self.opt()? }
+            }
+            14 => Op::In { ch: self.small(255)?, idx: self.val()? },
+            15 => Op::FrameCount,
+            16 => Op::BufLen(self.small(255)?),
+            _ => return None,
+        })
     }
 }

@@ -186,6 +186,14 @@ fn surface_cell(field: &dyn Sdf3, pos: [Vec3d; 8], v: [f64; 8]) -> SurfaceCell {
     SurfaceCell { polygons }
 }
 
+/// Fields meshed in this process so far (every [`mesh_surface`]): meshing is the cost a
+/// field-drawn part never pays outside export, and this is how that is checked.
+pub fn meshes_built() -> u64 {
+    MESHES_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static MESHES_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Mesh `field` over the box `min..max` with cubic cells of `cell` (coarser
 /// when the box would need more than [`MAX_CELLS`] along a side). The grid has
 /// two cells of margin round the box. Triangles are wound outwards; the result
@@ -193,6 +201,7 @@ fn surface_cell(field: &dyn Sdf3, pos: [Vec3d; 8], v: [f64; 8]) -> SurfaceCell {
 /// `lipschitz`: the field's bound ([`crate::lipschitz`]; 1 for a distance): the culling
 /// divides the value by it, so a field steeper than a distance keeps its surface bricks.
 pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, cell: f64, lipschitz: f64) -> TriMesh {
+    MESHES_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let size = max - min;
     let extent = size.x.max(size.y).max(size.z).max(1e-9);
     let cell = cell.max(extent / (MAX_CELLS - 4) as f64).max(1e-9);

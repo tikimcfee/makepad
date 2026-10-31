@@ -197,6 +197,10 @@ pub struct EngineCore {
     next_call: u64,
     doctrine: String,
     turn_active: bool,
+    /// Lines the person typed during the turn, for its end.
+    waiting_lines: VecDeque<String>,
+    /// When the model got the turn, while it has it without a word.
+    model_since: Option<f64>,
     subscriptions: HashMap<String, Subscription>,
     subscription_order: Vec<String>,
     lease_id: u64,
@@ -231,6 +235,8 @@ impl EngineCore {
             next_call: 0,
             doctrine: doctrine.unwrap_or(DOCTRINE).to_string(),
             turn_active: false,
+            waiting_lines: VecDeque::new(),
+            model_since: None,
             subscriptions: HashMap::new(),
             subscription_order: Vec::new(),
             lease_id,
@@ -269,7 +275,7 @@ impl EngineCore {
     /// Whether the host should keep scheduling pumps even though the model
     /// is idle (normally because a rate-limited publication is waiting).
     pub fn needs_pump(&self) -> bool {
-        self.turn_active || !self.pending.is_empty() || self.awaiting.is_some() || self.queued_message_count() != 0
+        self.turn_active || !self.pending.is_empty() || self.awaiting.is_some() || self.queued_message_count() != 0 || !self.waiting_lines.is_empty()
     }
 
     /// What the provider chip shows: the choice, the rows it may switch
@@ -303,12 +309,21 @@ impl EngineCore {
             self.console(rest.trim(), now);
             return;
         }
+        self.state.push(Entry::User { text: text.to_string() });
+        // A line typed during a turn waits for its end: it never throws away
+        // what the model is working on. Stop is what ends a turn.
         if self.turn_active {
-            self.cancel(now);
+            self.waiting_lines.push_back(text.to_string());
+            self.state.touch();
+            return;
         }
+        self.start_turn(text);
+    }
+
+    /// The model gets the person's line, already in the transcript.
+    fn start_turn(&mut self, text: &str) {
         self.reconfigure_if_needed();
         self.focus_target();
-        self.state.push(Entry::User { text: text.to_string() });
         self.state.status = Status::Thinking;
         self.state.thinking.clear();
         self.state.rate = None;
@@ -514,6 +529,7 @@ impl EngineCore {
 
     /// Stop the turn: the model, every running call, every parked one.
     pub fn cancel(&mut self, _now: f64) {
+        self.waiting_lines.clear();
         self.model.cancel();
         let running: Vec<(String, EndpointId)> = self.pending.drain().map(|(id, p)| (id, p.endpoint)).collect();
         for (call_id, endpoint) in running {
@@ -683,6 +699,7 @@ impl EngineCore {
         }
         self.close_gone_subscriptions();
         self.pump_awaiting(now);
+        self.count_model_wait(now);
         if !self.turn_active {
             self.reconfigure_if_needed();
         }
@@ -706,7 +723,11 @@ impl EngineCore {
             }
         }
         if !self.turn_active {
-            self.deliver_next_message(now);
+            if let Some(line) = self.waiting_lines.pop_front() {
+                self.start_turn(&line);
+            } else {
+                self.deliver_next_message(now);
+            }
         }
         let services = self.registry.services();
         if services != self.state.services {
@@ -717,6 +738,20 @@ impl EngineCore {
             events.push(EngineEvent::Changed);
         }
         events
+    }
+
+    /// The line under the conversation counts while the model is silent.
+    fn count_model_wait(&mut self, now: f64) {
+        let secs = if self.state.status == Status::Thinking {
+            (now - *self.model_since.get_or_insert(now)) as u64
+        } else {
+            self.model_since = None;
+            0
+        };
+        if secs != self.state.model_secs {
+            self.state.model_secs = secs;
+            self.state.touch();
+        }
     }
 
     fn reconfigure_if_needed(&mut self) {
@@ -799,7 +834,12 @@ impl EngineCore {
                     self.state.status = Status::Idle;
                 }
             }
+            ModelEvent::Working(note) => {
+                self.state.model_note = note;
+                self.state.status = Status::Thinking;
+            }
             ModelEvent::Delta(text) => {
+                self.state.model_note.clear();
                 self.state.status = Status::Streaming;
                 match self.state.streaming_mut() {
                     Some(s) => s.push_str(&text),
@@ -827,6 +867,7 @@ impl EngineCore {
             ModelEvent::ToolCall { call_id, name, args } => {
                 // A row that never got text sits above the card as a gap.
                 self.drop_empty_assistant();
+                self.state.model_note.clear();
                 self.state.status = Status::WaitingForTool;
                 return self.dispatch(call_id, &name, &args, false, now);
             }
@@ -854,6 +895,7 @@ impl EngineCore {
         self.turn_active = false;
         self.state.status = Status::Idle;
         self.state.thinking.clear();
+        self.state.model_note.clear();
         self.state.touch();
     }
 
@@ -1371,6 +1413,11 @@ impl EngineCore {
             result.text = if result.text.trim().is_empty() { note } else { format!("{note}\n{}", result.text) };
         }
         self.mark_done(call_id, &result);
+        // The last call is over: from here on the turn waits for the model.
+        if self.state.status == Status::WaitingForTool && self.pending.is_empty() && self.parked.is_empty() && self.awaiting.is_none() {
+            self.state.status = Status::Thinking;
+            self.model_since = None;
+        }
         if from_console {
             return;
         }
@@ -1521,6 +1568,67 @@ mod tests {
 
     fn setup(script: Vec<Vec<ModelEvent>>) -> (EngineCore, std::sync::Arc<std::sync::Mutex<Scripted>>, AiServicePort, EndpointId) {
         setup_with_lease(script, 1)
+    }
+
+    /// Regression: a line typed mid-turn killed the turn, and the model
+    /// started again on the same results.
+    #[test]
+    fn a_line_typed_during_a_turn_waits_for_its_end() {
+        let (mut core, model, _port, _e) = setup(vec![
+            vec![ModelEvent::Delta("Thinking it over".into())],
+            done("Second answer."),
+        ]);
+        core.send("first", 0.0);
+        core.pump(0.1);
+        core.send("second", 0.2);
+        core.pump(0.3);
+        {
+            let m = model.lock().unwrap();
+            assert_eq!(m.cancels, 0, "the turn goes on");
+            assert_eq!(m.sends.len(), 1);
+        }
+        let users = core.state().entries.iter().filter(|e| matches!(e, Entry::User { .. })).count();
+        assert_eq!(users, 2, "the line shows at once");
+        model.lock().unwrap().out.push(ModelEvent::TurnDone { tool_calls: 0 });
+        core.pump(0.4);
+        assert_eq!(model.lock().unwrap().sends.len(), 2);
+        assert_eq!(model.lock().unwrap().sends[1].0, "second");
+        // Stop ends the turn and what waits for it.
+        core.send("third", 0.6);
+        core.cancel(0.7);
+        core.pump(0.8);
+        assert_eq!(model.lock().unwrap().sends.len(), 2);
+        assert_eq!(core.state().status, Status::Idle);
+    }
+
+    /// Regression: with the last call over, the chat said "Waiting for the
+    /// app" while it really waited for the model, for as long as the model
+    /// wrote its next tool call out of sight.
+    #[test]
+    fn the_turn_waits_for_the_model_once_the_last_call_is_over() {
+        let (mut core, model, mut port, _e) = setup(vec![
+            vec![call("files.list_dir", r#"{"path":"~"}"#), ModelEvent::TurnDone { tool_calls: 1 }],
+            vec![ModelEvent::Working("Writing a tool call · 12 KB".into())],
+        ]);
+        core.send("what is in my home folder", 0.0);
+        core.pump(0.1);
+        assert_eq!(core.state().status, Status::WaitingForTool);
+        let PortEvent::Call(call) = port.test_drain().remove(0) else { panic!("no call") };
+        port.reply(ToolResult::ok(&call.call_id, "Desktop/", "listed ~"));
+        // In one pump: the result goes to the model, and the model answers.
+        core.pump(0.2);
+        assert_eq!(model.lock().unwrap().tool_results.len(), 1);
+        assert_eq!(core.state().status, Status::Thinking);
+        assert_eq!(core.state().model_note, "Writing a tool call · 12 KB");
+        // A silent model is seen to be taking its time.
+        core.pump(0.3);
+        core.pump(42.3);
+        assert_eq!(core.state().model_secs, 42);
+        assert!(core.state().status.is_busy(), "Stop stays on offer");
+        assert!(core.needs_pump());
+        core.cancel(43.0);
+        assert_eq!(core.state().status, Status::Idle);
+        assert_eq!(core.state().model_note, "");
     }
 
     #[test]

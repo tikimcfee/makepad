@@ -1428,7 +1428,9 @@ impl Cx {
                     "" => "unnamed",
                     name => name,
                 };
-                fb.timings.insert(serial, (group, name.to_string(), is_window));
+                // a frame closes with its window's pass, or with an offscreen XR pass (whose
+                // frame is never presented: it would fold into the next window frame)
+                fb.timings.insert(serial, (group, name.to_string(), is_window || offscreen_xr));
             }
         }
         fb.stats.frames += 1;

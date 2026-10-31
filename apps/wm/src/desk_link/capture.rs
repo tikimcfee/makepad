@@ -25,7 +25,7 @@
 //! limited range.
 
 use crate::dock_warp::WindowFrame;
-pub use makepad_desk_link::tiles::TilePlan;
+pub use makepad_desk_link::tile_plan::TilePlan;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use makepad_widgets::makepad_draw::render_target::{RenderTarget, RenderTargetFormat};

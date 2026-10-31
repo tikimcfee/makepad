@@ -886,6 +886,7 @@ impl Engine {
                             answer.push_str(&text);
                             self.emit(AgentEvent::Delta { lane: lane.id, text });
                         }
+                        ChatEvent::Working(_) => {}
                         ChatEvent::ToolCall { name, args } => calls.push((name, args)),
                         ChatEvent::TurnDone { tokens, secs, .. } => {
                             self.total_generated += tokens as u64;

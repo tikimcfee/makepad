@@ -2795,7 +2795,13 @@ impl<'a> Lcx<'a> {
                 TyKind::Closure(..) => self.u.closure_storage(up).fields.len(),
                 _ => 0,
             };
-            let vals = self.clone_shim_fields(&pa, up, 0, n);
+            // a closure's `&mut T` field it only reads through holds rustc's `&` capture of the
+            // place behind it: copied, as that capture's Clone (layout/closure.rs shared_reborrow)
+            let copied: Vec<bool> = match self.kind(up) {
+                TyKind::Closure(..) => { let s = self.u.closure_storage(up); (0..n).map(|i| s.shared_reborrow.get(i).copied().unwrap_or(false)).collect() }
+                _ => vec![false; n],
+            };
+            let vals = self.clone_shim_fields(&pa, up, 0, n, &copied);
             let v = if self.layout(t).leaves.is_none() {
                 let s = self.new_slot_for(t);
                 let place = Place::Mem(s, 0);
@@ -2825,7 +2831,7 @@ impl<'a> Lcx<'a> {
         tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: trivial, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
     }
 
-    fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
+    fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize, copied: &[bool]) -> Vec<(Val, TyId)> {
         // rustc_mir_transform/src/shim.rs:662-702: only initialized clones
         // participate in the unwind chain, in reverse initialization order.
         let mut vals = Vec::new();
@@ -2837,6 +2843,7 @@ impl<'a> Lcx<'a> {
             let (fa, ft) = self.project(pa, t, vi, fi as u32);
             let v = match self.kind(ft) {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(false, _, _) => self.read_place(&fa, ft),
+                TyKind::Ref(true, _, _) if copied.get(fi).copied().unwrap_or(false) => self.read_place(&fa, ft),
                 _ => {
                     let td = self.u.tcx.lang_items.get(LangItem::Clone);
                     let m = self.u.tcx.lang_items.get(LangItem::CloneFn);
@@ -9169,6 +9176,8 @@ impl<'a> Lcx<'a> {
                 self.lower_cond(*b, t, f);
             }
             ExprKind::Paren(x) if !matches!(ast.expr(*x).kind, ExprKind::Let(..)) => self.lower_cond(*x, t, f),
+            // `!c` of a bool (not an overloaded `Not`): the branch of `c`, its targets swapped
+            ExprKind::Unary(UnOp::Not, x) if !self.b.binops.contains_key(&c.0) && matches!(self.kind(self.body_ty(*x)), TyKind::Bool) && !matches!(ast.expr(*x).kind, ExprKind::Let(..)) => self.lower_cond(*x, f, t),
             _ => {
                 // a condition is a terminating scope: its temporaries (`c.borrow().len() == 0`)
                 // are dropped before either branch runs
@@ -9332,7 +9341,9 @@ impl<'a> Lcx<'a> {
     fn known_branch(&self, b: u32, tb: u32, eb: u32) -> Option<bool> {
         let blk = self.f.blocks.get(b as usize)?;
         let Term::Branch(c, t, e) = blk.term else { return None };
-        if (t, e) != (tb, eb) { return None; }
+        // (a `!c` condition branches on `c` with the targets swapped: lower_cond)
+        let swapped = (t, e) == (eb, tb) && tb != eb;
+        if (t, e) != (tb, eb) && !swapped { return None; }
         // A register is a constant only if the whole function writes it exactly once (RIR
         // registers are not SSA: a loop or a join may assign the same one again); the walk goes
         // only through such registers.
@@ -9365,7 +9376,7 @@ impl<'a> Lcx<'a> {
         let local: Vec<&Inst> = self.entry_inits.iter().chain(blk.insts.iter()).collect();
         let writes = |v: VReg| -> u32 { rir_writes(&self.f, &self.entry_inits, v) };
         let mut used = Vec::new();
-        let known = value(&self.f, &local, &writes, &mut used, c, 0).map(|k| k != 0);
+        let known = value(&self.f, &local, &writes, &mut used, c, 0).map(|k| (k != 0) != swapped);
         if known.is_some() { self.fold_regs.borrow_mut().extend(used); }
         known
     }
@@ -10150,6 +10161,13 @@ impl<'a> Lcx<'a> {
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
                 let mut types = Vec::new();
                 for value in &vals { types.push(value.1); }
+                // std::relax::main_hosted with the HAL bound to the loader: always hosted (the
+                // program's own main loop would be the HAL compiled from source, which a run
+                // with the HAL provided cannot run), so the standalone path folds away under a
+                // check and the boundary audit does not lower it
+                if foreign && vals.is_empty() && self.u.link_name(d) == "__relax_main_hosted" && self.u.provided.iter().any(|(k, _)| self.u.prog.syms.str(self.u.prog.crates[*k as usize].name) == "makepad_hal") {
+                    return Val::L(vec![self.iconst(1)]);
+                }
                 let callee = if foreign {
                     let Some(address) = self.u.foreign_sym(d) else {
                         self.err(self.pos, format!("unknown foreign function `{}` -- link its library (#[link])", self.u.prog.name(d)));

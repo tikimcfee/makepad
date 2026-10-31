@@ -61,11 +61,19 @@ const REATTACH_FOR: Duration = Duration::from_secs(900);
 /// After the master is back, how long its errors may still be its node links coming up.
 const SETTLE_FOR: Duration = Duration::from_secs(60);
 
+/// A node-side error that is its hub restarting for the self-update (the hub refused a run in its
+/// last moment, or is not up again yet): the lease stays, the call is tried again.
+fn node_restarting(e: &str) -> bool {
+    e.contains("restarting: ") || super::master::unreachable(e)
+}
+
 /// Calls `f` with the master's control client, through master restarts: while the master is not
 /// reachable (`up` fails) the call is tried again with backoff (0.5 s to 2 s; the master expires a
 /// silent holder after 10 s), and once it is back with a fresh client, re-attaching by the lease
-/// id. A live master's answer stands, except while its node links come back (`SETTLE_FOR`); "no
-/// lease" always stands. Said once each way on stderr.
+/// id. A live master's answer stands, except while its node links come back (`SETTLE_FOR`) or the
+/// lease's node hub restarts for its self-update ([`node_restarting`], up to `REATTACH_FOR`: the
+/// new hub takes the lease back from its ledger); "no lease" always stands. Said once each way on
+/// stderr.
 fn through_restarts<T>(id: &str, c: &mut Client, mut f: impl FnMut(&Client) -> Result<T, String>, up: &dyn Fn() -> Result<Client, String>) -> Result<T, String> {
     let mut down: Option<Instant> = None;
     let mut back: Option<Instant> = None;
@@ -87,6 +95,17 @@ fn through_restarts<T>(id: &str, c: &mut Client, mut f: impl FnMut(&Client) -> R
             Ok(fresh) => {
                 *c = fresh;
                 match (down, back) {
+                    (None, _) if node_restarting(&e) => {
+                        eprintln!("{id}: its node does not answer ({e}); its hub restarts? re-attaching when it is back");
+                        down = Some(Instant::now());
+                        back = Some(Instant::now());
+                    }
+                    (Some(t), _) if node_restarting(&e) => {
+                        if t.elapsed() > REATTACH_FOR {
+                            return Err(format!("{e} (the node stayed unreachable for {} s)", REATTACH_FOR.as_secs()));
+                        }
+                        back = Some(Instant::now());
+                    }
                     (None, _) => return Err(e),
                     (Some(_), None) => back = Some(Instant::now()),
                     (Some(_), Some(t)) if t.elapsed() > SETTLE_FOR => return Err(e),
@@ -319,12 +338,12 @@ fn release(c: &Client, id: &str, exit: Option<i32>) -> Option<Value> {
 /// Runs `cmd` on the node under the lease (relative to its work dir), streams its output.
 fn run_there(c: &Client, held: &Held, rel: &str, cmd: &[String]) -> Result<i32, String> {
     let argv = makepad_network::digest::base64_encode(cmd.join("\0").as_bytes());
-    let v = node_one(c, &held.node, "lease-run", &format!("lease-run {} {rel} {argv}", held.id))?;
+    let mut c = c.clone();
+    let v = through_restarts(&held.id, &mut c, |c| node_one(c, &held.node, "lease-run", &format!("lease-run {} {rel} {argv}", held.id)), &master)?;
     let run = v.get("n").and_then(super::num).map_or(1, |x| x as u64);
     let mut off = 0u64;
     let mut beat = Instant::now();
     let mut out = std::io::stdout();
-    let mut c = c.clone();
     loop {
         let v = through_restarts(&held.id, &mut c, |c| node_one(c, &held.node, "lease-log", &format!("lease-log {} {run} {off}", held.id)), &master)?;
         let data = b64_decode(&s(&v, "data")).ok_or("lease-log: bad data")?;
@@ -441,7 +460,7 @@ fn released_line(v: &Value) -> String {
     let at = if node.is_empty() { String::new() } else { format!("@{node}") };
     let head = format!("{} {}{at} (lane {}) {}", s(v, "id"), s(v, "kind"), s(v, "lane"), match s(v, "how").as_str() {
         "released" | "" => "released".to_string(),
-        "cancelled" => "cancelled by user".to_string(),
+        "cancelled" => { let why = s(v, "reason"); if why.is_empty() { "cancelled".to_string() } else { why } }
         how => format!("ended ({how})"),
     });
     let Some(c) = v.get("cleanup") else { return head };
@@ -920,7 +939,12 @@ fn cancel(id: &str) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    match one(&c, "cancel", id) {
+    // who asks: an agent or a lane says so (no name: the user)
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let lane = cwd.to_string_lossy().split("/wt.noindex/").nth(1).and_then(|r| r.split('/').next()).map(str::to_string);
+    let by = std::env::var("DEVHUB_AGENT").ok().or_else(|| std::env::var("DEVHUB_LANE").ok()).filter(|x| crate::trust::valid_name(x)).or(lane);
+    let line = by.map_or_else(|| id.to_string(), |b| format!("{id} by={b}"));
+    match one(&c, "cancel", &line) {
         Ok(v) => {
             println!("{}", released_line(&v));
             0

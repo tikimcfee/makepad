@@ -3,9 +3,9 @@
 # rustc-built dispatch (10-30: its Rust-ABI router in the HAL's static was refused, "static
 # `makepad_hal::a11y::UI_ROUTERS` is read from JIT-compiled code"). The WM registers a C entry
 # (a11y::ui_router); the HAL calls it and the WM's local route (dispatch_local) goes back to the
-# HAL. Headless, muted, fresh homes. Run from the workspace root after
-# `cargo build --release -p makepad-run`. TARGET (default target/release).
-T=${TARGET:-${CARGO_TARGET_DIR:-target}/release}
+# HAL. Headless, muted, fresh homes. Run from the workspace root.
+cargo build --profile host -p makepad-run --bin makepad || exit 3
+T=${CARGO_TARGET_DIR:-target}/host
 dir=$(mktemp -d "${TMPDIR:-/tmp}/wm_ui_route.XXXXXX") || exit 1
 mkdir -p "$dir/home" "$dir/t"
 MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_MUTE=1 SANDBOX_MUTE=1 MAKEPAD_HOME="$dir/home" TMPDIR="$dir/t" \

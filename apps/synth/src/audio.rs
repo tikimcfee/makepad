@@ -66,6 +66,9 @@ struct Shared {
     bpm: AtomicU64,
     playing: AtomicBool,
     published_at: AtomicU64,
+    /// The transport's locates as of the last pass (stored after the rest,
+    /// so a change seen means the clock above is of the new run).
+    located: AtomicU64,
     /// Output muted (a hidden instance): it renders, the device hears 0.
     muted: AtomicBool,
 }
@@ -104,6 +107,7 @@ impl Shared {
                 self.bpm.store((clock.bpm as f64).to_bits(), Ordering::Release);
                 self.playing.store(clock.playing, Ordering::Release);
                 self.published_at.store(makepad_audio_engine::clock::now().to_bits(), Ordering::Release);
+                self.located.store(clock.located as u64, Ordering::Release);
                 root.buffered = CHUNK;
                 root.taken = 0;
             }
@@ -130,6 +134,10 @@ impl ClockSource for EngineClock {
         let bpm = if bpm > 0.0 { bpm } else { 120.0 };
         let beat = if playing { beat + (makepad_audio_engine::clock::now() - Shared::f64(&s.published_at)).max(0.0) * bpm / 60.0 } else { beat };
         Some((beat, bpm, playing))
+    }
+
+    fn located(&self) -> u64 {
+        self.0.located.load(Ordering::Acquire)
     }
 }
 

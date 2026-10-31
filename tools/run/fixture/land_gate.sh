@@ -1,10 +1,10 @@
 #!/bin/bash
-# land_gate.sh <quick <base> <cbase>|full|full-a|full-b|stage>: the landing gate, run from the root of the tree under test on an x86_64 node,
+# land_gate.sh <quick <base> <cbase>|now <base> <cbase>|full|full-a|full-b|stage>: the landing gate, run from the root of the tree under test on an x86_64 node,
 # under a devhub gate lease (land.sh: `makepad devhub lease gate --rev <branch>,<commercial> -- bash
 # tools/run/fixture/land_gate.sh full`). The tree is work + the branch being landed + the nested apps/commercial.
 #   full  : build (0 warnings), rustc-check, relax-compiler libtest build, x64 relax tests, tier fuzzer (fixed
 #           seeds block, random batch never), makepad check of the 7 gate packages + Stage, headless Calc+Stage
-#           present, warm_zero (Calculator: the warm launch shows no JIT spinner), warm_after_app_edit (Sandbox: a
+#           present, boundary (provided_sweep.sh audits of the six smoke apps), warm_zero (Calculator: the warm launch shows no JIT spinner), warm_after_app_edit (Sandbox: a
 #           new item in an app file stays warm), warm_after_hal (a HAL body edit keeps the stored builds), inspect_cold
 #           (inspect during a cold start never stalls the app), relaunch (session relaunch never leaves the app
 #           dead), diff_fast, zone leg
@@ -12,8 +12,12 @@
 #           JIT runtime legs), for two nodes at once; together exactly the steps of full
 #   quick : the quick land (land-quick.sh): the JIT binary of the node's tree (rebuilds only when its own crates changed,
 #           0 warnings), `makepad check` of the affected set (affected.py: changed packages and their dependents within
-#           the gate allowlist; Calculator always checked) and a headless present of the affected apps on the node's one
-#           warm JIT cache. The full legs run after landing (verify-tip.sh).
+#           the gate allowlist; a one-app change gates that app) and a headless present of the affected apps at once on
+#           the node's one warm JIT cache. The full legs run after landing (verify-tip.sh).
+#   now   : a lane the user waits for (`devhub lane live <lane> on`): `makepad check` of the affected set only, about
+#           10 s. No JIT step: a diff that does not touch the JIT binary's sources checks with the box's built JIT (a
+#           failure there is checked again through cargo before it counts). The boot is at `devhub show`; the tests
+#           after landing (the verifier, which owes such a tip a box).
 #   stage : build, makepad check makepad-stage, headless Stage present (commercial-only branches)
 # Every mode runs in place: a devhub rev lease runs in the node's ONE tree (its synced checkout, moved to the gated
 # commits: only changed files get new mtimes), with the node's one target, JIT binary and JIT cache, so it is warm.
@@ -67,12 +71,30 @@ present() { # present <name> <dir> <pkg args...>: headless cold run from a fresh
     kill -0 $pid 2>/dev/null || break
     sleep 0.5
   done
-  sleep 2
+  # the settle window: the first frame comes before the app's worker threads do their work (Fab's model thread
+  # panicked 6.4 s after a passing present), so the app lives on until the JIT is idle (two quiet looks in a row)
+  # or SETTLE s (15); a panic (parked or not), a JIT compile error or an exit in that window fails the present
+  settled=""
+  if grep -q present $s/report 2>/dev/null; then
+    app=$(pgrep -P $pid | head -1)  # the JIT under cargo run: the app's own pid, for inspect
+    t0=$(date +%s); idle=0
+    while [ $(( $(date +%s) - t0 )) -lt ${SETTLE:-15} ] && [ $idle -lt 2 ] && kill -0 $pid 2>/dev/null; do
+      if [ -n "$app" ] && $B inspect $app jit ms=500 2>/dev/null | grep -q '^idle'; then idle=$((idle + 1)); else idle=0; sleep 0.5; fi
+    done
+    kill -0 $pid 2>/dev/null || settled="exited during the settle window"
+    bad=$(settle_errors "$s")
+    [ -n "$bad" ] && settled="$settled${settled:+; }$bad"
+  fi
   kill -0 $pid 2>/dev/null && kill $pid
   wait $pid 2>/dev/null
   n=$(grep -cx present $s/report 2>/dev/null)
-  echo "$name present: $n"
+  echo "$name present: $n${settled:+ (settle: $settled)}"
   [ "$n" = 1 ] || { fail="$fail $name-present"; echo "$name: no present within ${PRESENT_WAIT:-120} s; its last log lines:"; tail -30 "$s/out.log"; return 1; }
+  [ -z "$settled" ] || { fail="$fail $name-settle"; echo "$name: failed in the settle window after its first frame; its last log lines:"; tail -30 "$s/out.log"; return 1; }
+}
+settle_errors() { # settle_errors <run dir>: the panics and JIT compile errors of a run (its log and its report), one line
+  { grep -E 'panic parked|stale access parked|panicked|FATAL|compile error' "$1/out.log" 2>/dev/null
+    grep -E $'^(panic|error)\t' "$1/report" 2>/dev/null; } | head -3 | cut -c1-200 | tr '\n' ' '
 }
 step_present_calc() { present calc . makepad-app-calculator --no-default-features --features standalone; }
 step_present_stage() { present stage apps/commercial makepad-stage; }
@@ -155,11 +177,18 @@ step_relaunch() { # JITRELAUNCH: `session relaunch` 5x in place, 5x with stops t
   rl=$(WAIT=200 tools/run/fixture/relaunch.sh 2>&1 | tail -1 | cut -c1-400)
   echo "$rl"; echo "$rl" | grep -q "^relaunch: OK" || fail="$fail relaunch"
 }
+step_boundary() { # JITPROV: the smoke apps and the WM reach provided crates only through their ops (`makepad check --boundary
+  # all`: every body a run of the app compiles, from its main; a provided crate's static or rustc-laid field read from
+  # JIT-compiled code is a violation, caught here instead of at a user's first start)
+  bd=$(RUNS=0 SWEEP_OUT="$log/sweep" bash tools/run/fixture/provided_sweep.sh 2>&1)
+  echo "$bd" | grep -E "^audit |^provided_sweep" | cut -c1-200
+  echo "$bd" | grep -q "^provided_sweep: ok" || { fail="$fail boundary"; echo "$bd" | grep -A1 "^violation" | head -20 | cut -c1-300; }
+}
 # full-a + full-b = full; land-batch.sh runs the two halves on two pool nodes at once (each builds), balanced on the
 # measured step times (107, 2026-10-30: A ~460 s, B ~370 s with the build; full in series ~930 s)
-STEPS_FULL="step_x64_tests step_fuzz step_checks step_present_calc step_present_stage step_warm_zero step_warm_hal step_warm_app_edit step_inspect_cold step_relaunch step_diff step_zone"
+STEPS_FULL="step_x64_tests step_fuzz step_checks step_boundary step_present_calc step_present_stage step_warm_zero step_warm_hal step_warm_app_edit step_inspect_cold step_relaunch step_diff step_zone"
 STEPS_A="step_x64_tests step_fuzz step_checks step_present_calc step_present_stage step_warm_app_edit"
-STEPS_B="step_warm_zero step_warm_hal step_inspect_cold step_relaunch step_diff step_zone"
+STEPS_B="step_boundary step_warm_zero step_warm_hal step_inspect_cold step_relaunch step_diff step_zone"
 timed() { # timed <step fn>: runs it and prints "STEP <name> <s> s [start-end]" (the gate's wall-time breakdown)
   t=$(date +%s); t0=$(date +%T); "$1"; r=$?; echo "STEP ${1#step_} $(( $(date +%s) - t )) s [$t0-$(date +%T)]"; return $r
 }
@@ -173,13 +202,45 @@ step_affected() {
   python3 -I tools/run/fixture/affected.py "$QBASE" "$QCBASE" > "$log/affected" 2> "$log/affected.err" || { fail="$fail affected"; tail -5 "$log/affected.err"; return 1; }
   grep '^why' "$log/affected"; sum="$sum $(grep -c '^check' "$log/affected") checks $(grep -c '^present' "$log/affected") presents"
 }
-# quick: the smoke apps' checks and presents ONE AFTER ANOTHER on this one warm box, in affected.py's order (Stage first:
-# the most shared code), each reusing what the earlier ones compiled and stored in the box's one JIT cache
-step_qcheck() { while read -r _ pkg dir; do check_pkg "$pkg" "$pkg" "$dir"; done < <(grep '^check ' "$log/affected"); }
-step_qpresent() { while read -r _ pkg dir args; do present "$pkg" "$dir" "$pkg" $args; done < <(grep '^present ' "$log/affected"); }
+# quick: the affected apps' checks and presents all at once on this one warm box, on its one JIT cache; each in its
+# own subshell, so its output and failures are gathered here in affected.py's order
+at_once() { # at_once <fn> <lines file>: runs `<fn> <fields of a line>` per line in parallel
+  i=0
+  while read -r -a f; do
+    i=$((i + 1))
+    ( fail=""; "$1" "${f[@]}" > "$log/par-$i.out" 2>&1; printf '%s' "$fail" > "$log/par-$i.fail" ) &
+  done < "$2"
+  wait
+  for n in $(seq 1 $i); do
+    cat "$log/par-$n.out"; fail="$fail$(cat "$log/par-$n.fail" 2>/dev/null)"
+  done
+}
+qcheck_one() { check_pkg "$2" "$2" "$3"; }
+qpresent_one() { pkg=$2; dir=$3; shift 3; present "$pkg" "$dir" "$pkg" "$@"; }
+step_qcheck() { grep '^check ' "$log/affected" > "$log/checks"; at_once qcheck_one "$log/checks"; }
+step_qpresent() { grep '^present ' "$log/affected" > "$log/presents"; at_once qpresent_one "$log/presents"; }
+if [ "$mode" = now ]; then
+  QBASE=${2:?now <makepad base sha> <commercial base sha|->}; QCBASE=${3:--}
+  timed step_affected
+  if [ -z "$fail" ]; then
+    if grep -qx 'jit no' "$log/affected" && [ -x "$T/host/makepad" ]; then
+      cargo_b=$B; B=$T/host/makepad
+      timed step_qcheck
+      if [ -n "$fail" ]; then  # the box's built JIT may be older than this tree: only the tree's JIT has the last word
+        echo "now: failed on the box's built JIT ($fail ); checking again through cargo"
+        fail=""; B=$cargo_b; timed step_qcheck
+      fi
+    else
+      timed step_qcheck
+    fi
+  fi
+  who="[lease ${DEVHUB_LEASE:-none} lane ${MAKEPAD_TEST_LANE:-none} at $(git rev-parse --short=10 HEAD 2>/dev/null || echo unknown) in $PWD]"
+  if [ -n "$fail" ]; then echo "NODEGATE-FAIL:$fail $who"; exit 1; fi
+  echo "NODEGATE-OK now$sum $who"; exit 0
+fi
 if [ "$mode" = quick ]; then
   QBASE=${2:?quick <makepad base sha> <commercial base sha|->}; QCBASE=${3:--}
-  export PRESENT_WARM=1 PRESENT_WAIT=${PRESENT_WAIT:-30}  # warm presents take 3-20 s: a hang fails in 30 s
+  export PRESENT_WARM=1 PRESENT_WAIT=${PRESENT_WAIT:-60}  # warm presents take 3-20 s alone, more side by side: a hang fails in 60 s
   timed step_jit && timed step_affected && { timed step_qcheck; timed step_qpresent; }
   who="[lease ${DEVHUB_LEASE:-none} lane ${MAKEPAD_TEST_LANE:-none} at $(git rev-parse --short=10 HEAD 2>/dev/null || echo unknown) in $PWD]"
   if [ -n "$fail" ]; then echo "NODEGATE-FAIL:$fail $who"; exit 1; fi

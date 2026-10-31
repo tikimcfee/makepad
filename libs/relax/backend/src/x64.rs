@@ -1540,10 +1540,13 @@ impl<'a> Gen<'a> {
         self.saved = 8 * self.al.used_callee_int.len() as i32;
         // only slots something addresses take space; slots whose lifetimes cannot overlap share
         // it (frame::slot_layout)
-        let (at, end) = crate::frame::slot_layout(self.f, self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"));
+        // (the layout counts from the frame's base, 16-aligned, so a slot's alignment holds there:
+        // the saves come first and may be an odd number of words)
+        let (at, end) = crate::frame::slot_layout(self.f, (self.saved + self.al.spill_bytes as i32) as i64, !crate::stats::opt_off(options, "-slotcolor"));
+        let at: Vec<i64> = at.iter().map(|&x| x - self.saved as i64).collect();
         self.slot_off.extend(at.iter().map(|&x| x as i32));
         self.slot_pos = crate::frame::slot_addr_positions(self.f, &at);
-        let mut off = end as i32;
+        let mut off = (end - self.saved as i64) as i32;
         off = (off + 7) / 8 * 8;
         // C ABI body: buffers rebuilding aggregate params from registers, the result buffer
         if let Some(sig) = &self.f.cabi {

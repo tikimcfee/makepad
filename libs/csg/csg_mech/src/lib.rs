@@ -20,10 +20,11 @@ pub mod joint;
 pub mod mass;
 pub mod runner;
 pub mod sim;
+pub mod weave;
 
 pub use check::{Gap, LayerReport, Risk};
 pub use geom::{Prim, Solid, P3};
-pub use joint::{AnchorDecl, BallDecl, Extent, HingeDecl, JointDecl, JointGeom, Material, Note, PartBox, Profile};
+pub use joint::{AnchorDecl, BallDecl, Extent, HingeDecl, JointDecl, JointGeom, Material, Measured, Note, PartBox, Profile};
 
 use geom::*;
 use makepad_csg_sdf::Sdf3;
@@ -267,7 +268,7 @@ pub fn proxy_hulls(vertices: &[P3], keep_out: &[(P3, f64)]) -> Vec<Vec<P3>> {
 /// effective limits and pin friction, the anchors.
 pub fn assembly(plan: &Plan, parts: &[FinalPart], checks: &[JointCheck], fill: f64) -> sim::Assembly {
     let density = plan.profile.material.density;
-    let mu = plan.profile.material.mu;
+    let mu = plan.profile.measured.mu.unwrap_or(plan.profile.material.mu);
     let mut keep: Vec<Vec<(P3, f64)>> = vec![Vec::new(); parts.len()];
     for (g, d) in plan.joints.iter().zip(&plan.decls) {
         let (a, b) = d.parts();
@@ -278,7 +279,7 @@ pub fn assembly(plan: &Plan, parts: &[FinalPart], checks: &[JointCheck], fill: f
     let bodies = parts
         .iter()
         .enumerate()
-        .map(|(i, p)| sim::BodySpec { name: p.name.to_string(), mass: mass::mesh_mass(p.vertices, p.triangles, density, fill), hulls: proxy_hulls(p.vertices, &keep[i]) })
+        .map(|(i, p)| sim::BodySpec { name: p.name.to_string(), mass: mass::mesh_mass(p.vertices, p.triangles, density, fill), hulls: proxy_hulls(p.vertices, &keep[i]), tubes: Vec::new() })
         .collect();
     let joints = plan
         .joints
@@ -312,5 +313,5 @@ pub fn assembly(plan: &Plan, parts: &[FinalPart], checks: &[JointCheck], fill: f
             friction: sim::Friction { mu, radius: a.hole.map_or(0.0, |h| h.1), torque: 0.0 },
         })
         .collect();
-    sim::Assembly { bodies, joints, anchors, up: plan.profile.up }
+    sim::Assembly { bodies, joints, anchors, up: plan.profile.up, sleep: 0.0, workers: 1, contact_margin: 0.0, max_speed: 0.0, contact_hertz: 0.0, substeps: 0, ball: None }
 }

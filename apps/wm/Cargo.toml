@@ -52,7 +52,6 @@ default = ["tweaker"]
 tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 
 [dependencies]
-makepad-remote = { path = "../../libs/remote" }
 makepad-widgets = { path = "../../widgets", default-features = false, features = ["charts", "color", "data", "dates", "chat", "dock", "rich_text", "dropzone", "vector", "glass", "nav_menus", "command_palette"] }
 makepad-widgets-tweaker = { path = "../../widgets/families/tweaker", optional = true }
 makepad-studio-protocol = { path = "../../platform/studio" }
@@ -68,7 +67,6 @@ makepad-ai-hub = { path = "../../libs/ai/hub", default-features = false }
 # The shell's drawing kit and the AI hub control panel (shared with the AI Hub app).
 makepad-shell-kit = { path = "../../libs/shell_kit" }
 makepad-ai-hub-panel = { path = "../../libs/ai/hub_panel" }
-makepad-devhub = { path = "../../libs/devhub" }
 makepad-desk-link-panel = { path = "../../libs/desk_link_panel" }
 # In-process hosting (aicontrol §3): the module contract and the palette
 # applied into each instance's isolate. Which modules a build links is the
@@ -87,6 +85,8 @@ makepad-wayland-server = { path = "../../libs/wayland_server" }
 makepad-xkb-keymap = { path = "../../libs/xkb_keymap" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+makepad-remote = { path = "../../libs/remote" }
+makepad-devhub = { path = "../../libs/devhub" }
 # Serving Desk Link (listener, TLS, fleet credentials): native desktops only
 makepad-desk-link = { path = "../../libs/desk_link", features = ["server", "tiles"] }
 makepad-hal = { path = "../../platform/hal" }

@@ -1325,7 +1325,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     let session = unsafe { crate::jit::unit_session(up) };
     // after the first present: what the earlier run installed after its first present (the
     // slots before it were linked as this run's start called them)
-    let list = owner::call_quick(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
+    let list = owner::call(owner::Class::Program, || (&mut *up).cache.as_ref().map(|c| c.manifest[c.manifest_present..].to_vec()).unwrap_or_default());
     if list.is_empty() || !pipelined() || !ahead_policy().spec_cached {
         return;
     }
@@ -1431,12 +1431,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         let options = (&*up).prog.session.clone().options.clone();
         let gandalf = crate::borrowck::lazy::gandalf_enabled(&options);
         let mut notes = Vec::new();
-        // the identities of the image's slots are decoded after main started (complete_identities),
-        // unless this run needs them all now: lazily skipped files (a key naming one does not decode
-        // until it is loaded: decoded now, its slots stay lazy), perf maps, the cache trace and O3
-        // profile replay (they name the slots as they install them)
-        let eager = !(&*up).prog.skipped_files.is_empty() || perf_map_on() || crate::cache::trace_on() || t1prof_replay(&options);
-        let n = crate::cache::prelink_unit(up, eager, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
+        let n = crate::cache::prelink_unit(up, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
             u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
             crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
             let mut arm = Vec::with_capacity(slots.len());
@@ -1446,34 +1441,6 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             }
             (&mut *up).arm_counters(&arm);
         });
-        if IDS_PENDING.load(Ordering::Acquire) {
-            struct P(*mut Unit);
-            unsafe impl Send for P {}
-            let p = P(up);
-            { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name("run-ids".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
-                let p = p;
-                let up = p.0;
-                IDS_EXEMPT.with(|e| e.set(true));
-                loop {
-                    // (its turn like any holder: a waiting thread takes the unit next and decodes the
-                    // rest itself)
-                    let done = owner::publish(|| {
-                        let left = IDS_PENDING.load(Ordering::Acquire);
-                        let done = !left || crate::cache::complete_identities_unit(up, 512, true);
-                        if left && done {
-                            IDS_PENDING.store(false, Ordering::Release);
-                            ids_report(up);
-                        }
-                        done
-                    });
-                    if done {
-                        return;
-                    }
-                }
-            });
-            }
-        }
         Some((n, notes))
     });
     let Some((n, notes)) = prelinked else { return 0 };
@@ -1508,80 +1475,6 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         }
     }
     n
-}
-
-/// The startup image's slots have identities still encoded (cache/image.rs): the owner decodes
-/// the rest before it serves any request that is not quick, so every unit call sees every
-/// slot's key (`ids_on_serve`); a background thread decodes them meanwhile, a chunk per call
-/// (prelink_startup).
-static IDS_PENDING: AtomicBool = AtomicBool::new(false);
-static IDS_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-/// who made the owner decode the rest (the verbose report)
-static IDS_FORCED_BY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
-thread_local! {
-    /// the owner is decoding them (a request it serves meanwhile does not start again)
-    static IDS_EXEMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Before a request that is not quick (owner): the startup identities still encoded are
-/// decoded first.
-#[inline]
-pub(crate) fn ids_on_serve() {
-    if IDS_PENDING.load(Ordering::Acquire) && !IDS_EXEMPT.with(|e| e.get()) {
-        IDS_FORCED_BY.store(owner::serving().0 as u8, Ordering::Relaxed);
-        ids_complete();
-    }
-}
-
-/// Decodes every startup identity still encoded (owner).
-fn ids_complete() {
-    let up = IDS_UNIT.load(Ordering::Acquire);
-    if up.is_null() {
-        return;
-    }
-    let was = IDS_EXEMPT.with(|e| e.replace(true));
-    unsafe { crate::cache::complete_identities_unit(up, usize::MAX, false) };
-    IDS_PENDING.store(false, Ordering::Release);
-    IDS_EXEMPT.with(|e| e.set(was));
-    ids_report(up);
-}
-
-/// Startup identities still encoded: true on the owner (the caller decodes what it needs);
-/// elsewhere a unit call decodes them all first.
-#[inline]
-fn ids_pending_here() -> bool {
-    if !IDS_PENDING.load(Ordering::Acquire) || IDS_EXEMPT.with(|e| e.get()) {
-        return false;
-    }
-    if owner::is_owner() {
-        return true;
-    }
-    owner::call(owner::Class::Program, || ());
-    false
-}
-
-/// Before slot `id` is built: its identity decoded, if it is a startup image slot's.
-#[inline]
-fn ids_name(up: *mut Unit, id: u32) {
-    if ids_pending_here() {
-        unsafe { crate::cache::name_unnamed_unit(up, id) };
-    }
-}
-
-/// The startup image's slots were made with their identities encoded (cache/image.rs prelink,
-/// a unit call): from now on a lookup by key or a build decodes them first.
-pub(crate) fn ids_pending(up: *mut Unit) {
-    IDS_UNIT.store(up, Ordering::Release);
-    IDS_PENDING.store(true, Ordering::Release);
-}
-
-/// --verbose: how the startup identities were decoded (once, when the last is).
-fn ids_report(up: *mut Unit) {
-    let by = match IDS_FORCED_BY.load(Ordering::Relaxed) {
-        u8::MAX => "the background decoder".to_string(),
-        c => format!("a {} request", owner::CLASS_NAMES[c as usize & 7]),
-    };
-    unsafe { crate::cache::ids_report_unit(up, &by) };
 }
 
 /// O3 jobs that panicked outside their build's recovery (slot left at O1)
@@ -4082,6 +3975,7 @@ impl Unit {
     fn crossing_of(&self, ks: &[u32]) -> std::collections::HashSet<TyId> {
         let pt = &self.provided_types;
         let provided = &self.provided;
+        let opaque = &self.lay.opaque;
         // A bound fn has a shim under its key, and a key ends in the fn's own name. Only the
         // fns of those names are keyed, and only the ones a shim names get their signature
         // worked out (it drags in lifetime resolution): the provided crates have thousands of
@@ -4095,7 +3989,7 @@ impl Unit {
             let key = crate::provided::key(&self.prog, &self.tcx, d);
             provided.iter().any(|(pk, pc)| *pk == def.krate && pc.shims.contains_key(key.as_str()))
                 && crate::provided::unbound_reason(&self.prog, &self.tcx, def.krate, d, &|a| pt.contains_key(&a)).is_none()
-        })
+        }, &|d| opaque.contains_key(&d))
     }
 
 
@@ -5279,13 +5173,7 @@ impl Unit {
                 }
             }
         }
-        // a slot of the startup image whose identity is still encoded: found by the key's
-        // encoding (and named now)
-        if ids_pending_here() {
-            if let Some(id) = unsafe { crate::cache::image_slot_by_key_unit(self.self_ptr.0, &key) } {
-                return id;
-            }
-        } else if let Some(id) = self.fn_map.get(&key) {
+        if let Some(id) = self.fn_map.get(&key) {
             return id;
         }
         // fn_create is a leaf lock: nothing under it waits for a query, the owner or a pump
@@ -5488,7 +5376,7 @@ impl Unit {
     }
 
     /// `n` new slots in one go, ids `first..first + n` (the startup image's, cache/image.rs):
-    /// lazy stubs, no identity yet (GLUE_UNNAMED until `name_slot`). Returns `first`.
+    /// lazy stubs, no identity yet (GLUE_UNNAMED until `name_slot`, for good when the key does not decode). Returns `first`.
     pub(crate) fn new_slots(&self, n: usize) -> u32 {
         let _g = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
         let first = self.fns.len() as u32;
@@ -7278,8 +7166,6 @@ unsafe fn cost_name(up: *mut Unit, id: u32) {
 /// from the lazy stub on first call, and directly for eager compilation and patches.
 pub unsafe fn compile_slot(up: *mut Unit, id: u32) -> u64 {
     let _z = crate::zone_alloc::compiler();
-    // a slot of the startup image is built by its key
-    ids_name(up, id);
     let _job = compile_job();
     let code = ensure_sufficient_stack(|| compile_slot_on_stack(up, id));
     // a program thread compiles in bursts: its chunks go back between them (frees from other
@@ -10405,13 +10291,9 @@ pub(crate) fn frame_enter(rec: *const ()) -> Frame {
 pub(crate) fn frame_leave(f: Frame) -> bool {
     // builds a panic left open (backstop: their bookkeeping normally closes them)
     for id in BUILD_STACK.with(|s| std::mem::take(&mut *s.borrow_mut())) {
-        let up = IDS_UNIT.load(Ordering::Acquire);
-        let unit = cur_unit();
-        for u in [unit, up] {
-            if !u.is_null() && (id as usize) < unsafe { (&*u).fns.len() } {
-                unsafe { (&mut *u).fns[id as usize].building = false };
-                break;
-            }
+        let u = cur_unit();
+        if !u.is_null() && (id as usize) < unsafe { (&*u).fns.len() } {
+            unsafe { (&mut *u).fns[id as usize].building = false };
         }
     }
     BUILD_STACK.with(|s| *s.borrow_mut() = f.build_stack);
@@ -12635,15 +12517,9 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
         n
     };
     trace("typeck", &fname);
-    // a startup image slot reached before its identity was decoded: decode it now
-    let key = if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
-        crate::cache::name_unnamed_unit(up, id);
-        (&*up).fns[id as usize].key.clone()
-    } else {
-        key
-    };
+    // the slot of a startup image key that did not decode: nothing links to it (a whole-unit
+    // walk may still come here), so this error's stub is never called
     if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
-        crate::cache::image_broken_unit(up, id);
         return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
     }
     if let FnKey::Shim(ref shim) = key {
@@ -20805,6 +20681,10 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // (rand 0.8's ReseedingRng registers its fork handler at its first use)
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
+        // (glibc's atexit is there too; and a handler in libc's list would run after this thread's
+        // locals are gone, where a lazy compile of it cannot run: makepad-remote's socket cleanup)
+        #[cfg(unix)]
+        b"atexit" => Some(os::proc::program_atexit as *const () as usize),
         #[cfg(unix)]
         b"__relax_precompile" => Some(relax_precompile as *const () as usize),
         #[cfg(unix)]

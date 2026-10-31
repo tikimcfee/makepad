@@ -2,7 +2,8 @@
 //! put in its job, then resumed, so every process it starts is in the job from its first
 //! instruction; end = TerminateJobObject (there is no TERM to send a process tree). The run is
 //! BELOW_NORMAL priority (its children inherit the class), without a console window. If the hub
-//! dies the job handle closes and the run ends with it.
+//! dies the job handle closes and the run ends with it. So nothing outlives a run's job, and
+//! [`with_env`] has nothing to find.
 //!
 //! Also the machine's numbers (memory, CPU times, processes, disk, CPU name, battery) through the
 //! generated bindings (makepad-windows-sys).
@@ -304,3 +305,10 @@ pub fn battery() -> Option<(u32, bool)> {
 pub fn raise_fd_limit() -> u64 {
     0
 }
+
+/// The processes that left their run's group: none (see the top of this file).
+pub fn with_env(_marker: &str) -> Vec<u32> {
+    Vec::new()
+}
+
+pub fn signal_one(_pid: u32, _hard: bool) {}

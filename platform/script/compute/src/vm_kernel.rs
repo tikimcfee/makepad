@@ -236,9 +236,8 @@ impl KernelProgram {
     }
 }
 
-/// The kernels compiled in this process, by [`KernelProgram::key`]. Each side keeps its own
-/// (`per_side`): JIT-compiled callers cache the kernels they build, rustc's code its own.
-#[makepad_relax_api::relax_api(per_side)]
+/// The kernels compiled in this process, by [`KernelProgram::key`] (every compile runs inside
+/// the compiler: the `kernel_compile` op).
 static COMPILED: std::sync::Mutex<std::collections::BTreeMap<u64, KernelRef>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// A constant a kernel can hold, from a document value.
@@ -746,7 +745,22 @@ pub(crate) fn kernel_program_lifting(vm: &ScriptVm, k: &VmKernel, whole_values: 
 /// order after the declared ones. Every value of those numbers is the same
 /// program, compiled once. A kernel the lifted numbers do not compile (a
 /// loop bound must be a constant) compiles with them as constants.
+/// Like [`compile`], the program is built and compiled inside the compiler
+/// (the `kernel_compile` op): code Relax compiles only builds the views.
+#[inline(always)]
 pub fn compile_lifted(vm: &ScriptVm, k: &VmKernel, backend: Backend, max: usize) -> Result<(KernelRef, Vec<(String, f32)>), Vec<ShaderError>> {
+    with_view(k, |view| {
+        let mut compiled = crate::boundary::compile_vm_kernel_lifted(vm, view, backend, max as u32);
+        let lifted = compiled.view().lifted.iter().map(|l| (l.name.to_string(), l.value)).collect();
+        match compiled.take_kernel() {
+            Some(kernel) => Ok((kernel, lifted)),
+            None => Err(compile_errors(&compiled)),
+        }
+    })
+}
+
+/// The lifted compile, inside the compiler (`boundary::kernel_compile`).
+pub(crate) fn compile_lifted_impl(vm: &ScriptVm, k: &VmKernel, backend: Backend, max: usize) -> Result<(KernelRef, Vec<(String, f32)>), Vec<ShaderError>> {
     let mut lifted = Vec::new();
     let program = kernel_program_lifting(vm, k, false, Some((&mut lifted, max))).map_err(|e| vec![e])?;
     match program.compile(&[], backend, &[]) {
@@ -759,12 +773,30 @@ pub fn compile_lifted(vm: &ScriptVm, k: &VmKernel, backend: Backend, max: usize)
     }
 }
 
+/// A compilation's errors as the compiler's own.
+#[inline(always)]
+fn compile_errors(compiled: &crate::boundary::KernelCompilation) -> Vec<ShaderError> {
+    (0..compiled.error_count()).map(|index| {
+        let error = compiled.error(index);
+        ShaderError::new(error.start, error.end, error.message.to_string())
+    }).collect()
+}
+
 /// Compiles a kernel made from Splash values (see the module docs). The
 /// errors are the compiler's, their messages naming the document place.
 /// The host's declarations and layouts cross as borrowed views; the
 /// program is built and compiled inside the compiler.
 #[inline(always)]
 pub fn compile(vm: &ScriptVm, k: &VmKernel, layouts: &[crate::boundary::LayoutView<'_>], backend: Backend, modules: &[crate::module::Module]) -> Result<KernelRef, Vec<ShaderError>> {
+    with_view(k, |view| {
+        let mut compiled = crate::boundary::compile_vm_kernel(vm, view, layouts, backend, modules);
+        compiled.take_kernel().ok_or_else(|| compile_errors(&compiled))
+    })
+}
+
+/// `k` as the borrowed view the compiler's op takes, for `f`.
+#[inline(always)]
+fn with_view<R>(k: &VmKernel, f: impl FnOnce(&crate::boundary::VmKernelView<'_>) -> Result<R, Vec<ShaderError>>) -> Result<R, Vec<ShaderError>> {
     use crate::boundary::{DeclKind, DeclView, VmKernelView};
     let mut decls = Vec::with_capacity(k.decls.len());
     for d in &k.decls {
@@ -804,14 +836,7 @@ pub fn compile(vm: &ScriptVm, k: &VmKernel, layouts: &[crate::boundary::LayoutVi
     let bind_names: Vec<&str> = k.bind.iter().map(|(n, _)| n.as_str()).collect();
     let bind_fns: Vec<ScriptObject> = k.bind.iter().map(|(_, f)| *f).collect();
     let view = VmKernelView { decls: &decls, entry: k.entry, entry_fn: k.entry_fn, math: k.math, uses: &uses, bind_names: &bind_names, bind_fns: &bind_fns, whole_values: false };
-    let mut compiled = crate::boundary::compile_vm_kernel(vm, &view, layouts, backend, modules);
-    if let Some(kernel) = compiled.take_kernel() {
-        return Ok(kernel);
-    }
-    Err((0..compiled.error_count()).map(|index| {
-        let error = compiled.error(index);
-        ShaderError::new(error.start, error.end, error.message.to_string())
-    }).collect())
+    f(&view)
 }
 
 // ---------------------------------------------------------------------------

@@ -325,6 +325,7 @@ impl ChatTurn for HubChatTurn {
                     text: self.text.clone(),
                 }),
                 HubEvent::Failed(error) => out.push(ChatEvent::Failed(error)),
+                HubEvent::Working(_) => {}
                 HubEvent::ContextFull => {
                     out.push(ChatEvent::Failed("context full".to_string()))
                 }

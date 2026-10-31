@@ -60,6 +60,8 @@ pub enum Alert {
     Panic,
     /// rebuilding makepad for a change it cannot patch failed: the app runs the previous code (amber)
     RebuildFailed,
+    /// a change waits for a restart: the app runs the previous code; a click restarts it (amber)
+    UpdateReady,
 }
 
 /// What the run sees of the JIT (hal_run): it is busy (a ring without a `Want` fades out).
@@ -270,7 +272,7 @@ impl Ring {
         // a dot that goes (the stop ended, nothing else to show) fades out as the dot
         let alert = self.alert.or(self.want.is_none().then_some(self.last_alert).filter(|_| self.dot));
         let mode = match alert {
-            Some(Alert::Stale | Alert::RebuildFailed) => 2.0,
+            Some(Alert::Stale | Alert::RebuildFailed | Alert::UpdateReady) => 2.0,
             Some(Alert::Panic) => 3.0,
             None => self.back,
         };
@@ -294,6 +296,7 @@ pub fn summary(want: Option<Want>, alert: Option<Alert>) -> String {
             Alert::Stale => format!("paused on invalidated code · makepad inspect {} panics", std::process::id()),
             Alert::Panic => format!("paused on a panic · makepad inspect {} panics", std::process::id()),
             Alert::RebuildFailed => "rebuilding makepad failed · the app runs the previous code (see the terminal)".into(),
+            Alert::UpdateReady => "Update ready · click to restart".into(),
         };
     }
     let Some(w) = want else { return "settled".into() };

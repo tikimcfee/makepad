@@ -19,7 +19,7 @@ pub use makepad_score_tools::{find, ScoreToolDef, CHECK, GUIDE, INSTRUMENT_SEARC
 
 /// The composer guide `score_guide` answers.
 pub fn guide() -> String {
-    crate::guide::guide()
+    crate::guide::overview()
 }
 
 /// Run Score tool `name` (dotted or underscored) with `args` (checked
@@ -28,7 +28,10 @@ pub fn guide() -> String {
 /// worker. `Err` is a refusal to show the model.
 pub fn call(name: &str, args: &Value, open: Option<&str>) -> Result<Value, String> {
     match find(name).map(|tool| tool.api_name) {
-        Some("score_guide") => Ok(json::obj(vec![("guide", json::s(guide()))])),
+        Some("score_guide") => match args.get("section").and_then(Value::as_str) {
+            Some(name) => crate::guide::section(name).map(|text| json::obj(vec![("guide", json::s(text))])).ok_or_else(|| format!("the guide has no section `{name}`")),
+            None => Ok(json::obj(vec![("guide", json::s(guide()))])),
+        },
         Some("score_check") => Ok(check(&source_of(args, open)?)),
         Some("score_listen") => listen_args(args, open).map(|(json, _)| json),
         Some("instrument_search") => Ok(instrument_search(args)),

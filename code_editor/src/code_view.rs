@@ -62,6 +62,7 @@ script_mod! {
         find_open: View{
             width: Fit height: Fit
             open := ButtonFlatterIcon{
+                a11y: {label: "Find"}
                 width: 22 height: 22 padding: 0 align: Align{x: 0.5 y: 0.5}
                 icon_walk: Walk{width: 11 height: 11}
                 draw_icon +: {svg: crate_resource("makepad_widgets:resources/icons/icon_search.svg")}

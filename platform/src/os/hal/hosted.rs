@@ -352,9 +352,8 @@ impl Cx {
 
     /// The host's geometry for a window this app has made.
     fn hal_hosted_geom(&mut self, window: WindowId, geom: HostGeom) {
-        makepad_hal::a11y::set_screen_origin(
-            makepad_hal::a11y::window_key(self.hal.frames.w.session(), window.id() as u32),
-            geom.screen_origin.map(|(x,y)| (x as f32,y as f32)));
+        let origin = geom.screen_origin.map(|(x, y)| [x as f32, y as f32]);
+        self.hal.frames.w.window_screen_origin(hal_window_id(window), origin.unwrap_or_default(), origin.is_some());
         let [left, top, width, height] = geom.rect;
         let current = &self.windows[window].window_geom;
         if current.position == dvec2(left, top) && current.inner_size == dvec2(width, height) && current.dpi_factor == geom.dpi {
@@ -472,8 +471,7 @@ impl Cx {
                 }
             }
             StudioToApp::WindowFocus { window_id, focused } => {
-                makepad_hal::a11y::set_window_active(
-                    makepad_hal::a11y::window_key(self.hal.frames.w.session(), window_id as u32), focused);
+                self.hal.frames.w.window_a11y_active(makepad_hal::Id::new(window_id as u32, 0), focused);
                 let window = self.windows.id_iter().find(|w| w.id() == window_id);
                 if let Some(window) = window {
                     self.dispatch_studio_msg(StudioToApp::WindowFocus { window_id, focused }, window, dvec2(0.0, 0.0));
@@ -559,21 +557,37 @@ impl Cx {
         // it has written the FD batch. Each poll tries once until the parent listens.
         let inbox = crate::os::hosted_gpu::GpuInbox::start(&self.thread_spawner())?;
         if crate::app_main::hosted_by_window_manager() {
-            makepad_hal::hosted_native::enable_bridge(crate::thread::SignalToUI::set_ui_signal);
+            self.hal.frames.w.hosted_native_bridge();
         }
         self.hal.hosted.as_mut().unwrap().inbox = Some(inbox);
         Ok(())
     }
 
+    /// A native-layer request of the HAL's for the WM (`HostedNativeOut`): the fence fd or -1,
+    /// then the request (SerBin).
+    pub(crate) fn hal_hosted_native_out(&mut self, bytes: &[u8]) {
+        use crate::makepad_micro_serde::DeBin;
+        use std::os::fd::FromRawFd;
+        let Some(fence) = bytes.get(..4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])) else { return };
+        // SAFETY: the HAL handed the fence over with into_raw_fd (taken once)
+        let fence = (fence >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fence) });
+        let request = match makepad_studio_protocol::NativeAppRequest::deserialize_bin(&bytes[4..]) {
+            Ok(request) => request,
+            Err(error) => { crate::error!("hal native request: {error:?}"); return; }
+        };
+        let Some(inbox) = self.hal.hosted.as_mut().and_then(|h| h.inbox.as_mut()) else { return };
+        if let Err(error) = inbox.send_native(crate::os::hosted_gpu::Outgoing { request, fence }) { crate::error!("hal native request: {error}"); }
+    }
+
     fn hal_hosted_descriptors(&mut self) {
         let Some(inbox) = self.hal.hosted.as_mut().and_then(|h| h.inbox.as_mut()) else { return };
-        for request in makepad_hal::hosted_native::take_outgoing() {
-            if let Err(error) = inbox.send_native(request) { crate::error!("hal native request: {error}"); }
-        }
         let loaded = match inbox.poll() {
             Ok(loaded) => loaded,
             Err(error) => { crate::error!("hal hosted descriptors: {error}"); return; }
         };
+        for bytes in inbox.take_native() {
+            self.hal.frames.w.hosted_native_in(&bytes);
+        }
         let session = self.hal.frames.w.session();
         for batch in loaded {
             let swapchain = batch.request.swapchain;

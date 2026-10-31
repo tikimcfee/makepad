@@ -8,9 +8,16 @@
 //!   (`gpu_frame_timer`: per-pass GPU spans from timestamp queries on Metal,
 //!   Vulkan, D3D11 and the web) and the bake's share of each frame; the
 //!   bricks baked per frame follow the measured cost per brick so the bake
-//!   stays inside [`Budget::bake_ms`]. A host asks [`GpuMeter::over_budget`]
-//!   whether the field look holds its frame budget and falls back to meshes
-//!   when it does not.
+//!   stays inside [`Budget::bake_ms`].
+//! - **Degrades, never switches.** The field look stays the field look: a
+//!   frame over [`Budget::frame_ms`] turns its own levers down a [`Quality`]
+//!   level (march steps, the coarse pass's resolution, exact kernel
+//!   evaluation, the bake's share), a frame well under it turns them back up.
+//!   The judgement reads settled frames only: none for [`SETTLE`] frames
+//!   after a start or a level change (pipelines compile, the bake catches
+//!   up), none that folded repaints which never presented (several frames'
+//!   work, or a stall), and the bake's own passes left out (they keep their
+//!   own budget). Meshes are only ever the person's choice.
 //! - **Hard caps** that hold before any measurement: bricks per frame
 //!   ([`Budget::max_bricks_per_frame`]), kernel work per frame
 //!   ([`Budget::bake_ops`], with a kernel's own worst case per sample
@@ -30,8 +37,8 @@ pub const BYTES_PER_BRICK: u64 = 64 * 8 * 4 + 64 * 8 + 81 * 9 * 2 + 81 * 9;
 pub struct Budget {
     /// GPU ms a frame's bake (truth and copy passes) may take.
     pub bake_ms: f32,
-    /// Whole-frame GPU ms (median) past which the field look is not held:
-    /// the host shows meshes.
+    /// Whole-frame GPU ms (median of settled frames, the bake left out) the
+    /// field look keeps inside by its [`Quality`] levels.
     pub frame_ms: f32,
     /// Bricks a frame bakes at most (and at least, while any wait).
     pub max_bricks_per_frame: usize,
@@ -81,6 +88,46 @@ impl Budget {
     }
 }
 
+/// How finely the field look draws: the levers a frame over its budget
+/// turns down, one level at a time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Quality {
+    /// 0: full; [`Quality::LEVELS`]`.len() - 1`: the least.
+    pub level: usize,
+    /// The share of a view's sphere-tracing steps a ray takes.
+    pub steps: f32,
+    /// The coarse pass's size, of the march's (0.5: half per axis).
+    pub coarse_scale: f64,
+    /// Exact kernel evaluation where a pixel spans fewer cells than this
+    /// (else the render copy: level of detail).
+    pub exact_cells: f32,
+    /// The share of the bake budget a frame takes (fewer re-baked bricks).
+    pub bake: f32,
+}
+
+impl Quality {
+    pub const LEVELS: [Quality; 4] = [
+        Quality { level: 0, steps: 1.0, coarse_scale: 0.5, exact_cells: 2.0, bake: 1.0 },
+        Quality { level: 1, steps: 0.85, coarse_scale: 0.5, exact_cells: 1.0, bake: 0.75 },
+        Quality { level: 2, steps: 0.7, coarse_scale: 0.25, exact_cells: 0.5, bake: 0.5 },
+        Quality { level: 3, steps: 0.6, coarse_scale: 0.25, exact_cells: 0.0, bake: 0.25 },
+    ];
+
+    pub fn full() -> Quality {
+        Quality::LEVELS[0]
+    }
+
+    /// `steps` (a view's budget) at this level, at least 16.
+    pub fn steps_of(&self, steps: u32) -> u32 {
+        ((steps as f32 * self.steps) as u32).max(16)
+    }
+}
+
+/// Frames not judged after a start or a level change.
+pub const SETTLE: usize = 30;
+/// Settled frames a judgement takes the median of.
+const WINDOW: usize = 60;
+
 /// One measured frame.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameCost {
@@ -102,6 +149,9 @@ pub struct GpuMeter {
     pub ms_per_brick: f32,
     /// Frames measured since [`GpuMeter::reset_health`].
     pub measured: usize,
+    /// Frames still to skip before judging.
+    skip: usize,
+    quality: Quality,
 }
 
 /// Frames kept for the medians.
@@ -109,7 +159,7 @@ const KEEP: usize = 120;
 
 impl GpuMeter {
     pub fn new(budget: Budget) -> GpuMeter {
-        GpuMeter { budget, frames: VecDeque::new(), bricks: 0, ms_per_brick: 0.0, measured: 0 }
+        GpuMeter { budget, frames: VecDeque::new(), bricks: 0, ms_per_brick: 0.0, measured: 0, skip: SETTLE, quality: Quality::full() }
     }
 
     /// Bricks a baker recorded (for the cost per brick).
@@ -127,7 +177,9 @@ impl GpuMeter {
         let mut bake_ms = 0.0f32;
         for f in gpu_frame_timer::take_frames() {
             let mut c = FrameCost { busy_ms: f.busy_ms, ..FrameCost::default() };
+            let mut folded = false;
             for (name, ms) in &f.passes {
+                folded |= name.starts_with("unpresented ");
                 let name = name.trim_start_matches("unpresented ");
                 if name == "sdf_bake" || name == "sdf_copy" {
                     c.bake_ms += ms;
@@ -137,6 +189,14 @@ impl GpuMeter {
                 }
             }
             bake_ms += c.bake_ms;
+            // settled frames only: past the settling ones, none with folded repaints
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            if folded {
+                continue;
+            }
             self.frames.push_back(c);
             self.measured += 1;
             if self.frames.len() > KEEP {
@@ -150,35 +210,61 @@ impl GpuMeter {
         }
     }
 
-    /// Bricks a frame may bake now: the bake budget over the measured cost
-    /// per brick, within the caps.
+    /// Bricks a frame may bake now: the bake budget (the quality's share of
+    /// it) over the measured cost per brick, within the caps.
     pub fn bricks_per_frame(&self) -> usize {
         let b = &self.budget;
         if self.ms_per_brick <= 0.0 {
             return b.start_bricks_per_frame;
         }
-        ((b.bake_ms / self.ms_per_brick) as usize).clamp(b.min_bricks_per_frame, b.max_bricks_per_frame)
+        ((b.bake_ms * self.quality.bake / self.ms_per_brick) as usize).clamp(b.min_bricks_per_frame, b.max_bricks_per_frame)
     }
 
-    /// The median whole-frame GPU ms of the last `n` frames (`None`: fewer measured).
+    /// The median GPU ms (the bake left out) of the last `n` settled frames
+    /// (`None`: fewer measured).
     pub fn median_ms(&self, n: usize) -> Option<f32> {
         if self.frames.len() < n || n == 0 {
             return None;
         }
-        let mut v: Vec<f32> = self.frames.iter().rev().take(n).map(|f| f.busy_ms).collect();
+        let mut v: Vec<f32> = self.frames.iter().rev().take(n).map(|f| (f.busy_ms - f.bake_ms).max(0.0)).collect();
         v.sort_by(|a, b| a.total_cmp(b));
         Some(v[v.len() / 2])
     }
 
-    /// Whether the last frames (at least 30) ran over the frame budget.
-    pub fn over_budget(&self) -> bool {
-        self.median_ms(30).is_some_and(|m| m > self.budget.frame_ms)
+    /// The quality the field look draws at now.
+    pub fn quality(&self) -> Quality {
+        self.quality
     }
 
-    /// Starts judging afresh (the look changed: older frames say nothing).
+    /// Judges the settled frames: a median over the frame budget turns the
+    /// quality down a level, one under 40% of it back up. Returns the new
+    /// quality and the median that moved it.
+    pub fn judge(&mut self) -> Option<(Quality, f32)> {
+        let m = self.median_ms(WINDOW)?;
+        let level = self.quality.level;
+        let next = if m > self.budget.frame_ms {
+            (level + 1).min(Quality::LEVELS.len() - 1)
+        } else if m < self.budget.frame_ms * 0.4 {
+            level.saturating_sub(1)
+        } else {
+            level
+        };
+        if next == level {
+            return None;
+        }
+        self.quality = Quality::LEVELS[next];
+        self.frames.clear();
+        self.skip = SETTLE;
+        Some((self.quality, m))
+    }
+
+    /// Starts judging afresh (the look changed: older frames say nothing),
+    /// at full quality.
     pub fn reset_health(&mut self) {
         self.frames.clear();
         self.measured = 0;
+        self.skip = SETTLE;
+        self.quality = Quality::full();
     }
 
     /// The last frame's costs.
@@ -200,9 +286,10 @@ mod tests {
         assert_eq!(b.bricks_for_kernels(u64::MAX / 1024), 1);
         // the texture budget in bricks
         assert!(b.max_bricks() > 50_000 && Budget::web().max_bricks() < 12_000);
-        let m = GpuMeter::new(b);
+        let mut m = GpuMeter::new(b);
         assert_eq!(m.bricks_per_frame(), b.start_bricks_per_frame);
-        assert!(!m.over_budget());
+        assert_eq!(m.judge(), None);
+        assert_eq!(m.quality(), Quality::full());
     }
 
     #[test]
@@ -212,9 +299,36 @@ mod tests {
         assert_eq!(m.bricks_per_frame(), 1024);
         m.ms_per_brick = 1.0;
         assert_eq!(m.bricks_per_frame(), 32);
-        for _ in 0..30 {
-            m.frames.push_back(FrameCost { busy_ms: 40.0, ..Default::default() });
+    }
+
+    #[test]
+    fn a_slow_frame_degrades_the_field_never_drops_it() {
+        let mut m = GpuMeter::new(Budget::desktop());
+        let push = |m: &mut GpuMeter, ms: f32, bake: f32, n: usize| {
+            for _ in 0..n {
+                m.frames.push_back(FrameCost { busy_ms: ms, bake_ms: bake, ..Default::default() });
+            }
+        };
+        // a bake's passes are their own budget: 50 ms with 30 of bake is 20
+        push(&mut m, 50.0, 30.0, WINDOW);
+        assert_eq!(m.judge(), None);
+        // over budget: one level down at a time, to the least, never further
+        for level in 1..Quality::LEVELS.len() + 2 {
+            m.frames.clear();
+            push(&mut m, 40.0, 0.0, WINDOW);
+            let moved = m.judge();
+            assert_eq!(m.quality().level, level.min(Quality::LEVELS.len() - 1));
+            assert_eq!(moved.is_some(), level < Quality::LEVELS.len());
         }
-        assert!(m.over_budget());
+        // well under: back up
+        m.frames.clear();
+        push(&mut m, 5.0, 0.0, WINDOW);
+        assert_eq!(m.judge().map(|(q, _)| q.level), Some(Quality::LEVELS.len() - 2));
+        // fewer settled frames than a window: no judgement
+        push(&mut m, 40.0, 0.0, WINDOW - 1);
+        assert_eq!(m.judge(), None);
+        // a restart judges afresh at full quality
+        m.reset_health();
+        assert_eq!(m.quality(), Quality::full());
     }
 }

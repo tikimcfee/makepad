@@ -317,17 +317,25 @@ pub fn apply_dmx_mapping_with_colors(
 
     let lasers = fixture_patch::BEAM_LASERS;
     dmx_f32(state.fade[5], dmx, &lasers, 1);
-    dmx_f32(state.dial_5[0], dmx, &lasers, 2);
-    dmx_f32(state.dial_top[5], dmx, &lasers, 11);
-    dmx_f32(state.dial_5[1], dmx, &lasers, 12);
-    dmx_f32(0.5, dmx, &lasers, 3);
-    dmx_f32(0.3, dmx, &lasers, 4);
-    dmx_f32(state.dial_5[2], dmx, &lasers, 5);
-    dmx_f32(state.dial_5[3], dmx, &lasers, 6);
-    dmx_f32(0.5, dmx, &lasers, 7);
-    dmx_f32(0.5, dmx, &lasers, 8);
-    dmx_f32(0.5, dmx, &lasers, 9);
-    dmx_f32(0.5, dmx, &lasers, 10);
+    // Channel 1 at 0 does not black these lasers out while their other
+    // channels hold values: with the fader down all twelve are 0.
+    if state.fade[5] > 0.0 {
+        dmx_f32(state.dial_5[0], dmx, &lasers, 2);
+        dmx_f32(state.dial_top[5], dmx, &lasers, 11);
+        dmx_f32(state.dial_5[1], dmx, &lasers, 12);
+        dmx_f32(0.5, dmx, &lasers, 3);
+        dmx_f32(0.3, dmx, &lasers, 4);
+        dmx_f32(state.dial_5[2], dmx, &lasers, 5);
+        dmx_f32(state.dial_5[3], dmx, &lasers, 6);
+        dmx_f32(0.5, dmx, &lasers, 7);
+        dmx_f32(0.5, dmx, &lasers, 8);
+        dmx_f32(0.5, dmx, &lasers, 9);
+        dmx_f32(0.5, dmx, &lasers, 10);
+    } else {
+        for channel in 2..=12 {
+            dmx_u8(0, dmx, &lasers, channel);
+        }
+    }
 
     let uv = fixture_patch::UV;
     dmx_f32(state.fade[6], dmx, &uv, 1);
@@ -1430,6 +1438,21 @@ impl Drop for VideoArtNet {
 mod tests {
     use super::*;
 
+    #[test]
+    fn beam_fader_down_is_all_beam_channels_zero() {
+        let mut state = ControllerState { dial_5: [0.7; 8], dial_top: [0.7; 8], ..Default::default() };
+        let buttons = ControllerButtons { power: true, ..Default::default() };
+        let mut dmx = [9u8; DMX_LEN];
+        apply_dmx_mapping(&state, &buttons, &mut dmx, 0.0);
+        for base in fixture_patch::BEAM_LASERS {
+            assert_eq!(&dmx[base - 1..base + 11], &[0u8; 12], "beam laser at {base}");
+        }
+        state.fade[5] = 1.0;
+        apply_dmx_mapping(&state, &buttons, &mut dmx, 0.0);
+        assert_eq!(dmx[fixture_patch::BEAM_LASERS[0] - 1], 255);
+        assert_eq!(dmx[fixture_patch::BEAM_LASERS[0] + 1], 127);
+    }
+
     fn bgra(r: u8, g: u8, b: u8) -> u32 {
         u32::from_le_bytes([b, g, r, 255])
     }
@@ -1885,17 +1908,24 @@ mod tests {
 
         let lasers = fixture_patch::BEAM_LASERS;
         dmx_f32(state.fade[5], dmx, &lasers, 1);
-        dmx_f32(state.dial_5[0], dmx, &lasers, 2);
-        dmx_f32(state.dial_top[5], dmx, &lasers, 11);
-        dmx_f32(state.dial_5[1], dmx, &lasers, 12);
-        dmx_f32(0.5, dmx, &lasers, 3);
-        dmx_f32(0.3, dmx, &lasers, 4);
-        dmx_f32(state.dial_5[2], dmx, &lasers, 5);
-        dmx_f32(state.dial_5[3], dmx, &lasers, 6);
-        dmx_f32(0.5, dmx, &lasers, 7);
-        dmx_f32(0.5, dmx, &lasers, 8);
-        dmx_f32(0.5, dmx, &lasers, 9);
-        dmx_f32(0.5, dmx, &lasers, 10);
+        // The fader down is all twelve channels 0: channel 1 alone is no blackout.
+        if state.fade[5] > 0.0 {
+            dmx_f32(state.dial_5[0], dmx, &lasers, 2);
+            dmx_f32(state.dial_top[5], dmx, &lasers, 11);
+            dmx_f32(state.dial_5[1], dmx, &lasers, 12);
+            dmx_f32(0.5, dmx, &lasers, 3);
+            dmx_f32(0.3, dmx, &lasers, 4);
+            dmx_f32(state.dial_5[2], dmx, &lasers, 5);
+            dmx_f32(state.dial_5[3], dmx, &lasers, 6);
+            dmx_f32(0.5, dmx, &lasers, 7);
+            dmx_f32(0.5, dmx, &lasers, 8);
+            dmx_f32(0.5, dmx, &lasers, 9);
+            dmx_f32(0.5, dmx, &lasers, 10);
+        } else {
+            for channel in 2..=12 {
+                dmx_u8(0, dmx, &lasers, channel);
+            }
+        }
 
         let uv = fixture_patch::UV;
         dmx_f32(state.fade[6], dmx, &uv, 1);

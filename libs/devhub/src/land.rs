@@ -1,23 +1,29 @@
 //! The landing train (`makepad devhub land`), run by the master. Lanes hand in a branch pair (a makepad branch or
-//! `-`, plus an optional commercial worktree and branch); the master keeps the queue in `land.jsonl` (its state dir)
-//! and runs rounds: every pending entry gets its own candidate on the CURRENT work and commercial main tips (git
-//! merge-tree + commit-tree: plumbing only, nothing checked out) and its own quick gate lease (land_gate.sh quick on a
-//! linux x64 node's warm tree, one lane per entry, so the scheduler spreads them over the nodes), all at once. The
-//! passing entries then fast-forward work and main one after another in queue order (makepad half first: the pair
-//! rule), each re-merged onto tips the round already moved (a clean merge, not re-gated: land + fix forward); one that
-//! no longer merges waits for the next round. A failed or conflicting entry keeps its error lines (compiler errors, a
-//! present's log tail, the conflicting files) in its status and is not gated again until one of its branches moves.
+//! `-`, plus an optional commercial worktree and branch); the master keeps the queue in its state document (`state.json`'s `land` section)
+//! and rolls: every hand-in gets, the moment it comes, its own candidate on the CURRENT work and commercial main tips
+//! (git merge-tree + commit-tree: plumbing only, nothing checked out) and its own gate lease (land_gate.sh on a linux
+//! x64 node's warm tree, one lane per entry, so the scheduler spreads them over the nodes). An entry that passes
+//! fast-forwards work and main at once (makepad half first: the pair rule), re-merged onto the tips others moved
+//! meanwhile (a clean merge, not re-gated: land + fix forward); one that no longer merges is gated again on the new
+//! tips. A failed or conflicting entry keeps its error lines (compiler errors, a present's log tail, the conflicting
+//! files) in its status and is not gated again until one of its branches moves.
+//!
+//! A lane the user waits for (`devhub lane live <lane> on`, the manager's mark) takes the fast path: `land_gate.sh
+//! now`, a check of the changed app ahead of the queue; its boot is at `devhub show`, its tests the verifier's, which
+//! then owes that tip a box. Every other landing is tested before it lands.
 //! Every transition is a `land` record on the master's feed (`devhub stream`), so lanes subscribe instead of polling.
 //!
 //! Control service `land`: `add <branch|-> [<commercial worktree> <commercial branch>] [agent=<a>]`, `status [all|<branch>]`,
 //! `hold <branch> [reason]`, `unhold <branch>`, `retry <branch>`, `drop <branch>`, `import <landq> <failed> <held>`,
-//! `pause [reason]` / `resume` (the whole train: no new round starts while paused; a round under way finishes; kept in
-//! `land.paused` across restarts), `paused` (`{"paused":"<reason>"}`, empty when running).
+//! `pause [reason]` / `resume` (the whole train: no new gate starts while paused; gates under way finish; kept in
+//! the state document across restarts), `paused` (`{"paused":"<reason>"}`, empty when running).
 
 use crate::proto::{hub_record, Record, Sev};
 use makepad_strict_json::{obj, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,8 +33,18 @@ pub type Publish = Arc<dyn Fn(Record) + Send + Sync>;
 pub const REPO: &str = crate::lease::wt::DEFAULT_REPO;
 /// Where the quick gates run: linux x64 nodes with their dev switch on (the gate's warm tree is Linux-only).
 pub const GATE_NEEDS: &str = "arch=x64,os=linux";
-/// How often the train looks for work between rounds.
+/// How often the train looks at its entries when no hand-in or finished gate wakes it.
 const IDLE: Duration = Duration::from_secs(15);
+/// An entry that passed but could not land (a re-merge conflict, the user's uncommitted files) waits this long.
+const WAITING_RETRY_MS: u64 = 60_000;
+
+/// When a fast-path landing last skipped the tests before landing (0: not since this master started).
+static FAST_LANDED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// When a fast-path landing last skipped its tests: the verifier owes that tip a box.
+pub fn fast_landed_ms() -> u64 {
+    FAST_LANDED_MS.load(Ordering::Acquire)
+}
 /// Error lines kept per failed entry.
 const MAX_DETAIL: usize = 60;
 
@@ -224,6 +240,10 @@ pub struct Train {
     clock: fn() -> u64,
     /// why the train is paused (empty: it runs)
     paused: Mutex<String>,
+    /// the entries with a gate under way
+    inflight: Mutex<HashSet<u64>>,
+    /// a hand-in came or a gate ended: look now
+    kicked: AtomicBool,
 }
 
 /// The open entries by state, for a glance (the menu bar).
@@ -238,13 +258,14 @@ pub struct Counts {
 }
 
 impl Train {
-    fn path(&self) -> PathBuf {
-        self.home.join("land.jsonl")
+    /// The master's one state document (its `land` and `land_paused` sections).
+    fn store(&self) -> Arc<crate::state::Store> {
+        crate::state::Store::open_quiet(&self.home, &self.machine)
     }
     fn load(&self) {
-        let text = std::fs::read_to_string(self.path()).unwrap_or_default();
-        *self.st.lock().unwrap() = text.lines().filter_map(Entry::parse).collect();
-        *self.paused.lock().unwrap() = std::fs::read_to_string(self.home.join("land.paused")).map(|t| t.trim().to_string()).unwrap_or_default();
+        let (list, paused) = self.store().read(|d| (d.land.iter().filter_map(|v| Entry::parse(&v.to_json())).collect::<Vec<_>>(), d.land_paused.clone()));
+        *self.st.lock().unwrap() = list;
+        *self.paused.lock().unwrap() = paused;
     }
 
     /// Why the train is paused; None while it runs.
@@ -254,17 +275,9 @@ impl Train {
 
     /// Pauses the train (`Some(reason)`) or resumes it (`None`); kept across master restarts.
     pub fn set_paused(&self, reason: Option<&str>) {
-        let path = self.home.join("land.paused");
         let reason = reason.map(|r| if r.trim().is_empty() { "paused" } else { r.trim() });
         let was = std::mem::replace(&mut *self.paused.lock().unwrap(), reason.unwrap_or("").to_string());
-        match reason {
-            Some(r) => {
-                let _ = std::fs::write(&path, format!("{r}\n"));
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        self.store().update(|d| d.land_paused = reason.unwrap_or("").to_string());
         if was.is_empty() != reason.is_none() {
             self.event(Sev::Info, reason.map_or("land resumed".into(), |r| format!("land paused ({r})")), &[]);
         }
@@ -287,11 +300,8 @@ impl Train {
         c
     }
     fn save(&self, list: &[Entry]) {
-        let text: String = list.iter().map(|e| e.to_json() + "\n").collect();
-        let tmp = self.home.join("land.jsonl.new");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, self.path());
-        }
+        let vals: Vec<makepad_strict_json::Value> = list.iter().filter_map(|e| makepad_strict_json::parse_depth(e.to_json().as_bytes(), 16).ok()).collect();
+        self.store().update(|d| d.land = vals);
     }
     fn event(&self, sev: Sev, line: String, detail: &[String]) {
         (self.publish)(hub_record(&self.machine, "", 0, "land", sev, line, detail.join("\n")));
@@ -392,14 +402,22 @@ impl Train {
         }
         let now = (self.clock)();
         let mut list = self.st.lock().unwrap();
-        let open = list.iter().position(|e| e.state != St::Landed && e.branch == branch && e.cbranch == cb);
+        // a hand-in of newer commits while its gate runs is an entry of its own: that gate lands what it pinned
+        let inflight = self.inflight.lock().unwrap().clone();
+        let moved = |e: &Entry| {
+            let tip = |dir: &Path, b: &str, pin: &str| !b.is_empty() && b != "-" && rev(dir, &format!("refs/heads/{b}")).is_some_and(|s| s != pin);
+            tip(&self.repo, branch, &e.ms) || tip(Path::new(cwt), cb, &e.cs)
+        };
+        let open = list.iter().position(|e| e.state != St::Landed && e.branch == branch && e.cbranch == cb && !(inflight.contains(&e.id) && moved(e)));
         let id = match open {
             // a hand-in again: the same entry, queued again (its place in the queue kept)
             Some(i) => {
                 let e = &mut list[i];
                 e.cwt = cwt.to_string();
-                e.state = St::Queued;
-                e.detail.clear();
+                if !inflight.contains(&e.id) {
+                    e.state = St::Queued;
+                    e.detail.clear();
+                }
                 e.changed_ms = now;
                 e.id
             }
@@ -414,6 +432,7 @@ impl Train {
         let label = list.iter().find(|e| e.id == id).map(Entry::label).unwrap_or_default();
         drop(list);
         self.event(Sev::Info, format!("land queued {label} (#{id}, {pos} open)"), &[]);
+        self.kicked.store(true, Ordering::Release);
         Ok(format!("{{\"ok\":1,\"id\":{id},\"pos\":{pos}}}"))
     }
 
@@ -451,15 +470,29 @@ impl Train {
         Ok(n)
     }
 
-    /// One round; false when nothing was pending.
-    fn round(self: &Arc<Self>) -> bool {
+    /// Whether a lane the user waits for owns this entry's branches.
+    fn waited_for(&self, e: &Entry) -> bool {
+        self.store().read(|d| d.lanes.iter().any(|l| l.waited && l.state == "live" && ((!e.branch.is_empty() && l.branch == e.branch) || (!e.cbranch.is_empty() && l.cbranch == e.cbranch))))
+    }
+
+    /// Starts a gate for every entry ready for one, on the tips as they are now; the handles of
+    /// the gates started (each lands its entry when it passes).
+    fn start_ready(self: &Arc<Self>) -> Vec<std::thread::JoinHandle<()>> {
         let r = &self.repo;
         let c = r.join("apps/commercial");
-        let (Some(w0), Some(m0)) = (rev(r, "refs/heads/work"), rev(&c, "refs/heads/main")) else { return false };
-        // pin and pick
+        let (Some(w0), Some(m0)) = (rev(r, "refs/heads/work"), rev(&c, "refs/heads/main")) else { return Vec::new() };
+        let logs = self.home.join("land-logs");
+        let _ = std::fs::create_dir_all(&logs);
+        let now = (self.clock)();
         let list = self.st.lock().unwrap().clone();
-        let mut picked: Vec<(u64, String, String, String, String)> = Vec::new(); // id, ms, cs, cm, cc
+        let mut started = Vec::new();
         for e in list.iter().filter(|e| e.state != St::Landed && e.held.is_empty()) {
+            if self.inflight.lock().unwrap().contains(&e.id) {
+                continue;
+            }
+            if e.state == St::Waiting && now.saturating_sub(e.changed_ms) < WAITING_RETRY_MS {
+                continue;
+            }
             let ms = if e.branch == "-" { Some(String::new()) } else { rev(r, &format!("refs/heads/{}", e.branch)) };
             let cs = if e.cbranch.is_empty() { Some(String::new()) } else { rev(Path::new(&e.cwt), &format!("refs/heads/{}", e.cbranch)) };
             let (Some(ms), Some(cs)) = (ms, cs) else {
@@ -485,8 +518,8 @@ impl Train {
             let label = e.label();
             let cm = if mk_in { Ok(w0.clone()) } else { merge_onto(r, &w0, &ms, &format!("Merge branch '{}' into work (devhub land)", e.branch)) };
             let cc = if c_in { Ok(m0.clone()) } else { merge_onto(&c, &m0, &cs, &format!("Merge branch '{}' into main (devhub land)", e.cbranch)) };
-            match (cm, cc) {
-                (Ok(cm), Ok(cc)) => picked.push((e.id, ms, cs, cm, cc)),
+            let (cm, cc) = match (cm, cc) {
+                (Ok(cm), Ok(cc)) => (cm, cc),
                 (Err(f), _) | (_, Err(f)) => {
                     let (ms2, cs2) = (ms.clone(), cs.clone());
                     self.set(e.id, move |e| {
@@ -495,54 +528,58 @@ impl Train {
                         e.cs = cs2;
                         e.detail = f;
                     }, Some((Sev::Warn, format!("land conflict {label} with work {:.10} / main {:.10}", w0, m0))));
+                    continue;
                 }
-            }
-        }
-        if picked.is_empty() {
-            return false;
-        }
-        // all gates at once
-        let logs = self.home.join("land-logs");
-        let _ = std::fs::create_dir_all(&logs);
-        let stamp = (self.clock)();
-        let mut handles = Vec::new();
-        for (id, ms, cs, cm, cc) in picked.iter().cloned() {
-            let log = logs.join(format!("{id}-{stamp}.log"));
-            let label = self.st.lock().unwrap().iter().find(|e| e.id == id).map(Entry::label).unwrap_or_default();
+            };
+            let fast = self.waited_for(e);
+            let id = e.id;
+            let log = logs.join(format!("{id}-{}.log", (self.clock)()));
+            self.inflight.lock().unwrap().insert(id);
+            let (ms2, cs2) = (ms.clone(), cs.clone());
             self.set(id, |e| {
                 e.state = St::Gating;
-                e.ms = ms;
-                e.cs = cs;
+                e.ms = ms2;
+                e.cs = cs2;
                 e.node.clear();
                 e.detail.clear();
                 e.log = log.to_string_lossy().into_owned();
-            }, Some((Sev::Info, format!("land gating {label} ({:.10}/{:.10})", cm, cc))));
+            }, Some((Sev::Info, format!("land gating {label} ({:.10}/{:.10}){}", cm, cc, if fast { " on the fast path: the user waits for this lane" } else { "" }))));
             let t = self.clone();
             let (w0, m0) = (w0.clone(), m0.clone());
-            handles.push(std::thread::spawn(move || t.gate(id, &label, &cm, &cc, &w0, &m0, &log)));
+            started.push(std::thread::spawn(move || {
+                if t.gate(id, &label, &cm, &cc, &w0, &m0, &log, fast).is_some() && t.land_one(id, &ms, &cs, &cm, &cc, &w0, &m0) {
+                    if fast {
+                        FAST_LANDED_MS.store((t.clock)(), Ordering::Release);
+                    }
+                    // LIVEDEPLOY: the WM nodes get the new tips now
+                    let _ = Command::new(&t.exe).args(["devhub", "sync", "now"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                }
+                t.inflight.lock().unwrap().remove(&id);
+                t.kicked.store(true, Ordering::Release);
+            }));
         }
-        let passed: Vec<u64> = handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect();
-        // land the passing ones in queue order
-        let mut landed = 0;
-        for (id, ms, cs, cm, cc) in picked.iter().filter(|p| passed.contains(&p.0)) {
-            if self.land_one(*id, ms, cs, cm, cc, &w0, &m0) {
-                landed += 1;
-            }
-        }
-        if landed > 0 {
-            // LIVEDEPLOY: the WM nodes get the new tips now
-            let _ = Command::new(&self.exe).args(["devhub", "sync", "now"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
-        }
-        true
+        started
     }
 
-    /// One entry's quick gate (a lease on its own lane); Some(id) when it passed.
-    fn gate(&self, id: u64, label: &str, cm: &str, cc: &str, w0: &str, m0: &str, log: &Path) -> Option<u64> {
+    /// Every ready entry to its end; false when none was ready.
+    #[cfg(test)]
+    fn round(self: &Arc<Self>) -> bool {
+        let started = self.start_ready();
+        let any = !started.is_empty();
+        for h in started {
+            let _ = h.join();
+        }
+        any
+    }
+
+    /// One entry's gate (a lease on its own lane): the quick gate, or the fast path's check; Some(id) when it passed.
+    #[allow(clippy::too_many_arguments)]
+    fn gate(&self, id: u64, label: &str, cm: &str, cc: &str, w0: &str, m0: &str, log: &Path, fast: bool) -> Option<u64> {
         let file = std::fs::File::create(log).ok()?;
         let err = file.try_clone().ok()?;
         let mut child = Command::new(&self.exe)
-            .args(["devhub", "lease", "gate", "--needs", GATE_NEEDS, "--lane", &format!("landq{id}"), "--prio", "0", "--rev", &format!("land@{cm},land@{cc}"), "--"])
-            .args(["bash", "tools/run/fixture/land_gate.sh", "quick", w0, m0])
+            .args(["devhub", "lease", "gate", "--needs", GATE_NEEDS, "--lane", &format!("landq{id}"), "--prio", if fast { "-1" } else { "0" }, "--rev", &format!("land@{cm},land@{cc}"), "--"])
+            .args(["bash", "tools/run/fixture/land_gate.sh", if fast { "now" } else { "quick" }, w0, m0])
             .current_dir(&self.repo)
             .env("DEVHUB_AGENT", "devhub-land")
             .stdin(Stdio::null())
@@ -592,7 +629,7 @@ impl Train {
         let c = r.join("apps/commercial");
         let lock = r.join(".git/land-ff.lock");
         while std::fs::create_dir(&lock).is_err() {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(100));
         }
         let unlock = || {
             let _ = std::fs::remove_dir(&lock);
@@ -607,6 +644,13 @@ impl Train {
             }, Some((Sev::Info, format!("land waiting {label}: {why}"))));
             false
         };
+        // hold means hold, also for an entry whose gate was under way: it lands only after its unhold (gated again)
+        let held = self.st.lock().unwrap().iter().find(|e| e.id == id).map(|e| e.held.clone()).unwrap_or_default();
+        if !held.is_empty() {
+            unlock();
+            self.set(id, |e| e.state = St::Queued, Some((Sev::Info, format!("land {label} passed but is held ({held}): not landed"))));
+            return false;
+        }
         let on = |dir: &Path, want: &str| git(dir, &["branch", "--show-current"]).1 == want;
         if !on(r, "work") || !on(&c, "main") {
             return wait("the user checkout is not on work / main".into());
@@ -620,7 +664,7 @@ impl Train {
         } else {
             match merge_onto(r, &w, ms, &format!("Merge branch '{branch}' into work (devhub land)")) {
                 Ok(x) => x,
-                Err(f) => return wait(format!("passed, but no longer merges onto work as this round moved it ({}); next round", f.join(" "))),
+                Err(f) => return wait(format!("passed, but no longer merges onto work as it moved ({}); gated again on the new tips", f.join(" "))),
             }
         };
         let tc = if cs.is_empty() || is_ancestor(&c, cs, &m) {
@@ -630,7 +674,7 @@ impl Train {
         } else {
             match merge_onto(&c, &m, cs, &format!("Merge branch '{cbranch}' into main (devhub land)")) {
                 Ok(x) => x,
-                Err(f) => return wait(format!("passed, but no longer merges onto main as this round moved it ({}); next round", f.join(" "))),
+                Err(f) => return wait(format!("passed, but no longer merges onto main as it moved ({}); gated again on the new tips", f.join(" "))),
             }
         };
         let mut over = dirty_overlap(r, &tm);
@@ -663,7 +707,8 @@ impl Train {
     }
 
     fn run(self: Arc<Self>) {
-        // entries a restarted master left mid-round go back to the queue
+        // entries a restarted master left mid-gate go back to the queue; a fast-forward it died in holds no lock
+        let _ = std::fs::remove_dir(self.repo.join(".git/land-ff.lock"));
         {
             let mut list = self.st.lock().unwrap();
             for e in list.iter_mut().filter(|e| matches!(e.state, St::Gating | St::Passed | St::Waiting)) {
@@ -671,10 +716,15 @@ impl Train {
             }
             self.save(&list);
         }
+        let mut looked = std::time::Instant::now() - IDLE;
         loop {
-            if self.paused().is_some() || !self.round() {
-                std::thread::sleep(IDLE);
+            if self.kicked.swap(false, Ordering::AcqRel) || looked.elapsed() >= IDLE {
+                looked = std::time::Instant::now();
+                if self.paused().is_none() {
+                    drop(self.start_ready());
+                }
             }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
@@ -690,6 +740,8 @@ pub fn register(ep: &makepad_remote::Endpoint, machine: &str, publish: Publish) 
         st: Mutex::new(Vec::new()),
         clock: crate::proto::wall_ms,
         paused: Mutex::new(String::new()),
+        inflight: Mutex::new(HashSet::new()),
+        kicked: AtomicBool::new(false),
     });
     t.load();
     let t2 = t.clone();
@@ -758,6 +810,8 @@ mod tests {
             st: Mutex::new(Vec::new()),
             clock: crate::proto::wall_ms,
             paused: Mutex::new(String::new()),
+            inflight: Mutex::new(HashSet::new()),
+            kicked: AtomicBool::new(false),
         })
     }
 
@@ -844,7 +898,7 @@ mod tests {
         assert_eq!(t3.paused().as_deref(), Some("user review"));
         assert_eq!(ask("resume"), vec!["{\"paused\":\"\"}".to_string()]);
         assert_eq!(t.paused(), None);
-        assert!(!home.join("land.paused").exists());
+        assert!(!home.join("land.paused").exists() && !home.join("land.jsonl").exists());
         let ev = events.lock().unwrap().join("\n");
         for want in ["land queued rc-x", "land gating rc-x on n1", "land passed rc-x on n1", "land landed rc-y+rc-y", "land conflict rc-z", "land paused (user review)", "land resumed"] {
             assert!(ev.contains(want), "no `{want}` in\n{ev}");

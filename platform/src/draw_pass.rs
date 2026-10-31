@@ -731,6 +731,7 @@ pub struct CxDrawPass {
     /// that paint: a frame the backend completes with draws left out (`FramePartial`: a
     /// pipeline variant for this target layout still compiling) takes the paint back.
     pub(crate) painted_frame: u64,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) painted_before: u64,
     /// Kept attached although its attaching list was recorded again without
     /// it: a drawing recorded it, the frame was drawn again before it painted

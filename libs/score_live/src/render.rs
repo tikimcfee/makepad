@@ -94,10 +94,10 @@ pub fn arrangement_tempo(doc: &ScoreDoc) -> Vec<TempoEvent> {
     let mut beat = 0.0;
     for section in doc.arrange.iter().filter_map(|name| doc.sections.iter().find(|s| &s.name == name)) {
         if let Some(bpm) = section.bpm {
-            out.push(TempoEvent { beat, bpm, ramp: section.ramp });
+            out.push(TempoEvent { beat, bpm, ramp: section.ramp, locate: false });
         }
         let len = section.bars * doc.beats_per_bar();
-        out.extend(section.tempo.iter().filter(|(at, _)| *at < len).map(|&(at, bpm)| TempoEvent { beat: beat + at, bpm, ramp: 0.0 }));
+        out.extend(section.tempo.iter().filter(|(at, _)| *at < len).map(|&(at, bpm)| TempoEvent { beat: beat + at, bpm, ramp: 0.0, locate: false }));
         beat += len;
     }
     out

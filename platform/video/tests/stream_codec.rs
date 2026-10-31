@@ -210,7 +210,20 @@ fn encode_decode_round_trip_psnr_and_keyframes() {
     eprintln!("stream_codec round trip: {checked} frames, avg PSNR {:.2} dB", psnr_sum / checked as f64);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// The HAL's encoder is hardware the box may not have: it comes up, or says why not.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_hal_stream_encoder_comes_up_or_says_why() {
+    if let Err(err) = VideoStreamEncoder::new(VideoStreamEncoderOptions {
+        width: WIDTH,
+        height: HEIGHT,
+        ..Default::default()
+    }) {
+        assert!(!err.context.is_empty());
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "android")))]
 #[test]
 fn stream_codec_is_explicitly_unsupported_elsewhere() {
     let Err(err) = VideoStreamEncoder::new(VideoStreamEncoderOptions {

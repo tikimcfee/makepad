@@ -39,9 +39,13 @@ struct Tree {
     last_ms: u64,
 }
 
+/// Hears every file event in a tree it follows: (the tree, the path in it).
+pub type Listener = Arc<dyn Fn(&Path, &str) + Send + Sync>;
+
 #[derive(Default)]
 struct Inner {
     trees: BTreeMap<PathBuf, Tree>,
+    listeners: Vec<Listener>,
 }
 
 pub struct Monitor {
@@ -138,6 +142,11 @@ impl Monitor {
             Err(e) => (None, Some(e)),
         };
         Arc::new(Monitor { inner, watcher, roots: dirs, error })
+    }
+
+    /// Calls `f` on every file event in a followed tree, as it comes (live jobs ship edits so).
+    pub fn listen(&self, f: Listener) {
+        self.inner.lock().unwrap().listeners.push(f);
     }
 
     pub fn watching(&self) -> bool {
@@ -238,7 +247,20 @@ impl Monitor {
 }
 
 fn on_event(inner: &Mutex<Inner>, e: &FileSystemEvent) {
-    let mut g = inner.lock().unwrap();
+    let mut heard: Vec<(PathBuf, String)> = Vec::new();
+    let listeners = {
+        let mut g = inner.lock().unwrap();
+        touch(&mut g, e, &mut heard);
+        if heard.is_empty() { Vec::new() } else { g.listeners.clone() }
+    };
+    for (root, rel) in &heard {
+        for f in &listeners {
+            f(root, rel);
+        }
+    }
+}
+
+fn touch(g: &mut Inner, e: &FileSystemEvent, heard: &mut Vec<(PathBuf, String)>) {
     if let FileSystemEventKind::RescanRequired { .. } = e.kind {
         for t in g.trees.values_mut() {
             t.stale = true;
@@ -258,8 +280,9 @@ fn on_event(inner: &Mutex<Inner>, e: &FileSystemEvent) {
         let Some(rel) = rel.filter(|r| !r.is_empty()) else { continue };
         if let Some(t) = g.trees.get_mut(&root) {
             t.ignored.remove(&rel);
-            t.touched.insert(rel);
+            t.touched.insert(rel.clone());
             t.last_ms = crate::proto::wall_ms();
+            heard.push((root, rel));
         }
     }
 }

@@ -383,8 +383,13 @@ impl Cx {
                 }
             }
         }
-        while !self.hal.readbacks.images.is_empty() {
-            let Ok(slot) = self.task_pool().reserve(Lane::Heavy) else {
+        while let Some((ids, ..)) = self.hal.readbacks.images.front() {
+            // A remote grab's pixels only go to its encoder: short work, on the light lane. On
+            // the heavy lane it waited behind that lane's jobs, which a big scene re-recorded
+            // every frame keeps busy (Fab's 761-link chainmail sim: no grab came back in 10 s
+            // while it ran). Studio's ids are PNG-encoded here: heavy.
+            let lane = if crate::remote::grab_ids_only(ids) { Lane::Light } else { Lane::Heavy };
+            let Ok(slot) = self.task_pool().reserve(lane) else {
                 crate::warning!("HAL capture worker queue full; retaining image for the next turn");
                 crate::thread::SignalToUI::set_internal_signal();
                 break;

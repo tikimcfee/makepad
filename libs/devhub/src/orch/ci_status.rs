@@ -89,7 +89,10 @@ pub fn error_lines(log: &str) -> Vec<String> {
         let starts = (t.starts_with("error") && !t.starts_with("error: could not compile") && !t.starts_with("error: aborting"))
             || t.contains("panicked at")
             || (t.starts_with("test ") && t.ends_with(" FAILED"))
-            || t.starts_with("CIERR ");
+            || t.starts_with("CIERR ")
+            // cargo's short format: `path:line:col: error[E0659]: ...`
+            || t.contains(": error[")
+            || t.contains(": error: ");
         if starts {
             under = 3;
             out.push(crate::proto::clean(line, 300));
@@ -243,7 +246,7 @@ mod tests {
     use crate::state::{Blame, Failure, Run, Tip};
 
     fn leg(name: &str, state: &str, log: &str) -> Leg {
-        Leg { name: name.into(), state: state.into(), lease: "L1".into(), node: "101".into(), summary: format!("CI-{state}"), errors: Vec::new(), log: log.into() }
+        Leg { name: name.into(), state: state.into(), lease: "L1".into(), node: "101".into(), summary: format!("CI-{state}"), errors: Vec::new(), log: log.into(), run_n: 0 }
     }
 
     fn get<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
@@ -290,7 +293,7 @@ mod tests {
         let a = Pair::new(&"a".repeat(40), &"c".repeat(40));
         d.verify.verified.push(Tip { pair: a.clone(), at_ms: 1_000, diff: "affected".into() });
         let t = Pair::new(&"d".repeat(40), &"c".repeat(40));
-        d.verify.run = Some(Run { id: "R".into(), pair: t.clone(), started_ms: 1, diff: "affected".into(), dry: false, purpose: "tip".into(), legs: vec![leg("ci-workspace", "run", "")] });
+        d.verify.run = Some(Run { id: "R".into(), pair: t.clone(), started_ms: 1, diff: "affected".into(), dry: false, purpose: "tip".into(), legs: vec![leg("ci-workspace", "run", "")], asked: false, tries: 0 });
         let v = status_value(&d, 1, &|_| String::new());
         assert_eq!(get(&v, &["branches", "0", "verdict"]).as_str(), Some("running"));
         assert_eq!(get(&v, &["branches", "0", "tip"]).as_str(), Some(t.work.as_str()));

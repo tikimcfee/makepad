@@ -7,6 +7,8 @@
 //!
 //! Off until asked (`Cx::set_pass_load_enabled`); on, a pass adds one entry to a small queue
 //! that its `FrameDone` takes back.
+// (the web has no HAL frames: nothing there paints or finishes a pass through this)
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_mut))]
 
 use std::collections::VecDeque;
 

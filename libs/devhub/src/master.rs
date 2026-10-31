@@ -241,6 +241,9 @@ impl Master {
             o(&r);
         }));
         crate::node::listen_control(&ep)?;
+        // only now: what these do asks for leases on the control socket
+        #[cfg(feature = "checkout")]
+        crate::orch::go();
         let _ = std::fs::write(pid_file(), format!("{}\n", std::process::id()));
         *slot.lock().unwrap() = Some((sink.clone(), on_record.clone()));
         let m = Arc::new(Master { name: name.to_string(), local, hub, sink, followed: Mutex::new(HashSet::new()), heard, on_record, inbox, leases, recent, flow, land });
@@ -397,5 +400,54 @@ mod tests {
         };
         let names: Vec<String> = merge(&seeds, &heard, &identity).hosts.into_iter().map(|h| h.name).collect();
         assert_eq!(names, vec!["n100", "mini230", "217"]);
+    }
+
+    /// The open fds of this process.
+    fn fds() -> usize {
+        let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// The master's control socket (the hub's client endpoint, as `serve` builds it): many CLI
+    /// calls leave the fd count flat (each call's sockets used to stay open: 13k after an hour).
+    #[test]
+    fn cli_calls_leave_the_fd_count_flat() {
+        let hub = Hub::new(&Hosts::default());
+        let ep = hub.client_endpoint();
+        ep.register("ping", 1, makepad_remote::lines::service("ping", Arc::new(|_, out: &mut Vec<String>| out.push("{\"pong\":1}".into()))));
+        let sock = std::env::temp_dir().join(format!("devhub-fd-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        makepad_remote::carrier::unix::listen_at(&ep, &sock).unwrap();
+        let call = || {
+            let c = Client::new(Target::Unix(sock.clone()), "fd-test");
+            assert_eq!(crate::cli::ask(&c, None, "ping", "ping").unwrap(), vec!["{\"pong\":1}".to_string()]);
+            // and what the master's own per-call clients do: a route that finds no host, an answer
+            // read only in part, a client asked many times, a client dropped without asking
+            let c = Client::new(Target::Unix(sock.clone()), "fd-test");
+            let _ = makepad_remote::hub::ask(&c, "nowhere", "ps", "", "ps", &mut |_| true);
+            let _ = makepad_remote::hub::ask(&c, "nowhere:1", "cmd", "", "ping", &mut |_| false);
+            for _ in 0..3 {
+                let _ = crate::cli::ask(&c, None, "ping", "ping");
+            }
+            let _ = Client::new(Target::Unix(sock.clone()), "fd-test");
+        };
+        // warm: threads and the first connection's buffers settle
+        for _ in 0..20 {
+            call();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = fds();
+        for _ in 0..300 {
+            call();
+        }
+        // the server side sees the last closes a moment later
+        let t = std::time::Instant::now();
+        while fds() > before + 12 && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            call();
+        }
+        let after = fds();
+        let _ = std::fs::remove_file(&sock);
+        assert!(after <= before + 12, "300 CLI calls left {} fds open ({before} -> {after})", after.saturating_sub(before));
     }
 }

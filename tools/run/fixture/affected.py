@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Select the quick gate from both pinned diffs; run on a leased node only.
 
-Every gate checks and presents the SMOKE apps (the commercial apps + Calculator,
-user 2026-10-30), regardless of the diff, in SMOKE order (Stage first: the most
-shared code; each later app reuses what the earlier ones stored in the box's one
-JIT cache). The other GATE_PACKAGES are checked when the diff reaches them.
+A gate checks and presents what the diff reaches (user 2026-10-30, landing design):
+a change inside one app gates that app. The SMOKE apps all go when the diff reaches
+the JIT itself (makepad-run's dependencies; the devhub linked into its binary does
+not count, it changes no app's code) or a workspace-wide input; the other
+GATE_PACKAGES are checked when the diff reaches them. A diff that reaches no gate
+package gates Calculator, the one canary. Prints `jit yes|no`: whether the diff
+touches what the JIT binary is built from.
 """
 import json
 import os
@@ -12,11 +15,14 @@ from pathlib import Path
 import subprocess
 import sys
 
-# the smoke set, in run order: checked and presented on every gate
+# the smoke set, in run order: gated when the diff reaches the JIT or a workspace-wide input
 SMOKE = ("makepad-stage", "makepad-scope", "makepad-sandbox", "makepad-fab", "makepad-app-synth", "makepad-app-calculator")
 # checked too when the diff reaches them
 GATE_PACKAGES = SMOKE + ("makepad-example-counter", "makepad-platform", "makepad-draw", "makepad-widgets")
 CALC = "makepad-app-calculator"
+# the JIT binary, and what it links that changes no app's code
+JIT_PACKAGE = "makepad-run"
+NOT_APP_CODE = ("makepad-devhub",)
 # Explicit launch recipes: being a Cargo binary alone does not imply a present.
 PRESENT_ARGS = {
     "makepad-stage": [],
@@ -93,27 +99,45 @@ def main():
         return next((parent for parent in (path.parent, *path.parents)
                      if parent in packages), None)
 
-    touched = {owner(path) for path in files} - {None}
+    # the gate's own scripts and docs compile into nothing
+    compiled = [p for p in files if not p.startswith("tools/run/fixture/") and not p.endswith(".md")]
+    touched = {owner(path) for path in compiled} - {None}
     affected = closure(touched, reverse)
-    # Workspace-wide resolver/patch/profile inputs apply to every member.
-    if any(p in ("Cargo.toml", "Cargo.lock", ".cargo/config", ".cargo/config.toml") for p in files):
-        affected.update(packages)
     by_name = {p["name"]: d for d, p in packages.items()}
     missing = [name for name in SMOKE if name not in by_name]
     if missing:
         raise RuntimeError("smoke packages missing from metadata: " + " ".join(missing))
-    selected = {name for name in GATE_PACKAGES if by_name.get(name) in affected} | set(SMOKE)
+
+    # What the JIT binary is built from, with and without what changes no app's code.
+    forward = {}
+    for directory, pkg in packages.items():
+        forward[directory] = {Path(d["path"]).resolve() for d in pkg["dependencies"]
+                              if d.get("path") and d["kind"] != "dev"}
+    jit_dir = by_name.get(JIT_PACKAGE)
+    cut = {by_name[n] for n in NOT_APP_CODE if n in by_name}
+    binary = closure({jit_dir}, forward) if jit_dir else set()
+    jit_code = closure({jit_dir}, {d: e - cut for d, e in forward.items()}) if jit_dir else set()
+    # Workspace-wide resolver/patch/profile inputs apply to every member.
+    workspace = any(p in ("Cargo.toml", "Cargo.lock", ".cargo/config", ".cargo/config.toml") for p in compiled)
+    if workspace:
+        affected.update(packages)
+    selected = {name for name in GATE_PACKAGES if by_name.get(name) in affected}
+    if workspace or touched & jit_code:
+        selected |= set(SMOKE)
+    if not selected:
+        selected = {CALC}
 
     def where(name):
         # Launch from the actual package directory; works for nested workspaces.
         return str(by_name[name].relative_to(root))
 
     print(f"why files {len(files)}; changed: {' '.join(sorted(packages[d]['name'] for d in touched)) or '-'}; affected gate packages: {' '.join(sorted(selected)) or '-'}")
+    print("jit " + ("yes" if workspace or touched & binary else "no"))
     for name in GATE_PACKAGES:
         if name in selected:
             print(f"check {name} {where(name)}")
     for name in SMOKE:
-        if name in PRESENT_ARGS:
+        if name in PRESENT_ARGS and name in selected:
             print(" ".join(["present", name, where(name), *PRESENT_ARGS[name]]))
 
 

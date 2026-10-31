@@ -19,4 +19,6 @@ for toml in apps/*/Cargo.toml apps/*/*/Cargo.toml examples/*/Cargo.toml wm/Cargo
   n=$(printf '%s\n' "$out" | grep -E ' errors$' | grep -oE '[0-9]+ errors$' | grep -oE '^[0-9]+')
   if [ -z "$n" ]; then echo "?? $name (no summary line)"; elif [ "$n" != "0" ]; then echo "ERR $n $name"; printf '%s\n' "$out" | grep -E 'E[0-9]{4}|error' | head -3 | sed 's/^/    /'; fi
 done
+# the smoke apps' and the WM's provided-crate boundary (`makepad check --boundary all`, provided_sweep.sh audits only)
+RUNS=0 SWEEP_OUT=${TMPDIR:-/tmp}/allapps-sweep bash tools/run/fixture/provided_sweep.sh 2>&1 | grep -E "^audit |^provided_sweep|^violation" | head -40
 echo "allapps done"

@@ -163,6 +163,14 @@ impl<W> fmt::Display for IntoInnerError<W> {
     }
 }
 
+impl<W: Send + fmt::Debug> core::error::Error for IntoInnerError<W> {}
+
+impl<W> From<IntoInnerError<W>> for Error {
+    fn from(e: IntoInnerError<W>) -> Error {
+        e.1
+    }
+}
+
 impl<W: Write> BufWriter<W> {
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner)

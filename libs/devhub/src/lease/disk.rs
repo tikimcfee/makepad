@@ -354,17 +354,21 @@ impl Guard {
             if floor_cross {
                 self.emit(Sev::Warn, format!("disk_floor: {} has {:.0} GB free, floor {:.0} GB: reclaiming", self.machine, gb(free), gb(self.floor())));
             }
-            self.reclaim(&live(), false);
+            self.reclaim(&live(), false, 0);
         } else {
             let _ = self.items(&live(), false);
         }
     }
 
-    /// Reclaims (or with `dry`, plans) down to the floor; answer lines.
-    pub fn reclaim(&self, live: &Live, dry: bool) -> Vec<String> {
+    /// Reclaims (or with `dry`, plans) until `need` bytes are free over the floor (a waiting
+    /// lease's cost; 0: the floor itself); answer lines.
+    pub fn reclaim(&self, live: &Live, dry: bool, need: u64) -> Vec<String> {
         let items = self.items(live, !dry);
         let free = self.free();
-        let p = plan(&items, free, self.floor(), self.user_machine());
+        let p = plan(&items, free, self.floor() + need, self.user_machine());
+        if !dry && !p.reaches {
+            self.emit(Sev::Warn, format!("disk_short: {} has {:.0} GB free and cannot free {:.0} GB over its {:.0} GB floor: what is left is not build output", self.machine, gb(free), gb(need), gb(self.floor())));
+        }
         let mut out = vec![format!(
             "{{\"node\":{},\"free_gb\":{:.1},\"floor_gb\":{:.0},\"warn_gb\":{:.0},\"dry\":{},\"reclaim_gb\":{:.1},\"reaches_floor\":{}}}",
             json_str(&self.machine),

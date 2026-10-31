@@ -1022,6 +1022,12 @@ mod imp {
         })
     }
 
+    /// Every id is a remote grab or capture: answering them only hands the pixels to the
+    /// encoder (no PNG on the way), short work.
+    pub(crate) fn grab_ids_only(ids: &[u64]) -> bool {
+        ids.iter().all(|id| is_grab_id(*id))
+    }
+
     /// Whether a pending screenshot request waits on `window_id`'s pass, without
     /// taking it: a backend that paces presents (Wayland frame callbacks, which a
     /// compositor withholds from an occluded window) still draws that window.
@@ -3095,6 +3101,10 @@ mod imp {
     pub(crate) fn finish_capture_on_shutdown(_cx: &mut Cx) {}
     pub(crate) fn grab_targets_window(_request_id: u64, _window_id: Option<usize>) -> bool {
         true
+    }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn grab_ids_only(_ids: &[u64]) -> bool {
+        false
     }
     /// There is no remote bridge, so every grab id is non-remote and is returned to the caller.
     pub(crate) fn deliver_grabs(

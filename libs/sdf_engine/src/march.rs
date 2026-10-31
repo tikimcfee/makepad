@@ -55,6 +55,8 @@ script_mod! {
         vol_dim: uniform(vec3(1.0, 1.0, 1.0))
         cell: uniform(1.0)
         band: uniform(1.0)
+        // the field's distances per true distance (a kernel volume's 1 / Lipschitz bound)
+        kernel_scale: uniform(1.0)
         view_size: uniform(vec2(1.0, 1.0))
         // the view's origin in its target (pixels; a stereo eye's half) and
         // the target's size: the quad's clip space
@@ -178,7 +180,8 @@ script_mod! {
                         let l = floor(p / self.cell - b * 8.0 + vec3(0.5, 0.5, 0.5))
                         slot = floor(self.copy_slots.sample_nearest(self.copy_uv(e.x, l.xy, min(l.z, 8.0))).x * 255.0 + 0.5)
                     }
-                    let eps = max(self.cell * 0.02, t * cone)
+                    // the footprint is a true distance, d the field's
+                    let eps = max(self.cell * 0.02, t * cone) * self.kernel_scale
                     if d < eps {
                         hit = 1.0
                         break
@@ -343,7 +346,8 @@ script_mod! {
                         t = max(t, hmin / self.obj_scale - self.cell)
                     }
                 }
-                let tr = self.trace(ro, rd, inv, t, t1, self.pix_angle, 1.0)
+                // the cone's radius: half a pixel, so a pixel's stop grows the shape by half a pixel at most
+                let tr = self.trace(ro, rd, inv, t, t1, self.pix_angle * 0.5, 1.0)
                 t = tr.x
                 slot = tr.y
                 hit = tr.z
@@ -434,6 +438,67 @@ script_mod! {
             let clip = self.proj_m * (self.view_m * vec4(hit_w4.xyz / hit_w4.w, 1.0))
             self.depth_out = clip.z / clip.w
             self.fb0 = vec4(tr.w * self.obj_scale, t_hit, 0.0, 1.0)
+        }
+    }
+
+    // The shadow one field casts on a plane (a field has no mesh for a renderer's shadow maps):
+    // the pixel's ray onto the plane, from there toward the sun through the volume's box. Empty
+    // bricks read as the band, so the penumbra stays inside it.
+    mod.draw.SdfPlateShadow = mod.std.set_type_default() do #(DrawSdfPlateShadow::script_shader(vm)){
+        ..mod.draw.DrawQuad,
+        ..mod.draw.SdfInterp,
+        ..mod.draw.SdfField,
+        depth_out: fragment_depth(@any)
+        inv_proj: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+        inv_view: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+        sun_dir: uniform(vec3(0.35, 0.8, 0.45))
+        // world plane (n, d); x = how dark the full shadow is, y = penumbra sharpness
+        plane: uniform(vec4(0.0, 1.0, 0.0, 0.0))
+        shadow_ctl: uniform(vec2(0.55, 8.0))
+
+        vertex: fn() {
+            self.pos = self.geom.pos
+            let ndc = self.to_clip(self.rect_pos + self.geom.pos * self.rect_size)
+            self.vertex_pos = vec4(ndc.x, ndc.y, 0.0, 1.0)
+        }
+
+        fragment: fn() {
+            let pix = self.rect_pos + self.pos * self.rect_size
+            let ndc = self.to_ndc(pix)
+            let a4 = self.inv_proj * vec4(ndc.x, ndc.y, 0.0, 1.0)
+            let b4 = self.inv_proj * vec4(ndc.x, ndc.y, 1.0, 1.0)
+            let aw4 = self.inv_view * vec4(a4.xyz / a4.w, 1.0)
+            let bw4 = self.inv_view * vec4(b4.xyz / b4.w, 1.0)
+            let o = aw4.xyz / aw4.w
+            let d = bw4.xyz / bw4.w - o
+            let along = dot(self.plane.xyz, d)
+            if abs(along) < 0.000001 { discard() }
+            let s = (0.0 - self.plane.w - dot(self.plane.xyz, o)) / along
+            if s < 0.0 || s > 1.0 { discard() }
+            let hit_w = vec4(o + d * s, 1.0)
+            let p = (self.obj_from_world * hit_w).xyz
+            let l = normalize((self.obj_from_world * vec4(normalize(self.sun_dir), 0.0)).xyz)
+            let bs = self.cell * 8.0
+            let lo = self.vol_min * bs
+            let hi = (self.vol_min + self.vol_dim) * bs
+            let inv = vec3(1.0, 1.0, 1.0) / l
+            let t0 = (mix(hi, lo, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
+            let t1 = (mix(lo, hi, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
+            var t = max(max(max(t0.x, t0.y), t0.z), self.cell * 2.0)
+            let t_out = min(min(t1.x, t1.y), t1.z)
+            if t_out <= t { discard() }
+            var lit = 1.0
+            for i in 0..96 {
+                if t > t_out { break }
+                let f = self.field_copy(p + l * t)
+                lit = min(lit, f / min(t / self.shadow_ctl.y, self.band * 0.9))
+                if lit < 0.01 { break }
+                t = t + max(f, self.cell * 0.5)
+            }
+            lit = clamp(lit, 0.0, 1.0)
+            if lit > 0.99 { discard() }
+            self.depth_out = self.depth_of(hit_w) - self.depth_bias
+            self.fb0 = vec4(0.0, 0.0, 0.0, (1.0 - lit) * self.shadow_ctl.x)
         }
     }
 
@@ -657,16 +722,14 @@ script_mod! {
         // sits in the same light as a mesh beside it: Lambert without 1/pi
         // under a rig that sums to one, a GGX sun lobe, the hemisphere along
         // the reflection gated by a roughness-aware Fresnel; a metal has no
-        // diffuse. With the display transform the table's colours are
-        // encoded and decode as the renderer's texels do (2.2).
+        // diffuse. The table's colours and the overrides are linear
+        // reflectance (a material's base colour, as a mesh's): lit as they
+        // are, the display transform encodes the result.
         pbr: fn(n: vec3, v: vec3, slot: f32, ao: f32, shadow: f32) -> vec3 {
             let m0 = self.mat_row(slot, 0.0)
             let m1 = self.mat_row(slot, 1.0)
             let ov = self.override_tex.sample_nearest(vec2((slot + 0.5) / 256.0, 0.5))
-            var albedo = mix(m0.xyz, ov.xyz, ov.w)
-            if self.display.x > 0.5 {
-                albedo = pow(albedo, vec3(2.2, 2.2, 2.2))
-            }
+            let albedo = mix(m0.xyz, ov.xyz, ov.w)
             let emit = self.mat_row(slot, 2.0).xyz * m1.y
             if m1.z > 0.5 {
                 return albedo + emit
@@ -787,6 +850,13 @@ pub struct DrawSdfShade {
     pub draw_super: DrawQuad,
 }
 
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSdfPlateShadow {
+    #[deref]
+    pub draw_super: DrawQuad,
+}
+
 /// The view of one frame: the pass camera (view, projection) and its size.
 #[derive(Clone, Copy, Debug)]
 pub struct MarchView {
@@ -801,6 +871,11 @@ pub struct MarchView {
     pub target: DVec2,
     /// Sphere-tracing steps per ray (1..=256).
     pub steps: u32,
+    /// Exact kernel evaluation where a pixel spans fewer cells than this at
+    /// the volume's nearest point (level of detail; 0: never).
+    pub exact_cells: f32,
+    /// The coarse pass's size of this view's target, per axis (rounded up).
+    pub coarse_scale: f64,
 }
 
 /// Steps per ray of an XR eye: a frame at the headset's rate, at most a
@@ -810,18 +885,18 @@ pub const XR_STEPS: u32 = 96;
 impl MarchView {
     /// A whole-target view.
     pub fn new(view: Mat4f, proj: Mat4f, size: DVec2, fov_y: f32) -> MarchView {
-        MarchView { view, proj, size, fov_y, origin: DVec2::default(), target: size, steps: 256 }
+        MarchView { view, proj, size, fov_y, origin: DVec2::default(), target: size, steps: 256, exact_cells: 2.0, coarse_scale: 0.5 }
     }
 
     /// Eye `eye` (0 left, 1 right) of a stereo pair marched side by side into
     /// one target `2 eye_size.x` wide (scaled by `scale`: the coarse pass's
-    /// half size, unrounded, so its target is exactly half the march's), with
+    /// size, its `coarse_scale`, unrounded, so its target is exactly that of the march's), with
     /// the XR step budget. The vertical field of view comes from the
     /// (asymmetric) projection.
     pub fn eye(view: Mat4f, proj: Mat4f, eye_size: DVec2, eye: usize, scale: f64) -> MarchView {
         let size = DVec2 { x: eye_size.x * scale, y: eye_size.y * scale };
         let fov_y = 2.0 * (1.0 / proj.v[5]).atan();
-        MarchView { view, proj, size, fov_y, origin: DVec2 { x: size.x * eye as f64, y: 0.0 }, target: DVec2 { x: size.x * 2.0, y: size.y }, steps: XR_STEPS }
+        MarchView { view, proj, size, fov_y, origin: DVec2 { x: size.x * eye as f64, y: 0.0 }, target: DVec2 { x: size.x * 2.0, y: size.y }, steps: XR_STEPS, exact_cells: 2.0, coarse_scale: 0.5 }
     }
 
     /// This view's rect in its target.
@@ -893,6 +968,7 @@ impl FieldTex {
         dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
         dv.set_uniform(c, id!(cell), &[vol.cell]);
         dv.set_uniform(c, id!(band), &[vol.band]);
+        dv.set_uniform(c, id!(kernel_scale), &[vol.kernel_scale]);
         set_view(c, dv, view);
         dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
     }
@@ -910,6 +986,7 @@ fn set_field(c: &Cx, dv: &mut DrawVars, view: &MarchView, vol: &Volume, baker: &
     dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
     dv.set_uniform(c, id!(cell), &[vol.cell]);
     dv.set_uniform(c, id!(band), &[vol.band]);
+    dv.set_uniform(c, id!(kernel_scale), &[vol.kernel_scale]);
     set_view(c, dv, view);
     dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
 }
@@ -937,13 +1014,13 @@ pub fn draw_object(cx: &mut Cx2d, draw: &mut DrawSdfMarch, rect: Rect, view: &Ma
     // them compiled in; else it marches its render copy. Level of detail: where
     // a pixel spans two cells or more, the copy's sub-cell error is sub-pixel
     // and the exact evaluation is skipped (a far part costs a copy lookup a step).
-    let exact = exact && (vol.kernels.is_empty() || draw.kernels) && view.volume_pixel(&world_from_obj, vol) < 2.0 * vol.cell;
+    let exact = exact && (vol.kernels.is_empty() || draw.kernels) && view.volume_pixel(&world_from_obj, vol) < view.exact_cells * vol.cell;
     field.set(c, dv, view, vol, exact);
     match coarse {
         Some(t) => {
             dv.set_texture(4, t);
             dv.set_uniform(c, id!(coarse_in), &[1.0]);
-            let (cw, ch) = (view.target.x.max(1.0) / 2.0, view.target.y.max(1.0) / 2.0);
+            let (cw, ch) = (view.target.x.max(1.0) * view.coarse_scale, view.target.y.max(1.0) * view.coarse_scale);
             dv.set_uniform(c, id!(coarse_size_inv), &[1.0 / cw.ceil() as f32, 1.0 / ch.ceil() as f32]);
         }
         None => {
@@ -1117,8 +1194,27 @@ fn shade(cx: &mut Cx2d, draw: &mut DrawSdfShade, rect: Rect, view: &MarchView, e
     draw.draw_super.draw_abs(cx, rect);
 }
 
+/// Draws the shadow one object casts on `plane` (world `n`, `d`), in a pass that has the plane
+/// and the objects in depth. `depth_bias` keeps it above the plane's own surface.
+#[allow(clippy::too_many_arguments)]
+pub fn plate_shadow_object(cx: &mut Cx2d, draw: &mut DrawSdfPlateShadow, rect: Rect, view: &MarchView, world_from_obj: Mat4f, vol: &Volume, baker: &Baker, light: &MarchLight, depth_bias: f32, plane: [f32; 4]) {
+    let c = &*cx.cx;
+    let dv = &mut draw.draw_super.draw_vars;
+    set_field(c, dv, view, vol, baker, false);
+    dv.set_uniform(c, id!(depth_bias), &[depth_bias]);
+    dv.set_uniform(c, id!(sun_dir), &light.dir);
+    dv.set_uniform(c, id!(plane), &plane);
+    dv.set_uniform(c, id!(shadow_ctl), &[0.55, light.shadow_k]);
+    dv.set_uniform(c, id!(inv_proj), &view.proj.invert().v);
+    dv.set_uniform(c, id!(inv_view), &view.view.invert().v);
+    dv.set_uniform(c, id!(obj_from_world), &world_from_obj.invert().v);
+    dv.set_uniform(c, id!(world_from_obj), &world_from_obj.v);
+    draw.draw_super.new_draw_call(cx);
+    draw.draw_super.draw_abs(cx, rect);
+}
+
 /// A slot override table (256 x 1, `(rgb, a)`; a = 1 replaces the slot's
-/// albedo): all zero by default.
+/// albedo, linear like the table's): all zero by default.
 pub fn override_texture(cx: &mut Cx, overrides: &[(u8, [f32; 3])]) -> Texture {
     let mut data = vec![0.0f32; 256 * 4];
     for (slot, rgb) in overrides {

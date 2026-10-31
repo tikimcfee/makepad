@@ -347,6 +347,8 @@ pub struct FleetQwenChatProvider<T: FleetTransport> {
     max_tokens: Option<u32>,
     /// `None` preserves the serving model's default thinking mode.
     thinking: Option<bool>,
+    /// Models the election leaves out unless they are asked for by name.
+    excluded_models: Vec<String>,
     /// Every logical turn gets a fresh sample; admission attempts reuse it.
     sample_seed: u64,
     active: Option<ActiveJob>,
@@ -455,6 +457,7 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             // their fixed ceiling, which is merely what they did before.
             max_tokens: Some(u32::MAX),
             thinking: None,
+            excluded_models: Vec::new(),
             sample_seed: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -538,6 +541,11 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens.filter(|tokens| *tokens > 0);
+        self
+    }
+
+    pub fn with_excluded_models(mut self, models: Vec<String>) -> Self {
+        self.excluded_models = models;
         self
     }
 
@@ -783,6 +791,10 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             }
             if !crate::fleet::role_allows(base, domain) || (domain == "chat" && !has_chat) {
                 reasons.push(format!("{base}: {id} is excluded by role or capability"));
+                continue;
+            }
+            if wanted != Some(id) && self.excluded_models.iter().any(|model| model == id) {
+                reasons.push(format!("{base}: {id} did not pass the tool check"));
                 continue;
             }
             if row.get("available").and_then(Value::as_bool) != Some(true) {
