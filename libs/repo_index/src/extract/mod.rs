@@ -13,7 +13,8 @@
 //!
 //! [`Extract::extract_file`] (the overlay) has no tree around the file: its chunks carry no
 //! package, and a `Cargo.toml` becomes a card with its dependencies as written (no dependents,
-//! no apps) until the base is rebuilt.
+//! no apps). [`Extractor::cards`] gives the overlay the full cards instead: the package graph of
+//! the worktree's tree, for the packages its changes alter.
 
 pub mod cargo;
 pub mod git;
@@ -24,12 +25,13 @@ pub mod rust;
 pub mod splash;
 
 use crate::{
-    BaseCircle, BaseSource, Chunk, CircleName, CommitRecord, CrateCard, Detail, Error, Exclusion, Extract, ExtractReport, Family, Fields,
-    Flags, Keys, Kind, Lines, Oid, Repo, Rev, RevSpec, Span,
+    BaseCircle, BaseSource, Change, Chunk, CircleName, CommitRecord, CrateCard, Detail, Error, Exclusion, Extract, ExtractReport, Family, Fields,
+    Flags, Keys, Kind, Lines, Oid, Repo, Rev, RevSpec, Span, TreeFile,
 };
 use cargo::{Graph, APPS_JSON};
 use notes::Cite;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// The [`Extract`] implementation. [`Extractor::citing`] makes notes circles record edges to a
 /// repo circle; the cite (that circle's paths and commits) is computed the first time a notes
@@ -218,6 +220,32 @@ fn path_chunk(circle: &CircleName, path: &str, blob: Oid, package: Option<&str>,
     c.keys.package = package.map(str::to_string);
     c.flags.generated = vendored;
     c
+}
+
+/// A package graph's inputs: the tree's paths, its manifests' text, the app registry's.
+#[derive(Default)]
+struct GraphInput<'a> {
+    paths: Vec<&'a str>,
+    manifests: Vec<(String, String)>,
+    apps: Option<String>,
+}
+
+impl GraphInput<'_> {
+    fn add(&mut self, path: &str, text: String) {
+        if path == APPS_JSON {
+            self.apps = Some(text);
+        } else {
+            self.manifests.push((path.to_string(), text));
+        }
+    }
+}
+
+fn read_bytes(root: &Path, path: &str) -> Result<Vec<u8>, Error> {
+    std::fs::read(root.join(path)).map_err(|error| Error::Io { context: format!("crate cards: reading {path}"), error })
+}
+
+fn read_text(root: &Path, path: &str) -> Result<String, Error> {
+    Ok(String::from_utf8_lossy(&read_bytes(root, path)?).into_owned())
 }
 
 /// A file's batch, or its path chunk when extraction found nothing in it (an empty `.md`, a
@@ -409,6 +437,80 @@ impl Extractor {
             }
         };
         Ok(admit(batch, &def.families))
+    }
+
+    /// The crate cards a worktree's `changes` over `base` alter:
+    /// the package graph of the base tree and of the tree with the changes applied (changed
+    /// manifests and the app registry read under `root`), and one card per package whose card
+    /// differs or whose manifest changed, its modules from its crate root as it is now. Nothing
+    /// is read unless a change touches a `Cargo.toml` or the app registry, or adds or deletes a
+    /// `.rs` file.
+    pub fn cards(&self, circle: &CircleName, def: &BaseCircle, base: &Rev, root: &Path, changes: &[Change], repo: &mut dyn Repo) -> Result<Vec<Chunk>, Error> {
+        if !matches!(def.source, BaseSource::Tree { .. }) {
+            return Ok(Vec::new());
+        }
+        let changed: BTreeMap<&str, &Change> = changes
+            .iter()
+            .map(|c| match c {
+                Change::Added(p) | Change::Modified(p) | Change::Deleted(p) => (p.as_str(), c),
+            })
+            .filter(|(p, _)| excluded(p, &def.exclude).is_none())
+            .collect();
+        let graph_input = |p: &str| file_name(p) == "Cargo.toml" || p == APPS_JSON;
+        let moves_graph = changed.iter().any(|(p, c)| graph_input(p) || (!matches!(c, Change::Modified(_)) && ext(p) == "rs"));
+        if !moves_graph {
+            return Ok(Vec::new());
+        }
+        let base_files: Vec<TreeFile> = repo.files(base.tree)?.into_iter().filter(|f| excluded(&f.path, &def.exclude).is_none()).collect();
+        let blobs: BTreeMap<&str, Oid> = base_files.iter().map(|f| (f.path.as_str(), f.blob)).collect();
+        let (mut was, mut now) = (GraphInput::default(), GraphInput::default());
+        for f in &base_files {
+            was.paths.push(&f.path);
+            let change = changed.get(f.path.as_str()).copied();
+            if !matches!(change, Some(Change::Deleted(_))) {
+                now.paths.push(&f.path);
+            }
+            if graph_input(&f.path) {
+                let text = String::from_utf8_lossy(&repo.read_blob(f.blob)?).into_owned();
+                match change {
+                    None => now.add(&f.path, text.clone()),
+                    Some(Change::Deleted(_)) => {}
+                    Some(_) => now.add(&f.path, read_text(root, &f.path)?),
+                }
+                was.add(&f.path, text);
+            }
+        }
+        for (p, c) in &changed {
+            if matches!(c, Change::Added(_)) {
+                now.paths.push(p);
+                if graph_input(p) {
+                    now.add(p, read_text(root, p)?);
+                }
+            }
+        }
+        let was = Graph::build(&was.manifests, &was.paths, was.apps.as_deref());
+        let now_graph = Graph::build(&now.manifests, &now.paths, now.apps.as_deref());
+        let was_by_dir: BTreeMap<&str, usize> = was.packages.iter().enumerate().map(|(j, p)| (p.dir.as_str(), j)).collect();
+        let mut out = Vec::new();
+        for (i, p) in now_graph.packages.iter().enumerate() {
+            let manifest = if p.dir.is_empty() { "Cargo.toml".to_string() } else { format!("{}/Cargo.toml", p.dir) };
+            let same = !changed.contains_key(manifest.as_str()) && was_by_dir.get(p.dir.as_str()).is_some_and(|&j| now_graph.same_card(i, &was, j));
+            if same {
+                continue;
+            }
+            let modules = match p.roots.first() {
+                None => Vec::new(),
+                Some(r) => {
+                    let bytes = match (changed.contains_key(r.as_str()), blobs.get(r.as_str())) {
+                        (false, Some(&blob)) => repo.read_blob(blob)?,
+                        _ => read_bytes(root, r)?,
+                    };
+                    rust::scan(&bytes, p.vendored || rust::is_generated(&bytes)).mods
+                }
+            };
+            out.push(crate_chunk(circle, &p.name, now_graph.card(i, modules), p.vendored));
+        }
+        Ok(admit(out, &def.families))
     }
 
     fn tree(&mut self, circle: &CircleName, def: &BaseCircle, rev: &Rev, repo: &mut dyn Repo, emit: &mut Emit, report: &mut ExtractReport) -> Result<(), Error> {

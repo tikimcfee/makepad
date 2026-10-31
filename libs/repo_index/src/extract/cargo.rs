@@ -241,8 +241,10 @@ impl Graph {
         let mut g = Graph::default();
         let mut raws: Vec<Vec<RawDep>> = Vec::new();
         let mut workspaces: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
-        for (path, text) in manifests {
-            match parse(path, text, &file_set) {
+        // parsed on the shared workers, kept in manifest order
+        let parsed = crate::workers::fan_out(manifests.len(), |i| parse(&manifests[i].0, &manifests[i].1, &file_set));
+        for ((path, _), parsed) in manifests.iter().zip(parsed) {
+            match parsed {
                 Ok(parsed) => {
                     if let Some(ws) = parsed.workspace {
                         workspaces.insert(dir_of(path).to_string(), ws);
@@ -335,6 +337,25 @@ impl Graph {
     /// Whether `path` is the manifest of one of the graph's packages.
     pub fn is_manifest(&self, path: &str) -> bool {
         self.by_dir.contains_key(dir_of(path))
+    }
+
+    /// Package `i` here and package `j` of `other` give the same card, modules aside (they come
+    /// from the crate root's text, not the graph).
+    pub fn same_card(&self, i: usize, other: &Graph, j: usize) -> bool {
+        let (a, b) = (&self.packages[i], &other.packages[j]);
+        let deps = |g: &Graph, p: &Package| -> Vec<(String, String)> { p.deps.iter().map(|(d, cfg)| (g.packages[*d].dir.clone(), cfg.clone())).collect() };
+        let dependents = |g: &Graph, p: &Package| -> Vec<String> { p.dependents.iter().map(|d| g.packages[*d].dir.clone()).collect() };
+        a.name == b.name
+            && a.dir == b.dir
+            && a.description == b.description
+            && a.vendored == b.vendored
+            && a.roots == b.roots
+            && a.targets == b.targets
+            && a.apps == b.apps
+            && a.rs_files == b.rs_files
+            && a.private_members == b.private_members
+            && deps(self, a) == deps(other, b)
+            && dependents(self, a) == dependents(other, b)
     }
 
     /// The package whose directory is the longest prefix of `path`.
