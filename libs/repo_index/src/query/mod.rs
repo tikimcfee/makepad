@@ -10,6 +10,7 @@
 //! circles it names; [`crate::Mode::Refs`] goes through [`crate::Search::refs`].
 
 pub mod handle;
+pub mod lines;
 pub mod pointers;
 pub mod rank;
 pub mod refs;
@@ -129,7 +130,7 @@ impl Engine {
             CircleExpr::Circle(name) => {
                 let ci = circle_index(opened, name)?;
                 let c = &opened.open[ci];
-                let Ranked { entries, total, definitions, near, absent_terms, .. } = rank(c, ci, plan, filter, rank::KEEP);
+                let Ranked { entries, total, definitions, near, absent_terms, .. } = rank(c, ci, plan, filter, rank::KEEP, opened.blobs.as_ref());
                 vec![BlockRank { name: name.clone(), rev: circle_rev(c), entries, total, definitions, near, absent_terms }]
             }
             CircleExpr::Select { of, by } => {
@@ -270,7 +271,9 @@ fn fuse_by_rank(blocks: Vec<BlockRank>) -> BlockRank {
             near.push(e);
         }
     }
-    let by = |a: &Scored, b: &Scored| b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score)).then(a.circle.cmp(&b.circle));
+    let by = |a: &Scored, b: &Scored| {
+        b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score)).then(a.circle.cmp(&b.circle)).then(rank::at_key(a.at).cmp(&rank::at_key(b.at)))
+    };
     entries.sort_by(by);
     near.sort_by(by);
     near.truncate(rank::NEAREST);
@@ -293,7 +296,7 @@ pub(crate) fn build_hit(opened: &Opened, e: &Scored, ctx: &HitCtx) -> Hit {
     let target = match v.kind {
         Kind::Commit | Kind::Bullet => Target::Commit(v.commit.map(|o| short(&o)).unwrap_or_default()),
         Kind::Crate => Target::Crate(if v.package.is_empty() { v.name.to_string() } else { v.package.to_string() }),
-        _ => Target::Lines { path: v.path.to_string(), lines: v.lines },
+        _ => Target::Lines { path: v.path.to_string(), lines: e.line.map_or(v.lines, |l| crate::Lines { start: l, end: l }) },
     };
     let rev = circle_rev(c);
     let handle = Handle {
@@ -310,6 +313,7 @@ pub(crate) fn build_hit(opened: &Opened, e: &Scored, ctx: &HitCtx) -> Hit {
         kind: v.kind,
         package: v.package.to_string(),
         path: v.path.to_string(),
+        // The item's own range: the handle points at its best line, the hit spans the item.
         lines: v.lines,
         name: v.name.to_string(),
         sig: v.sig.to_string(),

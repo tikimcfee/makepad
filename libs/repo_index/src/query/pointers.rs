@@ -30,7 +30,7 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
             continue;
         }
         let Some(vis) = &c.visible else {
-            let ranked = rank(c, ci, plan, &Filter::default(), 0);
+            let ranked = rank(c, ci, plan, &Filter::default(), 0, None);
             if ranked.all_words > 0 {
                 out.push(pointer(c, ranked.all_words, PointerUnit::Chunks));
             }
@@ -39,7 +39,7 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
         // One ranking at any revision serves both: the commits the revision reaches, and the
         // local-only ones (a pinned upstream revision reaches none of them).
         let any_rev = Filter { any_rev: true, ..Filter::default() };
-        let matching = matching_commits(c, &rank(c, ci, plan, &any_rev, usize::MAX), plan);
+        let matching = matching_commits(c, &rank(c, ci, plan, &any_rev, usize::MAX, None), plan);
         let reached = matching.iter().filter(|o| vis.reachable.contains(o)).count() as u64;
         if reached > 0 {
             out.push(pointer(c, reached, PointerUnit::Commits));
@@ -50,7 +50,7 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
             matching
         } else {
             let plan = Plan::new(absent, &Terms.query_terms(absent));
-            matching_commits(c, &rank(c, ci, &plan, &any_rev, usize::MAX), &plan)
+            matching_commits(c, &rank(c, ci, &plan, &any_rev, usize::MAX, None), &plan)
         };
         if let Some(branch) = branch_pointer(opened, c, vis, &branch_matching, absent) {
             out.push(branch);
