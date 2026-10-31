@@ -17,6 +17,7 @@ pub mod score;
 pub mod verify;
 
 use crate::{
+    AbsentScope,
     circles, CircleExpr, CircleManifest, CircleName, Circles, Error, EvalMode, EvalOpts, EvalReport, GoldDrift, GoldTarget,
     Harness, Mode, Output, Precondition, Query, Question, QuestionRow, QuestionSet, Render, Repo, RevSpec, Search,
 };
@@ -74,6 +75,47 @@ struct RunCtx<'a> {
 }
 
 impl Eval<'_> {
+    /// Whether each `path:`, `package:` and `fn` absence scope of the group holds in the tree
+    /// circle of the harness's repo at `rev` (worktree changes included at the worktree): one
+    /// pass for the group. A scope that cannot be judged is a failure of its questions, and does
+    /// not hold.
+    fn scopes_held(&mut self, manifest: &CircleManifest, rev: &RevSpec, group: &[&Question], report: &mut EvalReport) -> Vec<(AbsentScope, bool)> {
+        let mut scopes: Vec<AbsentScope> = Vec::new();
+        let mut asking: Vec<&str> = Vec::new();
+        for q in group {
+            for g in &q.gold {
+                if let GoldTarget::Absent { scope: Some(s @ (AbsentScope::Path(_) | AbsentScope::Package(_) | AbsentScope::Fn(_))), semantic: false, .. } = &g.target {
+                    if !scopes.contains(s) {
+                        scopes.push(s.clone());
+                    }
+                    if !asking.contains(&q.id.as_str()) {
+                        asking.push(&q.id);
+                    }
+                }
+            }
+        }
+        if scopes.is_empty() {
+            return Vec::new();
+        }
+        let tree = manifest.defs.iter().find_map(|d| match &d.body {
+            crate::CircleBody::Base(b @ crate::BaseCircle { source: crate::BaseSource::Tree { root }, .. }) if crate::open::same_dir(root, &self.root) => Some(b),
+            _ => None,
+        });
+        let judged = match tree {
+            Some(def) => verify::scopes_hold(self.repo, def, rev, &scopes),
+            None => Err(Error::UnknownCircle(format!("a tree circle on {}", self.root.display()))),
+        };
+        match judged {
+            Ok(held) => scopes.into_iter().zip(held).collect(),
+            Err(e) => {
+                for id in asking {
+                    report.failures.push(format!("{id}: absence scopes not judged at {}: {e}", rev_text(rev)));
+                }
+                Vec::new()
+            }
+        }
+    }
+
     fn run_group(
         &mut self,
         ctx: &RunCtx,
@@ -96,6 +138,7 @@ impl Eval<'_> {
         for f in leak::containment(&opened, manifest) {
             report.failures.push(format!("containment: {f}"));
         }
+        let held = self.scopes_held(manifest, rev, group, report);
         for q in group {
             let query = Query {
                 mode: Mode::Find,
@@ -117,7 +160,7 @@ impl Eval<'_> {
                 }
             };
             let bytes = self.render.text(&Output::Find(out.clone())).len() as u32;
-            let scored = score::score(q, &out, opts.k, bytes, ms, configured);
+            let scored = score::score(q, &out, opts.k, bytes, ms, configured, &held);
             if scored.forbidden > 0 {
                 report.failures.push(format!("{}: containment: {} forbidden records ranked", q.id, scored.forbidden));
             }
@@ -774,6 +817,47 @@ mod tests {
         assert!(others.borrow()[0].contains(&"notes:t".to_string()), "{:?}", others.borrow());
         assert!(others.borrow()[0].contains(&"makepad:history".to_string()));
         assert!(store.state.borrow().manifests.len() >= 2);
+    }
+
+    #[test]
+    fn path_package_and_fn_scopes_are_judged_against_the_circle_not_the_printed_hits() {
+        let root = std::env::temp_dir().join(format!("repo-index-eval-scopes-{}", std::process::id())).join("makepad");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let files: &[(&str, &str)] = &[
+            ("apps/still/main.rs", "fn here_still() {}\n"),
+            ("libs/p/Cargo.toml", "[package]\nname = \"still-pkg\"\n"),
+            ("libs/repo_index/fixture/Cargo.toml", "[package]\nname = \"fixture-only\"\n"),
+        ];
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["c0ffee123", "HEAD", "refs/remotes/upstream/work"], 1, files);
+        let (mut circles, _) = opener(repo, &root.join("none.conf"));
+        // the query prints nothing at all: only the circle can say what is absent
+        let mut answers = HashMap::new();
+        answers.insert("zz".into(), FindOutput { blocks: vec![block("makepad", vec![], false)], pointers: vec![] });
+        let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
+        let mut r = mirror(&root, files);
+        let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
+        let absent = |s: AbsentScope| GoldTarget::Absent { scope: Some(s), semantic: false, term: None };
+        let one = |id: &str, s: AbsentScope| Question { query: "zz".into(), ..q(id, &["makepad"], vec![(2, absent(s))]) };
+        let questions = vec![
+            one("p_gone", AbsentScope::Path("apps/director".into())),
+            one("p_here", AbsentScope::Path("apps/still".into())),
+            one("p_suffix", AbsentScope::Path("main.rs".into())),
+            one("k_gone", AbsentScope::Package("ironfish".into())),
+            one("k_here", AbsentScope::Package("still-pkg".into())),
+            one("k_excluded", AbsentScope::Package("fixture-only".into())), // only in the index's own data
+            one("f_gone", AbsentScope::Fn("unit_here".into())),
+            one("f_here", AbsentScope::Fn("here_still".into())),
+        ];
+        let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: None };
+        let report = eval.run(&questions, &opts).unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let solved: Vec<(&str, bool)> = report.rows.iter().map(|r| (r.id.as_str(), r.solved)).collect();
+        assert_eq!(
+            solved,
+            [("p_gone", true), ("p_here", false), ("p_suffix", false), ("k_gone", true), ("k_here", false), ("k_excluded", true), ("f_gone", true), ("f_here", false)]
+        );
     }
 
     #[test]

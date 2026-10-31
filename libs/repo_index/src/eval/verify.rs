@@ -69,18 +69,72 @@ pub fn check_line(text: &str, line: u32, anchor: &Anchor) -> Option<Drift> {
     })
 }
 
-/// A tree's files and lazily read texts.
+/// Which files a question sees: a tree, or the worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum At {
+    Tree(Oid),
+    /// HEAD's tree with the uncommitted changes applied.
+    Worktree,
+}
+
+/// A tree's files and lazily read texts; at the worktree, a changed file is read from disk.
 struct Tree {
     files: Vec<TreeFile>,
     by_path: HashMap<String, usize>,
     texts: HashMap<usize, String>,
     cargo_names: Option<Vec<String>>,
+    /// Files read from the worktree, by index (their `blob` is not used).
+    disk: HashMap<usize, PathBuf>,
 }
 
 impl Tree {
+    fn new(files: Vec<TreeFile>, disk: HashMap<usize, PathBuf>) -> Tree {
+        let by_path = files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
+        Tree { files, by_path, texts: HashMap::new(), cargo_names: None, disk }
+    }
+
+    /// The files at `at`: a tree's, or HEAD's tree with the worktree's uncommitted changes (a
+    /// changed or added file read from disk, a deleted one gone), what a worktree query's
+    /// overlay holds.
+    fn at(repo: &mut dyn Repo, at: At) -> Result<Tree, Error> {
+        let tree = match at {
+            At::Tree(t) => t,
+            At::Worktree => repo.resolve(&RevSpec::Pinned("HEAD".into()))?.tree,
+        };
+        let mut files = repo.files(tree)?;
+        let mut disk = HashMap::new();
+        if at == At::Worktree {
+            let head = repo.resolve(&RevSpec::Pinned("HEAD".into()))?;
+            let changes = repo.changes(&head)?;
+            let changed: std::collections::HashSet<&str> = changes
+                .iter()
+                .map(|c| match c {
+                    crate::Change::Added(p) | crate::Change::Modified(p) | crate::Change::Deleted(p) => p.as_str(),
+                })
+                .collect();
+            files.retain(|f| !changed.contains(f.path.as_str()));
+            let root = repo.root();
+            for c in &changes {
+                if let crate::Change::Added(p) | crate::Change::Modified(p) = c {
+                    disk.insert(files.len(), root.join(p));
+                    files.push(TreeFile { path: p.clone(), blob: Oid([0; 20]), mode: 0o100644 });
+                }
+            }
+        }
+        Ok(Tree::new(files, disk))
+    }
+
+    /// File `i`'s bytes, not kept.
+    fn read(&self, repo: &mut dyn Repo, i: usize) -> Result<Vec<u8>, Error> {
+        match self.disk.get(&i) {
+            Some(p) => std::fs::read(p).map_err(|error| Error::Io { context: format!("eval: reading {}", p.display()), error }),
+            None => repo.read_blob(self.files[i].blob),
+        }
+    }
+
     fn text(&mut self, repo: &mut dyn Repo, i: usize) -> Result<&str, Error> {
         if !self.texts.contains_key(&i) {
-            let bytes = repo.read_blob(self.files[i].blob)?;
+            let bytes = self.read(repo, i)?;
             self.texts.insert(i, String::from_utf8_lossy(&bytes).into_owned());
         }
         Ok(&self.texts[&i])
@@ -91,25 +145,30 @@ impl Tree {
     }
     fn cargo_names<'s>(&'s mut self, repo: &mut dyn Repo) -> Result<&'s [String], Error> {
         if self.cargo_names.is_none() {
-            let mut names = Vec::new();
-            let idx: Vec<usize> = (0..self.files.len()).filter(|i| self.files[*i].path.ends_with("Cargo.toml")).collect();
-            for i in idx {
-                let mut in_package = false;
-                for line in self.text(repo, i)?.lines() {
-                    let t = line.trim();
-                    if t.starts_with('[') {
-                        in_package = t == "[package]";
-                    } else if in_package {
-                        if let Some(v) = t.strip_prefix("name").map(str::trim_start).and_then(|r| r.strip_prefix('=')) {
-                            names.push(v.trim().trim_matches('"').to_string());
-                            in_package = false;
-                        }
+            let all: Vec<usize> = (0..self.files.len()).collect();
+            self.cargo_names = Some(self.package_names(repo, &all)?);
+        }
+        Ok(self.cargo_names.as_deref().unwrap_or_default())
+    }
+    /// The `[package]` names of the manifests among files `among`.
+    fn package_names(&mut self, repo: &mut dyn Repo, among: &[usize]) -> Result<Vec<String>, Error> {
+        let mut names = Vec::new();
+        let idx: Vec<usize> = among.iter().copied().filter(|i| self.files[*i].path.ends_with("Cargo.toml")).collect();
+        for i in idx {
+            let mut in_package = false;
+            for line in self.text(repo, i)?.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    in_package = t == "[package]";
+                } else if in_package {
+                    if let Some(v) = t.strip_prefix("name").map(str::trim_start).and_then(|r| r.strip_prefix('=')) {
+                        names.push(v.trim().trim_matches('"').to_string());
+                        in_package = false;
                     }
                 }
             }
-            self.cargo_names = Some(names);
         }
-        Ok(self.cargo_names.as_deref().unwrap_or_default())
+        Ok(names)
     }
 }
 
@@ -182,6 +241,54 @@ fn history_record(def: &BaseCircle, c: &crate::CommitRecord) -> Option<String> {
     Some(format!("{}\n{}", c.message, kept.join("\n")).to_lowercase())
 }
 
+/// Whether a file at `file` is what a path `p` names: that file, a file under it, or a file
+/// whose path ends with it (`push-tree.sh` names `tools/push-tree.sh`).
+fn path_names(file: &str, p: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    file == p || file.starts_with(&format!("{p}/")) || file.ends_with(&format!("/{p}"))
+}
+
+/// Whether each `path:`, `package:` or `fn` absence scope holds in the tree circle `def` at
+/// `rev` (at the worktree, HEAD's tree with the uncommitted changes, as a worktree query sees
+/// it): no file the path names, no package of that name, no `fn <name>` definition, outside the
+/// circle's exclusions. These are facts about the circle, not about which hits a query printed.
+/// One pass over the files' texts, only when a `fn` scope asks for it. Any other scope is not
+/// judged here: `false`.
+pub fn scopes_hold(repo: &mut dyn Repo, def: &BaseCircle, rev: &RevSpec, scopes: &[AbsentScope]) -> Result<Vec<bool>, Error> {
+    let at = match rev {
+        RevSpec::Worktree => At::Worktree,
+        pinned => At::Tree(repo.resolve(pinned)?.tree),
+    };
+    let mut tree = Tree::at(repo, at)?;
+    let admitted: Vec<usize> = (0..tree.files.len()).filter(|i| circles::excluded(def, &tree.files[*i].path).is_none()).collect();
+    let fns: Vec<String> = scopes.iter().filter_map(|s| if let AbsentScope::Fn(f) = s { Some(format!("fn {f}")) } else { None }).collect();
+    let mut defined = vec![false; fns.len()];
+    if !fns.is_empty() {
+        for &i in &admitted {
+            let text = tree.text(repo, i)?;
+            for (k, needle) in fns.iter().enumerate() {
+                defined[k] |= text.match_indices(needle.as_str()).any(|(at, _)| !text[at + needle.len()..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_'));
+            }
+            tree.texts.remove(&i);
+        }
+    }
+    let packages = if scopes.iter().any(|s| matches!(s, AbsentScope::Package(_))) { tree.package_names(repo, &admitted)? } else { Vec::new() };
+    let mut out = Vec::with_capacity(scopes.len());
+    let mut next_fn = 0;
+    for s in scopes {
+        out.push(match s {
+            AbsentScope::Path(p) => !admitted.iter().any(|i| path_names(&tree.files[*i].path, p)),
+            AbsentScope::Package(n) => !packages.iter().any(|x| x == n),
+            AbsentScope::Fn(_) => {
+                next_fn += 1;
+                !defined[next_fn - 1]
+            }
+            AbsentScope::Circle(_) | AbsentScope::Text(_) => false,
+        });
+    }
+    Ok(out)
+}
+
 /// A path-shaped term without a `:line` or `:start-end` suffix.
 fn path_term(t: &str) -> &str {
     match t.rsplit_once(':') {
@@ -201,15 +308,18 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
     let mut out = vec![0u64; claims.len()];
     let root = repo.root();
     // (circle, tree) -> claim indices, for one pass per tree
-    let mut by_tree: HashMap<(String, Oid), Vec<usize>> = HashMap::new();
+    let mut by_tree: HashMap<(String, At), Vec<usize>> = HashMap::new();
     let mut by_history: HashMap<(String, Oid), Vec<usize>> = HashMap::new();
     let mut by_notes: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, c) in claims.iter().enumerate() {
         let Some(CircleBody::Base(def)) = manifest.defs.iter().find(|d| d.name == c.circle).map(|d| &d.body) else { continue };
         match &def.source {
             BaseSource::Tree { root: r } if std::fs::canonicalize(r).ok() == std::fs::canonicalize(&root).ok() => {
-                let rev = repo.resolve(&c.rev)?;
-                by_tree.entry((c.circle.0.clone(), rev.tree)).or_default().push(i);
+                let at = match &c.rev {
+                    RevSpec::Worktree => At::Worktree,
+                    pinned => At::Tree(repo.resolve(pinned)?.tree),
+                };
+                by_tree.entry((c.circle.0.clone(), at)).or_default().push(i);
             }
             BaseSource::History { root: r, .. } if std::fs::canonicalize(r).ok() == std::fs::canonicalize(&root).ok() => {
                 let rev = repo.resolve(&c.rev)?;
@@ -223,26 +333,26 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
         Some(CircleBody::Base(b)) => Some(b),
         _ => None,
     };
-    for ((circle, tree), idx) in by_tree {
+    for ((circle, at), idx) in by_tree {
         let Some(def) = def_of(&circle) else { continue };
         // a path-shaped term (query's own rule) is absent when no file's path is it, lies under
         // it or ends with it; any other term when no file's text or path holds it as a word
         let (paths, texts): (Vec<usize>, Vec<usize>) = idx.iter().partition(|i| crate::query::rank::path_shaped(path_term(&claims[**i].term)));
         let words: Vec<String> = texts.iter().map(|i| claims[*i].term.to_lowercase()).collect();
-        for f in repo.files(tree)? {
+        let tree = Tree::at(repo, at)?;
+        for (fi, f) in tree.files.iter().enumerate() {
             if circles::excluded(def, &f.path).is_some() {
                 continue;
             }
             for i in &paths {
-                let p = path_term(&claims[*i].term).trim_end_matches('/');
-                if f.path == p || f.path.starts_with(&format!("{p}/")) || f.path.ends_with(&format!("/{p}")) {
+                if path_names(&f.path, path_term(&claims[*i].term)) {
                     out[*i] += 1;
                 }
             }
             if words.is_empty() {
                 continue;
             }
-            let text = String::from_utf8_lossy(&repo.read_blob(f.blob)?).to_lowercase();
+            let text = String::from_utf8_lossy(&tree.read(repo, fi)?).to_lowercase();
             let path = f.path.to_lowercase();
             for (k, w) in words.iter().enumerate() {
                 if has_word(&text, w) || has_word(&path, w) {
@@ -305,11 +415,7 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
         };
         let tree = match trees.entry(rev.tree) {
             std::collections::hash_map::Entry::Occupied(t) => t.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let files = repo.files(rev.tree)?;
-                let by_path = files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
-                v.insert(Tree { files, by_path, texts: HashMap::new(), cargo_names: None })
-            }
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(Tree::at(repo, At::Tree(rev.tree))?),
         };
         let drift = |g: usize, drift: Drift| GoldDrift { id: q.id.clone(), gold: g, drift };
         for (gi, g) in q.gold.iter().enumerate() {
@@ -379,7 +485,7 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
                 }
                 GoldTarget::Absent { scope, .. } if q.subtype != "self-exclusion" => match scope {
                     Some(AbsentScope::Path(p)) => {
-                        let hits = tree.files.iter().filter(|f| f.path == *p || f.path.starts_with(&format!("{p}/")) || f.path.ends_with(&format!("/{p}"))).count();
+                        let hits = tree.files.iter().filter(|f| path_names(&f.path, p)).count();
                         if hits > 0 {
                             out.push(drift(gi, Drift::NoLongerAbsent { hits: hits as u64 }));
                         }
@@ -484,7 +590,7 @@ mod tests {
     use super::*;
     use crate::eval::score::tests::q;
     use crate::open::fakes::{oid, FakeRepo};
-    use crate::{CommitInfo, CommitRecord};
+    use crate::{Change, CommitInfo, CommitRecord};
 
     fn anchored(mut question: Question, gi: usize, anchor: Anchor) -> Question {
         question.gold[gi].symbol = Some(anchor);
@@ -555,6 +661,28 @@ mod tests {
         ];
         assert_eq!(occurrences(&mut repo2, &m, &paths).unwrap(), [0, 0, 1, 1, 1]);
         assert!(has_word("a b_c d", "b_c") && !has_word("ab_c", "b_c") && !has_word("x", ""));
+    }
+
+    #[test]
+    fn at_the_worktree_the_checks_read_the_uncommitted_changes() {
+        let root = std::env::temp_dir().join(format!("repo-index-occurs-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["HEAD"], 1, &[("a.rs", "// old_term\n"), ("c.rs", "fn gone_fn() {}\n"), ("keep.rs", "// kept_term\n")]);
+        std::fs::write(root.join("a.rs"), "// new_term\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn added_fn() {} // added_term\n").unwrap();
+        repo.changes = vec![Change::Modified("a.rs".into()), Change::Added("b.rs".into()), Change::Deleted("c.rs".into())];
+        let m = circles::manifest_for(&root, None, &root).unwrap();
+        let claim = |term: &str| Claim { id: "q".into(), circle: CircleName("makepad".into()), rev: RevSpec::Worktree, term: term.into() };
+        let claims = [claim("new_term"), claim("old_term"), claim("added_term"), claim("gone_fn"), claim("kept_term")];
+        assert_eq!(occurrences(&mut repo, &m, &claims).unwrap(), [1, 0, 1, 0, 1]);
+        let def = match &circles::find_def(&m, &CircleName("makepad".into())).unwrap().body {
+            CircleBody::Base(b) => b.clone(),
+            _ => unreachable!(),
+        };
+        let scopes = [AbsentScope::Path("c.rs".into()), AbsentScope::Path("b.rs".into()), AbsentScope::Fn("gone_fn".into()), AbsentScope::Fn("added_fn".into())];
+        assert_eq!(scopes_hold(&mut repo, &def, &RevSpec::Worktree, &scopes).unwrap(), [true, false, true, false]);
     }
 
     #[test]
