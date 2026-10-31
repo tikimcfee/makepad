@@ -43,7 +43,8 @@ pub struct Opener {
     pub conf: PathBuf,
     /// `~` in `circles.conf`.
     pub home: PathBuf,
-    /// Where history visibility is kept between calls ([`VisCache`]); `None` computes it every
+    /// Where history visibility is kept between calls (one small file per revision and ref
+    /// tips); `None` computes it every
     /// open.
     pub visibility_cache: Option<PathBuf>,
     /// Other repos opened so far, by root.
