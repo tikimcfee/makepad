@@ -23,7 +23,8 @@ pub const LINE_FROM: usize = 30;
 pub const LINES_PER_FILE: usize = 2;
 
 
-/// What one query word matches on a line: its folded whole (never an inner run of it).
+/// What one query word matches on a line: its folded whole or an inflection of it (never an
+/// inner run of it).
 struct LineWord {
     word: u16,
     texts: Vec<String>,
@@ -40,7 +41,7 @@ fn line_words(c: &OpenCircle, plan: &Plan) -> Vec<LineWord> {
         let mut texts: Vec<String> = plan
             .groups
             .iter()
-            .filter(|g| g.word == w && g.role == crate::query::rank::Role::Primary)
+            .filter(|g| g.word == w && matches!(g.role, crate::query::rank::Role::Primary | crate::query::rank::Role::Variant))
             .map(|g| g.text.clone())
             .collect();
         for p in plan.paths.iter().filter(|p| p.word == w) {

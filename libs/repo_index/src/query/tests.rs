@@ -923,3 +923,20 @@ fn line_scoring_leaves_one_word_scores_alone() {
     let scores = |o: &FindOutput| o.blocks[0].hits.iter().map(|h| (h.name.clone(), h.score)).collect::<Vec<_>>();
     assert_eq!(scores(&a), scores(&b));
 }
+
+#[test]
+fn plain_words_match_their_inflections() {
+    assert_eq!(rank::variants("remotely"), ["remote"]);
+    assert_eq!(rank::variants("guides"), ["guide"]);
+    assert_eq!(rank::variants("batches"), ["batch"]);
+    assert_eq!(rank::variants("entries"), ["entry"]);
+    assert_eq!(rank::variants("resetting"), ["resett", "resette"]);
+    assert_eq!(rank::variants("clamped"), ["clamp", "clampe"]);
+    assert!(rank::variants("class").is_empty(), "no plural strip after s");
+    assert!(rank::variants("spin").is_empty(), "short words stay");
+    let o = opened(vec![makepad()], vec![]);
+    // "spins" finds the chunks that say "spin" (the guide's heading says "Spinning"); its
+    // matches now cover the word.
+    let b = &find(&o, &query("gizmos spins", &["makepad"])).blocks[0];
+    assert!(b.hits.iter().any(|h| h.name == "Gizmo::spin"), "{:?}", names(b));
+}

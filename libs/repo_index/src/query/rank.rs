@@ -83,6 +83,44 @@ pub enum Role {
     /// A part of a path-shaped word other than its rarest: scored only on chunks the rarest
     /// part found, so the word covers a chunk only when all its parts are there.
     PathPart,
+    /// An English inflection of a plain word (`remotely` → `remote`, `guides` → `guide`): an
+    /// alternative that covers the word, at [`VARIANT_WEIGHT`].
+    Variant,
+}
+
+/// Weight of an inflection variant against the word as written.
+pub const VARIANT_WEIGHT: f32 = 0.8;
+
+/// Light English inflections of a plain lower-case word: -ly, plurals, -ing, -ed. Prose only
+/// (code identifiers never reach here: they are not plain words); each must occur in the circle
+/// to be scored.
+pub fn variants(w: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if w.len() < 5 || !w.bytes().all(|b| b.is_ascii_lowercase()) {
+        return out;
+    }
+    let mut push = |v: String| {
+        if v.len() >= 3 && v != w && !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    if let Some(b) = w.strip_suffix("ly") {
+        push(b.to_string());
+    }
+    if let Some(b) = w.strip_suffix("ies") {
+        push(format!("{b}y"));
+    } else if let Some(b) = w.strip_suffix("es").filter(|b| b.ends_with(['s', 'x', 'z']) || b.ends_with("ch") || b.ends_with("sh")) {
+        push(b.to_string());
+    } else if let Some(b) = w.strip_suffix('s').filter(|b| !b.ends_with('s')) {
+        push(b.to_string());
+    }
+    for suffix in ["ing", "ed"] {
+        if let Some(b) = w.strip_suffix(suffix) {
+            push(b.to_string());
+            push(format!("{b}e"));
+        }
+    }
+    out
 }
 
 /// One scored term of the query.
@@ -301,6 +339,14 @@ impl Plan {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Inflections of plain words, as alternatives.
+        for (i, (core, class)) in classes.iter().enumerate() {
+            if kept.contains(&(i as u16)) && *class == Class::Plain {
+                for text in variants(core) {
+                    plan.groups.push(Group { text, word: i as u16, role: Role::Variant, span: 1 });
                 }
             }
         }
@@ -657,7 +703,7 @@ fn forms(role: Role) -> &'static [(TermForm, f32)] {
     match role {
         Role::Primary | Role::Expansion => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
         Role::Exact => &[(TermForm::Exact, 1.0)],
-        Role::Phrase | Role::Run => &[(TermForm::Folded, 1.0)],
+        Role::Phrase | Role::Run | Role::Variant => &[(TermForm::Folded, 1.0)],
         Role::PathPart => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
     }
 }
@@ -814,6 +860,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
             }
             let role_weight = match g.role {
                 Role::Primary | Role::Phrase | Role::Run | Role::PathPart => 1.0,
+                Role::Variant => VARIANT_WEIGHT,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
             };
@@ -832,6 +879,10 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 Role::Run => {
                     run_covered.insert(g.word);
                     in_name = true;
+                }
+                Role::Variant => {
+                    phrase_covered.insert(g.word);
+                    in_name |= tf[0] > 0.0;
                 }
                 _ => {}
             }
