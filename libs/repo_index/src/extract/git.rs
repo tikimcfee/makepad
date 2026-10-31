@@ -153,13 +153,35 @@ impl Repo for GitRepo {
     /// The index's blob ids are compared with the base tree directly (committed and staged
     /// changes alike, no HEAD tree needed), and a worktree-only status gives what differs from
     /// the index (unstaged edits, deletions, untracked files the ignore rules admit). Only files
-    /// that status names are hashed; any other path's content is its index blob.
+    /// that status names are hashed; any other path's content is its index blob. The worktree
+    /// walk and the base tree's flatten run at once on the shared workers.
     fn changes(&mut self, base: &Rev) -> Result<Vec<Change>, Error> {
-        let base_files: HashMap<String, Oid> = self.files(base.tree)?.into_iter().map(|f| (f.path, f.blob)).collect();
         let index = self.repo.read_index().map_err(|e| git_err("read index", e))?;
-        let opts = makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() };
-        let status = makepad_git::compute_status_worktree_only_with_options(&index, &self.repo.workdir, opts)
-            .map_err(|e| git_err("worktree status", e))?;
+        let workdir = self.repo.workdir.clone();
+        let repo = std::sync::Mutex::new(&mut self.repo);
+        let base_tree = object_id(&base.tree);
+        enum Part {
+            Status(Result<makepad_git::Status, makepad_git::GitError>),
+            Base(Result<HashMap<String, (ObjectId, u32)>, makepad_git::GitError>),
+        }
+        let mut parts = crate::workers::fan_out(2, |i| match i {
+            0 => {
+                let opts = makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() };
+                Part::Status(makepad_git::compute_status_worktree_only_with_options(&index, &workdir, opts))
+            }
+            _ => Part::Base(repo.lock().unwrap_or_else(|e| e.into_inner()).flatten_tree_with_mode(&base_tree)),
+        })
+        .into_iter();
+        let (Some(Part::Status(status)), Some(Part::Base(flat))) = (parts.next(), parts.next()) else {
+            unreachable!("fan_out returns its parts in index order")
+        };
+        let status = status.map_err(|e| git_err("worktree status", e))?;
+        let base_files: HashMap<String, Oid> = flat
+            .map_err(|e| git_err("flatten base tree", e))?
+            .into_iter()
+            .filter(|(_, (_, mode))| REGULAR_FILE_MODES.contains(mode))
+            .map(|(path, (blob, _))| (path, oid(&blob)))
+            .collect();
         let off_index: HashSet<String> = status.entries.into_iter().map(|e| e.path).collect();
         let mut current: HashMap<&str, Option<Oid>> = HashMap::new();
         // regular files only, as the base side ([`Repo::files`])
