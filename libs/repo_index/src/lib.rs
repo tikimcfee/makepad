@@ -695,9 +695,12 @@ pub trait Store {
     fn manifest(&self, repo: Option<RepoId>, circle: &CircleName) -> Result<Option<SegmentManifest>, Error>;
     fn commit(&self, repo: Option<RepoId>, circle: &CircleName, change: ManifestChange) -> Result<SegmentManifest, Error>;
     fn open_segment(&self, repo: Option<RepoId>, circle: &CircleName, id: &SegmentId) -> Result<Box<dyn SegmentRead>, Error>;
-    /// Drops bases not in `live_bases`, and manifest circles not in `live_circles` (no longer
-    /// configured) once their newest manifest is older than the grace period.
-    fn gc(&self, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error>;
+    /// Sweeps only `repo`: its bases not in `live_bases` and its manifest circles not in
+    /// `live_circles` (under `repo-<repo>/`), plus the machine's notes circles (`notes-<topic>/`,
+    /// repo `None`) not in `live_circles`, each once its newest file is older than the grace
+    /// period. Never touches another `repo-<id>/` directory; a store-wide sweep would be its own
+    /// verb.
+    fn gc(&self, repo: RepoId, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error>;
 }
 
 #[derive(Clone, Debug, Default)]
