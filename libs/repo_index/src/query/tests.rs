@@ -270,6 +270,7 @@ fn history() -> OpenCircle {
         reachable: [oid(0xc1), oid(0xc2)].into_iter().collect(),
         local: [oid(0xc2)].into_iter().collect(),
         local_refs: vec!["work".into()],
+        local_files: Vec::new(),
     };
     open(
         "makepad:history",
@@ -284,7 +285,7 @@ fn history() -> OpenCircle {
 }
 
 fn opened(open: Vec<OpenCircle>, others: Vec<OpenCircle>) -> Opened {
-    Opened { open, others, unbuilt: Vec::new() }
+    Opened { open, others, unbuilt: Vec::new(), blobs: None }
 }
 
 fn query(words: &str, circles: &[&str]) -> Query {
