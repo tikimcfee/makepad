@@ -5,8 +5,11 @@
 //!   the file. Copies listed in `also_at` count;
 //! - a package matches a hit of that package; a commit a commit or bullet hit whose hex shares
 //!   the item's 7-digit prefix (or an `alt`'s), and with `via_pointer` a pointer naming it;
-//! - an absence matches the block's absent flag, or for a `path:`, `package:` or `fn` scope, no
-//!   hit of that path, package or function; a semantic absence is for agent mode only;
+//! - an absence is met in the circles its scope names (a circle scope: that circle's block; no
+//!   scope or a descriptive one: every queried block): each must name its term absent
+//!   ([`CircleBlock::absent_terms`]; the term is `term`, else the query when it is one token, else
+//!   the block's absent flag stands for it). A `path:`, `package:` or `fn` scope is met when no
+//!   ranked hit is of that path, package or function. A semantic absence is for agent mode only;
 //! - a pointer matches a pointer line to its circle, with the same count when the item has one;
 //! - `dependents` need the `crate` card, so retrieval mode skips them, reported as skipped.
 //!
@@ -80,7 +83,14 @@ fn ranked(block: &CircleBlock, k: usize) -> Vec<&Hit> {
     block.hits.iter().chain(&block.nearest).take(k).collect()
 }
 
-fn need(g: &Gold, out: &FindOutput, blocks: &[&CircleBlock], configured: &[CircleName]) -> Need {
+/// The query itself when it is one token.
+fn one_token(query: &str) -> Option<&str> {
+    let mut words = query.split_whitespace();
+    let first = words.next()?;
+    words.next().is_none().then_some(first)
+}
+
+fn need(g: &Gold, query: &str, out: &FindOutput, blocks: &[&CircleBlock], configured: &[CircleName]) -> Need {
     if g.requires.as_ref().is_some_and(|c| !configured.contains(c)) {
         return Need::Skip;
     }
@@ -100,11 +110,16 @@ fn need(g: &Gold, out: &FindOutput, blocks: &[&CircleBlock], configured: &[Circl
         }
         GoldTarget::Dependents { .. } | GoldTarget::Error(_) => Need::Skip,
         GoldTarget::Absent { semantic: true, .. } => Need::Skip,
-        GoldTarget::Absent { scope, .. } => {
+        GoldTarget::Absent { scope, term, .. } => {
             let hits = || blocks.iter().flat_map(|b| b.hits.iter());
+            let term = term.as_deref().or_else(|| one_token(query));
+            let says = |b: &CircleBlock| match term {
+                Some(t) => b.absent_terms.iter().any(|x| x.eq_ignore_ascii_case(t)),
+                None => b.absent,
+            };
             Need::Met(match scope {
-                None | Some(AbsentScope::Text(_)) => blocks.iter().any(|b| b.absent),
-                Some(AbsentScope::Circle(c)) => blocks.iter().any(|b| &b.circle == c && b.absent),
+                None | Some(AbsentScope::Text(_)) => !blocks.is_empty() && blocks.iter().all(|b| says(b)),
+                Some(AbsentScope::Circle(c)) => blocks.iter().any(|b| &b.circle == c && says(b)),
                 Some(AbsentScope::Path(p)) => !hits().any(|h| hit_paths(h).any(|x| path_in(p, x, h.kind) || x.ends_with(&format!("/{p}")))),
                 Some(AbsentScope::Package(n)) => !hits().any(|h| &h.package == n),
                 Some(AbsentScope::Fn(f)) => !hits().any(|h| {
@@ -134,9 +149,10 @@ pub fn forbidden(pattern: &str, block_circle: &CircleName, hit: &Hit) -> bool {
     }
 }
 
-/// Discounted gain of the ranked hits against the rankable gold, normalised; `NaN` when the
-/// question has no rankable gold.
-fn ndcg(hits: &[&Hit], gold: &[(u8, &GoldTarget)]) -> f32 {
+/// Discounted gain of the ranked hits against the rankable gold, normalised by the ideal
+/// ranking over `k` places (so returning fewer hits never raises it); `NaN` when the question has
+/// no rankable gold.
+fn ndcg(hits: &[&Hit], gold: &[(u8, &GoldTarget)], k: usize) -> f32 {
     let mut credited = vec![false; gold.len()];
     let mut dcg = 0.0f32;
     for (i, h) in hits.iter().enumerate() {
@@ -148,7 +164,7 @@ fn ndcg(hits: &[&Hit], gold: &[(u8, &GoldTarget)]) -> f32 {
     }
     let mut ideal: Vec<u8> = gold.iter().map(|(r, _)| *r).collect();
     ideal.sort_unstable_by(|a, b| b.cmp(a));
-    let idcg: f32 = ideal.iter().take(hits.len().max(1)).enumerate().map(|(i, r)| f32::from(*r) / (i as f32 + 2.0).log2()).sum();
+    let idcg: f32 = ideal.iter().take(k).enumerate().map(|(i, r)| f32::from(*r) / (i as f32 + 2.0).log2()).sum();
     if idcg == 0.0 {
         f32::NAN
     } else {
@@ -168,7 +184,7 @@ pub struct Scored {
 /// Scores `out` for `q`. `bytes` and `ms` are the rendered output's size and the query's time.
 pub fn score(q: &Question, out: &FindOutput, k: usize, bytes: u32, ms: f32, configured: &[CircleName]) -> Scored {
     let blocks: Vec<&CircleBlock> = out.blocks.iter().filter(|b| q.circles.contains(&b.circle)).collect();
-    let needs: Vec<(usize, Need)> = q.gold.iter().enumerate().map(|(i, g)| (i, need(g, out, &blocks, configured))).collect();
+    let needs: Vec<(usize, Need)> = q.gold.iter().enumerate().map(|(i, g)| (i, need(g, &q.query, out, &blocks, configured))).collect();
     let skipped = needs.iter().filter(|(_, n)| matches!(n, Need::Skip)).count() as u32;
     let rankable: Vec<(u8, &GoldTarget)> = needs
         .iter()
@@ -208,7 +224,7 @@ pub fn score(q: &Question, out: &FindOutput, k: usize, bytes: u32, ms: f32, conf
             rev: b.rev.clone(),
             circle: b.circle.clone(),
             ranks_of_rel2: ranks,
-            ndcg: ndcg(&hits, &rankable),
+            ndcg: ndcg(&hits, &rankable, k),
             distractor_above: match (first_distractor, first_gold) {
                 (Some(d), Some(g)) => d < g,
                 (Some(_), None) => true,
@@ -271,7 +287,8 @@ pub(crate) mod tests {
             uses: 0,
             hits,
             absent,
-            absent_terms: if absent { vec![circle.into()] } else { Vec::new() },
+            // the query of [`q`]
+            absent_terms: if absent { vec!["x".into()] } else { Vec::new() },
             nearest: Vec::new(),
             under: Vec::new(),
         }
@@ -363,7 +380,7 @@ pub(crate) mod tests {
         let absent = FindOutput { blocks: vec![block("makepad", vec![], true)], pointers: vec![pointer.clone()] };
         let s = score(&question, &absent, 10, 0, 0.0, &mk());
         assert!(s.solved);
-        assert_eq!(s.absent_claims, [(n("makepad"), "makepad".to_string())], "the block's named absent terms, once");
+        assert_eq!(s.absent_claims, [(n("makepad"), "x".to_string())], "the block's named absent terms, once");
         let wrong_count = FindOutput { pointers: vec![Pointer { count: 8, ..pointer.clone() }], ..absent.clone() };
         assert!(!score(&question, &wrong_count, 10, 0, 0.0, &mk()).solved);
         // an item that needs an unconfigured circle is skipped, not failed
@@ -383,6 +400,53 @@ pub(crate) mod tests {
         let premise = q("w22", &["makepad"], vec![(2, path("jit.rs", Some(1243))), (1, GoldTarget::Absent { scope: Some(AbsentScope::Fn("unit_here".into())), semantic: false, term: None })]);
         let out = FindOutput { blocks: vec![block("makepad", vec![hit("jit.rs", 1243, Kind::Fn, "cur_unit")], true)], pointers: vec![] };
         assert!(score(&premise, &out, 10, 0, 0.0, &mk()).solved);
+    }
+
+    #[test]
+    fn ndcg_is_normalised_over_k_not_over_the_hits_returned() {
+        // one hit returned, matching one of four rel-2 items: the ideal still has four places
+        let gold: Vec<(u8, GoldTarget)> = ["a.rs", "b.rs", "c.rs", "d.rs"].iter().map(|p| (2, path(p, None))).collect();
+        let question = q("n", &["makepad"], gold);
+        let out = FindOutput { blocks: vec![block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false)], pointers: vec![] };
+        let s = score(&question, &out, 10, 0, 0.0, &mk());
+        let idcg: f32 = (0..4).map(|i| 2.0 / (i as f32 + 2.0).log2()).sum();
+        assert!((s.rows[0].ndcg - 2.0 / idcg).abs() < 1e-4, "{}", s.rows[0].ndcg);
+        assert!(s.rows[0].ndcg < 0.5);
+        // k cuts the ideal too: at k = 1 the one right hit is the ideal
+        assert!((score(&question, &out, 1, 0, 0.0, &mk()).rows[0].ndcg - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_absence_is_met_in_the_circles_its_scope_names_for_its_term() {
+        let n = |s: &str| CircleName(s.into());
+        let both = [n("makepad"), n("makepad:history")];
+        let absent = |scope: Option<AbsentScope>, term: Option<&str>| GoldTarget::Absent { scope, semantic: false, term: term.map(str::to_string) };
+        let says = |circle: &str, terms: &[&str], hits: Vec<Hit>| {
+            let mut b = block(circle, hits, false);
+            b.absent_terms = terms.iter().map(|t| t.to_string()).collect();
+            b.absent = !b.absent_terms.is_empty() && b.hits.is_empty();
+            b
+        };
+        // present in makepad, absent only in history: no scope means every queried circle
+        let mut question = q("a1", &["makepad", "makepad:history"], vec![(2, absent(None, None))]);
+        question.query = "publish_instances".into();
+        let split = FindOutput {
+            blocks: vec![says("makepad", &[], vec![hit("a.rs", 1, Kind::Fn, "publish_instances")]), says("makepad:history", &["publish_instances"], vec![])],
+            pointers: vec![],
+        };
+        assert!(!score(&question, &split, 10, 0, 0.0, &both).solved);
+        // a circle scope: only that circle's block counts
+        question.gold[0].target = absent(Some(AbsentScope::Circle(n("makepad:history"))), None);
+        assert!(score(&question, &split, 10, 0, 0.0, &both).solved);
+        question.gold[0].target = absent(Some(AbsentScope::Circle(n("makepad"))), None);
+        assert!(!score(&question, &split, 10, 0, 0.0, &both).solved);
+        // `term` names the needle among several words: the block ranks KeyCode and names zz_absent
+        let mut two = q("a2", &["makepad"], vec![(2, absent(None, Some("zz_absent")))]);
+        two.query = "KeyCode zz_absent".into();
+        let out = FindOutput { blocks: vec![says("makepad", &["zz_absent"], vec![hit("k.rs", 1, Kind::Enum, "KeyCode")])], pointers: vec![] };
+        assert!(score(&two, &out, 10, 0, 0.0, &mk()).solved);
+        two.gold[0].target = absent(None, Some("KeyCode"));
+        assert!(!score(&two, &out, 10, 0, 0.0, &mk()).solved);
     }
 
     #[test]

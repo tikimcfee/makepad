@@ -53,7 +53,7 @@ fn contains_word(hay: &str, word: &str) -> bool {
 /// Checks a line-anchored item against `text`: `None` when it holds, else the drift.
 pub fn check_line(text: &str, line: u32, anchor: &Anchor) -> Option<Drift> {
     let lines: Vec<&str> = text.lines().collect();
-    if lines.get(line as usize - 1).is_some_and(|l| anchor_in(anchor, l)) {
+    if (line as usize).checked_sub(1).and_then(|i| lines.get(i)).is_some_and(|l| anchor_in(anchor, l)) {
         return None;
     }
     // the nearest line holding it
@@ -546,6 +546,8 @@ mod tests {
         assert!(check_line("a\nfn f() {}\n", 2, &Anchor::Def("fn f".into())).is_none());
         assert!(matches!(check_line("a\nb\nfn f() {}\n", 1, &Anchor::Def("fn f".into())), Some(Drift::Lines { by: 2, now: 3 })));
         assert!(matches!(check_line("a\n", 1, &Anchor::Def("fn f".into())), Some(Drift::Lost)));
+        // line 0 never underflows: it holds no line, so the anchor is looked for
+        assert!(matches!(check_line("fn f() {}\n", 0, &Anchor::Def("fn f".into())), Some(Drift::Lines { by: 1, now: 1 })));
     }
 
     #[test]
