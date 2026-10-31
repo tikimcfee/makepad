@@ -52,6 +52,10 @@ pub const IMPL_PRIOR: f32 = 0.5;
 pub const FALLBACK_PRIOR: f32 = 0.6;
 /// A chunk of a kind the query names (`enum`, `macro`, `crate`).
 pub const KIND_PRIOR: f32 = 1.5;
+/// Coverage's smoothing: a chunk covering nothing still keeps this share.
+pub const COVER_FLOOR: f32 = 0.5;
+/// How much of its word an inner-run match covers.
+pub const RUN_COVER: f32 = 0.5;
 /// Coverage weight of a named word against a descriptive one.
 pub const NAMED_WEIGHT: f32 = 2.0;
 /// A chunk at or under a path the query names.
@@ -659,6 +663,25 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
     let (c, circle, plan, filter, path_hits, path_idf, shadowed, avg, n) =
         (x.c, x.circle, x.plan, x.filter, &x.path_hits, &x.path_idf, &x.shadowed, &x.avg, x.n);
     let idfs: Vec<f32> = groups.iter().map(|g| idf(n, (x.df(g.role, &g.text) as f32).min(n))).collect();
+    // A word's coverage weight: how rare it is here (the best idf among its terms; a word
+    // with no term here is as rare as can be), doubled for a named word. `makepad` in a makepad
+    // circle covers little; the identifier the query names covers much.
+    let mut word_idf: HashMap<u16, f32> = HashMap::new();
+    for (g, i) in groups.iter().zip(&idfs) {
+        if matches!(g.role, Role::Primary | Role::Phrase | Role::Run) {
+            let e = word_idf.entry(g.word).or_insert(0.0);
+            *e = e.max(*i);
+        }
+    }
+    let max_idf = idf(n, 0.0);
+    let word_weight: HashMap<u16, f32> = plan
+        .content
+        .iter()
+        .map(|w| {
+            let rarity = word_idf.get(w).copied().or_else(|| path_idf.get(w).copied()).unwrap_or(max_idf) / max_idf;
+            (*w, rarity * if plan.named.contains(w) { NAMED_WEIGHT } else { 1.0 })
+        })
+        .collect();
     let mut acc: HashMap<AtKey, (ChunkAt, GroupTfs)> = HashMap::new();
     for (gi, g) in groups.iter().enumerate() {
         let restrict = g.role == Role::PathPart;
@@ -763,6 +786,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         let mut matched: HashMap<u16, usize> = HashMap::new();
         let mut in_name = false;
         let mut phrase_covered: HashSet<u16> = HashSet::new();
+        let mut run_covered: HashSet<u16> = HashSet::new();
         let mut why = Vec::new();
         for (gi, tf) in &tfs {
             let g = &groups[*gi];
@@ -795,11 +819,15 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                     *matched.entry(g.word).or_insert(0) += 1;
                     in_name |= tf[0] > 0.0 && !path_words.contains(&g.word);
                 }
-                Role::Phrase | Role::Run => {
+                Role::Phrase => {
                     for w in g.word..g.word.saturating_add(g.span) {
                         phrase_covered.insert(w);
                     }
                     in_name |= tf[0] > 0.0;
+                }
+                Role::Run => {
+                    run_covered.insert(g.word);
+                    in_name = true;
                 }
                 _ => {}
             }
@@ -826,9 +854,12 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
             why.push(Why { field: Field::Path, term: plan.paths.iter().find(|p| p.word == *word).map(|p| p.token.clone()).unwrap_or_default() });
         }
         let pin_rank = pins.get(&key).copied().unwrap_or(0);
-        let weight = |w: &u16| if plan.named.contains(w) { NAMED_WEIGHT } else { 1.0 };
+        let weight = |w: &u16| word_weight.get(w).copied().unwrap_or(1.0);
         let all: f32 = plan.content.iter().map(weight).sum();
-        let coverage = (1.0 + covered.iter().map(weight).sum::<f32>()) / (1.0 + all);
+        // A word met only through an inner run counts half: the whole token beats a part of it.
+        let partial: f32 = run_covered.iter().filter(|w| !covered.contains(*w)).map(|w| weight(w) * RUN_COVER).sum();
+        let coverage = (COVER_FLOOR + covered.iter().map(weight).sum::<f32>() + partial) / (COVER_FLOOR + all);
+        let covered_any = !covered.is_empty() || !run_covered.is_empty();
         let covered = covered.len() as u16;
         let definition = pin_rank >= 2 && pin_rank != 4 || in_name;
         if definition {
@@ -852,7 +883,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
             at,
             score: score * coverage * coverage * prior,
             covered,
-            primary: !expansions_only && (covered > 0 || pin_rank > 0),
+            primary: !expansions_only && (covered_any || pin_rank > 0),
             definition,
             pin: pin_rank,
             why,
@@ -892,7 +923,7 @@ fn order(c: &OpenCircle, entries: &mut Vec<Scored>, keep: usize) {
     *entries = order.into_iter().filter_map(|i| taken[i].take()).collect();
 }
 
-/// Byte-identical copies collapse into the best-ranked one, which lists the others' locations.
+/// Byte-identical copies collapse into the best-ranked one, which lists the others' paths.
 /// Every chunk of a file carries the file's blob, so a record is (blob, span), never the blob
 /// alone; kind and name keep apart chunks that share a span (a file and its only item).
 fn collapse(c: &OpenCircle, sorted: Vec<Scored>) -> Vec<Scored> {
@@ -903,7 +934,8 @@ fn collapse(c: &OpenCircle, sorted: Vec<Scored>) -> Vec<Scored> {
         if let Some(blob) = v.blob {
             let record = (blob, v.span.lo, v.span.hi, v.kind.as_str(), v.name);
             if let Some(&first) = seen.get(&record) {
-                out[first].also_at.push(location(&v));
+                // A copy has the same lines (same blob, same span): its path says it all.
+                out[first].also_at.push(v.path.to_string());
                 continue;
             }
             seen.insert(record, out.len());
@@ -911,13 +943,4 @@ fn collapse(c: &OpenCircle, sorted: Vec<Scored>) -> Vec<Scored> {
         out.push(e);
     }
     out
-}
-
-/// `path:start` or `path:start-end`.
-pub fn location(v: &ChunkView<'_>) -> String {
-    if v.lines.end > v.lines.start {
-        format!("{}:{}-{}", v.path, v.lines.start, v.lines.end)
-    } else {
-        format!("{}:{}", v.path, v.lines.start)
-    }
 }
