@@ -13,6 +13,8 @@ const REGULAR_FILE_MODES: [u32; 2] = [0o100644, 0o100755];
 pub struct GitRepo {
     repo: Repository,
     id: RepoId,
+    /// The canonical git common dir.
+    common: PathBuf,
 }
 
 fn git_err(context: &str, e: impl std::fmt::Display) -> Error {
@@ -39,6 +41,24 @@ pub fn blob_oid(bytes: &[u8]) -> Oid {
     oid(&makepad_git::oid::hash_object("blob", bytes))
 }
 
+/// The name a repo goes by in every worktree: the main checkout's directory name, from the
+/// git common dir (`<checkout>/.git` gives `<checkout>`; a bare `<name>.git` gives `<name>`).
+fn checkout_name(common: &Path) -> String {
+    let dir = if common.file_name().is_some_and(|n| n == ".git") { common.parent().unwrap_or(common) } else { common };
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    name.strip_suffix(".git").map(str::to_string).unwrap_or(name)
+}
+
+/// [`GitRepo::name`] of the repository whose worktree root is `root`; `None` when `root` is no
+/// worktree root (it has no `.git` entry).
+pub fn repo_name(root: &Path) -> Result<Option<String>, Error> {
+    let Some(paths) = makepad_git::repository_paths(root).map_err(|e| git_err(&format!("{}", root.display()), e))? else {
+        return Ok(None);
+    };
+    let common = paths.common_dir.canonicalize().map_err(|error| Error::Io { context: format!("canonicalize {}", paths.common_dir.display()), error })?;
+    Ok(Some(checkout_name(&common)))
+}
+
 fn change_path(c: TreeChange) -> String {
     match c {
         TreeChange::Added { path, .. } | TreeChange::Deleted { path, .. } | TreeChange::Modified { path, .. } => path,
@@ -54,7 +74,13 @@ impl GitRepo {
             error,
         })?;
         let id = RepoId(hash64(common.to_string_lossy().as_bytes()));
-        Ok(GitRepo { repo, id })
+        Ok(GitRepo { repo, id, common })
+    }
+
+    /// The repo's name, the same in every worktree: `makepad` for each worktree of a clone at
+    /// `.../makepad` (notes labels use it).
+    pub fn name(&self) -> String {
+        checkout_name(&self.common)
     }
 
     fn commit_tree(&mut self, commit: ObjectId) -> Result<ObjectId, Error> {
