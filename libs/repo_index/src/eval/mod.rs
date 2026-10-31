@@ -226,17 +226,21 @@ impl Harness for Eval<'_> {
             }
         }
         // a pointer counts only circles that are built, so build every circle a pointer can name
-        // first: the run is then a function of (revision, configuration), never of build state
+        // first: the run is then a function of (revision, configuration), never of build state.
+        // Each circle is built on its own; one that cannot be (a notes source missing here) is
+        // one failure, and only the questions that point at it go without its pointer.
         let mut prebuilt: Vec<RevSpec> = Vec::new();
-        for ((rev, _), group) in &groups {
+        for ((rev, _), _) in &groups {
             if prebuilt.contains(rev) {
                 continue;
             }
             prebuilt.push(rev.clone());
-            let all = pointer_circles(&manifest, &self.root);
-            if let Err(e) = self.circles.open(&manifest, &all, rev) {
-                for q in group {
-                    report.failures.push(format!("{}: building the circles pointers name at {}: {e}", q.id, rev_text(rev)));
+            for c in pointer_circles(&manifest, &self.root) {
+                if let Err(e) = self.circles.open(&manifest, std::slice::from_ref(&c), rev) {
+                    let f = format!("circle {} cannot be built here: {e}", c.0);
+                    if !report.failures.contains(&f) {
+                        report.failures.push(f);
+                    }
                 }
             }
         }
@@ -688,6 +692,31 @@ mod tests {
         assert!(others.borrow()[0].contains(&"notes:t".to_string()), "{:?}", others.borrow());
         assert!(others.borrow()[0].contains(&"makepad:history".to_string()));
         assert!(store.state.borrow().manifests.len() >= 2);
+    }
+
+    #[test]
+    fn a_circle_that_cannot_be_built_is_one_failure_not_every_question() {
+        let top = std::env::temp_dir().join(format!("repo-index-eval-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let root = top.join("makepad");
+        std::fs::create_dir_all(&root).unwrap();
+        let conf = top.join("c.conf");
+        std::fs::write(&conf, format!("notes:gone = notes {}\n", top.join("nowhere").display())).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["9a76551d7", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, &[("a.rs", "fn a() {}\n")]);
+        let (mut circles, _) = opener(repo, &conf);
+        let mut answers = HashMap::new();
+        answers.insert("alpha".into(), FindOutput { blocks: vec![block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false)], pointers: vec![] });
+        let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
+        let mut r = FakeRepo::new(&root);
+        let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
+        let questions: Vec<Question> =
+            ["w1", "w2"].iter().map(|id| Question { query: "alpha".into(), ..q(id, &["makepad"], vec![(2, path("a.rs", Some(1)))]) }).collect();
+        let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: None };
+        let report = eval.run(&questions, &opts).unwrap();
+        assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+        assert!(report.failures[0].starts_with("circle notes:gone cannot be built here"), "{:?}", report.failures);
+        assert!(report.rows.iter().all(|r| r.solved));
     }
 
     #[test]
