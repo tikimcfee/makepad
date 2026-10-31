@@ -341,7 +341,7 @@ pub(crate) mod tests {
             "x01",
             &["makepad"],
             vec![
-                (2, GoldTarget::Absent { scope: None, semantic: false }),
+                (2, GoldTarget::Absent { scope: None, semantic: false, term: None }),
                 (2, GoldTarget::Pointer { circle: n("notes:t"), count: Some(9), unit: PointerUnit::Blobs }),
             ],
         );
@@ -359,7 +359,7 @@ pub(crate) mod tests {
         let plain = q("w", &["makepad"], vec![(2, path("a.rs", None))]);
         assert!(score(&plain, &absent, 10, 0, 0.0, &mk()).false_absence);
         // a premise absence (rel 1) exempts the question, and a fn scope looks at definitions
-        let premise = q("w22", &["makepad"], vec![(2, path("jit.rs", Some(1243))), (1, GoldTarget::Absent { scope: Some(AbsentScope::Fn("unit_here".into())), semantic: false })]);
+        let premise = q("w22", &["makepad"], vec![(2, path("jit.rs", Some(1243))), (1, GoldTarget::Absent { scope: Some(AbsentScope::Fn("unit_here".into())), semantic: false, term: None })]);
         let out = FindOutput { blocks: vec![block("makepad", vec![hit("jit.rs", 1243, Kind::Fn, "cur_unit")], true)], pointers: vec![] };
         let s = score(&premise, &out, 10, 0, 0.0, &mk());
         assert!(s.solved && !s.false_absence);
@@ -367,7 +367,7 @@ pub(crate) mod tests {
 
     #[test]
     fn forbid_is_cross_circle_and_distractors_rank_only() {
-        let mut question = q("x03", &["makepad"], vec![(2, GoldTarget::Absent { scope: None, semantic: false })]);
+        let mut question = q("x03", &["makepad"], vec![(2, GoldTarget::Absent { scope: None, semantic: false, term: None })]);
         question.forbid = vec!["notes:*".into(), "local/agent_state/*".into()];
         let leak = hit("local/agent_state/port/g.rs", 1, Kind::Fn, "R");
         let mut tagged = hit("x.md", 1, Kind::Note, "n");

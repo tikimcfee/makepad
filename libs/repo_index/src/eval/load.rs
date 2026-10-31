@@ -146,13 +146,14 @@ fn gold(v: &Value, manifest: &CircleManifest, at: &At) -> Result<Gold, Error> {
         check_keys(v, &with(&["dependents", "scope"]), "a dependents item", at)?;
         GoldTarget::Dependents { names: strings(v, "dependents", at)?, scope: opt_str(v, "scope", at)? }
     } else if v.get("absent").is_some() {
-        check_keys(v, &with(&["absent", "scope", "semantic"]), "an absent item", at)?;
+        check_keys(v, &with(&["absent", "scope", "semantic", "term"]), "an absent item", at)?;
         if v.get("absent") != Some(&Value::Bool(true)) {
             return Err(at.err("`absent` is true"));
         }
         GoldTarget::Absent {
             scope: opt_str(v, "scope", at)?.map(|s| absent_scope(&s, manifest)),
             semantic: v.get("semantic").and_then(Value::as_bool).unwrap_or(false),
+            term: opt_str(v, "term", at)?,
         }
     } else if v.get("pointer").is_some() {
         check_keys(v, &with(&["pointer", "count", "unit"]), "a pointer item", at)?;
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn every_gold_form_parses() {
-        let line = r##"{"id":"q1","query":"KeyCode enum","agent_prompt":"hint","rev":"9a76551d7","precondition":{"unconfigured":"commercial"},"circles":["makepad","makepad:history"],"type":"where","subtype":"ident","difficulty":"medium","gold":[{"path":"a/b.rs","line":36,"end":40,"alt_lines":[[50,60]],"rel":2,"symbol":{"def":"enum KeyCode"}},{"note":"topic/x.md","line":3,"rel":1,"symbol":{"heading":"# x"},"requires":"notes:topic"},{"package":"pkg","rel":1},{"commit":"abc1234","alt":["def5678"],"via":"pointer","rel":1},{"dependents":[],"scope":"public tree","rel":2},{"absent":true,"scope":"path:apps/x","rel":1},{"absent":true,"scope":"fn unit_here","rel":1},{"absent":true,"scope":"makepad","semantic":true,"rel":1},{"pointer":"notes:topic","count":9,"unit":"blobs","rel":2},{"error":"unconfigured circle","rel":2}],"distractors":[{"path":"c.rs","line":5,"rel":0,"symbol":{"text":"x"}}],"forbid":["notes:*"],"notes":"n","source":"s"}"##;
+        let line = r##"{"id":"q1","query":"KeyCode enum","agent_prompt":"hint","rev":"9a76551d7","precondition":{"unconfigured":"commercial"},"circles":["makepad","makepad:history"],"type":"where","subtype":"ident","difficulty":"medium","gold":[{"path":"a/b.rs","line":36,"end":40,"alt_lines":[[50,60]],"rel":2,"symbol":{"def":"enum KeyCode"}},{"note":"topic/x.md","line":3,"rel":1,"symbol":{"heading":"# x"},"requires":"notes:topic"},{"package":"pkg","rel":1},{"commit":"abc1234","alt":["def5678"],"via":"pointer","rel":1},{"dependents":[],"scope":"public tree","rel":2},{"absent":true,"scope":"path:apps/x","rel":1},{"absent":true,"scope":"fn unit_here","rel":1},{"absent":true,"scope":"makepad","semantic":true,"rel":1,"term":"glyph"},{"pointer":"notes:topic","count":9,"unit":"blobs","rel":2},{"error":"unconfigured circle","rel":2}],"distractors":[{"path":"c.rs","line":5,"rel":0,"symbol":{"text":"x"}}],"forbid":["notes:*"],"notes":"n","source":"s"}"##;
         let q = question(line, &QuestionSet::Shipped, &manifest(), "f", 1).unwrap();
         assert_eq!(q.rev, RevSpec::Pinned("9a76551d7".into()));
         assert_eq!(q.precondition, Some(Precondition::Unconfigured(CircleName("commercial".into()))));
@@ -273,9 +274,9 @@ mod tests {
         assert_eq!(q.gold[0].symbol, Some(Anchor::Def("enum KeyCode".into())));
         assert_eq!(q.gold[1].requires, Some(CircleName("notes:topic".into())));
         assert!(matches!(&q.gold[3].target, GoldTarget::Commit { via_pointer: true, alt, .. } if alt == &["def5678"]));
-        assert!(matches!(&q.gold[5].target, GoldTarget::Absent { scope: Some(AbsentScope::Path(p)), semantic: false } if p == "apps/x"));
+        assert!(matches!(&q.gold[5].target, GoldTarget::Absent { scope: Some(AbsentScope::Path(p)), semantic: false, term: None } if p == "apps/x"));
         assert!(matches!(&q.gold[6].target, GoldTarget::Absent { scope: Some(AbsentScope::Fn(f)), .. } if f == "unit_here"));
-        assert!(matches!(&q.gold[7].target, GoldTarget::Absent { scope: Some(AbsentScope::Circle(_)), semantic: true }));
+        assert!(matches!(&q.gold[7].target, GoldTarget::Absent { scope: Some(AbsentScope::Circle(_)), semantic: true, term: Some(t) } if t == "glyph"));
         assert!(matches!(&q.gold[8].target, GoldTarget::Pointer { count: Some(9), unit: PointerUnit::Blobs, .. }));
         assert_eq!(q.distractors[0].rel, 0);
         let tip = line.replace("\"9a76551d7\"", "\"tip\"");

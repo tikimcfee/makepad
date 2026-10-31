@@ -1252,8 +1252,10 @@ pub enum GoldTarget {
     /// is named (a superset is fine).
     Dependents { names: Vec<String>, scope: Option<String> },
     /// The output's absent flag for the scope (default: every queried circle). `semantic`:
-    /// verify-gold does not check it lexically.
-    Absent { scope: Option<AbsentScope>, semantic: bool },
+    /// verify-gold does not check it lexically. `term`: the lexical needle verify-gold checks in
+    /// the scope (default: the query when it is one token): tracked files, or for a history
+    /// circle's scope, the messages and touched paths of commits reachable at the revision.
+    Absent { scope: Option<AbsentScope>, semantic: bool, term: Option<String> },
     /// A pointer line to the circle; `count` in `unit` ([`PointerUnit::Blobs`]).
     Pointer { circle: CircleName, count: Option<u64>, unit: PointerUnit },
     /// The command fails with an error naming the circle (`"unconfigured circle"`), never
