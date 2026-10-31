@@ -13,23 +13,8 @@ use crate::query::handle::format as handle_text;
 use crate::{
     CircleBlock, CircleName, CircleStatus, CrateView, Field, FindOutput, Hit, Origin, Output, Pointer, PointerUnit,
     Record, RefsOutput, Render, ShowOutput, StaleFinding, StaleKind, StaleOutput, StatusOutput, UseSummary,
-    MAX_GIST_CHARS, MAX_LINE_CHARS,
+    MAX_LINE_CHARS,
 };
-
-/// A chunk's gist: the first line of its doc text, cut at the end of its first sentence and at
-/// [`MAX_GIST_CHARS`] characters. Never generated; empty when there is no doc. The store keeps
-/// this as [`crate::ChunkView::gist`].
-pub fn gist(doc: &str) -> &str {
-    let line = doc.trim_start().lines().next().unwrap_or("").trim_end();
-    let line = match line.find(". ") {
-        Some(end) => &line[..end + 1],
-        None => line,
-    };
-    match line.char_indices().nth(MAX_GIST_CHARS) {
-        Some((cut, _)) => &line[..cut],
-        None => line,
-    }
-}
 
 /// The [`Render`] implementation.
 #[derive(Clone, Copy, Debug, Default)]
@@ -564,16 +549,6 @@ mod tests {
         for k in keys {
             assert!(v.get(k).is_some(), "{k} missing in {json}");
         }
-    }
-
-    #[test]
-    fn gist_is_the_first_sentence_of_the_first_line() {
-        assert_eq!(gist("Spins the gizmo. Then stops."), "Spins the gizmo.");
-        assert_eq!(gist("\n  Turns per tick,\n at most."), "Turns per tick,");
-        assert_eq!(gist(""), "");
-        let long = "x".repeat(200);
-        assert_eq!(gist(&long).chars().count(), MAX_GIST_CHARS);
-        assert_eq!(gist(&"é".repeat(100)).chars().count(), MAX_GIST_CHARS);
     }
 
     #[test]
