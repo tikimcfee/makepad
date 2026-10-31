@@ -794,6 +794,10 @@ pub trait Extract {
     /// The chunks of one file's bytes (the overlay re-extracts changed files with it). Empty for
     /// a path the circle's exclusions cover.
     fn extract_file(&mut self, circle: &CircleName, def: &BaseCircle, path: &str, bytes: &[u8]) -> Result<Vec<Chunk>, Error>;
+    /// [`Extract::extract_file`] for many `(path, bytes)` files at once, on the shared workers
+    /// ([`workers::fan_out`]): one result per file, in order, each what `extract_file` returns
+    /// for it (`parent` indexes that file's own chunks); the first failing file's error.
+    fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error>;
 }
 
 pub trait Tokenize {

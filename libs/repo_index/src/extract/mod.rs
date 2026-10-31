@@ -333,6 +333,56 @@ impl Extractor {
         Ok(t.resolved.as_ref())
     }
 
+    /// One file's chunks ([`Extract::extract_file`]); `&self`, so the workers can share it.
+    fn file(&self, circle: &CircleName, def: &BaseCircle, path: &str, bytes: &[u8]) -> Result<Vec<Chunk>, Error> {
+        let batch = match &def.source {
+            BaseSource::Tree { .. } => {
+                if excluded(path, &def.exclude).is_some() {
+                    return Ok(Vec::new());
+                }
+                let blob = Some(git::blob_oid(bytes));
+                match ext(path) {
+                    "rs" => rust_batch(circle, path, bytes, blob, None, rust::is_generated(bytes), &mut ExtractReport::default()).0,
+                    "md" => doc_batch(circle, path, bytes, blob, None),
+                    "splash" => splash_batch(circle, path, bytes, blob, None),
+                    _ if file_name(path) == "Cargo.toml" => {
+                        let text = String::from_utf8_lossy(bytes);
+                        match cargo::written_card(path, &text) {
+                            Ok(Some((name, card, vendored))) => vec![crate_chunk(circle, &name, card, vendored)],
+                            Ok(None) => Vec::new(),
+                            Err(message) => return Err(Error::Parse { file: path.to_string(), line: 0, message }),
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            BaseSource::Notes { sources } => {
+                let Some((src, rel)) = sources.iter().find_map(|s| path.strip_prefix(&format!("{}/", s.label)).map(|rel| (s, rel))) else {
+                    return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("no source of {} has this path's label", circle.0) });
+                };
+                if excluded(rel, &def.exclude).is_some() {
+                    return Ok(Vec::new());
+                }
+                let cite = match &self.cite {
+                    None => None,
+                    Some(CiteTarget { resolved: Some(c), .. }) => Some(c),
+                    Some(CiteTarget { resolved: None, circle: cited, .. }) => {
+                        return Err(Error::Parse {
+                            file: path.to_string(),
+                            line: 0,
+                            message: format!("{}'s cite of {} is resolved by extracting the circle first", circle.0, cited.0),
+                        });
+                    }
+                };
+                note_batch(circle, &src.label, rel, bytes, cite)?
+            }
+            BaseSource::History { .. } => {
+                return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("{} is a history circle: it has no files", circle.0) });
+            }
+        };
+        Ok(admit(batch, &def.families))
+    }
+
     fn tree(&mut self, circle: &CircleName, def: &BaseCircle, rev: &Rev, repo: &mut dyn Repo, emit: &mut Emit, report: &mut ExtractReport) -> Result<(), Error> {
         let mut files = Vec::new();
         for f in repo.files(rev.tree)? {
@@ -480,52 +530,12 @@ impl Extract for Extractor {
     }
 
     fn extract_file(&mut self, circle: &CircleName, def: &BaseCircle, path: &str, bytes: &[u8]) -> Result<Vec<Chunk>, Error> {
-        let batch = match &def.source {
-            BaseSource::Tree { .. } => {
-                if excluded(path, &def.exclude).is_some() {
-                    return Ok(Vec::new());
-                }
-                let blob = Some(git::blob_oid(bytes));
-                match ext(path) {
-                    "rs" => rust_batch(circle, path, bytes, blob, None, rust::is_generated(bytes), &mut ExtractReport::default()).0,
-                    "md" => doc_batch(circle, path, bytes, blob, None),
-                    "splash" => splash_batch(circle, path, bytes, blob, None),
-                    _ if file_name(path) == "Cargo.toml" => {
-                        let text = String::from_utf8_lossy(bytes);
-                        match cargo::written_card(path, &text) {
-                            Ok(Some((name, card, vendored))) => vec![crate_chunk(circle, &name, card, vendored)],
-                            Ok(None) => Vec::new(),
-                            Err(message) => return Err(Error::Parse { file: path.to_string(), line: 0, message }),
-                        }
-                    }
-                    _ => Vec::new(),
-                }
-            }
-            BaseSource::Notes { sources } => {
-                let Some((src, rel)) = sources.iter().find_map(|s| path.strip_prefix(&format!("{}/", s.label)).map(|rel| (s, rel))) else {
-                    return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("no source of {} has this path's label", circle.0) });
-                };
-                if excluded(rel, &def.exclude).is_some() {
-                    return Ok(Vec::new());
-                }
-                let cite = match &self.cite {
-                    None => None,
-                    Some(CiteTarget { resolved: Some(c), .. }) => Some(c),
-                    Some(CiteTarget { resolved: None, circle: cited, .. }) => {
-                        return Err(Error::Parse {
-                            file: path.to_string(),
-                            line: 0,
-                            message: format!("{}'s cite of {} is resolved by extracting the circle first", circle.0, cited.0),
-                        });
-                    }
-                };
-                note_batch(circle, &src.label, rel, bytes, cite)?
-            }
-            BaseSource::History { .. } => {
-                return Err(Error::Parse { file: path.to_string(), line: 0, message: format!("{} is a history circle: it has no files", circle.0) });
-            }
-        };
-        Ok(admit(batch, &def.families))
+        self.file(circle, def, path, bytes)
+    }
+
+    fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error> {
+        let this: &Extractor = self;
+        crate::workers::fan_out(files.len(), |i| this.file(circle, def, &files[i].0, &files[i].1)).into_iter().collect()
     }
 }
 
