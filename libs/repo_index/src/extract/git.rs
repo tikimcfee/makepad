@@ -15,6 +15,20 @@ pub struct GitRepo {
     id: RepoId,
     /// The canonical git common dir.
     common: PathBuf,
+    /// The last tree flattened ([`Repo::files`], or the base side of [`Repo::changes`]) and its
+    /// regular files, sorted: a tree id names its content, so it never goes stale.
+    flat: Option<(Oid, Vec<TreeFile>)>,
+}
+
+/// A flattened tree's regular files, sorted by path.
+fn regular_files(flat: HashMap<String, (ObjectId, u32)>) -> Vec<TreeFile> {
+    let mut files: Vec<TreeFile> = flat
+        .into_iter()
+        .filter(|(_, (_, mode))| REGULAR_FILE_MODES.contains(mode))
+        .map(|(path, (blob, mode))| TreeFile { path, blob: oid(&blob), mode })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 fn git_err(context: &str, e: impl std::fmt::Display) -> Error {
@@ -74,7 +88,7 @@ impl GitRepo {
             error,
         })?;
         let id = RepoId(hash64(common.to_string_lossy().as_bytes()));
-        Ok(GitRepo { repo, id, common })
+        Ok(GitRepo { repo, id, common, flat: None })
     }
 
     /// The repo's name, the same in every worktree: `makepad` for each worktree of a clone at
@@ -135,13 +149,14 @@ impl Repo for GitRepo {
     }
 
     fn files(&mut self, tree: Oid) -> Result<Vec<TreeFile>, Error> {
+        if let Some((t, files)) = &self.flat {
+            if *t == tree {
+                return Ok(files.clone());
+            }
+        }
         let flat = self.repo.flatten_tree_with_mode(&object_id(&tree)).map_err(|e| git_err("flatten tree", e))?;
-        let mut files: Vec<TreeFile> = flat
-            .into_iter()
-            .filter(|(_, (_, mode))| REGULAR_FILE_MODES.contains(mode))
-            .map(|(path, (blob, mode))| TreeFile { path, blob: oid(&blob), mode })
-            .collect();
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = regular_files(flat);
+        self.flat = Some((tree, files.clone()));
         Ok(files)
     }
 
@@ -176,12 +191,8 @@ impl Repo for GitRepo {
             unreachable!("fan_out returns its parts in index order")
         };
         let status = status.map_err(|e| git_err("worktree status", e))?;
-        let base_files: HashMap<String, Oid> = flat
-            .map_err(|e| git_err("flatten base tree", e))?
-            .into_iter()
-            .filter(|(_, (_, mode))| REGULAR_FILE_MODES.contains(mode))
-            .map(|(path, (blob, _))| (path, oid(&blob)))
-            .collect();
+        let files = regular_files(flat.map_err(|e| git_err("flatten base tree", e))?);
+        let base_files: HashMap<&str, Oid> = files.iter().map(|f| (f.path.as_str(), f.blob)).collect();
         let off_index: HashSet<String> = status.entries.into_iter().map(|e| e.path).collect();
         let mut current: HashMap<&str, Option<Oid>> = HashMap::new();
         // regular files only, as the base side ([`Repo::files`])
@@ -191,7 +202,7 @@ impl Repo for GitRepo {
             }
         }
         let mut candidates: Vec<&str> = current.iter().filter(|(p, o)| base_files.get(**p) != o.as_ref()).map(|(p, _)| *p).collect();
-        candidates.extend(base_files.keys().filter(|p| !current.contains_key(p.as_str())).map(String::as_str));
+        candidates.extend(base_files.keys().filter(|p| !current.contains_key(**p)).copied());
         candidates.extend(off_index.iter().map(String::as_str));
         candidates.sort_unstable();
         candidates.dedup();
@@ -208,6 +219,7 @@ impl Repo for GitRepo {
                 _ => {}
             }
         }
+        self.flat = Some((base.tree, files));
         Ok(out)
     }
 
