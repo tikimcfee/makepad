@@ -333,6 +333,7 @@ pub struct Summary {
     pub r10: f32,
     pub mrr: f32,
     pub ndcg: f32,
+    /// The share of questions with a distractor above their first rel-2 hit in some block.
     pub distractor_above: f32,
     pub bytes_p50: u32,
     pub bytes_p90: u32,
@@ -361,7 +362,8 @@ pub fn summarize_with(report: &EvalReport, qtype: &dyn Fn(&str) -> String) -> Ve
         rr: f32,
         ranked_items: u32,
         ndcg: Vec<f32>,
-        distractor: u32,
+        /// Questions with a distractor above their first rel-2 hit in some block, once each.
+        distractor: Vec<String>,
         bytes: Vec<u32>,
         ms: Vec<f32>,
     }
@@ -379,7 +381,7 @@ pub fn summarize_with(report: &EvalReport, qtype: &dyn Fn(&str) -> String) -> Ve
                 rr: 0.0,
                 ranked_items: 0,
                 ndcg: Vec::new(),
-                distractor: 0,
+                distractor: Vec::new(),
                 bytes: Vec::new(),
                 ms: Vec::new(),
             });
@@ -405,7 +407,9 @@ pub fn summarize_with(report: &EvalReport, qtype: &dyn Fn(&str) -> String) -> Ve
             if !row.ndcg.is_nan() {
                 a.ndcg.push(row.ndcg);
             }
-            a.distractor += u32::from(row.distractor_above);
+            if row.distractor_above && !a.distractor.contains(&row.id) {
+                a.distractor.push(row.id.clone());
+            }
         }
     }
     accs.into_iter()
@@ -421,7 +425,7 @@ pub fn summarize_with(report: &EvalReport, qtype: &dyn Fn(&str) -> String) -> Ve
                 r10: a.r[2] / n,
                 mrr: a.rr / n,
                 ndcg: if a.ndcg.is_empty() { f32::NAN } else { a.ndcg.iter().sum::<f32>() / a.ndcg.len() as f32 },
-                distractor_above: a.distractor as f32 / a.ids.len().max(1) as f32,
+                distractor_above: a.distractor.len() as f32 / a.ids.len().max(1) as f32,
                 bytes_p50: pct(&mut a.bytes, 0.5).unwrap_or(0),
                 bytes_p90: pct(&mut a.bytes, 0.9).unwrap_or(0),
                 ms_p50: pct(&mut a.ms, 0.5).unwrap_or(0.0),
@@ -770,6 +774,33 @@ mod tests {
         assert!(others.borrow()[0].contains(&"notes:t".to_string()), "{:?}", others.borrow());
         assert!(others.borrow()[0].contains(&"makepad:history".to_string()));
         assert!(store.state.borrow().manifests.len() >= 2);
+    }
+
+    #[test]
+    fn a_distractor_counts_once_per_question_whatever_its_blocks() {
+        let row = |id: &str, circle: &str, above: bool| QuestionRow {
+            id: id.into(),
+            set: QuestionSet::Shipped,
+            rev: "c0ffee123".into(),
+            circle: CircleName(circle.into()),
+            ranks_of_rel2: vec![Some(1)],
+            ndcg: 1.0,
+            distractor_above: above,
+            bytes: 0,
+            ms: 0.0,
+            absent_said: false,
+            forbidden_hits: 0,
+            skipped_items: 0,
+            solved: true,
+        };
+        // q1 has a distractor above its gold in both its blocks, q2 in neither
+        let report = EvalReport {
+            rows: vec![row("q1", "makepad", true), row("q1", "makepad:history", true), row("q2", "makepad", false)],
+            ..EvalReport::default()
+        };
+        let s = summarize(&report);
+        assert_eq!(s[0].questions, 2);
+        assert!((s[0].distractor_above - 0.5).abs() < 1e-6, "{}", s[0].distractor_above);
     }
 
     #[test]
