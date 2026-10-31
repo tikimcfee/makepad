@@ -711,15 +711,35 @@ impl<'a> DictView<'a> {
     /// Every entry in key order: key, value, count. Stops at the first entry that does not
     /// decode (the caller reports it by the shortfall against [`DictView::len`]).
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, &'a [u8], u32)> + '_ {
-        let mut i = 0;
-        let mut r = self.block(0);
+        self.iter_block(0)
+    }
+
+    /// The entries whose key starts with `prefix`, in key order: from the block that can hold
+    /// the first of them, decoded forward while keys match.
+    pub fn with_prefix<'p>(&'p self, prefix: &'p [u8]) -> impl Iterator<Item = (Vec<u8>, &'a [u8], u32)> + 'p {
+        let nb = self.n.div_ceil(BLOCK);
+        // the last block whose first key is < prefix holds the first match, if any precedes it
+        let (mut lo, mut hi) = (0, nb);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.first_key(mid) {
+                Some(k) if k < prefix => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        self.iter_block(lo.saturating_sub(1)).skip_while(move |(k, _, _)| k.as_slice() < prefix).take_while(move |(k, _, _)| k.starts_with(prefix))
+    }
+
+    fn iter_block(&self, start: usize) -> impl Iterator<Item = (Vec<u8>, &'a [u8], u32)> + '_ {
+        let mut i = (start * BLOCK).min(self.n);
+        let mut r = self.block(start.min(self.n.div_ceil(BLOCK)));
         let mut k: Vec<u8> = Vec::new();
         let mut val = 0i64;
         std::iter::from_fn(move || {
             if i == self.n {
                 return None;
             }
-            if i % BLOCK == 0 {
+            if i.is_multiple_of(BLOCK) {
                 r = self.block(i / BLOCK);
                 val = 0;
             }

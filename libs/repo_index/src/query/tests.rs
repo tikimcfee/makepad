@@ -86,6 +86,12 @@ impl SegmentRead for MemSegment {
             tf.iter().any(|t| *t > 0).then_some(Posting { chunk: ChunkId(i as u32), tf })
         }))
     }
+    fn terms_with_prefix(&self, form: TermForm, prefix: &str) -> Vec<String> {
+        let mut out: Vec<String> = self.terms.iter().flat_map(|t| &t.terms).filter(|o| o.form == form && o.text.starts_with(prefix)).map(|o| o.text.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
     fn chunk(&self, id: ChunkId) -> ChunkView<'_> {
         let c = &self.chunks[id.0 as usize];
         ChunkView {

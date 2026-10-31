@@ -648,6 +648,9 @@ pub trait SegmentRead {
     fn chunk_count(&self) -> u32;
     fn df(&self, form: TermForm, term: &str) -> u32;
     fn postings(&self, form: TermForm, term: &str) -> Box<dyn Iterator<Item = Posting> + '_>;
+    /// The distinct terms of `form` that start with `prefix`, in byte order (a range scan of
+    /// the sorted term dictionary; an empty prefix gives every term of the form).
+    fn terms_with_prefix(&self, form: TermForm, prefix: &str) -> Vec<String>;
     fn chunk(&self, id: ChunkId) -> ChunkView<'_>;
     fn keys(&self, id: ChunkId) -> Keys;
     fn detail(&self, id: ChunkId) -> Detail;
