@@ -71,6 +71,10 @@ fn circle_rev(c: &OpenCircle) -> String {
 
 impl Search for Engine {
     fn find(&self, opened: &Opened, query: &Query) -> Result<FindOutput, Error> {
+        // A word is a whitespace-free token: a caller that passed the whole query as one quoted
+        // argument gets the same answer as one that passed its words.
+        let split = Query { words: query.words.iter().flat_map(|w| w.split_whitespace()).map(String::from).collect(), ..query.clone() };
+        let query = &split;
         let terms = self.terms.query_terms(&query.words);
         let plan = Plan::new(&query.words, &terms);
         let filter = Filter { kinds: query.kinds.clone(), packages: query.packages.clone(), paths: query.paths.clone(), any_rev: false };
