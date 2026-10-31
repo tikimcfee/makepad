@@ -76,11 +76,13 @@ struct RunCtx<'a> {
     manifest: &'a CircleManifest,
     configured: &'a [CircleName],
     opts: &'a EvalOpts,
+    /// Questions whose pinned notes changed: asked for containment only.
+    stale: &'a [String],
 }
 
 impl Eval<'_> {
     fn run_group(&mut self, ctx: &RunCtx, rev: &RevSpec, circles_of: &[CircleName], group: &[&Question], report: &mut EvalReport) {
-        let RunCtx { manifest, configured, opts } = *ctx;
+        let RunCtx { manifest, configured, opts, stale } = *ctx;
         let opened = match self.circles.open(manifest, circles_of, rev) {
             Ok(o) => o,
             Err(e) => {
@@ -115,11 +117,16 @@ impl Eval<'_> {
             };
             let bytes = self.render.text(&Output::Find(out.clone())).len() as u32;
             let scored = score::score(q, &out, opts.k, bytes, ms, configured);
-            if scored.false_absence {
-                report.failures.push(format!("{}: false absence (absent claimed, gold exists)", q.id));
-            }
             if scored.forbidden > 0 {
                 report.failures.push(format!("{}: containment: {} forbidden records ranked", q.id, scored.forbidden));
+            }
+            // a stale question keeps its containment gate (it never depends on the gold's
+            // counts); its scores, pointer counts and absence check wait for fresh gold
+            if stale.contains(&q.id) {
+                continue;
+            }
+            if scored.false_absence {
+                report.failures.push(format!("{}: false absence (absent claimed, gold exists)", q.id));
             }
             if scored.rows.is_empty() {
                 report.failures.push(format!("{}: no block for {:?}", q.id, names(&q.circles)));
@@ -252,7 +259,6 @@ impl Harness for Eval<'_> {
             }
             if let Some(why) = stale_pin(&manifest, q)? {
                 report.stale.push((q.id.clone(), why));
-                continue;
             }
             let key = (q.rev.clone(), q.circles.clone());
             match groups.iter_mut().find(|(k, _)| *k == key) {
@@ -279,7 +285,8 @@ impl Harness for Eval<'_> {
                 }
             }
         }
-        let ctx = RunCtx { manifest: &manifest, configured: &configured, opts };
+        let stale: Vec<String> = report.stale.iter().map(|(id, _)| id.clone()).collect();
+        let ctx = RunCtx { manifest: &manifest, configured: &configured, opts, stale: &stale };
         for ((rev, circles_of), group) in &groups {
             self.run_group(&ctx, rev, circles_of, group, &mut report);
         }
@@ -787,9 +794,28 @@ mod tests {
         let fresh = eval.run(std::slice::from_ref(&question), &opts).unwrap();
         assert!(fresh.stale.is_empty() && fresh.rows.len() == 1, "unchanged notes: scored");
         std::fs::write(top.join("mail/t/b.md"), "# b\n").unwrap();
-        let later = eval.run(&[question], &opts).unwrap();
+        let later = eval.run(std::slice::from_ref(&question), &opts).unwrap();
         assert!(later.rows.is_empty() && later.failures.is_empty(), "stale: neither scored nor failed");
         assert_eq!(later.stale.len(), 1);
+        // but its containment gate still holds: a forbidden record ranked is a failure
+        let mut leaking = HashMap::new();
+        leaking.insert("x".to_string(), FindOutput { blocks: vec![block("makepad", vec![hit("local/agent_state/port/g.rs", 1, Kind::Fn, "g")], false)], pointers: vec![] });
+        let search2 = TableSearch { answers: leaking, calls: RefCell::new(Vec::new()) };
+        let mut r2 = FakeRepo::new(&root);
+        let (mut circles2, _) = opener(
+            {
+                let mut repo = FakeRepo::new(&root);
+                repo.rev(&["9a76551d7", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, &[]);
+                repo
+            },
+            &conf,
+        );
+        let mut eval2 = Eval { circles: &mut circles2, search: &search2, render: &LenRender, repo: &mut r2, root: root.clone() };
+        let guarded = Question { forbid: vec!["local/agent_state/*".into()], ..question.clone() };
+        let leak = eval2.run(&[guarded], &opts).unwrap();
+        assert_eq!(leak.stale.len(), 1);
+        assert!(leak.rows.is_empty(), "still not scored");
+        assert_eq!(leak.failures, ["n01: containment: 1 forbidden records ranked"]);
         assert!(later.stale[0].1.starts_with(&format!("notes:t changed since its gold: pinned {pinned:016x}")), "{:?}", later.stale);
         assert!(report_text(&later, &|_| "circle".into()).contains("stale n01: notes:t changed"));
     }
