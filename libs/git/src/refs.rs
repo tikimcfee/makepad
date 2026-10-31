@@ -40,13 +40,25 @@ fn ref_dir<'a>(git_dir: &'a Path, common_dir: &'a Path, name: &str) -> &'a Path 
 /// Read HEAD — returns Symbolic("refs/heads/main") or Direct(oid).
 pub fn read_head(git_dir: &Path) -> Result<RefTarget, GitError> {
     let head_path = git_dir.join("HEAD");
-    let content = fs::read_to_string(&head_path)?;
-    let content = content.trim_end();
+    parse_ref_contents("HEAD", &fs::read_to_string(&head_path)?)
+}
 
-    if let Some(rest) = content.strip_prefix("ref: ") {
-        Ok(RefTarget::Symbolic(rest.to_string()))
-    } else {
-        Ok(RefTarget::Direct(ObjectId::from_hex(content)?))
+/// Parse a loose ref file as git does: `ref:` and a target name, or an
+/// object id that may be followed by whitespace and more data (as
+/// `FETCH_HEAD` is).
+pub fn parse_ref_contents(name: &str, content: &str) -> Result<RefTarget, GitError> {
+    if let Some(rest) = content.strip_prefix("ref:") {
+        return Ok(RefTarget::Symbolic(rest.trim().to_string()));
+    }
+    let hex = content.get(..40).filter(|_| {
+        content[40..].chars().next().is_none_or(|c| c.is_ascii_whitespace())
+    });
+    match hex {
+        Some(hex) => Ok(RefTarget::Direct(ObjectId::from_hex(hex)?)),
+        None => Err(GitError::InvalidRef(format!(
+            "{name}: neither an object id nor a symbolic ref: {:?}",
+            content.trim_end()
+        ))),
     }
 }
 
@@ -67,12 +79,7 @@ pub fn read_ref_in(
     // Try loose ref first
     let loose_path = ref_dir(git_dir, common_dir, name).join(name);
     if loose_path.is_file() {
-        let content = fs::read_to_string(&loose_path)?;
-        let content = content.trim_end();
-        if let Some(rest) = content.strip_prefix("ref: ") {
-            return Ok(Some(RefTarget::Symbolic(rest.to_string())));
-        }
-        return Ok(Some(RefTarget::Direct(ObjectId::from_hex(content)?)));
+        return parse_ref_contents(name, &fs::read_to_string(&loose_path)?).map(Some);
     }
 
     // Try packed-refs (always in the common dir)
@@ -197,13 +204,7 @@ fn collect_refs_under(
     if prefix_path.is_dir() {
         collect_loose_refs(dir, &prefix_path, prefix, result)?;
     } else if prefix_path.is_file() && !prefix.is_empty() {
-        let content = fs::read_to_string(&prefix_path)?;
-        let content = content.trim_end();
-        let target = if let Some(rest) = content.strip_prefix("ref: ") {
-            RefTarget::Symbolic(rest.to_string())
-        } else {
-            RefTarget::Direct(ObjectId::from_hex(content)?)
-        };
+        let target = parse_ref_contents(prefix, &fs::read_to_string(&prefix_path)?)?;
         result.insert(prefix.to_string(), target);
     }
     Ok(())
@@ -306,13 +307,7 @@ fn collect_loose_refs(
                 .map_err(|_| GitError::InvalidRef("cannot strip git_dir prefix".into()))?;
             let name = rel.to_string_lossy().to_string();
             if name.starts_with(prefix) {
-                let content = fs::read_to_string(&path)?;
-                let content = content.trim_end();
-                let target = if let Some(rest) = content.strip_prefix("ref: ") {
-                    RefTarget::Symbolic(rest.to_string())
-                } else {
-                    RefTarget::Direct(ObjectId::from_hex(content)?)
-                };
+                let target = parse_ref_contents(&name, &fs::read_to_string(&path)?)?;
                 result.insert(name, target);
             }
         }
@@ -377,6 +372,20 @@ mod tests {
         match read_ref(git_dir, "refs/heads/main").unwrap() {
             Some(RefTarget::Direct(read_oid)) => assert_eq!(read_oid, oid),
             other => panic!("expected Direct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ref_contents_parse_as_git_reads_them() {
+        let hex = "552e2a0e14dd313f5f572118a18fba67ad99699c";
+        for content in [format!("{hex}\n"), format!("{hex}\t\tbranch 'x' of host:repo\n"), hex.to_string()] {
+            assert!(matches!(parse_ref_contents("R", &content).unwrap(), RefTarget::Direct(oid) if oid.to_hex() == hex));
+        }
+        for content in ["ref: refs/heads/main\n", "ref:refs/heads/main", "ref:  refs/heads/main \n"] {
+            assert!(matches!(parse_ref_contents("R", content).unwrap(), RefTarget::Symbolic(name) if name == "refs/heads/main"));
+        }
+        for content in ["", "552e2a0e\n", &format!("{hex}x\n")] {
+            assert!(parse_ref_contents("R", content).is_err(), "{content:?}");
         }
     }
 
