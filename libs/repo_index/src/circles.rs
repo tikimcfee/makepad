@@ -5,7 +5,8 @@
 //! `commercial` / `commercial:history` when `apps/commercial` is present. Machine-local:
 //! `notes:local`, the repo's untracked `local/` when present, minus the directories other circles
 //! claim ([`crate::Provenance::ClaimedBy`]), and every `circles.conf` circle. A circle that is not
-//! configured is [`crate::Error::UnknownCircle`], never an empty result. Owns
+//! configured is [`crate::Error::UnknownCircle`], never an empty result. Two sources of one circle
+//! with the same label are a `circles.conf` error. Owns
 //! [`crate::Circles::def_hash`]: SHA-1 over a canonical encoding of families, exclusions, ref
 //! names and notes labels, never machine paths.
 //!
