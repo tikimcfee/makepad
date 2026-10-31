@@ -311,7 +311,8 @@ pub enum Kind {
     Bullet,
     /// One Markdown section of a note.
     Note,
-    /// A notes file that is text but not Markdown (code, diffs, logs): one chunk, the whole file.
+    /// A notes file that is not Markdown: one chunk, the whole file (code, diffs, logs), or its
+    /// path alone for a binary file ([`Flags::binary`]).
     NoteFile,
 }
 
@@ -397,7 +398,8 @@ pub struct Lines {
 pub struct Fields {
     /// `Device::memory_type`, a package name, a heading, a commit subject.
     pub name: String,
-    /// The record's path; for a commit, its touched paths (low weight, collapsed in output).
+    /// The record's path (for a note, its path within its source, without the label); for a
+    /// commit, its touched paths (low weight, collapsed in output).
     pub path: String,
     pub sig: String,
     pub doc: String,
@@ -428,6 +430,8 @@ pub struct Flags {
     pub generated: bool,
     /// The lexer could not pair it: a file-level bag of identifiers.
     pub fallback: bool,
+    /// A binary notes file: a record of its path only.
+    pub binary: bool,
 }
 
 /// One record, as extraction produces it.
@@ -615,6 +619,9 @@ pub trait SegmentRead {
     fn chunks_with(&self, key: &Key) -> Vec<ChunkId>;
     /// Chunks whose stored edge targets `key`, with the edge ("cited by notes:X").
     fn cited_by(&self, key: &Key) -> Vec<(ChunkId, Edge)>;
+    /// A notes record's whole text (notes segments keep it, empty for a binary file; others
+    /// return `None`), for exact pointer counts.
+    fn record_text(&self, id: ChunkId) -> Option<&str>;
 }
 
 /// The numbered manifest of an append circle (history, notes): version N is committed by
@@ -720,7 +727,7 @@ pub struct ExtractReport {
     pub fallbacks: Vec<(String, String)>,
     /// Files skipped by an exclusion, counted per prefix.
     pub excluded: Vec<(String, u64)>,
-    /// Files not admitted at all (binary, unreadable), with why.
+    /// Files not admitted at all (unreadable), with why.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -902,8 +909,14 @@ pub struct CircleBlock {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerUnit {
     /// Distinct blobs (files after collapsing byte-identical copies) of the other circle with at
-    /// least one matching record (EVAL §3.1). Every circle pointer.
+    /// least one matching record: a record (one per Markdown section, one per other file) whose
+    /// text or path within its source, lowercased, contains every whitespace-split, lowercased
+    /// query term as a substring (EVAL §1.3; `eval/baseline/pointer_count.py`). Notes circles,
+    /// whose segments keep each record's text for it ([`SegmentRead::record_text`]); for a tree
+    /// circle the same rule is applied to its tokens instead, which no gold depends on.
     Blobs,
+    /// Commits of a history circle with a matching message or touched path.
+    Commits,
     /// Files touched by branch-work commits. Every branch pointer.
     Files,
 }
@@ -1093,47 +1106,113 @@ pub trait Render {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Eval
+// Eval (EVAL §1.3 question and gold format, §3.1 metrics, §3.3 harness)
 
-/// One eval question (`eval/questions.jsonl`; notes-circle questions in a machine-local file).
+/// Which file a question came from; metrics are reported per set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionSet {
+    /// `libs/repo_index/eval/questions.jsonl`.
+    Shipped,
+    /// An `eval =` file of `circles.conf`.
+    Local(PathBuf),
+    /// A held-out file whose path the caller passes; used only for acceptance.
+    Heldout(PathBuf),
+    /// Any other file named on the command line.
+    File(PathBuf),
+}
+
+/// One eval question.
 #[derive(Clone, Debug)]
 pub struct Question {
     pub id: String,
-    /// The revision the question is asked at; the harness indexes exactly this.
-    pub rev: RevSpec,
+    pub set: QuestionSet,
     pub query: String,
+    /// The prompt an agent-mode run gives, when it differs from `query`.
+    pub agent_prompt: Option<String>,
+    pub precondition: Option<Precondition>,
+    /// The revision the question is asked at, built from git objects; `"tip"` is
+    /// [`RevSpec::Worktree`] (the overlay included).
+    pub rev: RevSpec,
     pub circles: Vec<CircleName>,
+    /// `where`, `what`, `why`, `current`, `circle`.
     pub qtype: String,
+    /// `ident`, `concept`, `contain`, `cross`, `dedup`, `edge`, `error`, `paired-rev`,
+    /// `self-exclusion`, ...
     pub subtype: String,
     pub difficulty: String,
     pub gold: Vec<Gold>,
-    /// Record classes that must not appear in the queried circle's ranked list.
+    /// In-circle records (rel 0) that must not rank above the first rel-2 hit: ranking only,
+    /// never a gate.
+    pub distractors: Vec<Gold>,
+    /// Other circles' sources (`notes:*`, `makepad`, `local/agent_state/*`,
+    /// `libs/repo_index/eval/*`): a circle name or source path, `*` a glob. Any of them in the
+    /// queried circle's ranked list is a containment failure (the hard gate).
     pub forbid: Vec<String>,
-    /// In-circle records that may appear but never count as gold.
-    pub distractors: Vec<String>,
-    /// Shown in no doc or example; used only for acceptance.
-    pub held_out: bool,
     pub notes: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Precondition {
+    /// Skip, reported as skipped, when this circle is configured.
+    Unconfigured(CircleName),
 }
 
 #[derive(Clone, Debug)]
 pub struct Gold {
-    /// 2 = required, 1 = supporting.
+    /// 2 = required, 1 = supporting, 0 = a distractor.
     pub rel: u8,
-    /// The anchor symbol `verify-gold` re-resolves by.
-    pub symbol: Option<String>,
+    /// What verify-gold re-resolves the line by; present whenever the item has a line.
+    pub symbol: Option<Anchor>,
+    /// The scorer skips the item, reported as skipped, when this circle is not configured.
+    pub requires: Option<CircleName>,
     pub target: GoldTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// A definition, as `fn publish_instances` or `enum KeyCode`.
+    Def(String),
+    Heading(String),
+    Text(String),
 }
 
 #[derive(Clone, Debug)]
 pub enum GoldTarget {
-    Path { path: String, line: Option<u32>, end: Option<u32> },
+    /// A hit in the file whose range overlaps `[line-15, end+15]` or an `alt_lines` range; with
+    /// no line, any hit in the file. A directory matches any hit inside it, or the crate card of
+    /// the package at that directory.
+    Path { path: String, line: Option<u32>, end: Option<u32>, alt_lines: Vec<Lines> },
+    /// The same rules on a notes-circle record. The path is relative to the mailbox root or to
+    /// the repo's parent (`makepad/local/...`): a notes chunk path ([`NotesSource::label`]).
+    Note { path: String, line: Option<u32>, end: Option<u32>, alt_lines: Vec<Lines> },
+    /// A crate card or hit for the package.
     Package(String),
-    Commit { hex: String, refname: Option<String> },
-    Note { path: String, line: Option<u32> },
-    Dependents(Vec<String>),
-    Absent { scope: Option<String> },
+    /// A history hit for the commit or an `alt` commit; with `via_pointer`, a pointer line
+    /// naming it also counts.
+    Commit { hex: String, alt: Vec<String>, via_pointer: bool },
+    /// Empty: the answer states zero dependents in the scope. Otherwise every listed dependent
+    /// is named (a superset is fine).
+    Dependents { names: Vec<String>, scope: Option<String> },
+    /// The output's absent flag for the scope (default: every queried circle). `semantic`:
+    /// verify-gold does not check it lexically.
+    Absent { scope: Option<AbsentScope>, semantic: bool },
+    /// A pointer line to the circle; `count` in `unit` ([`PointerUnit::Blobs`]).
     Pointer { circle: CircleName, count: Option<u64>, unit: PointerUnit },
+    /// The command fails with an error naming the circle (`"unconfigured circle"`), never
+    /// an empty result.
+    Error(String),
+}
+
+/// An absence's scope. The checkable ones are `path:<p>`, `package:<name>`, `fn <name>`, a
+/// circle, or the query itself when it is one token; anything else is descriptive text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AbsentScope {
+    Path(String),
+    Package(String),
+    Fn(String),
+    Circle(CircleName),
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1145,63 +1224,86 @@ pub enum EvalMode {
 #[derive(Clone, Debug)]
 pub struct EvalOpts {
     pub mode: EvalMode,
-    pub questions: Vec<PathBuf>,
-    /// Overrides every question's own `rev` (a what-if run); `None` uses each question's.
-    pub rev: Option<RevSpec>,
+    pub sets: Vec<QuestionSet>,
+    /// `--in`: only questions on these circles.
     pub circles: Vec<CircleName>,
     pub k: usize,
+    pub json: bool,
     pub save: Option<PathBuf>,
 }
 
-/// One question's result in one circle.
+/// One question's result in one circle (EVAL §3.3's per-question output).
 #[derive(Clone, Debug)]
 pub struct QuestionRow {
     pub id: String,
-    pub circle: CircleName,
+    pub set: QuestionSet,
     pub rev: String,
+    pub circle: CircleName,
+    /// The rank of each rel-2 item, `None` when not in the top k.
     pub ranks_of_rel2: Vec<Option<u32>>,
     pub ndcg: f32,
+    /// A distractor ranked above the first rel-2 hit.
+    pub distractor_above: bool,
     pub bytes: u32,
     pub ms: f32,
     pub absent_said: bool,
     pub forbidden_hits: u32,
+    /// Items skipped for an unmet `requires`, or every item when the question was skipped.
+    pub skipped_items: u32,
     pub solved: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct EvalReport {
     pub rows: Vec<QuestionRow>,
-    /// Hard gates that failed (containment, false absence, a metric below tolerance).
+    /// Questions skipped (circle not configured, precondition), with why.
+    pub skipped: Vec<(String, String)>,
+    /// Hard gates that failed: containment, false absence, an unconfigured circle returning
+    /// empty, a metric beyond its tolerance of the last saved run.
     pub failures: Vec<String>,
 }
 
-/// A gold item that no longer holds at the revision checked.
+/// A gold item that no longer holds at its question's revision.
 #[derive(Clone, Debug)]
 pub struct GoldDrift {
     pub id: String,
+    /// Index into the question's `gold`.
     pub gold: usize,
     pub drift: Drift,
 }
 
 #[derive(Clone, Debug)]
 pub enum Drift {
-    Moved { to: String },
+    /// The path (or note file) is gone.
     Gone,
+    /// The symbol moved within the file.
     Lines { by: i64, now: u32 },
+    /// The symbol is no longer in the file.
+    Lost,
     PackageGone,
-    NotAncestor,
+    /// A commit or `alt` is not an ancestor of the rev.
+    NotAncestor { commit: String },
+    /// A `via_pointer` commit is not reachable from any ref.
+    Unreachable { commit: String },
+    /// A non-semantic absence now has hits in its scope.
     NoLongerAbsent { hits: u64 },
-    NoteGone,
+    /// A pointer count recomputed from `circles.conf` differs.
+    PointerCount { gold: u64, now: u64 },
+    /// The self-exclusion sentinel has no raw hit inside the eval dir, so the check is dead.
+    SentinelInert,
+    /// The sentinel has raw hits outside the eval dir, so the exclusion is not what hides it.
+    SentinelOutside { hits: u64 },
     /// A commit mixes eval data with other paths, so its message reaches `makepad:history`.
     MixedEvalCommit { commit: String },
 }
 
-/// The harness. Questions are grouped by (revision, circles); each group's circles are built or
-/// opened once at that revision.
+/// The harness. Questions are grouped by (revision, circles); each group's circles are opened
+/// once through [`Circles::open`] at that revision.
 pub trait Harness {
+    fn load(&mut self, sets: &[QuestionSet]) -> Result<Vec<Question>, Error>;
     fn run(&mut self, questions: &[Question], opts: &EvalOpts) -> Result<EvalReport, Error>;
-    /// Re-resolves every gold item at each question's revision (or `rev`) and at the tip.
-    fn verify_gold(&mut self, questions: &[Question], rev: Option<&RevSpec>) -> Result<Vec<GoldDrift>, Error>;
+    /// Re-resolves every gold item at its question's revision; only changes are returned.
+    fn verify_gold(&mut self, questions: &[Question]) -> Result<Vec<GoldDrift>, Error>;
 }
 
 // ---------------------------------------------------------------------------------------------

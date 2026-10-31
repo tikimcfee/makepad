@@ -15,7 +15,7 @@ pub const VERBS: &[(&str, &str, &str)] = &[
     ("build", "build [--in <circle>,..] [--rev r]", "Build or refresh the circles' indexes"),
     ("status", "status [--json]", "What is indexed, at which revision, and what the overlay holds"),
     ("gc", "gc", "Remove index data nothing uses any more"),
-    ("eval", "eval [run|verify-gold|diff] [--rev r] ..", "The eval harness; each question is indexed at its own pinned rev unless --rev overrides"),
+    ("eval", "eval [run|verify-gold|diff] [--mode retrieval|agent] [--set shipped|local|heldout|<file>] [--in c,..] [--k 10] [--json] [--save runs/<name>]", "The eval harness; each question is indexed at its own pinned rev"),
 ];
 
 pub fn usage() -> String {
