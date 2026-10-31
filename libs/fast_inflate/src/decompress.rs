@@ -1153,7 +1153,9 @@ fn deflate_decompress_with(
     bitsleft = bitsleft as u8 as u32;
     safety_check!(overread_count <= (bitsleft >> 3) as usize);
 
-    let actual_in_pos = in_pos - (bitsleft >> 3) as usize + overread_count;
+    // Unread whole bytes still in the bit buffer, less the zero bytes
+    // padded in past the end of a short input, go back to the input.
+    let actual_in_pos = in_pos - ((bitsleft >> 3) as usize - overread_count);
     Ok((actual_in_pos, out_pos - start))
 }
 
