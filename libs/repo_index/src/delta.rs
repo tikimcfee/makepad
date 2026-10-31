@@ -8,7 +8,7 @@
 //! claimed notes directory) is neither read, re-extracted nor shadowed, exactly as the base
 //! build skipped it, so a lane editing `libs/repo_index/eval/` never reaches the `makepad` circle.
 
-use crate::{circles, BaseCircle, Change, CircleName, Error, Extract, OverlayFile, Repo, Rev, Tokenize};
+use crate::{circles, BaseCircle, Change, Chunk, CircleName, Error, Extract, OverlayFile, Repo, Rev, Tokenize};
 use std::path::Path;
 
 /// A worktree's overlay over one tree circle.
@@ -34,9 +34,14 @@ pub struct Over<'a> {
 }
 
 /// The overlay of the worktree at `over.root` over `over.base`.
-pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &dyn Tokenize, over: &Over) -> Result<Overlay, Error> {
+/// Files are re-extracted one by one; their chunks are then tokenized together across cores
+/// ([`crate::open::tokenize_all`]), so one large file does not hold the rest up.
+pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn Tokenize + Sync), over: &Over) -> Result<Overlay, Error> {
     let Over { circle, def, base, root, package } = *over;
     let mut out = Overlay::default();
+    // every file's chunks in one run, with each file's (path, chunk count)
+    let mut all: Vec<Chunk> = Vec::new();
+    let mut files: Vec<(String, usize)> = Vec::new();
     for change in repo.changes(base)? {
         let (path, shadows) = match &change {
             Change::Added(p) => (p, false),
@@ -65,20 +70,21 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &dyn To
             Err(error) => return Err(Error::Io { context: format!("overlay: reading {path}"), error }),
         };
         let pkg = package(path);
-        let chunks: Vec<_> = extract
-            .extract_file(circle, def, path, &bytes)?
-            .into_iter()
-            .map(|mut c| {
-                if c.keys.package.is_none() {
-                    c.keys.package = pkg.clone();
-                }
-                let t = tokenize.chunk_terms(&c);
-                (c, t)
-            })
-            .collect();
-        if !chunks.is_empty() {
-            out.files.push(OverlayFile { path: path.clone(), chunks });
+        let mut chunks = extract.extract_file(circle, def, path, &bytes)?;
+        for c in &mut chunks {
+            if c.keys.package.is_none() {
+                c.keys.package = pkg.clone();
+            }
         }
+        if !chunks.is_empty() {
+            files.push((path.clone(), chunks.len()));
+            all.extend(chunks);
+        }
+    }
+    let terms = crate::open::tokenize_all(tokenize, &all);
+    let mut pairs = all.into_iter().zip(terms);
+    for (path, n) in files {
+        out.files.push(OverlayFile { path, chunks: pairs.by_ref().take(n).collect() });
     }
     out.files.sort_by(|a, b| a.path.cmp(&b.path));
     out.shadowed.sort();

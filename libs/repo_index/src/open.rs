@@ -18,7 +18,7 @@
 
 use crate::{
     circles, delta, BaseCircle, BaseSource, Chunk, CircleBody, CircleExpr, CircleManifest, CircleName, CircleStats, Circles,
-    Error, Extract, Key, ManifestChange, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
+    Error, Extract, FieldTerms, Key, ManifestChange, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
     SegmentSink, SourceStamp, Store, Tokenize, Visibility, INDEXER_VERSION,
 };
 use std::path::{Path, PathBuf};
@@ -33,7 +33,8 @@ pub struct Opener {
     pub open_repo: RepoOpener,
     pub store: Box<dyn Store>,
     pub extract: Box<dyn Extract>,
-    pub tokenize: Box<dyn Tokenize>,
+    /// Shared by the threads that tokenize a build's or an overlay's chunks.
+    pub tokenize: Box<dyn Tokenize + Sync>,
     /// `circles.conf`; absent is fine (built-in circles only).
     pub conf: PathBuf,
     /// `~` in `circles.conf`.
@@ -48,7 +49,7 @@ impl Opener {
         open_repo: RepoOpener,
         store: Box<dyn Store>,
         extract: Box<dyn Extract>,
-        tokenize: Box<dyn Tokenize>,
+        tokenize: Box<dyn Tokenize + Sync>,
         conf: PathBuf,
         home: PathBuf,
     ) -> Self {
@@ -79,6 +80,61 @@ fn repo_at<'a>(
         }
     };
     Ok(others[at].1.as_mut())
+}
+
+/// Chunks per batch a build tokenizes at once.
+pub const BATCH: usize = 8192;
+/// Fewer chunks than this per thread are tokenized on the calling thread.
+pub const MIN_PER_THREAD: usize = 256;
+
+/// The terms of `chunks`, in order, tokenized on every core (most of a build's time is here).
+pub fn tokenize_all(tokenize: &(dyn Tokenize + Sync), chunks: &[Chunk]) -> Vec<FieldTerms> {
+    let cores = match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(e) => {
+            eprintln!("makepad index: the core count is unknown ({e}); tokenizing on one thread");
+            1
+        }
+    };
+    let threads = cores.min(chunks.len() / MIN_PER_THREAD).max(1);
+    if threads == 1 {
+        return chunks.iter().map(|c| tokenize.chunk_terms(c)).collect();
+    }
+    let per = chunks.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = chunks
+            .chunks(per)
+            .map(|part| s.spawn(move || part.iter().map(|c| tokenize.chunk_terms(c)).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    })
+}
+
+/// Chunks on their way to a sink: tokenized [`BATCH`] at a time across cores, added in stream
+/// order (a chunk's id is its place in the stream).
+struct Batch<'a> {
+    tokenize: &'a (dyn Tokenize + Sync),
+    chunks: Vec<Chunk>,
+}
+
+impl<'a> Batch<'a> {
+    fn new(tokenize: &'a (dyn Tokenize + Sync)) -> Self {
+        Batch { tokenize, chunks: Vec::with_capacity(BATCH) }
+    }
+    fn push(&mut self, c: Chunk, sink: &mut dyn SegmentSink) -> Result<(), Error> {
+        self.chunks.push(c);
+        if self.chunks.len() >= BATCH {
+            self.flush(sink)?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self, sink: &mut dyn SegmentSink) -> Result<(), Error> {
+        let terms = tokenize_all(self.tokenize, &self.chunks);
+        for (c, t) in self.chunks.drain(..).zip(terms) {
+            sink.add(&c, &t)?;
+        }
+        Ok(())
+    }
 }
 
 /// The package a path belongs to in a base: that of its own chunks, else of the nearest
@@ -214,10 +270,9 @@ impl Opener {
                 let segment = match store.open_base(&key)? {
                     Some(s) => s,
                     None if build => store.build_base(&key, &mut |sink: &mut dyn SegmentSink| {
-                        let report = extract.extract(name, &def, Some(&indexed), repo, &mut |c: Chunk| {
-                            let t = tokenize.chunk_terms(&c);
-                            sink.add(&c, &t).map(|_| ())
-                        })?;
+                        let mut batch = Batch::new(tokenize.as_ref());
+                        let report = extract.extract(name, &def, Some(&indexed), repo, &mut |c: Chunk| batch.push(c, sink))?;
+                        batch.flush(sink)?;
                         for (path, why) in &report.skipped {
                             eprintln!("makepad index: {}: skipped {path}: {why}", name.0);
                         }
@@ -254,10 +309,9 @@ impl Opener {
                     stale if build => {
                         let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
                         let mut sink = store.new_segment(&key)?;
-                        let report = extract.extract(name, &def, None, repo.as_mut(), &mut |c: Chunk| {
-                            let t = tokenize.chunk_terms(&c);
-                            sink.add(&c, &t).map(|_| ())
-                        })?;
+                        let mut batch = Batch::new(tokenize.as_ref());
+                        let report = extract.extract(name, &def, None, repo.as_mut(), &mut |c: Chunk| batch.push(c, sink.as_mut()))?;
+                        batch.flush(sink.as_mut())?;
                         for (path, why) in &report.skipped {
                             eprintln!("makepad index: {}: skipped {path}: {why}", name.0);
                         }
@@ -319,10 +373,9 @@ impl Opener {
                     stale if build => {
                         let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
                         let mut sink = store.new_segment(&key)?;
-                        extract.extract(name, &def, Some(&at), repo, &mut |c: Chunk| {
-                            let t = tokenize.chunk_terms(&c);
-                            sink.add(&c, &t).map(|_| ())
-                        })?;
+                        let mut batch = Batch::new(tokenize.as_ref());
+                        extract.extract(name, &def, Some(&at), repo, &mut |c: Chunk| batch.push(c, sink.as_mut()))?;
+                        batch.flush(sink.as_mut())?;
                         let id = sink.finish()?;
                         let change = match stale {
                             Some(_) => ManifestChange::Replace(id),
@@ -942,6 +995,34 @@ mod tests {
         assert_eq!(c.rev.as_ref().unwrap().commit, pin.commit);
         assert!(c.overlay.is_empty() && c.shadowed.is_empty());
         assert_eq!(files_of(c), ["b.rs"]);
+    }
+
+    #[test]
+    fn parallel_tokenizing_keeps_stream_order() {
+        let text: String = (0..3000).map(|i| format!("fn item_{i}() {{}}\n")).collect();
+        let chunks = FakeExtract.extract_file(&n("makepad"), &crate::circles::manifest_for(Path::new("/r/m"), None, Path::new("/h")).map(|m| match &m.defs[0].body {
+            CircleBody::Base(b) => b.clone(),
+            _ => unreachable!(),
+        }).unwrap(), "a.rs", text.as_bytes()).unwrap();
+        assert!(chunks.len() > 2 * MIN_PER_THREAD);
+        let par = tokenize_all(&FakeTokenize, &chunks);
+        let seq: Vec<FieldTerms> = chunks.iter().map(|c| FakeTokenize.chunk_terms(c)).collect();
+        assert_eq!(par.len(), seq.len());
+        assert!(par.iter().zip(&seq).all(|(a, b)| a.terms == b.terms && a.lengths == b.lengths));
+        // a build adds them in stream order, batch by batch
+        let store = FakeStore::default();
+        let key = SegmentKey { repo: None, circle: n("makepad"), source: SourceStamp::Tree { tree: oid(1) }, def_hash: 0, indexer: 1 };
+        let seg = store
+            .build_base(&key, &mut |sink: &mut dyn SegmentSink| {
+                let mut b = Batch::new(&FakeTokenize);
+                for c in chunks.iter().cloned() {
+                    b.push(c, sink)?;
+                }
+                b.flush(sink)
+            })
+            .unwrap();
+        assert_eq!(seg.chunk_count() as usize, chunks.len());
+        assert!((0..seg.chunk_count()).all(|i| seg.chunk(crate::ChunkId(i)).name == chunks[i as usize].name));
     }
 
     #[test]
