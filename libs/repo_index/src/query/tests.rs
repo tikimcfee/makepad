@@ -767,10 +767,14 @@ fn a_missing_named_thing_is_absent_beside_present_words() {
     for q in ["alpha/src/lib.rs", "clamp_turn in beta", "what is fixture-beta", "MAX_TURN"] {
         assert!(!find(&o, &query(q, &["makepad"])).blocks[0].absent, "{q}");
     }
-    // Paths are judged in tree circles only; history never claims absence.
+    // Paths are judged in tree circles only.
     // (A note names alpha/src/lib.rs in its text; no note file has that path.)
     assert!(!find(&o, &query("alpha/src/lib.rs", &["notes:topic-a"])).blocks[0].absent);
-    assert!(!find(&o, &query("spin_wheel_limit spin", &["makepad:history"])).blocks[0].absent);
+    assert!(!find(&o, &query("beta/src/gone.rs clamp", &["makepad:history"])).blocks[0].absent);
+    // An identifier is judged everywhere, on whole words: no commit names spin_wheel_limit,
+    // though its parts match.
+    let b = &find(&o, &query("spin_wheel_limit spin", &["makepad:history"])).blocks[0];
+    assert_eq!(b.absent_terms, ["spin_wheel_limit"]);
 }
 
 #[test]
@@ -783,6 +787,10 @@ fn identifier_phrases_and_inner_runs() {
     let b = &find(&o, &query("FIXTURE_CLAMP_TURN_V2 step", &["makepad"])).blocks[0];
     assert!(b.absent);
     assert!(b.hits.iter().take(3).any(|h| h.name == "clamp_turn"), "{:?}", names(b));
+    // A run counts in names only: MAX_TURN's definition, not the body that mentions it.
+    let b = &find(&o, &query("MAX_TURN_CAP", &["makepad"])).blocks[0];
+    assert_eq!(b.hits[0].name, "MAX_TURN");
+    assert!(!b.hits.iter().any(|h| h.name == "Gizmo::spin"), "{:?}", names(b));
 }
 
 #[test]
