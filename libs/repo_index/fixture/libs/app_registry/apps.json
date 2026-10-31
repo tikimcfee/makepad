@@ -1,0 +1,7 @@
+[
+  {
+    "id": "spinner", "label": "Spinner", "package": "fixture-alpha",
+    "dir": "alpha", "bin": "fixture-alpha", "manifest": null, "args": [],
+    "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": [], "mobile": false
+  }
+]
