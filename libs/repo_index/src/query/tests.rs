@@ -986,3 +986,24 @@ fn a_prefix_matches_the_start_of_identifiers_only() {
     let b = &find(&o, &query("RATE_", &["makepad"])).blocks[0];
     assert!(b.absent, "no identifier starts with rate_");
 }
+
+#[test]
+fn a_query_passed_as_one_argument_reads_as_its_words() {
+    let o = opened(vec![makepad(), history()], vec![]);
+    let words = |q: &str, circles: &[&str]| find(&o, &query(q, circles));
+    let mut one = query("", &["makepad", "makepad:history"]);
+    one.words = vec!["why does the gizmo use every SPIN_ table".into()];
+    let whole = Engine::default().find(&o, &one).unwrap();
+    let split = words("why does the gizmo use every SPIN_ table", &["makepad", "makepad:history"]);
+    for (a, b) in whole.blocks.iter().zip(&split.blocks) {
+        assert_eq!(a.absent_terms, b.absent_terms);
+        assert_eq!(names(a), names(b));
+    }
+    // A present prefix in a sentence is never absent in the tree.
+    assert!(!split.blocks[0].absent, "{:?}", split.blocks[0].absent_terms);
+    // History names only the shaped word it lacks, never the sentence.
+    assert_eq!(split.blocks[1].absent_terms, ["SPIN_"]);
+    // A missing prefix in a sentence is named alone.
+    let b = &words("how are FOO_BAR_ values used", &["makepad"]).blocks[0];
+    assert_eq!(b.absent_terms, ["FOO_BAR_"]);
+}
