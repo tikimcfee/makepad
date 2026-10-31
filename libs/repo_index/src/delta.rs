@@ -22,16 +22,20 @@ pub struct Overlay {
     pub excluded: u64,
 }
 
-/// The overlay of the worktree at `root` over `base`.
-pub fn overlay(
-    repo: &mut dyn Repo,
-    extract: &mut dyn Extract,
-    tokenize: &dyn Tokenize,
-    circle: &CircleName,
-    def: &BaseCircle,
-    base: &Rev,
-    root: &Path,
-) -> Result<Overlay, Error> {
+/// What an overlay is taken over.
+pub struct Over<'a> {
+    pub circle: &'a CircleName,
+    pub def: &'a BaseCircle,
+    pub base: &'a Rev,
+    /// The worktree root the changed files are read from.
+    pub root: &'a Path,
+    /// A path's package in the base (a lone file's chunks carry none: no tree is around them).
+    pub package: &'a dyn Fn(&str) -> Option<String>,
+}
+
+/// The overlay of the worktree at `over.root` over `over.base`.
+pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &dyn Tokenize, over: &Over) -> Result<Overlay, Error> {
+    let Over { circle, def, base, root, package } = *over;
     let mut out = Overlay::default();
     for change in repo.changes(base)? {
         let (path, shadows) = match &change {
@@ -60,10 +64,14 @@ pub fn overlay(
             }
             Err(error) => return Err(Error::Io { context: format!("overlay: reading {path}"), error }),
         };
+        let pkg = package(path);
         let chunks: Vec<_> = extract
             .extract_file(circle, def, path, &bytes)?
             .into_iter()
-            .map(|c| {
+            .map(|mut c| {
+                if c.keys.package.is_none() {
+                    c.keys.package = pkg.clone();
+                }
                 let t = tokenize.chunk_terms(&c);
                 (c, t)
             })
@@ -112,7 +120,10 @@ mod tests {
             Change::Modified("libs/repo_index/eval/old.jsonl".into()),
         ];
         let base = Rev { spec: RevSpec::Worktree, commit: Oid([1; 20]), tree: Oid([2; 20]) };
-        let o = overlay(&mut repo, &mut FakeExtract, &FakeTokenize, &CircleName("makepad".into()), &def, &base, &root).unwrap();
+        let pkg = |p: &str| p.starts_with("a/").then(|| "pkg-a".to_string());
+        let name = CircleName("makepad".into());
+        let over = Over { circle: &name, def: &def, base: &base, root: &root, package: &pkg };
+        let o = overlay(&mut repo, &mut FakeExtract, &FakeTokenize, &over).unwrap();
         let paths: Vec<&str> = o.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["a/edited.rs", "a/new.rs"]);
         assert_eq!(o.shadowed, ["a/edited.rs", "a/gone.rs", "a/raced.rs"]);
@@ -121,5 +132,6 @@ mod tests {
         assert!(names.contains(&"edited_now") && names.contains(&"brand_new"), "{names:?}");
         assert!(!names.contains(&"never_indexed"));
         assert!(o.files.iter().all(|f| f.chunks.iter().all(|(_, t)| !t.terms.is_empty())));
+        assert!(o.files.iter().all(|f| f.chunks.iter().all(|(c, _)| c.keys.package.as_deref() == Some("pkg-a"))));
     }
 }
