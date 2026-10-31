@@ -14,9 +14,11 @@
 //!   revision when those tips do not reach it (a branch's own commits, a detached HEAD: walked
 //!   too, so the circle holds what it is labelled at); its [`Visibility`] is computed at every
 //!   open, or read from the visibility cache.
-//! - [`Opened::others`] are opened only when already built, never built, and carry no overlay:
-//!   they serve pointer counts. A notes index older than its sources still serves them, and says
-//!   so on stderr.
+//! - [`Opened::others`] are opened only when already built, never built, and carry the overlay
+//!   like a named circle: they serve pointer counts. A notes index older than its sources still
+//!   serves them, and says so on stderr.
+//! - A notes source that does not exist (a repo-local directory a worktree lacks) leaves the
+//!   circle with its other sources, said on stderr; its stamp records the absence.
 
 use crate::{
     circles, delta, BaseCircle, BaseSource, Chunk, CircleBody, CircleExpr, CircleManifest, CircleName, CircleStats, Circles,
@@ -222,11 +224,40 @@ fn sum_stats(segments: &[Box<dyn SegmentRead>]) -> CircleStats {
     s
 }
 
+/// Whether a notes source's directory is there: `false` when it does not exist (a repo-local
+/// directory in a worktree that lacks it); any other failure to look is an error.
+pub fn source_exists(s: &NotesSource) -> Result<bool, Error> {
+    match std::fs::metadata(&s.dir) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Io { context: format!("notes: {}", s.dir.display()), error }),
+    }
+}
+
+/// The sources of `circle` that are there; each missing one is said on stderr, once per call,
+/// and the circle has its other sources only.
+pub fn present_sources<'a>(circle: &CircleName, sources: &'a [NotesSource]) -> Result<Vec<&'a NotesSource>, Error> {
+    let mut out = Vec::new();
+    for s in sources {
+        if source_exists(s)? {
+            out.push(s);
+        } else {
+            eprintln!("makepad index: {}: notes source {} is missing ({}); the circle holds its other sources only", circle.0, s.label, s.dir.display());
+        }
+    }
+    Ok(out)
+}
+
 /// The stamp of a notes circle's sources as they are on disk: a hash of every admitted file's
-/// (label, path, size, content id), sorted.
+/// (label, path, size, content id), sorted, and of each missing source's label, so a source
+/// that appears or goes away changes it.
 pub fn notes_stamp(sources: &[NotesSource], def: &BaseCircle) -> Result<u64, Error> {
     let mut lines = Vec::new();
     for s in sources {
+        if !source_exists(s)? {
+            lines.push(format!("{}\tmissing", s.label));
+            continue;
+        }
         for (rel, full) in walk_files(&s.dir)? {
             if circles::excluded(def, &rel).is_some() {
                 continue;
@@ -242,22 +273,41 @@ pub fn notes_stamp(sources: &[NotesSource], def: &BaseCircle) -> Result<u64, Err
     Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
-/// Every file under `dir` (directory symlinks not followed), as (`/`-separated path within
-/// `dir`, full path), sorted.
+/// Every file under `dir`, as (`/`-separated path within `dir`, full path), sorted: the one
+/// walk of a notes directory, for its stamp, its build and the eval alike. Symlinks are followed,
+/// to files and to directories; a directory reached again (a symlink loop, or two links to one
+/// directory) is walked once, the repeat said on stderr. A symlink to nothing is skipped, said on
+/// stderr.
 pub fn walk_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
+    let canon = |p: &Path| std::fs::canonicalize(p).map_err(|error| Error::Io { context: format!("notes: {}", p.display()), error });
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    seen.insert(canon(dir)?);
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((d, rel)) = stack.pop() {
         let entries = std::fs::read_dir(&d).map_err(|error| Error::Io { context: format!("notes: listing {}", d.display()), error })?;
         for e in entries {
             let e = e.map_err(|error| Error::Io { context: format!("notes: listing {}", d.display()), error })?;
-            let ft = e.file_type().map_err(|error| Error::Io { context: format!("notes: {}", e.path().display()), error })?;
             let p = e.path();
-            if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() || (ft.is_symlink() && p.is_file()) {
-                let rel = p.strip_prefix(dir).map(circles::slash_path).unwrap_or_default();
-                out.push((rel, p));
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            // the entry's target: a symlink's is followed
+            let meta = match std::fs::metadata(&p) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("makepad index: notes: {} is a link to nothing; skipped", p.display());
+                    continue;
+                }
+                Err(error) => return Err(Error::Io { context: format!("notes: {}", p.display()), error }),
+            };
+            if meta.is_dir() {
+                if seen.insert(canon(&p)?) {
+                    stack.push((p, child));
+                } else {
+                    eprintln!("makepad index: notes: {} leads to a directory already walked; skipped", p.display());
+                }
+            } else if meta.is_file() {
+                out.push((child, p));
             }
         }
     }
@@ -330,7 +380,8 @@ impl Opener {
                     })?,
                     None => return Ok(None),
                 };
-                let (overlay, shadowed) = match overlay_from.filter(|_| build) {
+                // others carry it too: their pointer counts and `build`'s report follow the worktree
+                let (overlay, shadowed) = match overlay_from {
                     Some(base) => {
                         let package = |p: &str| base_package(segment.as_ref(), p);
                         let over = delta::Over { circle: name, def: &def, base: &base, root, package: &package };
@@ -353,6 +404,10 @@ impl Opener {
             BaseSource::Notes { sources } => {
                 let repo_key = (name.0 == circles::NOTES_LOCAL).then_some(main_id);
                 let stamp = SourceStamp::Notes { content: notes_stamp(sources, &def)? };
+                // the build reads the sources that are there (the key keeps the whole definition)
+                let present: Vec<NotesSource> = present_sources(name, sources)?.into_iter().cloned().collect();
+                let mut def = def.clone();
+                def.source = BaseSource::Notes { sources: present };
                 let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
                 let mut fill = |sink: &mut dyn SegmentSink| -> Result<(), Error> {
                     let mut batch = Batch::new(tokenize.as_ref());
@@ -1203,6 +1258,11 @@ mod tests {
         // a second open reuses the base
         o.open(&m, &[n("makepad")], &RevSpec::Worktree).unwrap();
         assert_eq!(store.state.borrow().builds, 1);
+        // opened for pointers only, the tree still carries its overlay
+        let other = o.open(&m, &[n("makepad:history")], &RevSpec::Worktree).unwrap();
+        let mk = other.others.iter().find(|c| c.name == n("makepad")).unwrap();
+        assert_eq!(mk.shadowed, ["a/x.rs"]);
+        assert!(mk.overlay[0].chunks.iter().any(|(ch, _)| ch.name == "changed_here"));
     }
 
     #[test]
@@ -1437,6 +1497,67 @@ mod tests {
         let opened = o.open(&m, &[n("makepad")], &RevSpec::Worktree).unwrap();
         let others: Vec<&str> = opened.others.iter().map(|c| c.name.0.as_str()).collect();
         assert_eq!(others, ["notes:local", "notes:topic"]);
+    }
+
+    #[test]
+    fn a_missing_notes_source_leaves_the_circle_its_other_sources() {
+        let top = scratch("missing");
+        let root = top.join("makepad");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(top.join("mail/topic")).unwrap();
+        std::fs::write(top.join("mail/topic/a.md"), "# a\n").unwrap();
+        let conf = top.join("circles.conf");
+        // the repo-local source does not exist in this worktree
+        std::fs::write(&conf, format!("notes:topic = notes {}\nnotes:topic = notes local/agent_state/port\n", top.join("mail/topic").display())).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["HEAD", "refs/remotes/upstream/work"], 1, &[]);
+        let (mut o, store) = opener(repo, &conf);
+        let m = o.manifest().unwrap();
+        let opened = o.open(&m, &[n("notes:topic")], &RevSpec::Worktree).unwrap();
+        assert_eq!(files_of(&opened.open[0]), ["topic/a.md"]);
+        let builds = store.state.borrow().builds;
+        // as one of the others too, it opens
+        let pointers = o.open(&m, &[n("makepad")], &RevSpec::Worktree).unwrap();
+        assert!(pointers.others.iter().any(|c| c.name == n("notes:topic")), "unbuilt: {:?}", pointers.unbuilt);
+        // the source appearing changes the stamp: rebuilt with it
+        std::fs::create_dir_all(root.join("local/agent_state/port")).unwrap();
+        std::fs::write(root.join("local/agent_state/port/x.md"), "# x\n").unwrap();
+        let opened = o.open(&m, &[n("notes:topic")], &RevSpec::Worktree).unwrap();
+        assert_eq!(files_of(&opened.open[0]), ["makepad/local/agent_state/port/x.md", "topic/a.md"]);
+        assert!(store.state.borrow().builds > builds);
+    }
+
+    #[test]
+    fn the_notes_walk_follows_links_once_and_the_stamp_sees_through_them() {
+        let top = scratch("links");
+        let (notes, real) = (top.join("notes"), top.join("real"));
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(notes.join("top.md"), "# top\n").unwrap();
+        std::fs::write(real.join("doc.md"), "alpha_before_edit\n").unwrap();
+        std::os::unix::fs::symlink(&real, notes.join("linked")).unwrap();
+        std::os::unix::fs::symlink(&real, notes.join("again")).unwrap(); // a second link to one directory
+        std::os::unix::fs::symlink(".", notes.join("loop")).unwrap(); // a loop
+        std::os::unix::fs::symlink(top.join("gone"), notes.join("dangling")).unwrap();
+        let files: Vec<String> = walk_files(&notes).unwrap().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.contains(&"top.md".to_string()));
+        assert!(files.iter().any(|f| f.ends_with("/doc.md")));
+        // the build walks exactly what the stamp walks
+        let built: Vec<String> = crate::extract::notes::walk(&notes).unwrap().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(built, files);
+        let def = BaseCircle {
+            source: BaseSource::Notes { sources: vec![NotesSource { dir: notes.clone(), label: "n".into() }] },
+            families: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let sources = match &def.source {
+            BaseSource::Notes { sources } => sources.clone(),
+            _ => unreachable!(),
+        };
+        let before = notes_stamp(&sources, &def).unwrap();
+        std::fs::write(real.join("doc.md"), "beta_after_edit\n").unwrap();
+        assert_ne!(notes_stamp(&sources, &def).unwrap(), before, "an edit behind a link restamps");
     }
 
     #[test]

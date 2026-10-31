@@ -63,26 +63,10 @@ pub fn records(rel: &str, bytes: &[u8]) -> Vec<NoteRecord> {
     }]
 }
 
-/// Every file under `dir`, sorted by its `/`-separated path within `dir`.
+/// Every file under `dir`, sorted by its `/`-separated path within `dir`: the one notes walk
+/// ([`crate::open::walk_files`]), so a circle's stamp and its build see the same files.
 pub fn walk(dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
-    let mut out = Vec::new();
-    let mut stack = vec![(dir.to_path_buf(), String::new())];
-    while let Some((path, rel)) = stack.pop() {
-        let entries = std::fs::read_dir(&path).map_err(|error| Error::Io { context: format!("read dir {}", path.display()), error })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| Error::Io { context: format!("read dir {}", path.display()), error })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push((p, child));
-            } else if p.is_file() {
-                out.push((child, p));
-            }
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
+    crate::open::walk_files(dir)
 }
 
 /// What notes may cite: a repo circle's tracked paths and commits.
