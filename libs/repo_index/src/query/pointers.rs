@@ -34,13 +34,15 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
             }
             continue;
         };
-        // Commits visible at the revision.
-        let ranked = rank(c, ci, plan, &Filter::default(), usize::MAX);
-        let commits = matching_commits(c, &ranked, plan);
-        if !commits.is_empty() {
-            out.push(pointer(c, commits.len() as u64, PointerUnit::Commits));
+        // One ranking at any revision serves both: the commits the revision reaches, and the
+        // local-only ones (a pinned upstream revision reaches none of them).
+        let any_rev = Filter { any_rev: true, ..Filter::default() };
+        let matching = matching_commits(c, &rank(c, ci, plan, &any_rev, usize::MAX), plan);
+        let reached = matching.iter().filter(|o| vis.reachable.contains(o)).count() as u64;
+        if reached > 0 {
+            out.push(pointer(c, reached, PointerUnit::Commits));
         }
-        if let Some(branch) = branch_pointer(opened, c, ci, vis, plan, absent) {
+        if let Some(branch) = branch_pointer(opened, c, vis, &matching, absent) {
             out.push(branch);
         }
     }
@@ -63,13 +65,11 @@ fn matching_commits(c: &OpenCircle, ranked: &Ranked, plan: &Plan) -> Vec<Oid> {
 /// Branch work not upstream: the files touched by the local-only commits that match, whether
 /// or not the revision reaches them (a pinned upstream revision never does), plus the files the
 /// branch changed whose text holds the absent terms (read only when there are any).
-fn branch_pointer(opened: &Opened, c: &OpenCircle, ci: usize, vis: &Visibility, plan: &Plan, absent: &[String]) -> Option<Pointer> {
+fn branch_pointer(opened: &Opened, c: &OpenCircle, vis: &Visibility, matching: &[Oid], absent: &[String]) -> Option<Pointer> {
     if vis.local.is_empty() && vis.local_files.is_empty() {
         return None;
     }
-    let any_rev = Filter { any_rev: true, ..Filter::default() };
-    let ranked = rank(c, ci, plan, &any_rev, usize::MAX);
-    let local: Vec<Oid> = matching_commits(c, &ranked, plan).into_iter().filter(|o| vis.local.contains(o)).collect();
+    let local: Vec<Oid> = matching.iter().copied().filter(|o| vis.local.contains(o)).collect();
     let mut files: HashSet<String> = HashSet::new();
     let mut sample = String::new();
     for oid in &local {
