@@ -422,6 +422,14 @@ fn worktree_changes_and_file_overlay() {
     fs::remove_file(dir.join("beta/src/lib.rs")).unwrap();
     fs::write(dir.join("alpha/src/new_file.rs"), "pub fn brand_new() {}\n").unwrap();
     fs::write(dir.join("ignored.txt"), "never a change\n").unwrap();
+    // staged, not committed
+    fs::write(dir.join("docs/guide.md"), "# Staged\n").unwrap();
+    Repository::open(dir).unwrap().stage_file("docs/guide.md").unwrap();
+    // staged, then edited back to the base content: no change
+    let splash = fs::read(dir.join("ui/demo.splash")).unwrap();
+    fs::write(dir.join("ui/demo.splash"), "let Other = View{}\n").unwrap();
+    Repository::open(dir).unwrap().stage_file("ui/demo.splash").unwrap();
+    fs::write(dir.join("ui/demo.splash"), &splash).unwrap();
     let mut repo = GitRepo::open(dir).unwrap();
     let mut changes = repo.changes(&base).unwrap();
     changes.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
@@ -432,6 +440,7 @@ fn worktree_changes_and_file_overlay() {
             Change::Added("alpha/src/new_file.rs".into()),
             Change::Deleted("beta/src/lib.rs".into()),
             Change::Modified("alpha/src/lib.rs".into()),
+            Change::Modified("docs/guide.md".into()),
         ]
     );
 
@@ -464,10 +473,14 @@ fn whole_repo_extraction() {
         exclude: crate::INDEX_OWN_DATA.iter().map(|p| Exclusion { prefix: p.to_string(), provenance: Provenance::IndexOwnData }).collect(),
     };
     let mut kinds: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    let mut generated: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut bytes = 0u64;
     let report = Extractor::new()
         .extract(&circle("makepad"), &def, Some(&rev), &mut repo, &mut |c| {
             *kinds.entry(c.kind.as_str()).or_default() += 1;
+            if c.flags.generated {
+                *generated.entry(c.path.clone()).or_default() += 1;
+            }
             bytes += (c.fields.name.len() + c.fields.path.len() + c.fields.sig.len() + c.fields.doc.len() + c.fields.body.len()) as u64;
             Ok(())
         })
@@ -475,6 +488,9 @@ fn whole_repo_extraction() {
     println!("rev {rev_name}: extracted {} files into {} chunks", report.files, report.chunks);
     println!("field text {:.1} MB; chunks by kind {kinds:?}", bytes as f64 / 1e6);
     println!("fallbacks {}: {:?}", report.fallbacks.len(), report.fallbacks);
+    let mut big: Vec<(u64, String)> = generated.iter().map(|(p, n)| (*n, p.clone())).collect();
+    big.sort_by(|a, b| b.cmp(a));
+    println!("generated: {} files, {} chunks; largest {:?}", generated.len(), generated.values().sum::<u64>(), &big[..big.len().min(6)]);
     println!("skipped {}: {:?}; excluded {:?}", report.skipped.len(), report.skipped, report.excluded);
 }
 
