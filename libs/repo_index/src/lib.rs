@@ -217,6 +217,9 @@ pub struct Visibility {
     pub reachable: HashSet<Oid>,
     /// Commits reachable from a `local` ref and not from `upstream`.
     pub local: HashSet<Oid>,
+    /// The short names of the local refs `local` was computed from (`work`), for
+    /// [`Pointer`]'s branch.
+    pub local_refs: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -446,6 +449,9 @@ pub struct Chunk {
     pub circle: CircleName,
     /// Source-root-relative, `/`-separated; a note's is `<label>/<path in dir>`.
     pub path: String,
+    /// For a note, the byte length of the `<label>` prefix of `path` (labels may contain `/`);
+    /// 0 for every other chunk. [`ChunkView::path_in_source`] is the rest.
+    pub label_len: u16,
     pub span: Span,
     pub lines: Lines,
     pub name: String,
@@ -599,6 +605,19 @@ pub struct ChunkView<'a> {
     pub commit: Option<Oid>,
     pub flags: Flags,
     pub field_lengths: [u32; 5],
+    /// As [`Chunk::label_len`].
+    pub label_len: u16,
+}
+
+impl<'a> ChunkView<'a> {
+    /// A note's path within its notes source (the pointer rule matches on it); for any other
+    /// chunk, its path.
+    pub fn path_in_source(&self) -> &'a str {
+        match self.label_len {
+            0 => self.path,
+            n => &self.path[n as usize + 1..],
+        }
+    }
 }
 
 /// Writes one segment: tmp file, fsync, rename to its content name. `add` returns `ChunkId(n)`
