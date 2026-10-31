@@ -3,6 +3,9 @@
 //! retried later and logged. A notes circle removed from `circles.conf` loses its segments (and
 //! the record text they keep) with it.
 //!
+//! It sweeps one repo's `repo-<id>/` and the machine's notes circles (`<circle>/` at the root),
+//! never another repo's directory: that repo's live worktrees are not known here.
+//!
 //! Per circle directory:
 //! - a base not in `live_bases` goes once its last use (`.used`, else its pointer's time) is
 //!   older than the grace period: pointer first, so no reader is sent to a missing segment;
@@ -24,11 +27,11 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub fn run(store: &FsStore, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
+pub fn run(store: &FsStore, repo: RepoId, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
     let live: HashSet<String> = live_bases.iter().map(base_name).collect();
     let configured: HashSet<PathBuf> = live_circles.iter().map(|(r, c)| store.circle_dir(*r, c)).collect::<Result<_, _>>()?;
     let mut report = GcReport::default();
-    for dir in circle_dirs(store.root())? {
+    for dir in circle_dirs(store.root(), repo)? {
         let manifests = manifest::numbers(&dir)?;
         if !manifests.is_empty() && !configured.contains(&dir) {
             drop_circle(&dir, manifests[0], store.grace(), &mut report)?;
@@ -85,16 +88,17 @@ fn list(dir: &Path) -> Result<Vec<(String, PathBuf, bool)>, Error> {
     Ok(out)
 }
 
-/// `repo-<id>/<circle>/` and `<circle>/` under the root.
-fn circle_dirs(root: &Path) -> Result<Vec<PathBuf>, Error> {
+/// `repo-<repo>/<circle>/` and the notes circles' `<circle>/` under the root.
+fn circle_dirs(root: &Path, repo: RepoId) -> Result<Vec<PathBuf>, Error> {
+    let mine = format!("repo-{:016x}", repo.0);
     let mut out = Vec::new();
     for (name, path, is_dir) in list(root)? {
         if !is_dir {
             continue;
         }
-        if name.starts_with("repo-") {
+        if name == mine {
             out.extend(list(&path)?.into_iter().filter(|e| e.2).map(|e| e.1));
-        } else {
+        } else if !name.starts_with("repo-") {
             out.push(path);
         }
     }
