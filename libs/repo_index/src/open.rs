@@ -768,6 +768,8 @@ pub(crate) mod fakes {
         pub segments: HashMap<String, (SegmentKey, Vec<(Chunk, FieldTerms)>)>,
         pub manifests: HashMap<String, SegmentManifest>,
         pub builds: u32,
+        /// Every gc call: (repo, live bases, live circles).
+        pub gc_calls: Vec<(RepoId, Vec<SegmentKey>, Vec<crate::cli::LiveCircle>)>,
     }
 
     /// A store in memory; `state` is shared so a test can look inside.
@@ -841,7 +843,8 @@ pub(crate) mod fakes {
             let (key, chunks) = st.segments.get(&id.0).ok_or_else(|| Error::Corrupt { path: PathBuf::from(&id.0), message: "missing".into() })?;
             Ok(Box::new(FakeSegment { key: key.clone(), chunks: chunks.clone() }))
         }
-        fn gc(&self, _live: &[SegmentKey], _circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
+        fn gc(&self, repo: RepoId, live: &[SegmentKey], circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
+            self.state.borrow_mut().gc_calls.push((repo, live.to_vec(), circles.to_vec()));
             Ok(GcReport::default())
         }
     }
