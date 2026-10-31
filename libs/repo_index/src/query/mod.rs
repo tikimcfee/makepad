@@ -190,8 +190,9 @@ impl Engine {
         let hits = selected.into_iter().map(|e| build_hit(opened, e, ctx)).collect();
         let nearest = nearest_pool.into_iter().take(rank::NEAREST).map(|e| build_hit(opened, e, ctx)).collect();
         let total = b.total;
-        // Nothing here matches at all: every content word is absent.
-        let absent_terms = if total == 0 { content_words(query) } else { b.absent_terms };
+        // Nothing here matches at all: every shaped word is absent. Plain words never are, and
+        // a block with no shaped word absent claims no absence.
+        let absent_terms = if total == 0 { shaped_words(query) } else { b.absent_terms };
         CircleBlock {
             circle: b.name,
             rev: b.rev,
@@ -206,12 +207,19 @@ impl Engine {
     }
 }
 
-/// The query's content words as written, without sentence punctuation (absent terms when a
+/// The query's identifier-, prefix- and path-shaped words as written (absent terms when a
 /// circle matches nothing).
-fn content_words(query: &Query) -> Vec<String> {
-    let classes: Vec<(String, rank::Class)> = query.words.iter().map(|w| rank::classify(w)).collect();
-    let only_function = classes.iter().all(|(_, c)| *c == rank::Class::Function);
-    classes.into_iter().filter(|(core, c)| !core.is_empty() && (only_function || *c != rank::Class::Function)).map(|(core, _)| core).collect()
+fn shaped_words(query: &Query) -> Vec<String> {
+    query
+        .words
+        .iter()
+        .map(|w| rank::classify(w))
+        .filter_map(|(core, c)| match c {
+            rank::Class::Subject { .. } | rank::Class::Path => Some(core),
+            rank::Class::Prefix => Some(format!("{core}_")),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Picks hits in rank order, at most [`crate::HITS_PER_GROUP`] per package, up to `limit`; then
