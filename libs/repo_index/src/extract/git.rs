@@ -186,6 +186,18 @@ impl Repo for GitRepo {
         Ok(out)
     }
 
+    /// makepad-git's `worktree_list`: the main checkout, then each registration under
+    /// `<common>/worktrees/`. A registration whose directory is gone (prunable) or whose HEAD is
+    /// unborn has no tree to keep, so it is not listed.
+    fn worktrees(&mut self) -> Result<Vec<(PathBuf, Oid)>, Error> {
+        let list = self.repo.worktree_list().map_err(|e| git_err("worktree list", e))?;
+        Ok(list
+            .into_iter()
+            .filter(|w| w.prunable.is_none())
+            .filter_map(|w| w.head.map(|h| (w.path, oid(&h))))
+            .collect())
+    }
+
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error> {
         let m = self.repo.merge_base(&object_id(&a), &object_id(&b)).map_err(|e| git_err("merge-base", e))?;
         Ok(m.map(|id| oid(&id)))
