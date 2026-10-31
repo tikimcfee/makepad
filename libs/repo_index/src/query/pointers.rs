@@ -7,6 +7,10 @@
 //!   plus a branch pointer ([`PointerUnit::Files`]): the files touched by the matching
 //!   local-only commits, reachable or not, and the branch's changed files
 //!   ([`crate::Visibility::local_files`]) whose text holds every absent term.
+//!
+//! A history circle the query named gets no count (its block is the answer), but when its
+//! block names absent terms it gets the branch pointer for them: local-only commits are not
+//! in the block (it shows what the revision reaches), so this is where they surface.
 
 use std::collections::HashSet;
 
@@ -16,10 +20,21 @@ use crate::terms::Terms;
 use crate::Tokenize;
 use crate::{ChunkId, Key, Kind, Oid, OpenCircle, Opened, Pointer, PointerUnit, Visibility};
 
-pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) -> Vec<Pointer> {
+/// `absent` is every block's absent terms; `named_absent` a named circle's own block's.
+pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String], named_absent: &dyn Fn(&OpenCircle) -> Vec<String>) -> Vec<Pointer> {
     let mut out = Vec::new();
     if plan.words == 0 {
         return out;
+    }
+    for (ci, c) in opened.open.iter().enumerate() {
+        let Some(vis) = &c.visible else { continue };
+        let absent = named_absent(c);
+        if absent.is_empty() {
+            continue;
+        }
+        if let Some(branch) = branch_pointer(opened, c, vis, &absent_commits(c, ci, &absent), &absent) {
+            out.push(branch);
+        }
     }
     for (ci, c) in opened.others.iter().enumerate() {
         if c.rev.is_none() && c.visible.is_none() {
@@ -46,17 +61,18 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
         }
         // The branch's commits matter for what this circle lacks: with absent terms, a local
         // commit matches on those alone.
-        let branch_matching = if absent.is_empty() {
-            matching
-        } else {
-            let plan = Plan::new(absent, &Terms.query_terms(absent));
-            matching_commits(c, &rank(c, ci, &plan, &any_rev, usize::MAX, None), &plan)
-        };
+        let branch_matching = if absent.is_empty() { matching } else { absent_commits(c, ci, absent) };
         if let Some(branch) = branch_pointer(opened, c, vis, &branch_matching, absent) {
             out.push(branch);
         }
     }
     out
+}
+
+/// The commits at any revision holding every absent term.
+fn absent_commits(c: &OpenCircle, ci: usize, absent: &[String]) -> Vec<Oid> {
+    let plan = Plan::new(absent, &Terms.query_terms(absent));
+    matching_commits(c, &rank(c, ci, &plan, &Filter { any_rev: true, ..Filter::default() }, usize::MAX, None), &plan)
 }
 
 /// Distinct commits among the chunks matching every content word, best first.

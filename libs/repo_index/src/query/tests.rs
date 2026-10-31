@@ -1152,3 +1152,29 @@ fn a_path_new_in_the_worktree_is_found_by_its_name() {
     let b = &find(&o, &query("old_tool.py", &["makepad"])).blocks[0];
     assert_eq!(b.absent_terms, ["old_tool.py"]);
 }
+
+#[test]
+fn a_named_history_block_with_absent_terms_points_at_the_branch() {
+    // Pinned at upstream: the local commit c2 is the only one naming `TurnClamp`, and the
+    // revision does not reach it. The history block says absent; the branch pointer says where.
+    let mut h = history();
+    h.segments = vec![Box::new(MemSegment::new(
+        "makepad:history",
+        vec![
+            commit(1, "alpha: gizmos spin by a clamped step", &["alpha/src/lib.rs"]),
+            commit(2, "beta: TurnClamp harder", &["beta/src/lib.rs", "beta/src/broken.rs"]),
+        ],
+    ))];
+    if let Some(vis) = &mut h.visible {
+        vis.reachable.remove(&oid(0xc2));
+    }
+    let o = opened(vec![makepad(), h], vec![]);
+    let out = find(&o, &query("TurnClamp gizmos", &["makepad", "makepad:history"]));
+    assert_eq!(out.blocks[1].absent_terms, ["TurnClamp"]);
+    let br = out.pointers.iter().find(|p| p.branch.is_some()).expect("a branch pointer");
+    assert_eq!((br.count, br.commits, br.branch.as_deref()), (2, 1, Some("work")));
+    assert_eq!(br.sample, format!("{} beta: TurnClamp harder", short(&oid(0xc2))));
+    // No absent term in the history block: no branch pointer for it.
+    let out = find(&o, &query("gizmos", &["makepad", "makepad:history"]));
+    assert!(out.pointers.iter().all(|p| p.branch.is_none()), "{:?}", out.pointers);
+}

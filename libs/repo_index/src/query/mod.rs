@@ -121,7 +121,9 @@ impl Search for Engine {
             }
             a
         };
-        let pointers = if query.pointers { pointers::count(opened, &query.words, &plan, &absent) } else { Vec::new() };
+        // A named history circle's own block (not a fused or filtered composite of it).
+        let named_absent = |c: &OpenCircle| blocks.iter().find(|b| b.circle == c.name).map(|b| b.absent_terms.clone()).unwrap_or_default();
+        let pointers = if query.pointers { pointers::count(opened, &query.words, &plan, &absent, &named_absent) } else { Vec::new() };
         Ok(FindOutput { blocks, pointers })
     }
 
