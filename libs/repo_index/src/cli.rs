@@ -15,6 +15,12 @@ use crate::{
     Render, Repo, RepoId, RevSpec, Search, SegmentKey, ShowOutput, SourceStamp, StatusOutput, Store, Target, DEFAULT_LIMIT,
     INDEXER_VERSION, SHOW_MAX_LINES,
 };
+use crate::extract::{git::GitRepo, notes::Cite, Extractor};
+use crate::open::{Opener, RepoOpener};
+use crate::output::Renderer;
+use crate::query::Engine;
+use crate::store::{index_root, FsStore};
+use crate::terms::Terms;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,10 +61,33 @@ pub struct Parts {
     pub cwd: PathBuf,
 }
 
-/// Builds [`Parts`] over the concrete store, extract, terms, query and output parts. Until they
-/// are joined on `work` there is nothing to build them from.
-fn wire() -> Result<Parts, String> {
-    Err("the store, extract, terms, query and output parts are not joined into this build yet".into())
+/// Builds [`Parts`] over the concrete parts: makepad-git for the repo the caller stands in, the
+/// file store under [`index_root`], the extractor (notes cite the `makepad` circle at HEAD), the
+/// tokenizer, the ranking engine and the renderer.
+fn wire() -> Result<Parts, Error> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io { context: "the current directory".into(), error })?;
+    let mut repo = GitRepo::open(&cwd)?;
+    let head = repo.resolve(&RevSpec::Pinned("HEAD".into()))?;
+    let cite = Cite::from_repo(CircleName(circles::MAKEPAD.into()), &mut repo, &head)?;
+    let index = index_root()?;
+    let open_repo: RepoOpener = Box::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
+    let opener = Opener::new(
+        Box::new(GitRepo::open(&cwd)?),
+        open_repo,
+        Box::new(FsStore::new(index.clone())),
+        Box::new(Extractor { cite: Some(cite) }),
+        Box::new(Terms),
+        circles::conf_path()?,
+        circles::user_home()?,
+    );
+    Ok(Parts {
+        circles: Box::new(opener),
+        search: Box::new(Engine::default()),
+        render: Box::new(Renderer),
+        repo: Box::new(repo),
+        store: Box::new(FsStore::new(index)),
+        cwd,
+    })
 }
 
 /// Runs `makepad index` with the words after `index`; the exit code.
@@ -74,9 +103,9 @@ pub fn main(args: &[String]) -> i32 {
         }
         Some(verb) if VERBS.iter().any(|(v, _, _)| *v == verb) => match wire() {
             Ok(mut parts) => run(&mut parts, args, &mut std::io::stdout(), &mut std::io::stderr()),
-            Err(why) => {
-                eprintln!("makepad index {verb}: not built yet: {why}");
-                2
+            Err(e) => {
+                eprintln!("makepad index {verb}: {e}");
+                1
             }
         },
         Some(other) => {
