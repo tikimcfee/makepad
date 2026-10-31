@@ -14,7 +14,7 @@ use crate::{
     Render, Repo, RepoId, RevSpec, Search, SegmentKey, ShowOutput, SourceStamp, StatusOutput, Store, Target, DEFAULT_LIMIT,
     INDEXER_VERSION, SHOW_MAX_LINES,
 };
-use crate::extract::{git::GitRepo, notes::Cite, Extractor};
+use crate::extract::{git::GitRepo, Extractor};
 use crate::open::{Opener, RepoOpener};
 use crate::output::Renderer;
 use crate::query::{self, Engine};
@@ -65,16 +65,14 @@ pub struct Parts {
 /// tokenizer, the ranking engine and the renderer.
 fn wire() -> Result<Parts, Error> {
     let cwd = std::env::current_dir().map_err(|error| Error::Io { context: "the current directory".into(), error })?;
-    let mut repo = GitRepo::open(&cwd)?;
-    let head = repo.resolve(&RevSpec::Pinned("HEAD".into()))?;
-    let cite = Cite::from_repo(CircleName(circles::MAKEPAD.into()), &mut repo, &head)?;
+    let repo = GitRepo::open(&cwd)?;
     let index = index_root()?;
     let open_repo: RepoOpener = Box::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
     let opener = Opener::new(
         Box::new(GitRepo::open(&cwd)?),
         open_repo,
         Box::new(FsStore::new(index.clone())),
-        Box::new(Extractor { cite: Some(cite) }),
+        Box::new(Extractor::citing(CircleName(circles::MAKEPAD.into()), RevSpec::Pinned("HEAD".into()))),
         Box::new(Terms),
         circles::conf_path()?,
         circles::user_home()?,
