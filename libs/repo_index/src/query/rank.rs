@@ -642,7 +642,7 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
                         let v = seg.chunk(p.chunk);
                         !shadowed.contains(v.path) && (filter.any_rev || visible(c, &v))
                     }))
-        }) || c.overlay.iter().any(|f| f.chunks.iter().any(|(_, ft)| ft.terms.iter().any(|t| t.form == form && t.text == text)))
+        }) || c.overlay.iter().any(|f| f.chunks.iter().any(|(_, ft)| ft.iter().any(|t| t.form == form && t.text == text)))
     };
     let tree = c.rev.is_some() && c.visible.is_none();
     let mut absent_terms = Vec::new();
@@ -678,9 +678,9 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
         }
         for f in &c.overlay {
             for (_, ft) in &f.chunks {
-                for t in ft.terms.iter().filter(|t| t.form == TermForm::Folded && t.text.starts_with(&start)) {
+                for t in ft.iter().filter(|t| t.form == TermForm::Folded && t.text.starts_with(&start)) {
                     if !terms.iter().any(|(_, x)| *x == t.text) {
-                        terms.push((0, t.text.clone()));
+                        terms.push((0, t.text.to_string()));
                     }
                 }
             }
@@ -706,7 +706,7 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
     // added) has parts no segment holds.
     let overlay_df = |text: &str| {
         let forms = forms(Role::Primary);
-        c.overlay.iter().flat_map(|f| &f.chunks).filter(|(_, ft)| ft.terms.iter().any(|t| t.text == text && forms.iter().any(|(form, _)| *form == t.form))).count() as u32
+        c.overlay.iter().flat_map(|f| &f.chunks).filter(|(_, ft)| ft.iter().any(|t| t.text == text && forms.iter().any(|(form, _)| *form == t.form))).count() as u32
     };
     for pw in &plan.paths {
         let rarest = pw
@@ -847,7 +847,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         for (fi, file) in c.overlay.iter().enumerate() {
             for (ci, (_, ft)) in file.chunks.iter().enumerate() {
                 let mut tf = [0f32; 5];
-                for t in &ft.terms {
+                for t in ft.iter() {
                     if t.text == g.text {
                         if let Some((_, w)) = forms(g.role).iter().find(|(form, _)| *form == t.form) {
                             tf[field_index(t.field)] += t.tf as f32 * w;

@@ -139,7 +139,7 @@ mod tests {
         let names: Vec<&str> = o.files.iter().flat_map(|f| f.chunks.iter().map(|(c, _)| c.name.as_str())).collect();
         assert!(names.contains(&"edited_now") && names.contains(&"brand_new"), "{names:?}");
         assert!(!names.contains(&"never_indexed"));
-        assert!(o.files.iter().all(|f| f.chunks.iter().all(|(_, t)| !t.terms.is_empty())));
+        assert!(o.files.iter().all(|f| f.chunks.iter().all(|(_, t)| !t.is_empty())));
         assert!(o.files.iter().all(|f| f.chunks.iter().all(|(c, _)| c.keys.package.as_deref() == Some("pkg-a"))));
     }
 }

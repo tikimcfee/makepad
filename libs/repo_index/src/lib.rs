@@ -527,19 +527,59 @@ pub enum TermForm {
     Part,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TermOcc {
+/// One term of a chunk, read from its [`FieldTerms`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermOcc<'a> {
     pub field: Field,
     pub form: TermForm,
-    pub text: String,
+    pub text: &'a str,
     pub tf: u32,
 }
 
-/// A chunk's terms plus its field lengths (BM25F norms).
-#[derive(Clone, Debug, Default)]
+/// A chunk's terms plus its field lengths (BM25F norms). The terms' texts share one buffer:
+/// a chunk costs two allocations however many terms it has, to build and to free.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FieldTerms {
-    pub terms: Vec<TermOcc>,
+    text: String,
+    terms: Vec<TermSpan>,
     pub lengths: [u32; 5],
+}
+
+/// A term's place in [`FieldTerms`]' buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TermSpan {
+    field: Field,
+    form: TermForm,
+    at: u32,
+    len: u32,
+    tf: u32,
+}
+
+impl FieldTerms {
+    /// No terms yet; `text` bytes and `terms` entries reserved.
+    pub fn with_capacity(text: usize, terms: usize) -> FieldTerms {
+        FieldTerms { text: String::with_capacity(text), terms: Vec::with_capacity(terms), lengths: [0; 5] }
+    }
+
+    /// Appends a term (equal terms are not merged: the tokenizer gives each once).
+    pub fn push(&mut self, field: Field, form: TermForm, text: &str, tf: u32) {
+        let at = self.text.len() as u32;
+        self.text.push_str(text);
+        self.terms.push(TermSpan { field, form, at, len: text.len() as u32, tf });
+    }
+
+    /// The terms, in the order pushed.
+    pub fn iter(&self) -> impl Iterator<Item = TermOcc<'_>> + '_ {
+        self.terms.iter().map(|t| TermOcc { field: t.field, form: t.form, text: &self.text[t.at as usize..(t.at + t.len) as usize], tf: t.tf })
+    }
+
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
 }
 
 /// One query term; `word` indexes the query word it came from (coverage).
