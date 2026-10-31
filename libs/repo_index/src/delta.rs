@@ -38,14 +38,18 @@ pub struct Over<'a> {
 /// The overlay of the worktree at `over.root` over `over.base`. The changed files are read,
 /// re-extracted together ([`Extract::extract_files`], on the crate's workers), and their chunks
 /// tokenized together ([`crate::open::tokenize_all`], the same workers), so one large file does
-/// not hold the rest up.
+/// not hold the rest up. The crate cards the changes alter ([`Extract::extract_cards`]: full
+/// cards, as a base build of the worktree gives them) are each their manifest path's whole
+/// overlay file, in place of the manifest-only card `extract_files` gives, and shadow that path
+/// even when the manifest itself is unchanged (a card whose dependents changed).
 pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn Tokenize + Sync), over: &Over) -> Result<Overlay, Error> {
     let Over { circle, def, base, root, package } = *over;
     let mut out = Overlay::default();
     let mut read: Vec<(String, Vec<u8>)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
-    for change in repo.changes(base)? {
-        let (path, shadows) = match &change {
+    let changes = repo.changes(base)?;
+    for change in &changes {
+        let (path, shadows) = match change {
             Change::Added(p) => (p, false),
             Change::Modified(p) | Change::Deleted(p) => (p, true),
         };
@@ -74,18 +78,28 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
         }
     }
     let extracted = extract.extract_files(circle, def, &read)?;
-    // the overlay's manifests: a card's package, or none (a virtual workspace manifest)
-    let cards: Vec<(&str, Option<String>)> = read
+    let full = extract.extract_cards(circle, def, base, root, &changes, repo)?;
+    // the overlay's manifests: the package of its full card, or none (a changed manifest with no
+    // card: virtual now, or not parsing; its own chunks stand)
+    let mut cards: Vec<(&str, Option<String>)> = read
         .iter()
-        .zip(&extracted)
-        .filter(|((p, _), _)| p == "Cargo.toml" || p.ends_with("/Cargo.toml"))
-        .map(|((p, _), chunks)| (p.as_str(), chunks.iter().find(|c| c.kind == crate::Kind::Crate).and_then(|c| c.keys.package.clone())))
+        .map(|(p, _)| p.as_str())
+        .filter(|p| *p == "Cargo.toml" || p.ends_with("/Cargo.toml"))
+        .map(|p| (p, full.iter().find(|c| c.path == p).and_then(|c| c.keys.package.clone())))
         .collect();
+    for c in &full {
+        if !cards.iter().any(|(p, _)| *p == c.path) {
+            cards.push((c.path.as_str(), c.keys.package.clone()));
+        }
+    }
     let deleted: HashSet<&str> = deleted.iter().map(String::as_str).collect();
     // every file's chunks in one run, with each file's (path, chunk count)
     let mut all: Vec<Chunk> = Vec::new();
     let mut files: Vec<(String, usize)> = Vec::new();
     for ((path, _), mut chunks) in read.iter().zip(extracted) {
+        if full.iter().any(|c| c.path == *path) {
+            continue; // its full card replaces the manifest-only one
+        }
         let pkg = package_of(path, &cards, &deleted, package);
         for c in &mut chunks {
             if c.keys.package.is_none() {
@@ -97,6 +111,13 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
             all.extend(chunks);
         }
     }
+    for c in &full {
+        if !out.shadowed.contains(&c.path) {
+            out.shadowed.push(c.path.clone());
+        }
+        files.push((c.path.clone(), 1));
+    }
+    all.extend(full.iter().cloned());
     let terms = crate::open::tokenize_all(tokenize, &all);
     let mut pairs = all.into_iter().zip(terms);
     for (path, n) in files {
@@ -207,6 +228,18 @@ mod tests {
             _ => unreachable!(),
         };
         let mut repo = FakeRepo::new(&root);
+        let base = repo.rev(
+            &["base"],
+            1,
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"libs/old\", \"libs/gone\"]\n"),
+                ("libs/old/Cargo.toml", "[package]\nname = \"old-crate\"\nversion = \"0.1.0\"\n"),
+                ("libs/old/src/a.rs", "pub fn before() {}\n"),
+                ("libs/gone/Cargo.toml", "[package]\nname = \"gone-crate\"\nversion = \"0.1.0\"\n"),
+                ("libs/gone/src/b.rs", "pub fn orphan() {}\n"),
+            ],
+        );
+        std::fs::write(root.join("libs/old/Cargo.toml"), "[package]\nname = \"old-crate\"\nversion = \"0.1.0\"\n").unwrap();
         repo.changes = vec![
             Change::Modified("Cargo.toml".into()),
             Change::Added("libs/new/Cargo.toml".into()), // a crate new since the base
@@ -215,7 +248,6 @@ mod tests {
             Change::Deleted("libs/gone/Cargo.toml".into()), // its manifest went away
             Change::Modified("libs/gone/src/b.rs".into()),
         ];
-        let base = Rev { spec: RevSpec::Worktree, commit: Oid([1; 20]), tree: Oid([2; 20]) };
         let cards = |p: &str| match p {
             "libs/old/Cargo.toml" => Some("old-crate".to_string()),
             "libs/gone/Cargo.toml" => Some("gone-crate".to_string()),
@@ -231,6 +263,17 @@ mod tests {
         assert_eq!(pkg("libs/new/src/lib.rs").as_deref(), Some("new-crate"));
         assert_eq!(pkg("libs/old/src/a.rs").as_deref(), Some("old-crate"));
         assert_eq!(pkg("libs/gone/src/b.rs"), None, "a deleted manifest is no card");
+        // the new crate's manifest is its full card alone, and shadows its path
+        let card = o.files.iter().find(|f| f.path == "libs/new/Cargo.toml").unwrap();
+        assert_eq!(card.chunks.len(), 1);
+        assert!(o.shadowed.contains(&"libs/new/Cargo.toml".to_string()), "a card shadows its path: {:?}", o.shadowed);
+        assert_eq!((card.chunks[0].0.kind, card.chunks[0].0.keys.package.as_deref()), (crate::Kind::Crate, Some("new-crate")));
+        match &card.chunks[0].0.detail {
+            crate::Detail::Crate(c) => assert_eq!(c.rs_files, 1, "a full card counts the crate's files"),
+            d => panic!("{d:?}"),
+        }
+        // the virtual root manifest, changed, is its path chunk
+        assert!(o.files.iter().any(|f| f.path == "Cargo.toml"));
         // the virtual root manifest is no card: nothing falls through to it
         let none: HashSet<&str> = HashSet::new();
         assert_eq!(package_of("x/y.rs", &[("Cargo.toml", None)], &none, &|p: &str| (p == "Cargo.toml").then(|| "root-pkg".into())), None);
