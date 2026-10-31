@@ -145,6 +145,46 @@ fn resolves_revisions() {
 }
 
 #[test]
+fn lists_worktrees_with_their_heads() {
+    let tmp = fixture_repo();
+    let main_head = GitRepo::open(tmp.path()).unwrap().resolve(&RevSpec::Pinned("HEAD".into())).unwrap().commit;
+    let linked = makepad_git::test_support::tempdir().unwrap();
+    let lane = linked.path().join("lane");
+    let gone = linked.path().join("gone");
+    {
+        let mut repo = Repository::open(tmp.path()).unwrap();
+        let start = repo.head_oid().unwrap();
+        repo.worktree_add(&lane, makepad_git::WorktreeBranch::NewFrom { name: "lane", start }, None).unwrap();
+        repo.worktree_add(&gone, makepad_git::WorktreeBranch::NewFrom { name: "gone", start }, None).unwrap();
+    }
+    fs::write(lane.join("alpha/lane.rs"), "pub fn lane() {}\n").unwrap();
+    commit_all(&lane, "lane: work", 1_700_000_400);
+    fs::remove_dir_all(&gone).unwrap();
+    let lane_head = GitRepo::open(&lane).unwrap().resolve(&RevSpec::Worktree).unwrap().commit;
+    assert_ne!(lane_head, main_head);
+    for from in [tmp.path(), lane.as_path()] {
+        let mut repo = GitRepo::open(from).unwrap();
+        let list = repo.worktrees().unwrap();
+        let canon = |p: &Path| p.canonicalize().unwrap();
+        let got: Vec<(PathBuf, crate::Oid)> = list.iter().map(|(p, h)| (canon(p), *h)).collect();
+        assert_eq!(got, vec![(canon(tmp.path()), main_head), (canon(&lane), lane_head)], "the removed worktree is not listed");
+    }
+}
+
+/// Every worktree of a real checkout: `MAKEPAD_INDEX_REPO=<checkout> cargo test -p
+/// makepad-repo-index real_worktrees -- --ignored --nocapture`, to compare with
+/// `git worktree list`.
+#[test]
+#[ignore]
+fn real_worktrees() {
+    let Some(root) = std::env::var_os("MAKEPAD_INDEX_REPO") else { panic!("set MAKEPAD_INDEX_REPO") };
+    let mut repo = GitRepo::open(Path::new(&root)).unwrap();
+    for (path, head) in repo.worktrees().unwrap() {
+        println!("{} {}", path.display(), super::notes::hex(&head));
+    }
+}
+
+#[test]
 fn tree_circle_from_the_fixture() {
     let tmp = fixture_repo();
     let mut repo = GitRepo::open(tmp.path()).unwrap();
