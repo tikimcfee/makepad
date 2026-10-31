@@ -1,7 +1,8 @@
 //! The circle registry: the built-in circles of the repo the caller stands in, plus
 //! `~/.makepad/index/circles.conf`, as a [`crate::CircleManifest`]; the default scope; `--in`.
 //!
-//! Built in: `makepad` (the tree; excludes [`crate::INDEX_OWN_DATA`]), `makepad:history`, and
+//! Built in: `makepad` (the tree) and `makepad:history`, both excluding
+//! [`crate::INDEX_OWN_DATA`], and
 //! `commercial` / `commercial:history` when `apps/commercial` is present. Machine-local:
 //! `notes:local`, the repo's untracked `local/` when present, minus the directories other circles
 //! claim ([`crate::Provenance::ClaimedBy`]), and every `circles.conf` circle. A circle that is not
@@ -80,7 +81,7 @@ fn base_def(n: &str, source: BaseSource, families: &[Family], exclude: Vec<Exclu
 /// The registry for the repo at `root`: its built-in circles, plus `conf` (the file's path and
 /// its text) when there is one. `home` expands `~`.
 pub fn manifest_for(root: &Path, conf: Option<(&Path, &str)>, home: &Path) -> Result<CircleManifest, Error> {
-    let own_data = INDEX_OWN_DATA
+    let own_data: Vec<Exclusion> = INDEX_OWN_DATA
         .iter()
         .map(|p| Exclusion { prefix: p.to_string(), provenance: Provenance::IndexOwnData })
         .collect();
@@ -90,8 +91,9 @@ pub fn manifest_for(root: &Path, conf: Option<(&Path, &str)>, home: &Path) -> Re
         local: local.iter().map(|s| s.to_string()).collect(),
     };
     let mut defs = vec![
-        base_def(MAKEPAD, BaseSource::Tree { root: root.to_path_buf() }, TREE_FAMILIES, own_data),
-        base_def(MAKEPAD_HISTORY, history(root, MAKEPAD_UPSTREAM, MAKEPAD_LOCAL), HISTORY_FAMILIES, Vec::new()),
+        base_def(MAKEPAD, BaseSource::Tree { root: root.to_path_buf() }, TREE_FAMILIES, own_data.clone()),
+        // a commit of the index's own data only never reaches history; a mixed one loses those paths
+        base_def(MAKEPAD_HISTORY, history(root, MAKEPAD_UPSTREAM, MAKEPAD_LOCAL), HISTORY_FAMILIES, own_data),
     ];
     let commercial = root.join("apps").join("commercial");
     if commercial.is_dir() {
@@ -536,6 +538,7 @@ mod tests {
         let mk = base(&m, MAKEPAD);
         assert_eq!(mk.exclude.len(), INDEX_OWN_DATA.len());
         assert!(mk.exclude.iter().all(|e| e.provenance == Provenance::IndexOwnData));
+        assert_eq!(base(&m, MAKEPAD_HISTORY).exclude, mk.exclude, "history excludes the index's own data too");
         std::fs::create_dir_all(root.join("apps/commercial")).unwrap();
         std::fs::create_dir_all(root.join("local/plans")).unwrap();
         let m = manifest_for(&root, None, &root).unwrap();
