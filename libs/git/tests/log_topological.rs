@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use makepad_core_util::clock::monotonic_now;
 
 fn sig_at(timestamp: i64) -> Signature {
     Signature {
@@ -504,9 +504,9 @@ fn cost_linear_3000() {
     let ids = linear_chain(&repo, tree, N, |i| i as i64 * HOUR);
     let head = *ids.last().unwrap();
 
-    let t0 = Instant::now();
+    let t0 = monotonic_now();
     let clipped = repo.log(&head, 10).unwrap();
-    let clipped_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let clipped_ms = (monotonic_now() - t0) * 1000.0;
     assert_eq!(clipped.len(), 10);
     assert_eq!(clipped[0].0, head);
     assert_child_before_every_parent(&clipped);
@@ -526,9 +526,9 @@ fn cost_linear_3000() {
 
     println!("log(head, 10) on {N} commits: {clipped_ms:.3} ms");
 
-    let t1 = Instant::now();
+    let t1 = monotonic_now();
     let full = repo.log(&head, N).unwrap();
-    let full_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let full_ms = (monotonic_now() - t1) * 1000.0;
     println!("log(head, {N}) on {N} commits: {full_ms:.3} ms, len = {}", full.len());
     assert_unique_and_complete(&full, &ids);
     assert_child_before_every_parent(&full);
@@ -606,7 +606,7 @@ const HOUR: i64 = 3600;
 const SKEW_23H: i64 = 23 * HOUR;
 const SKEW_72H: i64 = 72 * HOUR;
 const RANDOM_DAG_COUNT: u64 = 200;
-const LOG_TIMEOUT: Duration = Duration::from_millis(1500);
+const LOG_TIMEOUT_SECS: f64 = 1.5;
 
 /// `Repository::log` can fail to return on some skewed DAGs (promotion with
 /// `i64::MAX` leaves the newest pending commit at the heap top). Bound the wait
@@ -622,10 +622,16 @@ fn log_or_timeout(
         let mut repo = Repository::open(&workdir).expect("reopen repo for log");
         let _ = tx.send(repo.log(&tip, max_count).map_err(|e| e.to_string()));
     });
-    match rx.recv_timeout(LOG_TIMEOUT) {
-        Ok(Ok(log)) => Ok(log),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("timed out (walk did not return)".into()),
+    let deadline = monotonic_now() + LOG_TIMEOUT_SECS;
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(mpsc::TryRecvError::Disconnected) => return Err("log thread panicked".into()),
+            Err(mpsc::TryRecvError::Empty) if monotonic_now() > deadline => {
+                return Err("timed out (walk did not return)".into());
+            }
+            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+        }
     }
 }
 

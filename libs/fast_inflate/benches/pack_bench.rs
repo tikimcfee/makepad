@@ -2,7 +2,7 @@
 //
 // Run with: cargo bench -p makepad-fast-inflate --bench pack_bench
 
-use std::time::Instant;
+use makepad_core_util::clock::monotonic_now;
 
 fn find_pack_file() -> Option<std::path::PathBuf> {
     // Walk up from cwd to find .git/objects/pack/*.pack
@@ -156,7 +156,7 @@ fn main() {
     println!("fast_inflate (Rust, with intrinsics):");
     let mut best_rust = f64::MAX;
     for i in 0..iterations {
-        let start = Instant::now();
+        let start = monotonic_now();
         let mut total_written = 0usize;
         for obj in &objects {
             let mut out = vec![0u8; obj.expected_size];
@@ -165,7 +165,7 @@ fn main() {
                     .expect("fast_inflate failed");
             total_written += written;
         }
-        let elapsed = start.elapsed().as_secs_f64();
+        let elapsed = monotonic_now() - start;
         let throughput = total_decompressed as f64 / elapsed / 1e6;
         println!(
             "  run {}: {:.3}s  ({:.1} MB/s decompressed, {} bytes written)",

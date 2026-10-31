@@ -21,8 +21,9 @@ struct IdxTables {
     sorted_offsets: Vec<u64>,
 }
 
-/// Parsed indexes still in use, by .idx path (with its length and mtime).
-type SharedTables = std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, std::sync::Weak<IdxTables>)>;
+/// Parsed indexes still in use, by .idx path (with its length and mtime since
+/// the Unix epoch).
+type SharedTables = std::collections::HashMap<PathBuf, (u64, Option<std::time::Duration>, std::sync::Weak<IdxTables>)>;
 static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex::new(None);
 
 /// Resolved delta bases a bounded reader keeps: consecutive versions of a
@@ -97,7 +98,7 @@ impl PackIndex {
 /// that already has).
 pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
     let meta = fs::metadata(idx_path)?;
-    let key = (meta.len(), meta.modified().ok());
+    let key = (meta.len(), meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()));
     // Held while parsing, so readers opening together parse once.
     let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     let shared = shared.get_or_insert_with(Default::default);

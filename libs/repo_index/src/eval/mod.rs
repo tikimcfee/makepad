@@ -20,6 +20,7 @@ use crate::{
     circles, CircleExpr, CircleManifest, CircleName, Circles, Error, EvalMode, EvalOpts, EvalReport, GoldDrift, GoldTarget,
     Harness, Mode, Output, Precondition, Query, Question, QuestionRow, QuestionSet, Render, Repo, RevSpec, Search,
 };
+use makepad_core_util::clock::monotonic_now;
 use makepad_strict_json::{obj, s, Value};
 use std::path::{Path, PathBuf};
 
@@ -53,19 +54,11 @@ fn rev_text(rev: &RevSpec) -> String {
     }
 }
 
-/// A call and its wall time in milliseconds. The index runs natively; a wasm build has no std
-/// clock and reports 0 ms.
+/// A call and its wall time in milliseconds.
 fn timed<T>(f: impl FnOnce() -> T) -> (T, f32) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let t = std::time::Instant::now();
-        let r = f();
-        (r, t.elapsed().as_secs_f32() * 1000.0)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        (f(), 0.0)
-    }
+    let t = monotonic_now();
+    let r = f();
+    (r, ((monotonic_now() - t) * 1000.0) as f32)
 }
 
 /// Questions sharing one (revision, circles) open.

@@ -504,12 +504,12 @@ fn bounded_tree_diff_matches_real_repository_commits() {
     let limits = TreeDiffLimits::default();
     let mut total = TreeDiffCounters::default();
     let mut records = 0;
-    let mut elapsed = std::time::Duration::ZERO;
+    let mut elapsed = 0.0;
     for (old, new) in pairs {
         let before = repo.read_stats().blob_reads;
-        let start = std::time::Instant::now();
+        let start = makepad_core_util::clock::monotonic_now();
         let bounded = repo.diff_commits_bounded(Some(old), Some(new), &limits, &account, &|| false).unwrap();
-        elapsed += start.elapsed();
+        elapsed += makepad_core_util::clock::monotonic_now() - start;
         assert!(bounded.complete, "{old}..{new}: {:?}", bounded.reason);
         assert_eq!(bounded.omitted_records, 0);
         assert_eq!(repo.read_stats().blob_reads, before);
@@ -526,7 +526,7 @@ fn bounded_tree_diff_matches_real_repository_commits() {
         drop(bounded);
         assert_eq!(account.reserved(), 0);
     }
-    eprintln!("bounded-tree real totals: records={records}, counters={total:?}, account_peak={}, time_ms={:.3}, blob_reads={}", account.peak(), elapsed.as_secs_f64() * 1000.0, repo.read_stats().blob_reads);
+    eprintln!("bounded-tree real totals: records={records}, counters={total:?}, account_peak={}, time_ms={:.3}, blob_reads={}", account.peak(), elapsed * 1000.0, repo.read_stats().blob_reads);
 }
 
 #[test]

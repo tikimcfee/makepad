@@ -12,6 +12,9 @@ include = ["../../examples/splash/resources/app_icon.png", "../../examples/uizoo
 
 [dependencies]
 
+[dev-dependencies]
+makepad-core-util = { path = "../core_util" }
+
 [[bench]]
 name = "decompress_bench"
 harness = false

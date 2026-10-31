@@ -19,5 +19,6 @@ relax-lex = { workspace = true }
 makepad-search = { path = "../search" }
 makepad-toml-parser = { path = "../toml_parser" }
 makepad-shared-bytes = { path = "../shared_bytes" }
+makepad-core-util = { path = "../core_util" }
 makepad-git = { path = "../git" }
 makepad-strict-json = { workspace = true }
