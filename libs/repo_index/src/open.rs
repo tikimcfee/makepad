@@ -643,6 +643,9 @@ pub(crate) mod fakes {
         fn changes(&mut self, _base: &Rev) -> Result<Vec<Change>, Error> {
             Ok(self.changes.clone())
         }
+        fn commit_ids(&mut self, tips: &[Oid]) -> Result<Vec<Oid>, Error> {
+            Ok(self.commits(tips, &[])?.into_iter().map(|c| c.oid).collect())
+        }
         fn commits(&mut self, tips: &[Oid], hide: &[Oid]) -> Result<Vec<CommitRecord>, Error> {
             Ok(self
                 .commits

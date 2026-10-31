@@ -100,7 +100,7 @@ impl Cite {
     /// The paths of `rev`'s tree and the commits reachable from it.
     pub fn from_repo(circle: CircleName, repo: &mut dyn Repo, rev: &Rev) -> Result<Cite, Error> {
         let paths = repo.files(rev.tree)?.into_iter().map(|f| f.path).collect();
-        let mut commits: Vec<(String, Oid)> = repo.commits(&[rev.commit], &[])?.into_iter().map(|c| (hex(&c.oid), c.oid)).collect();
+        let mut commits: Vec<(String, Oid)> = repo.commit_ids(&[rev.commit])?.into_iter().map(|c| (hex(&c), c)).collect();
         commits.sort();
         Ok(Cite { circle, commit: rev.commit, paths, commits })
     }

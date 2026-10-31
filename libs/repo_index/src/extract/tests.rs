@@ -352,6 +352,10 @@ impl Repo for Counting<'_> {
     fn worktrees(&mut self) -> Result<Vec<(PathBuf, crate::Oid)>, crate::Error> {
         self.inner.worktrees()
     }
+    fn commit_ids(&mut self, tips: &[crate::Oid]) -> Result<Vec<crate::Oid>, crate::Error> {
+        self.walks += 1;
+        self.inner.commit_ids(tips)
+    }
     fn merge_base(&mut self, a: crate::Oid, b: crate::Oid) -> Result<Option<crate::Oid>, crate::Error> {
         self.inner.merge_base(a, b)
     }
@@ -507,6 +511,7 @@ fn real_cite_parts() {
     match part.as_str() {
         "files" => println!("files {}", repo.files(head.tree).unwrap().len()),
         "commits" => println!("commits {}", repo.commits(&[head.commit], &[]).unwrap().len()),
+        "ids" => println!("ids {}", repo.commit_ids(&[head.commit]).unwrap().len()),
         "cite" => println!("cite {}", Cite::from_repo(circle("makepad"), &mut repo, &head).unwrap().commits.len()),
         _ => println!("resolved"),
     }
