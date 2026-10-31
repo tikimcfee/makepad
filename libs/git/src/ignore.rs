@@ -525,7 +525,7 @@ fn user_excludes_file(common_dir: &Path) -> Option<PathBuf> {
     let configured = configs
         .iter()
         .filter_map(|config| config_excludes_file(config))
-        .last();
+        .next_back();
     match configured {
         Some(value) => match (value.strip_prefix("~/"), &home) {
             (Some(rest), Some(home)) => Some(home.join(rest)),

@@ -545,7 +545,7 @@ fn bounded_tree_diff_git_name_status_oracle() {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let fields: Vec<_> = output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
         assert_eq!(fields.len() % 2, 0);
-        let expected: Vec<_> = fields.chunks_exact(2).map(|p| (std::str::from_utf8(p[0]).unwrap(), std::str::from_utf8(p[1]).unwrap())).collect();
+        let expected: Vec<_> = fields.as_chunks::<2>().0.iter().map(|[status, path]| (std::str::from_utf8(status).unwrap(), std::str::from_utf8(path).unwrap())).collect();
         let actual: Vec<_> = bounded.records.iter().map(|r| (match r.kind {
             TreeChangeKind::Added => "A", TreeChangeKind::Deleted => "D", TreeChangeKind::TypeChanged => "T",
             TreeChangeKind::Modified | TreeChangeKind::ModeOnly => "M",

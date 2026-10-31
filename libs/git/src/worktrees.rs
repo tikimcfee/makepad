@@ -161,7 +161,6 @@ impl Repository {
             let packs = &self.packs;
             let alts = &self.alternates;
             worktree::checkout_tree(
-                &git_dir,
                 &path,
                 &tree,
                 "",

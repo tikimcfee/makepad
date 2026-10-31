@@ -30,7 +30,7 @@ pub(crate) fn compress_stored(d: &mut CompressorOxide, callback: &mut CallbackOx
             let dictb = &mut d.dict.b;
 
             let mut dst_pos = (lookahead_pos + lookahead_size) & LZ_DICT_SIZE_MASK;
-            let mut ins_pos = lookahead_pos + lookahead_size - 2;
+            let ins_pos = lookahead_pos + lookahead_size - 2;
             // Start the hash value from the first two bytes
             let mut hash = update_hash(
                 u16::from(dictb.dict[ins_pos & LZ_DICT_SIZE_MASK]),
@@ -39,7 +39,7 @@ pub(crate) fn compress_stored(d: &mut CompressorOxide, callback: &mut CallbackOx
 
             lookahead_size += num_bytes_to_process;
 
-            for &c in &in_buf[src_pos..src_pos + num_bytes_to_process] {
+            for (ins_pos, &c) in (ins_pos..).zip(&in_buf[src_pos..src_pos + num_bytes_to_process]) {
                 // Add byte to input buffer.
                 dictb.dict[dst_pos] = c;
                 if dst_pos < MAX_MATCH_LEN - 1 {
@@ -52,7 +52,6 @@ pub(crate) fn compress_stored(d: &mut CompressorOxide, callback: &mut CallbackOx
                 // and insert it into the hash chain.
                 dictb.hash[hash as usize] = ins_pos as u16;
                 dst_pos = (dst_pos + 1) & LZ_DICT_SIZE_MASK;
-                ins_pos += 1;
             }
             src_pos += num_bytes_to_process;
         } else {
@@ -144,7 +143,7 @@ fn compress_rle(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> bool {
             let dictb = &mut d.dict.b;
 
             let mut dst_pos = (lookahead_pos + lookahead_size) & LZ_DICT_SIZE_MASK;
-            let mut ins_pos = lookahead_pos + lookahead_size - 2;
+            let ins_pos = lookahead_pos + lookahead_size - 2;
             // Start the hash value from the first two bytes
             let mut hash = update_hash(
                 u16::from(dictb.dict[ins_pos & LZ_DICT_SIZE_MASK]),
@@ -153,7 +152,7 @@ fn compress_rle(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> bool {
 
             lookahead_size += num_bytes_to_process;
 
-            for &c in &in_buf[src_pos..src_pos + num_bytes_to_process] {
+            for (ins_pos, &c) in (ins_pos..).zip(&in_buf[src_pos..src_pos + num_bytes_to_process]) {
                 // Add byte to input buffer.
                 dictb.dict[dst_pos] = c;
                 if dst_pos < MAX_MATCH_LEN - 1 {
@@ -166,7 +165,6 @@ fn compress_rle(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> bool {
                 // and insert it into the hash chain.
                 dictb.hash[hash as usize] = ins_pos as u16;
                 dst_pos = (dst_pos + 1) & LZ_DICT_SIZE_MASK;
-                ins_pos += 1;
             }
             src_pos += num_bytes_to_process;
         } else {
