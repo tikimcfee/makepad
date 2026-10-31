@@ -352,13 +352,11 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<DiffOp> {
         let mut k = -d;
         while k <= d {
             let ki = (k + offset) as usize;
-            let x: i64;
-            if k == -d || (k != d && v[ki - 1] < v[ki + 1]) {
-                x = v[ki + 1]; // move down
+            let mut x = if k == -d || (k != d && v[ki - 1] < v[ki + 1]) {
+                v[ki + 1] // move down
             } else {
-                x = v[ki - 1] + 1; // move right
-            }
-            let mut x = x;
+                v[ki - 1] + 1 // move right
+            };
             let mut y = x - k;
 
             // Follow diagonal (matching lines)
@@ -403,12 +401,11 @@ fn backtrack(trace: &[Vec<i64>], n: usize, m: usize, offset: i64) -> Vec<Edit> {
         let k = x - y;
         let ki = (k + offset) as usize;
 
-        let prev_k;
-        if k == -d || (k != d && v[ki - 1] < v[ki + 1]) {
-            prev_k = k + 1; // came from above (insert)
+        let prev_k = if k == -d || (k != d && v[ki - 1] < v[ki + 1]) {
+            k + 1 // came from above (insert)
         } else {
-            prev_k = k - 1; // came from left (delete)
-        }
+            k - 1 // came from left (delete)
+        };
 
         let prev_ki = (prev_k + offset) as usize;
         let prev_x = v[prev_ki];
@@ -512,6 +509,9 @@ impl LineEnding {
     }
     pub fn len(self) -> usize {
         self.as_str().len()
+    }
+    pub fn is_empty(self) -> bool {
+        self == LineEnding::None
     }
 }
 
@@ -1230,8 +1230,8 @@ fn build_hunks(
         // Calculate old_start and new_start by counting through line_edits
         let mut oi = 0;
         let mut ni = 0;
-        for i in 0..start {
-            match line_edits[i].0 {
+        for (kind, _) in &line_edits[..start] {
+            match kind {
                 ' ' => {
                     oi += 1;
                     ni += 1;
@@ -1248,8 +1248,7 @@ fn build_hunks(
         let old_start = oi;
         let new_start = ni;
 
-        for i in start..end {
-            let (kind, text) = &line_edits[i];
+        for (kind, text) in &line_edits[start..end] {
             hunk_lines.push(format!("{}{}", kind, text));
             match kind {
                 ' ' => {
