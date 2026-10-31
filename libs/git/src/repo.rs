@@ -1182,7 +1182,6 @@ impl Repository {
         let git_dir = self.common_dir.clone();
         let workdir = self.workdir.clone();
         worktree::checkout_tree(
-            &git_dir,
             &workdir,
             &target_tree,
             "",
@@ -1375,7 +1374,6 @@ impl Repository {
             let git_dir = self.common_dir.clone();
             let workdir = self.workdir.clone();
             worktree::checkout_tree(
-                &git_dir,
                 &workdir,
                 &theirs_tree,
                 "",
@@ -1655,7 +1653,7 @@ pub(crate) fn read_loose_object_from_objects_dir(
     let space_pos = header
         .find(' ')
         .ok_or_else(|| GitError::InvalidObject(format!("no space in header for {}", oid)))?;
-    let kind = ObjectKind::from_str(&header[..space_pos])?;
+    let kind: ObjectKind = header[..space_pos].parse()?;
     let data = raw[null_pos + 1..].to_vec();
     Ok(Object { kind, data })
 }

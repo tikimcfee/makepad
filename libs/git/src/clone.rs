@@ -211,7 +211,7 @@ pub fn local_clone_depth1(
 
     // Partition file entries into chunks for each thread
     let total = file_entries.len();
-    let chunk_size = (total + num_threads - 1) / num_threads;
+    let chunk_size = total.div_ceil(num_threads);
 
     let mut chunks: Vec<Vec<FileEntry>> = Vec::with_capacity(num_threads);
     let mut iter = file_entries.into_iter();
@@ -316,10 +316,7 @@ pub fn local_clone_depth1(
     let mut bytes_written = 0u64;
     for handle in handles {
         let (entries, bytes) = handle.join().map_err(|_| {
-            GitError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "thread panicked",
-            ))
+            GitError::Io(std::io::Error::other("thread panicked"))
         })??;
         index_entries.extend(entries);
         bytes_written += bytes;

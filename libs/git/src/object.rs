@@ -22,19 +22,6 @@ impl ObjectKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Result<Self, GitError> {
-        match s {
-            "blob" => Ok(ObjectKind::Blob),
-            "tree" => Ok(ObjectKind::Tree),
-            "commit" => Ok(ObjectKind::Commit),
-            "tag" => Ok(ObjectKind::Tag),
-            _ => Err(GitError::InvalidObject(format!(
-                "unknown object type: {}",
-                s
-            ))),
-        }
-    }
-
     /// From pack file type number
     pub fn from_type_num(n: u8) -> Result<Self, GitError> {
         match n {
@@ -45,6 +32,23 @@ impl ObjectKind {
             _ => Err(GitError::InvalidObject(format!(
                 "unknown type number: {}",
                 n
+            ))),
+        }
+    }
+}
+
+impl std::str::FromStr for ObjectKind {
+    type Err = GitError;
+
+    fn from_str(s: &str) -> Result<Self, GitError> {
+        match s {
+            "blob" => Ok(ObjectKind::Blob),
+            "tree" => Ok(ObjectKind::Tree),
+            "commit" => Ok(ObjectKind::Commit),
+            "tag" => Ok(ObjectKind::Tag),
+            _ => Err(GitError::InvalidObject(format!(
+                "unknown object type: {}",
+                s
             ))),
         }
     }
@@ -88,7 +92,7 @@ pub fn read_loose_object(git_dir: &Path, oid: &ObjectId) -> Result<Object, GitEr
 
     let type_str = &header[..space_pos];
     let size_str = &header[space_pos + 1..];
-    let kind = ObjectKind::from_str(type_str)?;
+    let kind: ObjectKind = type_str.parse()?;
     let size: usize = size_str.parse().map_err(|_| {
         GitError::InvalidObject(format!(
             "invalid size in header for {}: '{}'",

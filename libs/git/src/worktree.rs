@@ -452,10 +452,7 @@ fn ignore_error(error: IgnoreError) -> GitError {
 
 fn path_to_rel_slash(root: &Path, path: &Path) -> Result<String, GitError> {
     let rel = path.strip_prefix(root).map_err(|_| {
-        GitError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "cannot compute relative path",
-        ))
+        GitError::Io(std::io::Error::other("cannot compute relative path"))
     })?;
     let mut out = String::new();
     for (idx, comp) in rel.components().enumerate() {
@@ -537,13 +534,11 @@ fn collect_untracked(
                 }
             }
             collect_untracked(root, &path, index_map, entries, options, ignore, cancel)?;
-        } else if is_file {
-            if !index_map.contains_key(rel_str.as_str()) {
-                entries.push(StatusEntry {
-                    path: rel_str,
-                    status: FileStatus::Untracked,
-                });
-            }
+        } else if is_file && !index_map.contains_key(rel_str.as_str()) {
+            entries.push(StatusEntry {
+                path: rel_str,
+                status: FileStatus::Untracked,
+            });
         }
     }
     Ok(())
@@ -618,7 +613,6 @@ pub fn flatten_tree(
 ///
 /// This writes all files from the tree to the workdir and creates a matching index.
 pub fn checkout_tree(
-    git_dir: &Path,
     workdir: &Path,
     tree: &Tree,
     prefix: &str,
@@ -639,7 +633,6 @@ pub fn checkout_tree(
             fs::create_dir_all(&dir_path)?;
             let sub_prefix = format!("{}/", path);
             checkout_tree(
-                git_dir,
                 workdir,
                 &sub_tree,
                 &sub_prefix,
