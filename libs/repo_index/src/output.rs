@@ -150,8 +150,7 @@ fn hit_line(h: &Hit) -> String {
 fn block_text(t: &mut String, b: &CircleBlock) {
     let counts = format!("{}, {}", plural(b.definitions, "definition", "definitions"), plural(b.uses, "use", "uses"));
     if b.absent {
-        let at = if b.rev.is_empty() { String::new() } else { format!(" at {}", b.rev) };
-        push_line(t, &format!("{} · absent: {counts}{at}", at_rev(&b.circle, &b.rev)));
+        push_line(t, &format!("{} · absent: {counts}", at_rev(&b.circle, &b.rev)));
     } else {
         push_line(t, &format!("{} · {} of {} · {counts}", at_rev(&b.circle, &b.rev), b.hits.len(), b.total));
     }
@@ -203,9 +202,22 @@ fn find_text(t: &mut String, f: &FindOutput) {
     for b in &f.blocks {
         block_text(t, b);
     }
-    if !f.pointers.is_empty() {
-        let parts: Vec<String> = f.pointers.iter().map(pointer_text).collect();
-        push_line(t, &format!("also: {}", parts.join(" · ")));
+    // Pointers wrap whole, never clipped mid-count.
+    let mut line = String::new();
+    for p in &f.pointers {
+        let item = pointer_text(p);
+        if line.is_empty() {
+            line = format!("also: {item}");
+        } else if line.chars().count() + 3 + item.chars().count() > MAX_LINE_CHARS {
+            push_line(t, &line);
+            line = format!("      {item}");
+        } else {
+            line.push_str(" · ");
+            line.push_str(&item);
+        }
+    }
+    if !line.is_empty() {
+        push_line(t, &line);
     }
 }
 
@@ -677,6 +689,20 @@ mod tests {
         for line in Renderer.json_lines(&Renderer.records(&status)).lines() {
             every_field(line, &["circle_status", "name", "origin", "source", "rev", "segments", "chunks", "overlay_files", "built", "note"]);
         }
+    }
+
+    #[test]
+    fn pointer_lines_wrap_whole() {
+        let p = |c: &str, n| Pointer { circle: Some(circle(c)), branch: None, count: n, unit: PointerUnit::Blobs, commits: 0, sample: String::new() };
+        let mut pointers: Vec<Pointer> = (0..6).map(|i| p(&format!("notes:a-rather-long-topic-name-{i}"), 10 + i)).collect();
+        pointers.push(Pointer { circle: None, branch: Some("work".into()), count: 3, unit: PointerUnit::Files, commits: 1, sample: "a9e2df5db next-solver 2x recursion_limit root retry".into() });
+        let text = Renderer.text(&Output::Find(FindOutput { blocks: Vec::new(), pointers }));
+        assert!(text.lines().all(|l| l.chars().count() <= MAX_LINE_CHARS), "{text}");
+        for i in 0..6 {
+            assert!(text.contains(&format!("notes:a-rather-long-topic-name-{i} {} files", 10 + i)), "{text}");
+        }
+        assert!(text.contains("branch work: 3 files in 1 commit not upstream (a9e2df5db next-solver 2x recursion_limit root retry)"), "{text}");
+        assert!(text.starts_with("also: ") && text.lines().skip(1).all(|l| l.starts_with("      ")), "{text}");
     }
 
     #[test]

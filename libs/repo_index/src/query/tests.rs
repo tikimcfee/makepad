@@ -404,7 +404,7 @@ fn absence_is_an_answer_with_nearest_hits() {
     assert!(b.nearest.iter().any(|h| h.name.to_lowercase().contains("spin")));
     let text = Renderer.text(&Output::Find(out));
     assert!(text.starts_with("makepad @"), "{text}");
-    assert!(text.contains("absent: 0 definitions, 0 uses at "), "{text}");
+    assert!(text.lines().next().unwrap().ends_with(" · absent: 0 definitions, 0 uses"), "{text}");
     assert!(text.contains("nearest:"), "{text}");
 }
 
