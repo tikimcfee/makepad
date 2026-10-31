@@ -411,6 +411,9 @@ pub struct Fields {
     pub path: String,
     pub sig: String,
     pub doc: String,
+    /// For [`Kind::Note`] and [`Kind::NoteFile`], the record's whole text exactly (the
+    /// [`PointerUnit::Blobs`] rule matches it), empty for a binary file; the store keeps it as
+    /// [`SegmentRead::record_text`].
     pub body: String,
 }
 
@@ -455,6 +458,9 @@ pub struct Chunk {
     pub span: Span,
     pub lines: Lines,
     pub name: String,
+    /// At most [`MAX_GIST_CHARS`]: the first doc sentence, crate description or heading; never
+    /// generated. Filled by [`Extract`], stored verbatim.
+    pub gist: String,
     /// The stream index of an earlier chunk (an impl for its methods, a commit for its bullets,
     /// a file for its items): chunks are numbered from 0 in the order [`Extract`] emits them,
     /// which is the [`ChunkId`] the sink assigns, so nothing is dropped between the two. For
@@ -671,8 +677,9 @@ pub enum ManifestChange {
     Replace(SegmentId),
 }
 
-/// Bases (content-addressed, built once under an `O_EXCL` lock on the key; a loser waits and
-/// maps the winner's file), manifests, and GC. Deletes that fail (Windows: still mapped) are
+/// Bases (content-addressed, built once under an exclusive OS file lock on the key, released
+/// if its holder dies; a loser blocks, then maps the winner's file. The lock only dedupes
+/// builds: correctness rests on content names and put-if-absent), manifests, and GC. Deletes that fail (Windows: still mapped) are
 /// retried and logged, never fatal. Choosing which base a worktree needs is [`Circles::open`]'s.
 pub trait Store {
     fn open_base(&self, key: &SegmentKey) -> Result<Option<Box<dyn SegmentRead>>, Error>;
@@ -686,7 +693,9 @@ pub trait Store {
     fn manifest(&self, repo: Option<RepoId>, circle: &CircleName) -> Result<Option<SegmentManifest>, Error>;
     fn commit(&self, repo: Option<RepoId>, circle: &CircleName, change: ManifestChange) -> Result<SegmentManifest, Error>;
     fn open_segment(&self, repo: Option<RepoId>, circle: &CircleName, id: &SegmentId) -> Result<Box<dyn SegmentRead>, Error>;
-    fn gc(&self, live_bases: &[SegmentKey]) -> Result<GcReport, Error>;
+    /// Drops bases not in `live_bases`, and manifest circles not in `live_circles` (no longer
+    /// configured) once their newest manifest is older than the grace period.
+    fn gc(&self, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error>;
 }
 
 #[derive(Clone, Debug, Default)]
