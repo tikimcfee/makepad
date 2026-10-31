@@ -46,6 +46,9 @@ pub const EXACT_WEIGHT: f32 = 0.25;
 pub const DEFINITION_PRIOR: f32 = 1.3;
 pub const CRATE_PRIOR: f32 = 1.3;
 pub const GENERATED_PRIOR: f32 = 0.3;
+/// An impl header: its methods are chunks of their own and its type is defined elsewhere, so
+/// the header itself says little.
+pub const IMPL_PRIOR: f32 = 0.5;
 pub const FALLBACK_PRIOR: f32 = 0.6;
 /// A chunk of a kind the query names (`enum`, `macro`, `crate`).
 pub const KIND_PRIOR: f32 = 1.5;
@@ -66,9 +69,13 @@ pub enum Role {
     Expansion,
     Exact,
     /// Consecutive query words written as one identifier (`memory type` → `memory_type`,
-    /// `memorytype`), or a long identifier's inner run (`memory_budget` in
-    /// `VK_EXT_memory_budget`): covers the words it spans.
+    /// `memorytype`): covers the words it spans.
     Phrase,
+    /// A long identifier's inner run (`memory_budget` in `VK_EXT_memory_budget`), scored on an
+    /// item's own name only (the last segment of `A::b`): a definition named by the run is a
+    /// likely referent; a chunk that merely mentions `FOO_BAR`, or a method of a type it names,
+    /// is not about `FOO_BAR_BAZ`. Covers its word.
+    Run,
     /// A part of a path-shaped word other than its rarest: scored only on chunks the rarest
     /// part found, so the word covers a chunk only when all its parts are there.
     PathPart,
@@ -286,7 +293,7 @@ impl Plan {
                     for run in parts.windows(len) {
                         for text in [run.join("_"), run.concat()] {
                             if !plan.groups.iter().any(|g| g.text == text) {
-                                plan.groups.push(Group { text, word: i as u16, role: Role::Phrase, span: 1 });
+                                plan.groups.push(Group { text, word: i as u16, role: Role::Run, span: 1 });
                             }
                         }
                     }
@@ -544,14 +551,12 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
     };
     let tree = c.rev.is_some() && c.visible.is_none();
     let mut absent_terms = Vec::new();
-    // History circles never claim absence: their messages summarize, so a missing mention says
-    // nothing.
-    if c.visible.is_none() {
-        for (folded, written) in &plan.subjects {
-            let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, folded) > 0) || overlay_has(TermForm::Folded, folded);
-            if !present && !absent_terms.contains(written) {
-                absent_terms.push(written.clone());
-            }
+    // An identifier is absent when no chunk holds it as a whole word (its parts don't count:
+    // `vec3d` is not `3d`), in every circle; a history circle with no commit naming it says so.
+    for (folded, written) in &plan.subjects {
+        let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, folded) > 0) || overlay_has(TermForm::Folded, folded);
+        if !present && !absent_terms.contains(written) {
+            absent_terms.push(written.clone());
         }
     }
 
@@ -644,7 +649,7 @@ fn forms(role: Role) -> &'static [(TermForm, f32)] {
     match role {
         Role::Primary | Role::Expansion => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
         Role::Exact => &[(TermForm::Exact, 1.0)],
-        Role::Phrase => &[(TermForm::Folded, 1.0)],
+        Role::Phrase | Role::Run => &[(TermForm::Folded, 1.0)],
         Role::PathPart => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
     }
 }
@@ -761,7 +766,16 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         let mut why = Vec::new();
         for (gi, tf) in &tfs {
             let g = &groups[*gi];
-            let pseudo: f32 = (0..5)
+            // A run counts in the item's own name only (the last segment of `A::b`): a method of a
+            // type the run names is not the run's referent.
+            if g.role == Role::Run {
+                let own = v.name.rsplit("::").next().unwrap_or(v.name);
+                if !words(own).any(|w| w.eq_ignore_ascii_case(&g.text) || makepad_search::fold(w) == g.text) {
+                    continue;
+                }
+            }
+            let fields = if g.role == Role::Run { 0..1 } else { 0..5 };
+            let pseudo: f32 = fields
                 .map(|f| {
                     let norm = if avg[f] > 0.0 { 1.0 - B + B * v.field_lengths[f] as f32 / avg[f] } else { 1.0 };
                     weights[f] * tf[f] / norm
@@ -771,7 +785,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 continue;
             }
             let role_weight = match g.role {
-                Role::Primary | Role::Phrase | Role::PathPart => 1.0,
+                Role::Primary | Role::Phrase | Role::Run | Role::PathPart => 1.0,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
             };
@@ -781,7 +795,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                     *matched.entry(g.word).or_insert(0) += 1;
                     in_name |= tf[0] > 0.0 && !path_words.contains(&g.word);
                 }
-                Role::Phrase => {
+                Role::Phrase | Role::Run => {
                     for w in g.word..g.word.saturating_add(g.span) {
                         phrase_covered.insert(w);
                     }
@@ -790,7 +804,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 _ => {}
             }
             for (f, field) in Field::ALL.iter().enumerate() {
-                if tf[f] > 0.0 && !why.iter().any(|w: &Why| w.field == *field && w.term == g.text) {
+                if tf[f] > 0.0 && !(g.role == Role::Run && f > 0) && !why.iter().any(|w: &Why| w.field == *field && w.term == g.text) {
                     why.push(Why { field: *field, term: g.text.clone() });
                 }
             }
@@ -825,6 +839,9 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         }
         if v.flags.generated {
             prior *= GENERATED_PRIOR;
+        }
+        if v.kind == Kind::Impl {
+            prior *= IMPL_PRIOR;
         }
         if v.flags.fallback {
             prior *= FALLBACK_PRIOR;
