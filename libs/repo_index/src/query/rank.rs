@@ -702,16 +702,22 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
 
     // Path words: each through its rarest part (by df in this circle) as a text term, and the
     // chunks whose path meets it.
+    // A part's df counts the overlay's chunks too: a file new in the worktree (untracked or
+    // added) has parts no segment holds.
+    let overlay_df = |text: &str| {
+        let forms = forms(Role::Primary);
+        c.overlay.iter().flat_map(|f| &f.chunks).filter(|(_, ft)| ft.terms.iter().any(|t| t.text == text && forms.iter().any(|(form, _)| *form == t.form))).count() as u32
+    };
     for pw in &plan.paths {
         let rarest = pw
             .parts
             .iter()
-            .map(|p| (p, x.df(Role::Primary, p)))
+            .map(|p| (p, x.df(Role::Primary, p) + overlay_df(p)))
             .filter(|(_, df)| *df > 0)
             .min_by_key(|(_, df)| *df);
         let mut found = false;
         if let Some((part, df)) = rarest {
-            x.path_idf.insert(pw.word, idf(n, df as f32));
+            x.path_idf.insert(pw.word, idf(n, (df as f32).min(n)));
             let path_hits = &mut x.path_hits;
             // The rarest part finds the candidates (it comes first); the others must be there too.
             groups.insert(0, Group { text: part.clone(), word: pw.word, role: Role::Primary, span: 1 });

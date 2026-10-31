@@ -1133,3 +1133,22 @@ fn def_counts_the_definitions_it_shows() {
     assert_eq!(b.hits.len() as u64, b.total);
     assert_eq!(b.definitions, b.total, "{} of {} · {} definitions", b.hits.len(), b.total, b.definitions);
 }
+
+#[test]
+fn a_path_new_in_the_worktree_is_found_by_its_name() {
+    // A file no segment holds (untracked or added on the branch): its parts are only in the
+    // overlay, so the path word must find its candidates there.
+    let mut c = makepad();
+    let tool = chunk("makepad", C { kind: Kind::File, path: "scripts/new_tool.py", lines: (1, 1), name: "scripts/new_tool.py", package: "", sig: "", doc: "", body: "", idents: &[], blob: 0 });
+    let ft = Terms.chunk_terms(&tool);
+    c.overlay = vec![OverlayFile { path: "scripts/new_tool.py".into(), chunks: vec![(tool, ft)] }];
+    let o = opened(vec![c], vec![]);
+    for q in ["new_tool.py", "scripts/new_tool.py", "scripts/"] {
+        let b = &find(&o, &query(q, &["makepad"])).blocks[0];
+        assert!(!b.absent, "{q}: {:?}", b.absent_terms);
+        assert_eq!(b.hits[0].path, "scripts/new_tool.py", "{q}");
+        assert!(b.hits[0].overlay);
+    }
+    let b = &find(&o, &query("old_tool.py", &["makepad"])).blocks[0];
+    assert_eq!(b.absent_terms, ["old_tool.py"]);
+}
