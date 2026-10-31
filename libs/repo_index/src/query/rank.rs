@@ -49,6 +49,8 @@ pub const GENERATED_PRIOR: f32 = 0.3;
 pub const FALLBACK_PRIOR: f32 = 0.6;
 /// A chunk of a kind the query names (`enum`, `macro`, `crate`).
 pub const KIND_PRIOR: f32 = 1.5;
+/// Coverage weight of a named word against a descriptive one.
+pub const NAMED_WEIGHT: f32 = 2.0;
 /// A chunk at or under a path the query names.
 pub const PATH_PRIOR: f32 = 1.5;
 /// Nearest hits shown under an absence.
@@ -187,6 +189,11 @@ pub struct Plan {
     pub expansions: Vec<Group>,
     /// Content words: coverage's denominator.
     pub words: u16,
+    /// The content words' indices in the query.
+    pub content: Vec<u16>,
+    /// Named words (path-, package- and identifier-shaped): they count [`NAMED_WEIGHT`] in
+    /// coverage, so chunks holding the thing named outrank chunks holding only description.
+    pub named: HashSet<u16>,
     /// Identifiers whose exact definitions are pinned, with the `A::b` path the query wrote.
     pub pinned: Vec<(String, Option<String>)>,
     /// Kinds the query names; they order pinned definitions.
@@ -307,6 +314,13 @@ impl Plan {
         let primaries: HashSet<String> = plan.groups.iter().filter(|g| g.role == Role::Primary).map(|g| g.text.clone()).collect();
         plan.expansions.retain(|g| !primaries.contains(&g.text));
         plan.words = kept.len() as u16;
+        plan.content = kept.iter().copied().collect();
+        plan.content.sort_unstable();
+        plan.named = kept
+            .iter()
+            .copied()
+            .filter(|w| matches!(classes[*w as usize].1, Class::Path | Class::Package | Class::Subject { .. }))
+            .collect();
         plan
     }
 }
@@ -795,8 +809,10 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
             why.push(Why { field: Field::Path, term: plan.paths.iter().find(|p| p.word == *word).map(|p| p.token.clone()).unwrap_or_default() });
         }
         let pin_rank = pins.get(&key).copied().unwrap_or(0);
+        let weight = |w: &u16| if plan.named.contains(w) { NAMED_WEIGHT } else { 1.0 };
+        let all: f32 = plan.content.iter().map(weight).sum();
+        let coverage = (1.0 + covered.iter().map(weight).sum::<f32>()) / (1.0 + all);
         let covered = covered.len() as u16;
-        let coverage = (1.0 + covered as f32) / (1.0 + plan.words as f32);
         let definition = pin_rank >= 2 && pin_rank != 4 || in_name;
         if definition {
             prior *= DEFINITION_PRIOR;
