@@ -4,18 +4,18 @@
 
 /// Every verb, with its one-line usage and summary (the runner's help page prints these too).
 pub const VERBS: &[(&str, &str, &str)] = &[
-    ("find", "find <words..> [--in <circle>,..] [--kind k] [--crate p] [--path p] [-n 10] [--rev r] [--json]", "Ranked hits per circle, one line each"),
-    ("show", "show <handle> [--context N] [--all]", "An item, section or commit, bounded"),
-    ("crate", "crate <package>", "A crate's card: description, deps, dependents, apps"),
-    ("def", "def <identifier>", "Exact definitions of an identifier"),
-    ("refs", "refs <identifier> [--uses]", "Definitions, re-exports, then uses by name"),
-    ("history", "history <path|words..>", "Commits in makepad:history"),
-    ("stale", "stale", "Docs and headers naming things that are gone"),
-    ("circles", "circles", "Configured circles, their sources and index state"),
+    ("find", "find <words..> [--in <circle>,..] [--kind k,..] [--crate p] [--path p] [-n 10] [--rev r] [--json]", "Ranked hits per circle, one line each; --kind takes kinds (fn, struct, method, ..) or families (item, doc, commit, note, ..)"),
+    ("show", "show <handle> [--in <circle>] [--rev r] [--context N] [--all] [--json]", "An item, section or commit, bounded; a handle ending in @<rev> resolves at that rev"),
+    ("crate", "crate <package> [--rev r] [--json]", "A crate's card: description, deps, dependents, apps"),
+    ("def", "def <identifier> [--in <circle>,..] [--rev r] [--json]", "Exact definitions of an identifier"),
+    ("refs", "refs <identifier> [--uses] [--rev r] [--json]", "Definitions, re-exports, then uses by name"),
+    ("history", "history <path|words..> [--rev r] [--json]", "Commits in makepad:history"),
+    ("stale", "stale [--rev r] [--json]", "Docs and headers naming things that are gone"),
+    ("circles", "circles [--json]", "Configured circles, their sources and index state"),
     ("build", "build [--in <circle>,..] [--rev r]", "Build or refresh the circles' indexes"),
-    ("status", "status", "What is indexed, at which revision, and what the overlay holds"),
+    ("status", "status [--json]", "What is indexed, at which revision, and what the overlay holds"),
     ("gc", "gc", "Remove index data nothing uses any more"),
-    ("eval", "eval [run|verify-gold|diff] ..", "The eval harness"),
+    ("eval", "eval [run|verify-gold|diff] [--rev r] ..", "The eval harness; each question is indexed at its own pinned rev unless --rev overrides"),
 ];
 
 pub fn usage() -> String {

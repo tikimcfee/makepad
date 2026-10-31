@@ -12,25 +12,33 @@
 //! - [`Extract`]: chunks from a base circle's sources (`extract/`);
 //! - [`Tokenize`]: terms per field for chunks and queries (`terms.rs`);
 //! - [`SegmentSink`], [`SegmentRead`], [`Store`]: segments, bases and manifests (`store/`);
-//! - [`Search`]: ranked, per-circle results (`query/`);
-//! - [`Render`]: text and `--json` output (`output.rs`);
+//! - [`Circles`]: the registry, `def_hash`, and opening circles at a revision (`circles.rs`,
+//!   `open.rs`);
+//! - [`Search`]: ranked per-circle results, handle resolution, refs (`query/`);
+//! - [`Render`]: text and `--json` output for every verb (`output.rs`);
 //! - [`Harness`]: the eval (`eval/`).
 //!
 //! Index data is machine-local, under `~/.makepad/index/` (`MAKEPAD_HOME` moves it), never in a
 //! tree: `repo-<id>/<circle dir>/` for a repo's circles and `notes-<topic>/` for notes circles.
+//!
+//! One hash everywhere: SHA-1 (`makepad_git::oid::hash_object("blob", bytes)`). Segment files
+//! are named by its full hex; [`RepoId`] and [`SegmentKey::def_hash`] are its first 8 bytes,
+//! little-endian. Never a process-seeded hasher.
 
 pub mod circles;
 pub mod cli;
 pub mod delta;
 pub mod eval;
 pub mod extract;
+pub mod open;
 pub mod output;
 pub mod query;
 pub mod store;
 pub mod terms;
 
+use std::collections::HashSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Bumped whenever extraction, tokenizing or the segment format changes: a base is keyed by
 /// (tree oid, indexer version), so a new indexer never reads an old segment.
@@ -45,6 +53,8 @@ pub const MAX_LINE_CHARS: usize = 120;
 pub const MAX_GIST_CHARS: usize = 80;
 /// `find` output budget: p90 at most this many bytes.
 pub const FIND_P90_BYTES: usize = 1536;
+/// `show` prints at most this many lines unless `--all`.
+pub const SHOW_MAX_LINES: usize = 80;
 /// Repo paths the built-in `makepad` circle never admits: the index's own eval data and
 /// fixture are not makepad content (provenance [`Provenance::IndexOwnData`]).
 pub const INDEX_OWN_DATA: &[&str] = &["libs/repo_index/eval/", "libs/repo_index/fixture/"];
@@ -56,8 +66,8 @@ pub const INDEX_OWN_DATA: &[&str] = &["libs/repo_index/eval/", "libs/repo_index/
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Oid(pub [u8; 20]);
 
-/// A repository, by a hash of its git common dir: every worktree of one clone shares it, and
-/// two clones never collide. Names the `repo-<id>` directory.
+/// A repository, by the hash of its git common dir's canonical path: every worktree of one
+/// clone shares it, and two clones never collide. Names the `repo-<id>` directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RepoId(pub u64);
 
@@ -65,10 +75,10 @@ pub struct RepoId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevSpec {
     /// The worktree: HEAD plus the query-time overlay of everything between the base and the
-    /// files on disk (committed or not). The default for every verb but `eval`.
+    /// files on disk. The default for every verb but `eval`; a question's `rev: "tip"`.
     Worktree,
-    /// A pinned revision: a full or abbreviated commit hex, a branch (`work`), a remote branch
-    /// (`upstream/work`) or a full ref name. Read from git objects only; no overlay.
+    /// A pinned revision: a full or abbreviated commit hex, `HEAD`, a branch (`work`), a remote
+    /// branch (`upstream/work`) or a full ref name. Read from git objects only; no overlay.
     Pinned(String),
 }
 
@@ -94,6 +104,8 @@ pub struct CircleName(pub String);
 pub struct CircleManifest {
     pub defs: Vec<CircleDef>,
     pub conf: Option<PathBuf>,
+    /// Machine-local eval question files (`eval = <file.jsonl>` lines of `circles.conf`).
+    pub eval: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,12 +146,21 @@ pub struct BaseCircle {
 pub enum BaseSource {
     /// A repo's tree at a revision. `root` is the repo's worktree root.
     Tree { root: PathBuf },
-    /// Commits reachable from `upstream` (for example `refs/remotes/upstream/work`), plus those
-    /// reachable from `local` refs but not from `upstream`, which are labelled local.
+    /// Commits reachable from `upstream` (for example `refs/remotes/upstream/work`) or from a
+    /// `local` ref. Which are local-only is computed at query time ([`Visibility`]).
     History { root: PathBuf, upstream: String, local: Vec<String> },
-    /// Notes: Markdown sections from directories, outside a repo or inside its untracked
-    /// `local/` (relative to the repo root).
-    Notes { dirs: Vec<PathBuf> },
+    /// Notes: every text file of the sources' directories, read from disk.
+    Notes { sources: Vec<NotesSource> },
+}
+
+/// One directory of a notes circle. Its chunks' paths are `<label>/<path in dir>`, so sources
+/// never collide and a note gold path (EVAL §1.3) is a chunk path as is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotesSource {
+    pub dir: PathBuf,
+    /// Default: the directory's name for a directory outside a repo (`<topic>`); for one inside
+    /// a repo, the repo directory's name and the path from its root (`makepad/local/plans`).
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,9 +200,19 @@ pub enum Fuse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selector {
-    Families(Vec<Family>),
+    Kinds(Vec<KindFilter>),
     PathPrefix(String),
     Package(String),
+}
+
+/// Which commits a history circle shows at a revision, and which are local-only. Computed when
+/// the circle is opened, never stored: both change whenever a ref moves.
+#[derive(Clone, Debug, Default)]
+pub struct Visibility {
+    /// Commits reachable from the revision the circle is opened at.
+    pub reachable: HashSet<Oid>,
+    /// Commits reachable from a `local` ref and not from `upstream`.
+    pub local: HashSet<Oid>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -218,7 +249,7 @@ pub struct Edge {
 // ---------------------------------------------------------------------------------------------
 // Chunks
 
-/// What `--kind` filters on, and what a circle admits.
+/// A group of kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Crate,
@@ -228,6 +259,29 @@ pub enum Family {
     Splash,
     Commit,
     Note,
+}
+
+impl Family {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Family::Crate => "crate",
+            Family::File => "file",
+            Family::Item => "item",
+            Family::Doc => "doc",
+            Family::Splash => "splash",
+            Family::Commit => "commit",
+            Family::Note => "note",
+        }
+    }
+}
+
+/// What `--kind` takes: a kind name (`fn`, `struct`, ...) or a family name (`item`, `doc`,
+/// `commit`, `note`, ...). `crate`, `file`, `doc`, `splash` and `commit` name both, meaning the
+/// family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KindFilter {
+    Kind(Kind),
+    Family(Family),
 }
 
 /// A chunk's kind; `as_str` is the stable name in text and `--json` output.
@@ -255,8 +309,10 @@ pub enum Kind {
     Commit,
     /// One bullet of a commit message, parented to its commit.
     Bullet,
-    /// One section of a note.
+    /// One Markdown section of a note.
     Note,
+    /// A notes file that is text but not Markdown (code, diffs, logs): one chunk, the whole file.
+    NoteFile,
 }
 
 impl Kind {
@@ -281,6 +337,7 @@ impl Kind {
             Kind::Commit => "commit",
             Kind::Bullet => "bullet",
             Kind::Note => "note",
+            Kind::NoteFile => "note-file",
         }
     }
     pub fn family(self) -> Family {
@@ -302,7 +359,7 @@ impl Kind {
             Kind::Doc => Family::Doc,
             Kind::Splash => Family::Splash,
             Kind::Commit | Kind::Bullet => Family::Commit,
-            Kind::Note => Family::Note,
+            Kind::Note | Kind::NoteFile => Family::Note,
         }
     }
 }
@@ -347,7 +404,8 @@ pub struct Fields {
     pub body: String,
 }
 
-/// The keys a record carries: the morphisms computed at query time, plus stored edges.
+/// The keys a record carries: the morphisms computed at query time, plus stored edges. All of
+/// them are stored and looked up by [`SegmentRead::chunks_with`] / [`SegmentRead::cited_by`].
 #[derive(Clone, Debug, Default)]
 pub struct Keys {
     /// Its own path, or a commit's touched paths.
@@ -370,21 +428,22 @@ pub struct Flags {
     pub generated: bool,
     /// The lexer could not pair it: a file-level bag of identifiers.
     pub fallback: bool,
-    /// A commit reachable from local refs only (branch work not upstream).
-    pub local_only: bool,
 }
 
-/// One record, as extraction produces it. `parent` indexes an earlier chunk of the same
-/// extraction batch (an impl for its methods, a commit for its bullets, a file for its items).
+/// One record, as extraction produces it.
 #[derive(Clone, Debug)]
 pub struct Chunk {
     pub kind: Kind,
     pub circle: CircleName,
-    /// Source-root-relative, `/`-separated (a note: relative to its notes directory).
+    /// Source-root-relative, `/`-separated; a note's is `<label>/<path in dir>`.
     pub path: String,
     pub span: Span,
     pub lines: Lines,
     pub name: String,
+    /// The stream index of an earlier chunk (an impl for its methods, a commit for its bullets,
+    /// a file for its items): chunks are numbered from 0 in the order [`Extract`] emits them,
+    /// which is the [`ChunkId`] the sink assigns, so nothing is dropped between the two. For
+    /// [`Extract::extract_file`] the stream is that one call.
     pub parent: Option<u32>,
     pub fields: Fields,
     pub keys: Keys,
@@ -411,6 +470,14 @@ pub struct CrateCard {
     pub dependents: Vec<String>,
     /// `libs/app_registry/apps.json` entries whose package reaches this one.
     pub apps: Vec<String>,
+    /// `lib`, `bin <name>`, ...
+    pub targets: Vec<String>,
+    pub rs_files: u32,
+    /// Top-level modules of the crate root.
+    pub modules: Vec<String>,
+    /// `Cargo.toml` names paths in a private or ignored tree (`apps/commercial`), so "used by 0"
+    /// is said for the public tree only.
+    pub private_members: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -463,25 +530,27 @@ pub struct QueryTerm {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SourceStamp {
     Tree { tree: Oid },
-    History { upstream: Oid, local: Vec<Oid> },
-    /// A hash of the notes directories' (path, size, content hash) list.
+    /// The tips the commits were walked from.
+    History { tips: Vec<Oid> },
+    /// A hash of the notes sources' (label, path, size, content hash) list.
     Notes { content: u64 },
 }
 
-/// A segment's identity; its file is named by a hash of this plus its content hash. A base of
-/// the code circle is the segment for `(tree oid, indexer version)`.
+/// A segment's identity. A base of the code circle is the segment for `(tree oid, indexer
+/// version)`: every worktree of the repo on that tree shares it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SegmentKey {
     pub repo: Option<RepoId>,
     pub circle: CircleName,
     pub source: SourceStamp,
-    /// A hash of the circle's [`BaseCircle`] (sources, families, exclusions): changing an
-    /// exclusion makes a new key, never a mix.
+    /// [`Circles::def_hash`] of the circle's [`BaseCircle`]: families, exclusions, ref names and
+    /// notes labels, never machine paths (`root`, `dir`), so worktrees share bases and changing
+    /// an exclusion makes a new key, never a mix.
     pub def_hash: u64,
     pub indexer: u32,
 }
 
-/// A segment file's name in its circle directory, `seg-<hash>.mpx`.
+/// A segment file's name in its circle directory, `seg-<sha1 hex of its content>.mpx`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SegmentId(pub String);
 
@@ -492,7 +561,7 @@ pub struct CircleStats {
     pub field_lengths: [u64; 5],
 }
 
-/// A chunk's index within its segment.
+/// A chunk's index within its segment: its stream index ([`Chunk::parent`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkId(pub u32);
 
@@ -500,11 +569,11 @@ pub struct ChunkId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Posting {
     pub chunk: ChunkId,
-    pub tf: [u16; 5],
+    pub tf: [u32; 5],
 }
 
 /// A stored chunk, read from a mapped segment. Text beyond name, gist and sig is read back from
-/// the source (worktree file or blob) through [`Repo`].
+/// the source (worktree file, blob, or notes file) when shown.
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkView<'a> {
     pub kind: Kind,
@@ -523,24 +592,29 @@ pub struct ChunkView<'a> {
     pub field_lengths: [u32; 5],
 }
 
-/// Writes one segment: tmp file, fsync, rename to its content name. Chunks arrive in
-/// extraction order; `parent` refers to the returned ids.
+/// Writes one segment: tmp file, fsync, rename to its content name. `add` returns `ChunkId(n)`
+/// for the n-th chunk added.
 pub trait SegmentSink {
     fn add(&mut self, chunk: &Chunk, terms: &FieldTerms) -> Result<ChunkId, Error>;
     fn finish(self: Box<Self>) -> Result<SegmentId, Error>;
 }
 
-/// A mapped, immutable segment.
+/// A mapped, immutable segment. Its format holds every key and edge from the first version, so
+/// the lookups composition needs never change the format.
 pub trait SegmentRead {
     fn key(&self) -> &SegmentKey;
     fn stats(&self) -> CircleStats;
+    fn chunk_count(&self) -> u32;
     fn df(&self, form: TermForm, term: &str) -> u32;
     fn postings(&self, form: TermForm, term: &str) -> Box<dyn Iterator<Item = Posting> + '_>;
     fn chunk(&self, id: ChunkId) -> ChunkView<'_>;
-    /// The chunks of a path, for the overlay's shadowing and `show`.
-    fn chunks_of(&self, path: &str) -> Vec<ChunkId>;
-    /// Outward edges of a chunk (notes circles).
-    fn edges(&self, id: ChunkId) -> Vec<Edge>;
+    fn keys(&self, id: ChunkId) -> Keys;
+    fn detail(&self, id: ChunkId) -> Detail;
+    /// Chunks carrying a key: `Path` (the overlay's shadowing, `show`), `Package` (`crate`),
+    /// `Commit` (a commit handle), `Ident` (`def`), `Blob` (copies), and overlaps on any.
+    fn chunks_with(&self, key: &Key) -> Vec<ChunkId>;
+    /// Chunks whose stored edge targets `key`, with the edge ("cited by notes:X").
+    fn cited_by(&self, key: &Key) -> Vec<(ChunkId, Edge)>;
 }
 
 /// The numbered manifest of an append circle (history, notes): version N is committed by
@@ -568,7 +642,7 @@ pub enum ManifestChange {
 
 /// Bases (content-addressed, built once under an `O_EXCL` lock on the key; a loser waits and
 /// maps the winner's file), manifests, and GC. Deletes that fail (Windows: still mapped) are
-/// retried and logged, never fatal.
+/// retried and logged, never fatal. Choosing which base a worktree needs is [`Circles::open`]'s.
 pub trait Store {
     fn open_base(&self, key: &SegmentKey) -> Result<Option<Box<dyn SegmentRead>>, Error>;
     /// Builds the base for `key` unless it exists; `fill` writes its chunks.
@@ -602,7 +676,7 @@ pub struct TreeFile {
     pub mode: u32,
 }
 
-/// A path that differs between a base and the worktree (committed or not).
+/// A path that differs between a base and the worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     Added(String),
@@ -623,14 +697,18 @@ pub struct CommitRecord {
 pub trait Repo {
     fn id(&self) -> RepoId;
     fn root(&self) -> PathBuf;
-    /// Resolves a revision: full or abbreviated hex, branch, remote branch or full ref name.
+    /// Resolves a revision (see [`RevSpec::Pinned`]); an ambiguous abbreviation is an error.
     fn resolve(&mut self, spec: &RevSpec) -> Result<Rev, Error>;
     fn files(&mut self, tree: Oid) -> Result<Vec<TreeFile>, Error>;
     fn read_blob(&mut self, blob: Oid) -> Result<Vec<u8>, Error>;
-    /// Paths that differ between `base` and the worktree (stat-checked against the git index).
+    /// Paths that differ between `base` and the worktree: committed since, staged, unstaged
+    /// (stat-checked against the git index, content-checked when the stat differs) and deleted;
+    /// plus untracked files that the ignore rules do not ignore, as `Added`. Ignored files are
+    /// never changes (that is how `local/` stays out of `makepad`).
     fn changes(&mut self, base: &Rev) -> Result<Vec<Change>, Error>;
-    /// Commits reachable from `tip`, newest first, stopping at `stop` when given.
-    fn commits(&mut self, tip: Oid, stop: Option<Oid>) -> Result<Vec<CommitRecord>, Error>;
+    /// Commits reachable from some `tips` and from none of `hide` (`git rev-list tips ^hide`),
+    /// newest first.
+    fn commits(&mut self, tips: &[Oid], hide: &[Oid]) -> Result<Vec<CommitRecord>, Error>;
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error>;
 }
 
@@ -642,25 +720,75 @@ pub struct ExtractReport {
     pub fallbacks: Vec<(String, String)>,
     /// Files skipped by an exclusion, counted per prefix.
     pub excluded: Vec<(String, u64)>,
+    /// Files not admitted at all (binary, unreadable), with why.
+    pub skipped: Vec<(String, String)>,
 }
 
-/// Chunks from a base circle's sources at a revision. `rev` is ignored by notes circles.
+/// Chunks from a base circle's sources. `rev` is `None` for notes circles.
 pub trait Extract {
     fn extract(
         &mut self,
         circle: &CircleName,
         def: &BaseCircle,
-        rev: &Rev,
+        rev: Option<&Rev>,
         repo: &mut dyn Repo,
         sink: &mut dyn FnMut(Chunk) -> Result<(), Error>,
     ) -> Result<ExtractReport, Error>;
-    /// The chunks of one file's bytes (the overlay re-extracts dirty files with it).
+    /// The chunks of one file's bytes (the overlay re-extracts changed files with it). Empty for
+    /// a path the circle's exclusions cover.
     fn extract_file(&mut self, circle: &CircleName, def: &BaseCircle, path: &str, bytes: &[u8]) -> Result<Vec<Chunk>, Error>;
 }
 
 pub trait Tokenize {
     fn chunk_terms(&self, chunk: &Chunk) -> FieldTerms;
     fn query_terms(&self, words: &[String]) -> Vec<QueryTerm>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opening circles
+
+/// The overlay chunks of one changed file; their `parent` indexes this file's `chunks`.
+#[derive(Clone, Debug)]
+pub struct OverlayFile {
+    pub path: String,
+    pub chunks: Vec<(Chunk, FieldTerms)>,
+}
+
+/// A circle opened at a revision: its segments, statistics, and (worktree) overlay.
+pub struct OpenCircle {
+    pub name: CircleName,
+    /// `None` for notes circles.
+    pub rev: Option<Rev>,
+    pub segments: Vec<Box<dyn SegmentRead>>,
+    pub stats: CircleStats,
+    pub overlay: Vec<OverlayFile>,
+    /// Base paths the overlay replaces or deletes.
+    pub shadowed: Vec<String>,
+    /// History circles: what is visible at `rev`, and what is local-only.
+    pub visible: Option<Visibility>,
+}
+
+/// The circles a query named, plus the registered ones it did not (for pointer counts only).
+pub struct Opened {
+    pub open: Vec<OpenCircle>,
+    pub others: Vec<OpenCircle>,
+}
+
+/// The circle registry and the one way to open circles: resolve the revision, take the base
+/// for its merge-base with upstream (`Store::open_base`, else `build_base` through
+/// [`Extract`] → [`Tokenize`] → [`SegmentSink`]), build the overlay (`delta.rs`) and, for history,
+/// the [`Visibility`]. The implementation holds its [`Repo`], [`Store`], [`Extract`] and
+/// [`Tokenize`]; cli and eval both open through it.
+pub trait Circles {
+    fn manifest(&mut self) -> Result<CircleManifest, Error>;
+    /// The repo the caller stands in: `makepad` in a makepad worktree, `notes:<topic>` in a
+    /// notes directory.
+    fn default_scope(&self, manifest: &CircleManifest, cwd: &Path) -> Vec<CircleName>;
+    /// `--in a,b` and derived names into expressions; an unknown circle is an error.
+    fn parse_in(&self, manifest: &CircleManifest, arg: &str) -> Result<Vec<CircleExpr>, Error>;
+    /// The SHA-1 of the canonical encoding of families, exclusions, ref names and notes labels.
+    fn def_hash(&self, def: &BaseCircle) -> u64;
+    fn open(&mut self, manifest: &CircleManifest, names: &[CircleName], rev: &RevSpec) -> Result<Opened, Error>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -683,7 +811,7 @@ pub struct Query {
     /// The circles named by `--in`, or the default scope of the repo the caller stands in.
     pub circles: Vec<CircleExpr>,
     pub rev: RevSpec,
-    pub families: Vec<Family>,
+    pub kinds: Vec<KindFilter>,
     pub packages: Vec<String>,
     pub paths: Vec<String>,
     pub limit: usize,
@@ -697,11 +825,13 @@ pub struct Query {
 /// - `crate:<package>`;
 /// - a commit's hex (7 or more digits);
 /// - any of these prefixed by `<circle>/` outside the default circle, for example
-///   `notes:<topic>/FILE.md:64`.
+///   `notes:<topic>/<label>/FILE.md:64`;
+/// - suffixed by `@<rev>` when the hit came from a pinned revision, so its lines resolve there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Handle {
     pub circle: Option<CircleName>,
     pub target: Target,
+    pub rev: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -710,6 +840,19 @@ pub enum Target {
     Item { path: String, item: String },
     Crate(String),
     Commit(String),
+}
+
+/// Where a resolved handle points: a circle of [`Opened::open`] and a chunk in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Located {
+    pub circle: usize,
+    pub at: ChunkAt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkAt {
+    Segment { segment: usize, chunk: ChunkId },
+    Overlay { file: usize, chunk: usize },
 }
 
 /// Why a hit matched: field and query term.
@@ -735,13 +878,15 @@ pub struct Hit {
     pub also_at: Vec<String>,
     /// From the query-time overlay, not the base.
     pub overlay: bool,
+    /// A commit reachable from local refs only (branch work not upstream).
+    pub local: bool,
 }
 
 /// One circle's block: its own header, ranking and statistics.
 #[derive(Clone, Debug)]
 pub struct CircleBlock {
     pub circle: CircleName,
-    /// Abbreviated commit of the revision indexed.
+    /// Abbreviated commit of the revision indexed; empty for notes circles.
     pub rev: String,
     pub total: u64,
     pub definitions: u64,
@@ -756,21 +901,22 @@ pub struct CircleBlock {
 /// The unit a pointer counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerUnit {
-    /// Chunks of the other circle that match with `find`'s own semantics.
-    Records,
-    /// Commits reachable from local refs only.
-    Commits,
-    /// Files touched by those commits.
+    /// Distinct blobs (files after collapsing byte-identical copies) of the other circle with at
+    /// least one matching record (EVAL §3.1). Every circle pointer.
+    Blobs,
+    /// Files touched by branch-work commits. Every branch pointer.
     Files,
 }
 
-/// A count in a circle the query did not open, or in branch work not upstream.
+/// A count in a circle the query did not open (`circle`), or in branch work not upstream
+/// (`branch`, with `commits` the number of unindexed commits).
 #[derive(Clone, Debug)]
 pub struct Pointer {
     pub circle: Option<CircleName>,
     pub branch: Option<String>,
     pub count: u64,
     pub unit: PointerUnit,
+    pub commits: u64,
     /// One example (a commit's short hex and subject), if any.
     pub sample: String,
 }
@@ -781,21 +927,130 @@ pub struct FindOutput {
     pub pointers: Vec<Pointer>,
 }
 
-/// A circle opened at a revision: its segments, statistics and (worktree) overlay.
-pub struct OpenCircle {
-    pub name: CircleName,
-    pub rev: Rev,
-    pub segments: Vec<Box<dyn SegmentRead>>,
-    pub stats: CircleStats,
-    /// Overlay chunks (re-extracted dirty or lane files) and the paths they shadow.
-    pub overlay: Vec<(Chunk, FieldTerms)>,
-    pub shadowed: Vec<String>,
+/// Uses by name, counted.
+#[derive(Clone, Debug, Default)]
+pub struct UseSummary {
+    pub total: u64,
+    pub files: u64,
+    /// Lines per directory, most first.
+    pub by_dir: Vec<(String, u64)>,
 }
 
+/// `show`: an item, section or commit, bounded to [`SHOW_MAX_LINES`] unless `--all`.
+#[derive(Clone, Debug)]
+pub struct ShowOutput {
+    pub circle: CircleName,
+    pub rev: String,
+    pub handle: Handle,
+    pub kind: Kind,
+    pub package: String,
+    pub path: String,
+    pub lines: Lines,
+    pub name: String,
+    pub text: Vec<String>,
+    /// Lines cut by the bound.
+    pub more: u32,
+    /// Item uses by name (`refs` for all).
+    pub uses: Option<UseSummary>,
+    /// Records of registered notes circles that cite this one, counted per circle.
+    pub cited_by: Vec<(CircleName, u64)>,
+    pub also_at: Vec<String>,
+}
+
+/// `crate`: the card, as stored.
+#[derive(Clone, Debug)]
+pub struct CrateView {
+    pub circle: CircleName,
+    pub rev: String,
+    pub name: String,
+    pub card: CrateCard,
+}
+
+/// `refs`: definitions, then re-exports, then uses, then same-named definitions elsewhere.
+#[derive(Clone, Debug)]
+pub struct RefsOutput {
+    pub circle: CircleName,
+    pub rev: String,
+    pub ident: String,
+    pub defs: Vec<Hit>,
+    pub reexports: Vec<Hit>,
+    pub uses: UseSummary,
+    /// The use lines themselves, with `--uses`.
+    pub use_hits: Vec<Hit>,
+    pub other_defs: Vec<Hit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleKind {
+    /// The path or name does not resolve.
+    Dangling,
+    /// A successor says "was X" and X has no callers.
+    Retired,
+    /// The tree the code reads is absent.
+    Missing,
+    /// The names exist only in private or ignored trees.
+    Outside,
+    /// A design doc is cited but not present.
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaleFinding {
+    pub kind: StaleKind,
+    pub path: String,
+    pub line: u32,
+    pub name: String,
+    pub detail: String,
+    /// Other places with the same finding.
+    pub also: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaleOutput {
+    pub circle: CircleName,
+    pub rev: String,
+    pub findings: Vec<StaleFinding>,
+}
+
+/// One circle, for `circles` (every configured circle) and `status` (the ones opened here).
+#[derive(Clone, Debug)]
+pub struct CircleStatus {
+    pub name: CircleName,
+    pub origin: Origin,
+    /// Its source or expression, one line.
+    pub source: String,
+    pub rev: String,
+    pub segments: Vec<SegmentId>,
+    pub chunks: u64,
+    /// Files in the worktree overlay.
+    pub overlay_files: u64,
+    pub built: bool,
+    /// Why not built, or what is pending.
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StatusOutput {
+    pub circles: Vec<CircleStatus>,
+}
+
+/// Everything a verb prints.
+#[derive(Clone, Debug)]
+pub enum Output {
+    Find(FindOutput),
+    Show(Box<ShowOutput>),
+    Crate(Box<CrateView>),
+    Refs(Box<RefsOutput>),
+    Stale(StaleOutput),
+    Status(StatusOutput),
+}
+
+/// Ranking, handle resolution and refs over opened circles (`others` only for pointers).
 pub trait Search {
-    /// `open` holds the circles the query names; `others` are the registered circles it did
-    /// not name, consulted only for pointer counts.
-    fn find(&self, open: &[OpenCircle], others: &[OpenCircle], query: &Query) -> Result<FindOutput, Error>;
+    fn find(&self, opened: &Opened, query: &Query) -> Result<FindOutput, Error>;
+    /// Every chunk a handle names, in the circles opened; empty when none.
+    fn resolve(&self, opened: &Opened, handle: &Handle) -> Result<Vec<Located>, Error>;
+    fn refs(&self, opened: &Opened, ident: &str, uses: bool) -> Result<RefsOutput, Error>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -807,18 +1062,33 @@ pub enum Record {
     /// `{"header":true,"circle","rev","total","definitions","uses","absent"}`
     Header { circle: CircleName, rev: String, total: u64, definitions: u64, uses: u64, absent: bool },
     /// `{"handle","circle","rev","kind","package","path","start","end","name","sig","gist",
-    /// "score","why","also_at","overlay","nearest"}`
+    /// "score","why","also_at","overlay","local","nearest"}`
     Hit { circle: CircleName, rev: String, hit: Box<Hit>, nearest: bool },
-    /// `{"pointer":true,"circle","branch","count","unit","sample"}`
+    /// `{"pointer":true,"circle","branch","count","unit","commits","sample"}`
     Pointer(Pointer),
+    /// `{"show":true,"circle","rev","handle","kind","package","path","start","end","name",
+    /// "text","more","uses","cited_by","also_at"}`
+    Show(Box<ShowOutput>),
+    /// `{"crate":true,"circle","rev","name","dir","description","deps","dependents","apps",
+    /// "targets","rs_files","modules","private_members"}`
+    Crate(Box<CrateView>),
+    /// `{"refs":true,"circle","rev","ident","uses","by_dir"}`, then the defs, re-exports, use
+    /// hits and other defs as `Hit` records.
+    Refs { circle: CircleName, rev: String, ident: String, uses: UseSummary },
+    /// `{"stale":"dangling|retired|missing|outside|unavailable","path","line","name","detail","also"}`
+    Stale(StaleFinding),
+    /// `{"circle_status":true,"name","origin","source","rev","segments","chunks","overlay_files",
+    /// "built","note"}`
+    Circle(CircleStatus),
 }
 
-/// Text: a header line per circle (revision, counts, circle), hits grouped by package (groups
-/// ordered by best hit, [`HITS_PER_GROUP`] each, a count footer), each hit one line of at most
-/// [`MAX_LINE_CHARS`]: `path:line-range  kind  name — gist`; then one `also:` pointer line.
+/// Text output. `find`: a header line per circle (revision, counts, circle), hits grouped by
+/// package (groups ordered by best hit, [`HITS_PER_GROUP`] each, a count footer), each hit one
+/// line of at most [`MAX_LINE_CHARS`]: `handle  kind  name — gist`; then one `also:` pointer
+/// line. The other verbs follow EVAL §4's examples.
 pub trait Render {
-    fn text(&self, out: &FindOutput) -> String;
-    fn records(&self, out: &FindOutput) -> Vec<Record>;
+    fn text(&self, out: &Output) -> String;
+    fn records(&self, out: &Output) -> Vec<Record>;
     fn json_lines(&self, records: &[Record]) -> String;
 }
 
