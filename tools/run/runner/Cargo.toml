@@ -26,3 +26,4 @@ makepad-remote = { workspace = true }
 relax-light-http = { workspace = true }
 makepad-network = { path = "../../../platform/network" }
 makepad-devhub = { path = "../../../libs/devhub" }
+makepad-repo-index = { path = "../../../libs/repo_index" }
