@@ -13,7 +13,7 @@
 //!
 //! [`Extract::extract_file`] (the overlay) has no tree around the file: its chunks carry no
 //! package, and a `Cargo.toml` becomes a card with its dependencies as written (no dependents,
-//! no apps). [`Extractor::cards`] gives the overlay the full cards instead: the package graph of
+//! no apps). [`Extract::extract_cards`] gives the overlay the full cards instead: the package graph of
 //! the worktree's tree, for the packages its changes alter.
 
 pub mod cargo;
@@ -439,13 +439,13 @@ impl Extractor {
         Ok(admit(batch, &def.families))
     }
 
-    /// The crate cards a worktree's `changes` over `base` alter:
+    /// The crate cards a worktree's `changes` over `base` alter ([`Extract::extract_cards`]):
     /// the package graph of the base tree and of the tree with the changes applied (changed
     /// manifests and the app registry read under `root`), and one card per package whose card
     /// differs or whose manifest changed, its modules from its crate root as it is now. Nothing
     /// is read unless a change touches a `Cargo.toml` or the app registry, or adds or deletes a
     /// `.rs` file.
-    pub fn cards(&self, circle: &CircleName, def: &BaseCircle, base: &Rev, root: &Path, changes: &[Change], repo: &mut dyn Repo) -> Result<Vec<Chunk>, Error> {
+    fn cards(&self, circle: &CircleName, def: &BaseCircle, base: &Rev, root: &Path, changes: &[Change], repo: &mut dyn Repo) -> Result<Vec<Chunk>, Error> {
         if !matches!(def.source, BaseSource::Tree { .. }) {
             return Ok(Vec::new());
         }
@@ -672,6 +672,10 @@ impl Extract for Extractor {
     fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error> {
         let this: &Extractor = self;
         crate::workers::fan_out(files.len(), |i| this.file(circle, def, &files[i].0, &files[i].1)).into_iter().collect()
+    }
+
+    fn extract_cards(&mut self, circle: &CircleName, def: &BaseCircle, base: &Rev, root: &Path, changes: &[Change], repo: &mut dyn Repo) -> Result<Vec<Chunk>, Error> {
+        self.cards(circle, def, base, root, changes, repo)
     }
 }
 
