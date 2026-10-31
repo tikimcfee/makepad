@@ -43,6 +43,9 @@ pub fn count_blobs(sources: &[NotesSource], def: &BaseCircle, query: &str) -> Re
     let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut blobs = HashSet::new();
     for s in sources {
+        if !open::source_exists(s)? {
+            continue; // nothing of it is in the circle (opening it says so)
+        }
         for (rel, full) in open::walk_files(&s.dir)? {
             if circles::excluded(def, &rel).is_some() {
                 continue;

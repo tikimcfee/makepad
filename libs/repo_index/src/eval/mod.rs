@@ -779,6 +779,8 @@ mod tests {
         let root = top.join("makepad");
         std::fs::create_dir_all(&root).unwrap();
         let conf = top.join("c.conf");
+        // a source that is a file, not a directory, cannot be listed (a missing one is just left out)
+        std::fs::write(top.join("nowhere"), "x").unwrap();
         std::fs::write(&conf, format!("notes:gone = notes {}\n", top.join("nowhere").display())).unwrap();
         let mut repo = FakeRepo::new(&root);
         repo.rev(&["c0ffee123", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, &[("a.rs", "fn a() {}\n")]);

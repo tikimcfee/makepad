@@ -267,6 +267,9 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
         let Some(def @ BaseCircle { source: BaseSource::Notes { sources }, .. }) = def_of(&circle) else { continue };
         let words: Vec<String> = idx.iter().map(|i| claims[*i].term.to_lowercase()).collect();
         for s in sources {
+            if !crate::open::source_exists(s)? {
+                continue; // nothing of it is in the circle (opening it says so)
+            }
             for (rel, full) in crate::open::walk_files(&s.dir)? {
                 if circles::excluded(def, &rel).is_some() {
                     continue;
