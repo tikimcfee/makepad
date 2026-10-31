@@ -49,14 +49,6 @@ pub const TREE_FAMILIES: &[Family] = &[Family::Crate, Family::File, Family::Item
 pub const HISTORY_FAMILIES: &[Family] = &[Family::Commit];
 pub const NOTES_FAMILIES: &[Family] = &[Family::Note];
 
-/// `~/.makepad/index` (`MAKEPAD_HOME` moves `~/.makepad`, as for devhub).
-pub fn index_home() -> Result<PathBuf, Error> {
-    if let Some(home) = std::env::var_os("MAKEPAD_HOME").filter(|h| !h.is_empty()) {
-        return Ok(PathBuf::from(home).join("index"));
-    }
-    user_home().map(|h| h.join(".makepad").join("index"))
-}
-
 /// The user's home directory, for `~` in `circles.conf`.
 pub fn user_home() -> Result<PathBuf, Error> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
@@ -68,9 +60,9 @@ pub fn user_home() -> Result<PathBuf, Error> {
         })
 }
 
-/// `circles.conf` under [`index_home`].
+/// `circles.conf` under the index root ([`crate::store::index_root`]).
 pub fn conf_path() -> Result<PathBuf, Error> {
-    index_home().map(|h| h.join("circles.conf"))
+    crate::store::index_root().map(|h| h.join("circles.conf"))
 }
 
 fn name(s: &str) -> CircleName {
