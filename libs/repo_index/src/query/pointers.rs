@@ -12,6 +12,8 @@ use std::collections::HashSet;
 
 use crate::query::rank::{chunks_with, keys, rank, view, Filter, Plan, Ranked};
 use crate::query::short;
+use crate::terms::Terms;
+use crate::Tokenize;
 use crate::{ChunkId, Key, Kind, Oid, OpenCircle, Opened, Pointer, PointerUnit, Visibility};
 
 pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) -> Vec<Pointer> {
@@ -42,7 +44,15 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan, absent: &[String]) 
         if reached > 0 {
             out.push(pointer(c, reached, PointerUnit::Commits));
         }
-        if let Some(branch) = branch_pointer(opened, c, vis, &matching, absent) {
+        // The branch's commits matter for what this circle lacks: with absent terms, a local
+        // commit matches on those alone.
+        let branch_matching = if absent.is_empty() {
+            matching
+        } else {
+            let plan = Plan::new(absent, &Terms.query_terms(absent));
+            matching_commits(c, &rank(c, ci, &plan, &any_rev, usize::MAX), &plan)
+        };
+        if let Some(branch) = branch_pointer(opened, c, vis, &branch_matching, absent) {
             out.push(branch);
         }
     }
@@ -69,7 +79,7 @@ fn branch_pointer(opened: &Opened, c: &OpenCircle, vis: &Visibility, matching: &
     if vis.local.is_empty() && vis.local_files.is_empty() {
         return None;
     }
-    let local: Vec<Oid> = matching.iter().copied().filter(|o| vis.local.contains(o)).collect();
+    let mut local: Vec<Oid> = matching.iter().copied().filter(|o| vis.local.contains(o)).collect();
     let mut files: HashSet<String> = HashSet::new();
     let mut sample = String::new();
     for oid in &local {
@@ -83,11 +93,14 @@ fn branch_pointer(opened: &Opened, c: &OpenCircle, vis: &Visibility, matching: &
     }
     if !absent.is_empty() {
         if let Some(read) = &opened.blobs {
-            let terms: Vec<String> = absent.iter().map(|t| t.to_lowercase()).collect();
+            let terms: Vec<String> = absent.iter().map(|t| t.to_ascii_lowercase()).collect();
             for (path, blob) in &vis.local_files {
                 match read(*blob) {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).to_lowercase();
+                    Ok(mut bytes) => {
+                        // Lower-cased in place: the terms are identifiers and paths, ASCII in
+                        // practice, so ASCII folding finds them without copying the text.
+                        bytes.make_ascii_lowercase();
+                        let text = String::from_utf8_lossy(&bytes);
                         if terms.iter().all(|t| text.contains(t.as_str())) {
                             files.insert(path.clone());
                         }
@@ -97,6 +110,35 @@ fn branch_pointer(opened: &Opened, c: &OpenCircle, vis: &Visibility, matching: &
             }
         } else if !vis.local_files.is_empty() {
             eprintln!("makepad index: {}: no blob reader, so the branch's changed files are not searched", c.name.0);
+        }
+    }
+    // The local commits that touched a matched file count too, newest first after the ones
+    // that matched by text; the sample names the best.
+    let mut touching: Vec<(i64, Oid)> = Vec::new();
+    for path in &files {
+        for at in chunks_with(c, &Key::Path { path: path.clone(), line: None }) {
+            let v = view(c, at);
+            if let (Kind::Commit, Some(oid)) = (v.kind, v.commit) {
+                if vis.local.contains(&oid) && !local.contains(&oid) && !touching.iter().any(|(_, o)| *o == oid) {
+                    let time = match &at {
+                        crate::ChunkAt::Segment { segment, chunk } => match c.segments[*segment].detail(*chunk) {
+                            crate::Detail::Commit(info) => info.time,
+                            _ => 0,
+                        },
+                        crate::ChunkAt::Overlay { .. } => 0,
+                    };
+                    touching.push((time, oid));
+                }
+            }
+        }
+    }
+    touching.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    local.extend(touching.into_iter().map(|(_, o)| o));
+    if sample.is_empty() {
+        if let Some(oid) = local.first() {
+            if let Some(at) = chunks_with(c, &Key::Commit(*oid)).into_iter().find(|at| view(c, *at).kind == Kind::Commit) {
+                sample = format!("{} {}", short(oid), view(c, at).name);
+            }
         }
     }
     if files.is_empty() && local.is_empty() {

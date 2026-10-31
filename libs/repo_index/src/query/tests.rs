@@ -841,13 +841,18 @@ fn branch_pointer_reads_changed_files_only_for_absent_terms() {
     let mut o = opened(vec![makepad()], vec![h]);
     o.blobs = Some(Box::new(move |blob: Oid| {
         counter.set(counter.get() + 1);
-        Ok(if blob == oid(0xd1) { b"pub const SPIN_WHEEL_LIMIT: u32 = 4; // spin_wheel_limit".to_vec() } else { b"fn clamp_turn() {}".to_vec() })
+        Ok(if blob == oid(0xd1) { b"pub const SPIN_WHEEL_LIMIT: u32 = 4; // spin_wheel_limit".to_vec() } else { b"fn zz_branch_only() {}".to_vec() })
     }));
     let out = find(&o, &query("spin_wheel_limit", &["makepad"]));
     assert!(out.blocks[0].absent);
     let br = out.pointers.iter().find(|p| p.branch.is_some()).expect("a branch pointer");
     assert_eq!((br.count, br.commits, br.unit), (1, 0, PointerUnit::Files));
     assert_eq!(reads.get(), 2);
+    // A matched file a local commit touched names that commit.
+    let out = find(&o, &query("zz_branch_only", &["makepad"]));
+    let br = out.pointers.iter().find(|p| p.branch.is_some()).expect("a branch pointer");
+    assert_eq!((br.count, br.commits), (1, 1));
+    assert_eq!(br.sample, format!("{} beta: clamp the turn harder", short(&oid(0xc2))));
     // Nothing absent: the changed files are never read.
     reads.set(0);
     let _ = find(&o, &query("spin", &["makepad"]));

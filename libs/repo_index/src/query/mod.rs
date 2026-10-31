@@ -81,10 +81,20 @@ impl Search for Engine {
         // The hit limit is the whole answer's: blocks share it, so a two-circle find costs about
         // what a one-circle find does (PLAN §1's byte budget).
         let limit = if query.limit == 0 { crate::DEFAULT_LIMIT } else { query.limit };
-        // A block with nothing to rank (its words are absent there) takes no share.
-        let sharing = ranked.iter().filter(|b| !b.entries.is_empty()).count().max(1);
-        let share = limit.div_ceil(sharing).max(crate::HITS_PER_GROUP);
-        let blocks: Vec<CircleBlock> = ranked.into_iter().map(|b| self.block(opened, b, query, &ctx, share)).collect();
+        // A block with nothing to rank takes no share. Beside other blocks, one whose named
+        // terms are absent shows only its nearest few: its answer is the absence.
+        let several = ranked.len() > 1;
+        let brief = |b: &BlockRank| b.entries.is_empty() || (several && !b.absent_terms.is_empty());
+        let briefs = ranked.iter().filter(|b| brief(b) && !b.entries.is_empty()).count();
+        let sharing = ranked.iter().filter(|b| !brief(b)).count().max(1);
+        let share = limit.saturating_sub(briefs * rank::NEAREST).div_ceil(sharing).max(crate::HITS_PER_GROUP);
+        let blocks: Vec<CircleBlock> = ranked
+            .into_iter()
+            .map(|b| {
+                let n = if brief(&b) { rank::NEAREST } else { share };
+                self.block(opened, b, query, &ctx, n)
+            })
+            .collect();
         let absent: Vec<String> = {
             let mut a: Vec<String> = Vec::new();
             for b in &blocks {
