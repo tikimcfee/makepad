@@ -70,8 +70,74 @@ impl fmt::Display for ObjectId {
     }
 }
 
+/// An abbreviated object id: 4 to 40 hex digits (git's minimum
+/// abbreviation is 4), either case, stored lowercase.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectIdPrefix {
+    /// The digits as bytes, zero-padded: the smallest id the prefix names.
+    bytes: [u8; 20],
+    digits: usize,
+}
+
+impl ObjectIdPrefix {
+    pub const MIN_DIGITS: usize = 4;
+
+    pub fn from_hex(hex: &str) -> Result<Self, GitError> {
+        if !(Self::MIN_DIGITS..=40).contains(&hex.len()) {
+            return Err(GitError::InvalidObjectId(format!(
+                "abbreviated id {hex:?} has {} hex digits; {} to 40 are needed",
+                hex.len(),
+                Self::MIN_DIGITS
+            )));
+        }
+        let mut bytes = [0u8; 20];
+        for (i, c) in hex.chars().enumerate() {
+            let nibble = c
+                .to_digit(16)
+                .ok_or_else(|| GitError::InvalidObjectId(format!("invalid hex: {hex}")))?
+                as u8;
+            bytes[i / 2] |= if i.is_multiple_of(2) { nibble << 4 } else { nibble };
+        }
+        Ok(ObjectIdPrefix { bytes, digits: hex.len() })
+    }
+
+    /// The number of hex digits.
+    pub fn digits(&self) -> usize {
+        self.digits
+    }
+
+    /// The smallest id the prefix names; every match sorts at or after it.
+    pub fn lower_bound(&self) -> ObjectId {
+        ObjectId(self.bytes)
+    }
+
+    pub fn matches(&self, oid: &ObjectId) -> bool {
+        let whole = self.digits / 2;
+        oid.0[..whole] == self.bytes[..whole]
+            && (self.digits.is_multiple_of(2) || oid.0[whole] >> 4 == self.bytes[whole] >> 4)
+    }
+
+    pub fn to_hex(&self) -> String {
+        let mut hex = ObjectId(self.bytes).to_hex();
+        hex.truncate(self.digits);
+        hex
+    }
+}
+
+impl fmt::Debug for ObjectIdPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ObjectIdPrefix({})", self.to_hex())
+    }
+}
+
+impl fmt::Display for ObjectIdPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
 /// Hash raw content with a git object header to produce an ObjectId.
-/// Format: "<type> <size>\0<data>" — SHA-1 of this produces the OID.
+/// Format: `<type> <size>\0<data>` — SHA-1 of this produces the OID.
 pub fn hash_object(kind: &str, data: &[u8]) -> ObjectId {
     let mut hasher = ObjectHasher::new(kind, data.len());
     hasher.update(data);
@@ -136,6 +202,25 @@ mod tests {
         let (dir, file) = oid.loose_path_components();
         assert_eq!(dir, "55");
         assert_eq!(file, "2e2a0e14dd313f5f572118a18fba67ad99699c");
+    }
+
+    #[test]
+    fn prefix_matches_odd_and_even_lengths() {
+        let oid = ObjectId::from_hex("552e2a0e14dd313f5f572118a18fba67ad99699c").unwrap();
+        for hex in ["552e", "552E2", "552e2a0e14dd313f5f572118a18fba67ad99699c"] {
+            let prefix = ObjectIdPrefix::from_hex(hex).unwrap();
+            assert!(prefix.matches(&oid), "{hex}");
+            assert_eq!(prefix.to_hex(), hex.to_ascii_lowercase());
+        }
+        assert!(!ObjectIdPrefix::from_hex("552e3").unwrap().matches(&oid));
+        assert!(!ObjectIdPrefix::from_hex("552f").unwrap().matches(&oid));
+        assert_eq!(
+            ObjectIdPrefix::from_hex("552e2").unwrap().lower_bound().to_hex(),
+            "552e200000000000000000000000000000000000"
+        );
+        for bad in ["552", "552g", "552e2a0e14dd313f5f572118a18fba67ad99699c0"] {
+            assert!(ObjectIdPrefix::from_hex(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

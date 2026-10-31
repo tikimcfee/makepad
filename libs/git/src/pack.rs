@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::GitError;
 use crate::object::{Object, ObjectKind};
-use crate::oid::ObjectId;
+use crate::oid::{ObjectId, ObjectIdPrefix};
 
 /// Trait for looking up object offsets in a pack — used for delta resolution.
 pub trait PackLookup {
@@ -74,6 +74,19 @@ impl PackLookup for PackIndex {
             Ok(idx) => Some(self.tables.offsets[start + idx]),
             Err(_) => None,
         }
+    }
+}
+
+impl PackIndex {
+    /// Append the ids in this pack that `prefix` abbreviates, in id order.
+    pub(crate) fn find_prefix(&self, prefix: &ObjectIdPrefix, out: &mut Vec<ObjectId>) {
+        let lower = prefix.lower_bound();
+        let first = lower.as_bytes()[0] as usize;
+        let start = if first == 0 { 0 } else { self.tables.fanout[first - 1] as usize };
+        let end = self.tables.fanout[first] as usize;
+        let slice = &self.tables.oids[start..end];
+        let from = slice.partition_point(|oid| oid.as_bytes() < lower.as_bytes());
+        out.extend(slice[from..].iter().take_while(|oid| prefix.matches(oid)));
     }
 }
 

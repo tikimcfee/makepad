@@ -14,6 +14,14 @@ pub enum GitError {
     RefNotFound(String),
     InvalidIndex(String),
     CorruptPack(String),
+    /// A revision that names no object, with what failed to resolve.
+    BadRevision { rev: String, reason: String },
+    /// An abbreviated id that names more than one object: every candidate,
+    /// with its kind.
+    AmbiguousObjectId {
+        prefix: String,
+        candidates: Vec<(crate::oid::ObjectId, crate::object::ObjectKind)>,
+    },
 }
 
 impl fmt::Display for GitError {
@@ -29,6 +37,15 @@ impl fmt::Display for GitError {
             GitError::RefNotFound(s) => write!(f, "ref not found: {}", s),
             GitError::InvalidIndex(s) => write!(f, "invalid index: {}", s),
             GitError::CorruptPack(s) => write!(f, "corrupt pack: {}", s),
+            GitError::BadRevision { rev, reason } => write!(f, "bad revision '{}': {}", rev, reason),
+            GitError::AmbiguousObjectId { prefix, candidates } => {
+                write!(f, "short object id {} is ambiguous; candidates:", prefix)?;
+                for (i, (oid, kind)) in candidates.iter().enumerate() {
+                    let sep = if i == 0 { " " } else { ", " };
+                    write!(f, "{}{} {}", sep, oid, kind.as_str())?;
+                }
+                Ok(())
+            }
         }
     }
 }
