@@ -7,7 +7,7 @@ The tests use it two ways:
 
 - **As a `tree` circle.** The tests commit it into a scratch git repository and index it with
   these exclusions:
-  - `excluded/`: provenance `IndexOwnData`. The term `fixture_sentinel_excluded` must never
+  - `excluded/`: provenance `IndexOwnData`. The sentinel function defined in `excluded/sentinel.rs` must never
     appear in any chunk, term or statistic, whether from the base or the overlay.
   - `notes/`: claimed by the notes circle (provenance `ClaimedBy`).
 - **As a notes circle `notes:topic-a`,** read from disk, the way real notes are: untracked
