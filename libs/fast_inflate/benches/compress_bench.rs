@@ -2,7 +2,7 @@
 //
 // Run with: cargo bench -p makepad-fast-inflate --bench compress_bench
 
-use std::time::Instant;
+use makepad_core_util::clock::monotonic_now;
 
 fn make_test_data(size: usize) -> Vec<u8> {
     let phrase = b"The quick brown fox jumps over the lazy dog. Makepad is fast! ";
@@ -26,14 +26,14 @@ fn bench_compress(
     // Warm up
     let _ = makepad_fast_inflate::zlib_compress(data, level_rust);
 
-    let start = Instant::now();
+    let start = monotonic_now();
     let mut rust_compressed_len = 0;
     for _ in 0..iterations {
         let out = makepad_fast_inflate::zlib_compress(data, level_rust);
         rust_compressed_len = out.len();
     }
-    let rust_elapsed = start.elapsed();
-    let rust_ns = rust_elapsed.as_nanos() as f64 / iterations as f64;
+    let rust_elapsed = monotonic_now() - start;
+    let rust_ns = rust_elapsed * 1e9 / iterations as f64;
     let rust_throughput = input_len as f64 / (rust_ns / 1e9) / 1e6;
 
     println!("{:>20}  Rust: {:>8.1} MB/s ({:>7.0}us)", label, rust_throughput, rust_ns / 1000.0);

@@ -62,13 +62,10 @@ impl Sha256 {
                 return;
             }
         }
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            self.compress(&block);
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            self.compress(block);
         }
-        let rest = chunks.remainder();
         self.block[..rest.len()].copy_from_slice(rest);
         self.block_len = rest.len();
     }
@@ -137,7 +134,7 @@ impl Sha256 {
     /// hardware kernel is checked against — see `tests::hardware_matches_software_oracle`.
     fn compress_sw(h: &mut [u32; 8], chunk: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {
@@ -262,7 +259,7 @@ mod hw {
         #[target_feature(enable = "sha2")]
         pub unsafe fn compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
             let mut w = [0u32; 64];
-            for (i, word) in chunk.chunks_exact(4).enumerate() {
+            for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
                 w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
             }
             for i in 16..64 {
@@ -318,7 +315,7 @@ mod hw {
         #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
         pub unsafe fn compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
             let mut w = [0u32; 64];
-            for (i, word) in chunk.chunks_exact(4).enumerate() {
+            for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
                 w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
             }
             for i in 16..64 {
@@ -442,13 +439,10 @@ mod tests {
     /// regardless of what `Sha256::compress`'s runtime dispatch would pick.
     fn hash_with(data: &[u8], kernel: fn(&mut [u32; 8], &[u8; 64])) -> [u8; 32] {
         let mut h = H0;
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            kernel(&mut h, &block);
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            kernel(&mut h, block);
         }
-        let rest = chunks.remainder();
         let bit_len = (data.len() as u64).wrapping_mul(8);
         let mut tail = [0u8; 128];
         tail[..rest.len()].copy_from_slice(rest);
@@ -522,7 +516,6 @@ mod tests {
                  compress() will never use hardware on this run"
             );
             check_hardware_kernel_against_software(|h, c| unsafe { hw::aarch64::compress(h, c) });
-            return;
         }
         #[cfg(target_arch = "x86_64")]
         {
@@ -538,7 +531,6 @@ mod tests {
                  compress() will never use hardware on this run"
             );
             check_hardware_kernel_against_software(|h, c| unsafe { hw::x86_64::compress(h, c) });
-            return;
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
@@ -555,26 +547,26 @@ mod tests {
         let data = vec![0x37u8; 64 * 1024 * 1024];
         let rounds = 4;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::monotonic_now();
         for _ in 0..rounds {
             let mut h = Sha256::new();
             h.update(&data);
             std::hint::black_box(h.finalize());
         }
-        let dispatched = t0.elapsed();
+        let dispatched = crate::clock::monotonic_now() - t0;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::monotonic_now();
         for _ in 0..rounds {
             std::hint::black_box(hash_with(&data, Sha256::compress_sw));
         }
-        let software = t0.elapsed();
+        let software = crate::clock::monotonic_now() - t0;
 
         let mb = (data.len() * rounds) as f64 / (1024.0 * 1024.0);
         println!(
             "sha256 throughput over {} MiB: dispatched(compress) = {:.1} MB/s · forced-software = {:.1} MB/s · hw_verified = {}",
             data.len() / (1024 * 1024),
-            mb / dispatched.as_secs_f64(),
-            mb / software.as_secs_f64(),
+            mb / dispatched,
+            mb / software,
             hw::verified(),
         );
     }
