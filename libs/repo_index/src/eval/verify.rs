@@ -130,6 +130,10 @@ fn note_file<'m>(manifest: &'m CircleManifest, path: &str) -> Option<(PathBuf, S
     best.map(|(p, rest, b, _)| (p, rest, b))
 }
 
+fn is_history(manifest: &CircleManifest, name: &str) -> bool {
+    manifest.defs.iter().any(|d| d.name.0 == name && matches!(&d.body, CircleBody::Base(BaseCircle { source: BaseSource::History { .. }, .. })))
+}
+
 fn notes_def<'a>(manifest: &'a CircleManifest, name: &str) -> Option<&'a BaseCircle> {
     manifest.defs.iter().find(|d| d.name.0 == name).and_then(|d| match &d.body {
         CircleBody::Base(b @ BaseCircle { source: BaseSource::Notes { .. }, .. }) => Some(b),
@@ -144,6 +148,8 @@ struct Needle {
     text: String,
     /// `fn <name>` must be followed by a non-identifier character.
     as_fn: bool,
+    /// Matched case-insensitively (`text` is lowercase): an absence's `term`.
+    fold: bool,
 }
 
 /// Re-resolves every gold item.
@@ -217,6 +223,25 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
                     }
                 }
                 GoldTarget::Absent { semantic: true, .. } | GoldTarget::Dependents { .. } | GoldTarget::Error(_) => {}
+                GoldTarget::Absent { scope, term: Some(t), .. } if q.subtype != "self-exclusion" => {
+                    let history = match scope {
+                        Some(AbsentScope::Circle(c)) => is_history(manifest, &c.0),
+                        _ => false,
+                    };
+                    if history {
+                        let t = t.to_lowercase();
+                        let hits = repo
+                            .commits(&[rev.commit], &[])?
+                            .iter()
+                            .filter(|c| c.message.to_lowercase().contains(&t) || c.touched.iter().any(|p| p.to_lowercase().contains(&t)))
+                            .count();
+                        if hits > 0 {
+                            out.push(drift(gi, Drift::NoLongerAbsent { hits: hits as u64 }));
+                        }
+                    } else {
+                        needles.entry(rev.tree).or_default().push(Needle { q: qi, g: gi, text: t.to_lowercase(), as_fn: false, fold: true });
+                    }
+                }
                 GoldTarget::Absent { scope, .. } if q.subtype != "self-exclusion" => match scope {
                     Some(AbsentScope::Path(p)) => {
                         let hits = tree.files.iter().filter(|f| f.path == *p || f.path.starts_with(&format!("{p}/")) || f.path.ends_with(&format!("/{p}"))).count();
@@ -230,12 +255,12 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
                         }
                     }
                     Some(AbsentScope::Fn(f)) => {
-                        needles.entry(rev.tree).or_default().push(Needle { q: qi, g: gi, text: format!("fn {f}"), as_fn: true })
+                        needles.entry(rev.tree).or_default().push(Needle { q: qi, g: gi, text: format!("fn {f}"), as_fn: true, fold: false })
                     }
                     Some(AbsentScope::Text(_)) => {}
                     None | Some(AbsentScope::Circle(_)) => {
                         if !q.query.trim().is_empty() && !q.query.trim().contains(char::is_whitespace) {
-                            needles.entry(rev.tree).or_default().push(Needle { q: qi, g: gi, text: q.query.trim().to_string(), as_fn: false })
+                            needles.entry(rev.tree).or_default().push(Needle { q: qi, g: gi, text: q.query.trim().to_string(), as_fn: false, fold: false })
                         }
                     }
                 },
@@ -293,8 +318,11 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
                 continue;
             }
             let text = tree.text(repo, i)?;
+            let folded = list.iter().any(|n| n.fold).then(|| text.to_lowercase());
             for (n, needle) in list.iter().enumerate() {
-                let found = if needle.as_fn {
+                let found = if needle.fold {
+                    folded.as_deref().is_some_and(|f| f.contains(&needle.text))
+                } else if needle.as_fn {
                     text.match_indices(&needle.text).any(|(at, _)| {
                         !text[at + needle.text.len()..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
                     })
@@ -326,6 +354,26 @@ mod tests {
     fn anchored(mut question: Question, gi: usize, anchor: Anchor) -> Question {
         question.gold[gi].symbol = Some(anchor);
         question
+    }
+
+    #[test]
+    fn an_absent_term_is_checked_in_files_or_in_history() {
+        let root = std::env::temp_dir().join(format!("repo-index-verify-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        let rev = repo.rev(&["9a76551d7"], 1, &[("a.rs", "// Mentions GlyphX here\n"), ("libs/repo_index/eval/questions.jsonl", "consumerword\n")]);
+        repo.commits = vec![CommitRecord { oid: rev.commit, info: CommitInfo { time: 0, parents: vec![] }, message: "relax: fix for ConsumerWord".into(), touched: vec!["b.rs".into()] }];
+        let m = circles::manifest_for(&root, None, &root).unwrap();
+        let term = |t: &str, scope| GoldTarget::Absent { scope, semantic: false, term: Some(t.into()) };
+        let history = Some(AbsentScope::Circle(crate::CircleName("makepad:history".into())));
+        let questions = vec![
+            q("files", &["makepad"], vec![(2, term("glyphx", Some(AbsentScope::Text("tracked files".into())))), (2, term("consumerword", None))]),
+            q("hist", &["makepad:history"], vec![(2, term("consumerword", history.clone())), (2, term("glyphx", history))]),
+        ];
+        let got: Vec<String> = verify(&mut repo, &m, &questions).unwrap().iter().map(|d| format!("{}#{} {:?}", d.id, d.gold, d.drift)).collect();
+        // case-insensitive; the eval data is never searched; history looks at messages, not files
+        assert_eq!(got, ["files#0 NoLongerAbsent { hits: 1 }", "hist#0 NoLongerAbsent { hits: 1 }"]);
     }
 
     #[test]
@@ -365,7 +413,7 @@ mod tests {
         }];
         repo.merge_bases.insert((oid(3), rev.commit), oid(9));
         let p = |path: &str, line: Option<u32>| GoldTarget::Path { path: path.into(), line, end: None, alt_lines: vec![] };
-        let absent = |scope| GoldTarget::Absent { scope, semantic: false };
+        let absent = |scope| GoldTarget::Absent { scope, semantic: false, term: None };
         let questions = vec![
             anchored(q("p", &["makepad"], vec![(2, p("a/lib.rs", Some(1))), (2, p("gone.rs", None)), (1, p("a", None))]), 0, Anchor::Def("fn keep".into())),
             q("k", &["makepad"], vec![(2, GoldTarget::Package("pkg-a".into())), (2, GoldTarget::Package("pkg-gone".into()))]),
