@@ -129,6 +129,24 @@ impl Eval<'_> {
     }
 }
 
+/// Every base circle whose index a revision of the repo at `root` decides: its tree and history
+/// circles, and every notes circle. Another repo's circles (`commercial`) are not opened at this
+/// repo's revisions.
+pub fn pointer_circles(manifest: &CircleManifest, root: &Path) -> Vec<CircleName> {
+    use crate::{BaseCircle, BaseSource, CircleBody};
+    let here = |r: &Path| std::fs::canonicalize(r).ok() == std::fs::canonicalize(root).ok();
+    manifest
+        .defs
+        .iter()
+        .filter(|d| match &d.body {
+            CircleBody::Base(BaseCircle { source: BaseSource::Tree { root: r } | BaseSource::History { root: r, .. }, .. }) => here(r),
+            CircleBody::Base(BaseCircle { source: BaseSource::Notes { .. }, .. }) => true,
+            CircleBody::Derived(_) => false,
+        })
+        .map(|d| d.name.clone())
+        .collect()
+}
+
 fn names(c: &[CircleName]) -> Vec<&str> {
     c.iter().map(|n| n.0.as_str()).collect()
 }
@@ -205,6 +223,21 @@ impl Harness for Eval<'_> {
             match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, g)) => g.push(q),
                 None => groups.push((key, vec![q])),
+            }
+        }
+        // a pointer counts only circles that are built, so build every circle a pointer can name
+        // first: the run is then a function of (revision, configuration), never of build state
+        let mut prebuilt: Vec<RevSpec> = Vec::new();
+        for ((rev, _), group) in &groups {
+            if prebuilt.contains(rev) {
+                continue;
+            }
+            prebuilt.push(rev.clone());
+            let all = pointer_circles(&manifest, &self.root);
+            if let Err(e) = self.circles.open(&manifest, &all, rev) {
+                for q in group {
+                    report.failures.push(format!("{}: building the circles pointers name at {}: {e}", q.id, rev_text(rev)));
+                }
             }
         }
         let ctx = RunCtx { manifest: &manifest, configured: &configured, opts };
@@ -616,6 +649,45 @@ mod tests {
         let d = diff_runs(&runs.join("one.jsonl"), &runs.join("two.jsonl")).unwrap();
         assert!(d.contains("loss  w1@makepad"), "{d}");
         assert!(report_json(&report).lines().count() >= 5);
+    }
+
+    #[test]
+    fn pointer_circles_are_built_before_scoring() {
+        let top = std::env::temp_dir().join(format!("repo-index-eval-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let root = top.join("makepad");
+        std::fs::create_dir_all(top.join("mail/t")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(top.join("mail/t/a.md"), "# a\n").unwrap();
+        let conf = top.join("c.conf");
+        std::fs::write(&conf, format!("notes:t = notes {}\n", top.join("mail/t").display())).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["9a76551d7", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, &[("a.rs", "fn a() {}\n")]);
+        let (mut circles, store) = opener(repo, &conf);
+        let search = TableSearch { answers: HashMap::new(), calls: RefCell::new(Vec::new()) };
+        let others = RefCell::new(Vec::new());
+        struct Spy<'a>(&'a TableSearch, &'a RefCell<Vec<Vec<String>>>);
+        impl Search for Spy<'_> {
+            fn find(&self, opened: &Opened, query: &Query) -> Result<FindOutput, Error> {
+                self.1.borrow_mut().push(opened.others.iter().map(|c| c.name.0.clone()).collect());
+                self.0.find(opened, query)
+            }
+            fn resolve(&self, o: &Opened, h: &crate::Handle) -> Result<Vec<crate::Located>, Error> {
+                self.0.resolve(o, h)
+            }
+            fn refs(&self, o: &Opened, i: &str, u: bool) -> Result<crate::RefsOutput, Error> {
+                self.0.refs(o, i, u)
+            }
+        }
+        let spy = Spy(&search, &others);
+        let mut r = FakeRepo::new(&root);
+        let mut eval = Eval { circles: &mut circles, search: &spy, render: &LenRender, repo: &mut r, root: root.clone() };
+        let pointer = GoldTarget::Pointer { circle: CircleName("notes:t".into()), count: None, unit: crate::PointerUnit::Blobs };
+        let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: None };
+        eval.run(&[q("x", &["makepad"], vec![(2, pointer)])], &opts).unwrap();
+        assert!(others.borrow()[0].contains(&"notes:t".to_string()), "{:?}", others.borrow());
+        assert!(others.borrow()[0].contains(&"makepad:history".to_string()));
+        assert!(store.state.borrow().manifests.len() >= 2);
     }
 
     #[test]
