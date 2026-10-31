@@ -294,6 +294,11 @@ impl Graph {
         out
     }
 
+    /// Whether `path` is the manifest of one of the graph's packages.
+    pub fn is_manifest(&self, path: &str) -> bool {
+        self.by_dir.contains_key(dir_of(path))
+    }
+
     /// The package whose directory is the longest prefix of `path`.
     pub fn package_of(&self, path: &str) -> Option<usize> {
         let mut dir = dir_of(path);

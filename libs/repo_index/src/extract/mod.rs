@@ -3,8 +3,9 @@
 //! exclusions before anything is read.
 //!
 //! A tree circle streams, per package (by directory): its crate card, then each of its files
-//! (`.rs` as a file chunk and its items, `.md` as sections, `.splash` as definitions); then the
-//! files no package owns. Files of a crates.io port or with a generated header are skeletons.
+//! (`.rs` as a file chunk and its items, `.md` as sections, `.splash` as definitions, any other
+//! tracked file but the card's own `Cargo.toml` as one path-only file chunk); then the files no
+//! package owns. Files of a crates.io port or with a generated header are skeletons.
 //! Every chunk of a file carries that file's blob, so a hit's copies are found by
 //! (blob, span). Chunks outside the circle's families are not emitted, and a parent that is not
 //! emitted becomes the next emitted ancestor's index (or none).
@@ -207,6 +208,17 @@ fn rust_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, 
     (batch, scanned.mods)
 }
 
+/// A tracked file nothing else chunks (scripts, data, configuration, binaries): one record of
+/// its path, so path questions find it. Its content is not read; only a crates.io port's files
+/// are flagged generated.
+fn path_chunk(circle: &CircleName, path: &str, blob: Oid, package: Option<&str>, vendored: bool) -> Chunk {
+    let mut c = base_chunk(Kind::File, circle, path, file_name(path));
+    c.keys.blob = Some(blob);
+    c.keys.package = package.map(str::to_string);
+    c.flags.generated = vendored;
+    c
+}
+
 fn doc_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, package: Option<&str>) -> Batch {
     let text = String::from_utf8_lossy(bytes);
     markdown::doc_sections(&text)
@@ -357,9 +369,6 @@ impl Extractor {
         let by_dir: BTreeMap<&str, usize> = graph.packages.iter().enumerate().map(|(i, p)| (p.dir.as_str(), i)).collect();
         let order: BTreeMap<usize, usize> = by_dir.values().enumerate().map(|(rank, &i)| (i, rank)).collect();
         for (fi, f) in files.iter().enumerate() {
-            if !matches!(ext(&f.path), "rs" | "md" | "splash") {
-                continue;
-            }
             let key = match graph.package_of(&f.path) {
                 Some(i) => (false, order[&i]),
                 None => (true, 0),
@@ -379,6 +388,15 @@ impl Extractor {
             let mut modules = Vec::new();
             for fi in members {
                 let f = &files[fi];
+                let card_manifest = file_name(&f.path) == "Cargo.toml" && graph.is_manifest(&f.path);
+                if card_manifest {
+                    // its crate card stands for it
+                    continue;
+                }
+                if !matches!(ext(&f.path), "rs" | "md" | "splash") {
+                    batches.push(vec![path_chunk(circle, &f.path, f.blob, package.as_deref(), vendored)]);
+                    continue;
+                }
                 let bytes = repo.read_blob(f.blob)?;
                 report.files += 1;
                 let batch = match ext(&f.path) {
