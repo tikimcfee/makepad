@@ -12,7 +12,8 @@
 use crate::{
     circles, eval, ChunkAt, CircleExpr, CircleManifest, CircleName, CircleStatus, Circles, CrateView, Detail, Error, EvalMode,
     EvalOpts, Handle, Harness, Key, KindFilter, Lines, Located, Mode, Oid, OpenCircle, Opened, Output, Query, QuestionSet,
-    Render, Repo, RevSpec, Search, ShowOutput, StatusOutput, Target, DEFAULT_LIMIT, SHOW_MAX_LINES,
+    Render, Repo, RepoId, RevSpec, Search, SegmentKey, ShowOutput, SourceStamp, StatusOutput, Store, Target, DEFAULT_LIMIT,
+    INDEXER_VERSION, SHOW_MAX_LINES,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -47,8 +48,10 @@ pub struct Parts {
     pub circles: Box<dyn Circles>,
     pub search: Box<dyn Search>,
     pub render: Box<dyn Render>,
-    /// Git reads in the repo the caller stands in (`show` text, `eval verify-gold`).
+    /// Git reads in the repo the caller stands in (`show` text, `eval verify-gold`, `gc`).
     pub repo: Box<dyn Repo>,
+    /// The index store (`gc`).
+    pub store: Box<dyn Store>,
     pub cwd: PathBuf,
 }
 
@@ -377,12 +380,94 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
             emit(parts, out, &Output::Status(status(&manifest, &opened)), a.has("--json"))
         }
         "stale" => Err(Failure::NotBuilt("`stale` arrives in phase 4 (PLAN §10)".into())),
-        "gc" => Err(Failure::NotBuilt(
-            "`gc` needs every live worktree's base, and `Repo` has no list of the repo's worktrees yet".into(),
-        )),
+        "gc" => {
+            let a = parse_args(args, &[], &[]).map_err(usage_err)?;
+            if !a.words.is_empty() {
+                return Err(usage_err("gc takes no words"));
+            }
+            let manifest = parts.circles.manifest()?;
+            let (bases, circles_live) = live(&manifest, parts.repo.as_mut(), parts.circles.as_ref())?;
+            let report = parts.store.gc(&bases, &circles_live)?;
+            for p in &report.removed {
+                writeln!(out, "removed {}", p.display()).map_err(io)?;
+            }
+            for (p, why) in &report.deferred {
+                writeln!(out, "kept {}: {why}", p.display()).map_err(io)?;
+            }
+            writeln!(out, "gc: {} live bases, {} removed, {} kept for now", bases.len(), report.removed.len(), report.deferred.len()).map_err(io)?;
+            Ok(0)
+        }
         "eval" => eval_verb(parts, args, out),
         other => Err(usage_err(format!("unknown verb `{other}`"))),
     }
+}
+
+/// A manifest circle GC keeps: its repo (`None` for a machine's notes circle) and name.
+pub type LiveCircle = (Option<RepoId>, CircleName);
+
+/// What GC keeps (PLAN §6): for each tree circle of this repo, the base of every worktree's
+/// merge-base with the circle's upstream, and the upstream tip's own base; and every configured
+/// circle that keeps a manifest (history, notes). Tree circles of other repos are not this
+/// repo's: their bases are not kept here and rebuild on first use.
+pub fn live(
+    manifest: &CircleManifest,
+    repo: &mut dyn Repo,
+    circles_reg: &dyn Circles,
+) -> Result<(Vec<SegmentKey>, Vec<LiveCircle>), Error> {
+    use crate::{BaseCircle, BaseSource, CircleBody};
+    let root = repo.root();
+    let mut keys: Vec<SegmentKey> = Vec::new();
+    let mut circles_live = Vec::new();
+    let worktrees = repo.worktrees()?;
+    for d in &manifest.defs {
+        let CircleBody::Base(def @ BaseCircle { source, .. }) = &d.body else { continue };
+        match source {
+            BaseSource::Tree { root: r } if r == &root => {
+                let upstream = manifest.defs.iter().find_map(|h| match &h.body {
+                    CircleBody::Base(BaseCircle { source: BaseSource::History { root: hr, upstream, .. }, .. }) if hr == r => Some(upstream.clone()),
+                    _ => None,
+                });
+                let up = match &upstream {
+                    Some(u) => match repo.resolve(&RevSpec::Pinned(u.clone())) {
+                        Ok(x) => Some(x.commit),
+                        Err(e) => {
+                            eprintln!("makepad index gc: {u} does not resolve ({e}); each worktree keeps the base of its HEAD");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let mut commits: Vec<Oid> = up.into_iter().collect();
+                for (_, head) in &worktrees {
+                    let base = match up {
+                        Some(u) => repo.merge_base(*head, u)?.unwrap_or(*head),
+                        None => *head,
+                    };
+                    commits.push(base);
+                }
+                for c in commits {
+                    let tree = repo.resolve(&RevSpec::Pinned(crate::open::hex(&c)))?.tree;
+                    let key = SegmentKey {
+                        repo: Some(repo.id()),
+                        circle: d.name.clone(),
+                        source: SourceStamp::Tree { tree },
+                        def_hash: circles_reg.def_hash(def),
+                        indexer: INDEXER_VERSION,
+                    };
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            BaseSource::Tree { .. } => {}
+            BaseSource::History { .. } => circles_live.push((Some(repo.id()), d.name.clone())),
+            BaseSource::Notes { .. } => {
+                let repo_key = (d.name.0 == circles::NOTES_LOCAL).then(|| repo.id());
+                circles_live.push((repo_key, d.name.clone()));
+            }
+        }
+    }
+    Ok((keys, circles_live))
 }
 
 fn names(opened: &Opened) -> String {
@@ -419,7 +504,7 @@ fn status(manifest: &CircleManifest, opened: &Opened) -> StatusOutput {
                 origin: d.origin.clone(),
                 source: source_line(d),
                 rev: open.map(|c| short(&c.rev)).unwrap_or_default(),
-                segments: Vec::new(),
+                segments: open.map(|c| c.segments.iter().map(|s| s.id()).collect()).unwrap_or_default(),
                 chunks: open.map_or(0, |c| c.stats.chunks),
                 overlay_files: open.map_or(0, |c| c.overlay.len() as u64),
                 built: open.is_some(),
@@ -693,9 +778,16 @@ mod tests {
         repo.rev(&["HEAD", "refs/remotes/upstream/work", "9a76551d7"], 1, files);
         let mut show_repo = FakeRepo::new(&root);
         show_repo.rev(&["HEAD", "refs/remotes/upstream/work", "9a76551d7"], 1, files);
-        let (circles, _) = opener(repo, &root.join("none.conf"));
+        let (circles, store) = opener(repo, &root.join("none.conf"));
         let seen = Rc::new(RefCell::new(Seen::default()));
-        let p = Parts { circles: Box::new(circles), search: Box::new(EchoSearch(seen.clone())), render: Box::new(DebugRender), repo: Box::new(show_repo), cwd: root.join("src") };
+        let p = Parts {
+            circles: Box::new(circles),
+            search: Box::new(EchoSearch(seen.clone())),
+            render: Box::new(DebugRender),
+            repo: Box::new(show_repo),
+            store: Box::new(store),
+            cwd: root.join("src"),
+        };
         (p, seen, root)
     }
 
@@ -767,6 +859,30 @@ mod tests {
         assert_eq!(call(&mut p, &["build"]).0, 0);
         let (_, out, _) = call(&mut p, &["status"]);
         assert!(out.contains("makepad built=true"), "{out}");
+        let (code, out, _) = call(&mut p, &["gc"]);
+        assert!(code == 0 && out.contains("gc: 1 live bases"), "{out}");
+    }
+
+    #[test]
+    fn gc_keeps_every_worktrees_base_and_the_manifest_circles() {
+        let root = std::env::temp_dir().join(format!("repo-index-cli-gc-{}", std::process::id())).join("makepad");
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        let up = repo.rev(&["refs/remotes/upstream/work"], 1, &[]);
+        let a = repo.rev(&["a"], 2, &[]);
+        let b = repo.rev(&["b"], 3, &[]);
+        let mb = repo.rev(&["mb"], 4, &[]);
+        repo.merge_bases.insert((a.commit, up.commit), mb.commit);
+        repo.merge_bases.insert((b.commit, up.commit), up.commit);
+        repo.worktrees = vec![(root.clone(), a.commit), (root.join("../wt"), b.commit)];
+        let m = circles::manifest_for(&root, None, &root).unwrap();
+        let (reg, _) = opener(FakeRepo::new(&root), &root.join("none.conf"));
+        let (keys, live_circles) = live(&m, &mut repo, &reg).unwrap();
+        let trees: Vec<Oid> = keys.iter().map(|k| match k.source { SourceStamp::Tree { tree } => tree, _ => unreachable!() }).collect();
+        assert_eq!(trees, [up.tree, mb.tree], "the upstream tip, and each worktree's merge-base once");
+        let names: Vec<&str> = live_circles.iter().map(|(_, n)| n.0.as_str()).collect();
+        assert_eq!(names, ["makepad:history", "notes:local"]);
+        assert!(live_circles.iter().all(|(r, _)| r.is_some()), "both belong to the repo");
     }
 
     #[test]

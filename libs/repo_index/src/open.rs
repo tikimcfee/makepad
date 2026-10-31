@@ -470,6 +470,7 @@ pub(crate) mod fakes {
         pub merge_bases: HashMap<(Oid, Oid), Oid>,
         pub commits: Vec<CommitRecord>,
         pub resolved: Rc<RefCell<Vec<String>>>,
+        pub worktrees: Vec<(PathBuf, Oid)>,
     }
 
     impl FakeRepo {
@@ -482,6 +483,7 @@ pub(crate) mod fakes {
                 merge_bases: HashMap::new(),
                 commits: Vec::new(),
                 resolved: Rc::new(RefCell::new(Vec::new())),
+                worktrees: Vec::new(),
             }
         }
         /// A revision named `names` (commit `n`, tree `n + 100`) holding `files`.
@@ -543,6 +545,9 @@ pub(crate) mod fakes {
                 .filter(|c| !hide.contains(&c.oid))
                 .cloned()
                 .collect())
+        }
+        fn worktrees(&mut self) -> Result<Vec<(PathBuf, Oid)>, Error> {
+            Ok(self.worktrees.clone())
         }
         fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error> {
             if a == b {
@@ -674,6 +679,9 @@ pub(crate) mod fakes {
     impl SegmentRead for FakeSegment {
         fn key(&self) -> &SegmentKey {
             &self.key
+        }
+        fn id(&self) -> SegmentId {
+            SegmentId(format!("seg-{}-{:?}", self.key.circle.0, self.key.source))
         }
         fn stats(&self) -> CircleStats {
             CircleStats { chunks: self.chunks.len() as u64, field_lengths: [0; 5] }
