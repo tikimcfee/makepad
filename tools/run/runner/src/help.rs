@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `makepad` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "app", "fetch", "export", "pack-src", "inspect", "devhub", "observe", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
+    "run", "app", "fetch", "export", "pack-src", "inspect", "devhub", "observe", "index", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
     "parse", "resolve", "file", "std-surface", "lex", "hub", "remote-relay", "remote", "help",
 ];
 
@@ -126,6 +126,7 @@ fn main_page(st: &Style) -> String {
     p.row("pack-src <out> <package>...", "Pack the sources a run of these packages reads into one store");
     p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
     p.row("devhub <stream|ls|inspect>", "Every JIT on the LAN, through the local devhub (also `observe`)");
+    p.row("index <verb>", "Ranked search over code, docs, history and notes (circles)");
     p.row("hub | remote-relay | remote", "Reach apps on other machines (see makepad help inspect)");
     p.row("check <package>", "Type- and borrow-check without running");
     p.row("check --src <store> <package>", "Check an app from a packed source archive, reading only it");
@@ -307,6 +308,22 @@ fn fix_page(st: &Style) -> String {
     p.out
 }
 
+fn index_page(st: &Style) -> String {
+    let mut p = Page::new(st, 0);
+    title(&mut p, "ranked search over the repo's circles");
+    p.blank();
+    p.usage("makepad index <verb> ...");
+    p.blank();
+    p.text("Keywords in, one ranked line per hit out, per circle: makepad (code, docs, crates,");
+    p.text("splash), makepad:history, and the machine-local notes circles of circles.conf.");
+    p.section("Verbs:");
+    for (_, usage, summary) in makepad_repo_index::cli::VERBS {
+        p.text(&st.spec(usage));
+        p.text(&format!("    {summary}"));
+    }
+    p.out
+}
+
 fn serve_page(st: &Style) -> String {
     let mut p = Page::new(st, 28);
     title(&mut p, "the warm check server");
@@ -393,6 +410,7 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         Some("pack-src") => pack_src_page(st),
         Some("inspect") => inspect_page(st),
         Some("devhub" | "observe") => observe_page(st),
+        Some("index") => index_page(st),
         Some("check") => check_page(st),
         Some("selftest") => selftest_page(st),
         Some("test") => test_page(st),

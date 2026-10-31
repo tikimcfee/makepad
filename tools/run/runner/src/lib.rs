@@ -259,6 +259,8 @@ fn run(raw_args: Vec<Vec<u8>>) {
         // on the LAN from the master)
         #[cfg(unix)]
         Some("devhub" | "observe") => std::process::exit(makepad_devhub::cli::main(&args[2..])),
+        // `index <verb>`: ranked search over the repo's circles (code, docs, history, notes)
+        Some("index") => std::process::exit(makepad_repo_index::cli::main(&args[2..])),
         Some("remote-relay") => std::process::exit(remote::relay(&args[2..])),
         Some("remote") => std::process::exit(remote::remote(&args[2..])),
         // `pack-src [--target <triple>] <out.store> <package>...`: the source archive `run --src` runs from
