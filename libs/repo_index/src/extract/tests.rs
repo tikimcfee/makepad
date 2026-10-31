@@ -522,3 +522,70 @@ fn real_cite_parts() {
         _ => println!("resolved"),
     }
 }
+
+/// The overlay's extraction cost on a real lane, timed with `time` around each part:
+/// `MAKEPAD_INDEX_REPO=<worktree> MAKEPAD_INDEX_REV=<base> MAKEPAD_INDEX_PART=changes|read|extract
+/// <test binary> real_overlay_parts --ignored --nocapture`.
+#[test]
+#[ignore]
+fn real_overlay_parts() {
+    let Some(root) = std::env::var_os("MAKEPAD_INDEX_REPO") else { panic!("set MAKEPAD_INDEX_REPO") };
+    let base_name = std::env::var("MAKEPAD_INDEX_REV").unwrap_or_else(|_| "HEAD".into());
+    let part = std::env::var("MAKEPAD_INDEX_PART").unwrap_or_default();
+    let root = PathBuf::from(root);
+    let mut repo = GitRepo::open(&root).unwrap();
+    let base = repo.resolve(&RevSpec::Pinned(base_name)).unwrap();
+    if part.is_empty() {
+        return println!("opened");
+    }
+    let changes = repo.changes(&base).unwrap();
+    if part == "changes" {
+        return println!("changes {}", changes.len());
+    }
+    let mut files = Vec::new();
+    for c in &changes {
+        if let Change::Added(p) | Change::Modified(p) = c {
+            files.push((p.clone(), fs::read(root.join(p)).unwrap()));
+        }
+    }
+    let bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
+    if part == "read" {
+        return println!("read {} files, {bytes} bytes", files.len());
+    }
+    if part == "hash" {
+        let n = files.iter().filter(|(_, b)| super::git::blob_oid(b).0[0] < 255).count();
+        return println!("hash {n}");
+    }
+    if part == "lex" {
+        let mut toks = Vec::new();
+        let opts = relax_lex::lexer::LexOptions { edition: 2021, mode: relax_lex::lexer::Mode::Rust, trivia: true };
+        let mut n = 0;
+        for (_, b) in files.iter().filter(|(p, _)| p.ends_with(".rs")) {
+            toks.clear();
+            let _ = relax_lex::lexer::lex_with(b, &opts, &mut toks);
+            n += toks.len();
+        }
+        return println!("lex {n}");
+    }
+    if part == "scan" {
+        let n: usize = files.iter().filter(|(p, _)| p.ends_with(".rs")).map(|(_, b)| super::rust::scan(b, false).items.len()).sum();
+        return println!("scan {n}");
+    }
+    if part == "sizes" {
+        let mut v: Vec<(usize, &str)> = files.iter().map(|(p, b)| (b.len(), p.as_str())).collect();
+        v.sort();
+        v.reverse();
+        return println!("sizes {:?}", &v[..8]);
+    }
+    let def = BaseCircle {
+        source: BaseSource::Tree { root: root.clone() },
+        families: CODE.to_vec(),
+        exclude: crate::INDEX_OWN_DATA.iter().map(|p| Exclusion { prefix: p.to_string(), provenance: Provenance::IndexOwnData }).collect(),
+    };
+    let mut ex = Extractor::new();
+    let mut chunks = 0;
+    for (p, b) in &files {
+        chunks += ex.extract_file(&circle("makepad"), &def, p, b).unwrap().len();
+    }
+    println!("extract {} files, {bytes} bytes, {chunks} chunks", files.len());
+}

@@ -54,7 +54,7 @@ pub fn scan(src: &[u8], skeleton: bool) -> RustFile {
     let Some(ends) = matching(&toks) else {
         return RustFile { lines: line_count, fallback: Some("delimiters do not pair".into()), ..Default::default() };
     };
-    let mut s = Scanner { src, toks: &toks, ends: &ends, lines: &lines, skeleton, out: RustFile { lines: line_count, ..Default::default() } };
+    let mut s = Scanner { src, utf8: std::str::from_utf8(src).ok(), toks: &toks, ends: &ends, lines: &lines, skeleton, out: RustFile { lines: line_count, ..Default::default() } };
     s.level(0, toks.len(), Container::File, None);
     s.out
 }
@@ -134,6 +134,8 @@ struct Decl {
 
 struct Scanner<'a> {
     src: &'a [u8],
+    /// `src` as text, validated once (`None` for a file that is not UTF-8).
+    utf8: Option<&'a str>,
     toks: &'a [Tok],
     ends: &'a [u32],
     lines: &'a LineIndex,
@@ -181,11 +183,17 @@ fn doc_text(raw: &str) -> String {
 impl<'a> Scanner<'a> {
     fn text(&self, i: usize) -> &'a str {
         let t = self.toks[i];
-        std::str::from_utf8(&self.src[t.lo as usize..t.hi as usize]).unwrap_or("")
+        match self.utf8 {
+            Some(s) => s.get(t.lo as usize..t.hi as usize).unwrap_or(""),
+            None => std::str::from_utf8(&self.src[t.lo as usize..t.hi as usize]).unwrap_or(""),
+        }
     }
 
     fn slice(&self, lo: u32, hi: u32) -> String {
-        String::from_utf8_lossy(&self.src[lo as usize..hi as usize]).into_owned()
+        match self.utf8.and_then(|s| s.get(lo as usize..hi as usize)) {
+            Some(s) => s.to_string(),
+            None => String::from_utf8_lossy(&self.src[lo as usize..hi as usize]).into_owned(),
+        }
     }
 
     fn line(&self, pos: u32) -> u32 {
