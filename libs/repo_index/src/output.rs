@@ -137,7 +137,10 @@ fn hit_line(h: &Hit) -> String {
 fn block_text(t: &mut String, b: &CircleBlock) {
     let counts = format!("{}, {}", plural(b.definitions, "definition", "definitions"), plural(b.uses, "use", "uses"));
     let absent = if b.absent_terms.is_empty() { String::new() } else { format!(" · absent: {}", b.absent_terms.join(", ")) };
-    if b.total == 0 {
+    if b.total == 0 && !b.under.is_empty() {
+        // The filter left nothing: that says nothing about the circle.
+        push_line(t, &format!("{} · no hits under {}{absent}", at_rev(&b.circle, &b.rev), b.under.join(", ")));
+    } else if b.total == 0 {
         push_line(t, &format!("{} · 0 definitions, 0 uses{absent}", at_rev(&b.circle, &b.rev)));
     } else {
         push_line(t, &format!("{} · {} of {} · {counts}{absent}", at_rev(&b.circle, &b.rev), b.hits.len(), b.total));

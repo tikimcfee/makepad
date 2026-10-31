@@ -1037,19 +1037,31 @@ fn a_filter_with_no_hits_claims_no_absence() {
     let o = opened(vec![makepad()], vec![]);
     let mut q = query("MAX_TURN", &["makepad"]);
     q.paths = vec!["beta/".into()];
-    let b = &find(&o, &q).blocks[0];
+    let out = find(&o, &q);
+    let b = &out.blocks[0];
     assert_eq!(b.total, 0);
     assert!(!b.absent, "{:?}", b.absent_terms);
+    assert_eq!(b.under, ["--path beta/"]);
+    let text = Renderer.text(&Output::Find(out.clone()));
+    assert_eq!(text.lines().next().unwrap(), format!("makepad @{} · no hits under --path beta/", short(&oid(0x9a))));
+    let out_find = Output::Find(out);
+    let json = Renderer.json_lines(&Renderer.records(&out_find));
+    assert!(json.lines().next().unwrap().contains(r#""under":["--path beta/"]"#), "{json}");
     let mut q = query("MAX_TURN", &[]);
     q.circles = vec![CircleExpr::Select { of: Box::new(CircleExpr::Circle(CircleName("makepad".into()))), by: Selector::PathPrefix("docs/".into()) }];
     q.kinds = vec![KindFilter::Kind(Kind::Struct)];
     let b = &find(&o, &q).blocks[0];
     assert_eq!(b.total, 0);
     assert!(!b.absent, "{:?}", b.absent_terms);
+    assert_eq!(b.under, ["--kind struct", "--path docs/"]);
     // A word the circle lacks is still absent under a filter.
     let mut q = query("MAX_TURN NoSuchWidget", &["makepad"]);
     q.paths = vec!["beta/".into()];
-    assert_eq!(find(&o, &q).blocks[0].absent_terms, ["NoSuchWidget"]);
+    let out = find(&o, &q);
+    assert_eq!(out.blocks[0].absent_terms, ["NoSuchWidget"]);
+    assert!(Renderer.text(&Output::Find(out)).starts_with(&format!("makepad @{} · no hits under --path beta/ · absent: NoSuchWidget", short(&oid(0x9a)))));
+    // Unfiltered, nothing matching is an absence.
+    assert!(Renderer.text(&Output::Find(find(&o, &query("NoSuchWidget", &["makepad"])))).contains("0 definitions, 0 uses · absent: NoSuchWidget"));
 }
 
 #[test]
