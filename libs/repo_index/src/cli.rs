@@ -37,7 +37,7 @@ pub const VERBS: &[(&str, &str, &str)] = &[
     ("build", "build [--in <circle>,..] [--rev r]", "Build or refresh the circles' indexes"),
     ("status", "status [--json]", "What is indexed, at which revision, and what the overlay holds"),
     ("gc", "gc", "Remove index data nothing uses any more"),
-    ("eval", "eval [run|verify-gold|diff] [--mode retrieval|agent] [--set shipped|local|heldout|<file>] [--in c,..] [--k 10] [--json] [--save runs/<name>]", "The eval harness; each question is indexed at its own pinned rev"),
+    ("eval", "eval [run|verify-gold|diff|stamps] [--mode retrieval|agent] [--set shipped|local|heldout|<file>] [--in c,..] [--k 10] [--json] [--save runs/<name>]", "The eval harness; each question is indexed at its own pinned rev"),
 ];
 
 pub fn usage() -> String {
@@ -649,6 +649,13 @@ fn eval_verb(parts: &mut Parts, args: &[String], out: &mut dyn Write) -> Result<
         let [_, x, y] = a.words.as_slice() else { return Err(usage_err("eval diff <run a> <run b>")) };
         let d = eval::diff_runs(Path::new(x), Path::new(y))?;
         writeln!(out, "{d}").map_err(io)?;
+        return Ok(0);
+    }
+    if sub == "stamps" {
+        let manifest = parts.circles.manifest()?;
+        for (c, stamp) in eval::notes_stamps(&manifest)? {
+            writeln!(out, "{} {stamp:016x}", c.0).map_err(io)?;
+        }
         return Ok(0);
     }
     if !matches!(sub, "run" | "verify-gold") || a.words.len() > 1 {

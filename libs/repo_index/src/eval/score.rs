@@ -278,6 +278,7 @@ pub(crate) mod tests {
             gold: gold.into_iter().map(|(rel, target)| Gold { rel, symbol: None, requires: None, target }).collect(),
             distractors: Vec::new(),
             forbid: Vec::new(),
+            pins: Vec::new(),
             notes: String::new(),
             source: String::new(),
         }

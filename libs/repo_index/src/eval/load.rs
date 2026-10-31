@@ -186,7 +186,7 @@ pub fn question(text: &str, set: &QuestionSet, manifest: &CircleManifest, file: 
         &v,
         &[
             "id", "query", "agent_prompt", "rev", "precondition", "circles", "type", "subtype", "difficulty", "gold", "distractors",
-            "forbid", "notes", "source",
+            "forbid", "pin", "notes", "source",
         ],
         "a question",
         &at,
@@ -217,6 +217,17 @@ pub fn question(text: &str, set: &QuestionSet, manifest: &CircleManifest, file: 
     if gold.is_empty() {
         return Err(at.err("a question needs gold"));
     }
+    let pins = match v.get("pin") {
+        None => Vec::new(),
+        Some(Value::Obj(pairs)) => pairs
+            .iter()
+            .map(|(c, h)| match h.as_str().filter(|h| h.len() == 16).and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                Some(stamp) => Ok((CircleName(c.clone()), stamp)),
+                None => Err(at.err(format!("`pin` maps a notes circle to its 16-hex content stamp (`makepad index eval stamps`); {c} is not"))),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(at.err("`pin` is an object of circle -> stamp")),
+    };
     Ok(Question {
         id: str_of(&v, "id", &at)?.to_string(),
         set: set.clone(),
@@ -231,6 +242,7 @@ pub fn question(text: &str, set: &QuestionSet, manifest: &CircleManifest, file: 
         gold,
         distractors: items("distractors")?,
         forbid: strings(&v, "forbid", &at)?,
+        pins,
         notes: opt_str(&v, "notes", &at)?.unwrap_or_default(),
         source: opt_str(&v, "source", &at)?.unwrap_or_default(),
     })

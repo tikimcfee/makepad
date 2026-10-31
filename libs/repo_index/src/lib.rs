@@ -1217,6 +1217,11 @@ pub struct Question {
     /// `libs/repo_index/eval/*`): a circle name or source path, `*` a glob. Any of them in the
     /// queried circle's ranked list is a containment failure (the hard gate).
     pub forbid: Vec<String>,
+    /// Notes circles the gold was written against, with their content stamp then (the
+    /// [`SourceStamp::Notes`] hash of [`crate::open::notes_stamp`]). Notes are live: when a
+    /// pinned circle's stamp differs now, the question is stale, excluded from the scores and
+    /// listed in [`EvalReport::stale`], never failed.
+    pub pins: Vec<(CircleName, u64)>,
     pub notes: String,
     pub source: String,
 }
@@ -1332,6 +1337,9 @@ pub struct EvalReport {
     /// Hard gates that failed: containment, false absence, an unconfigured circle returning
     /// empty, a metric beyond its tolerance of the last saved run.
     pub failures: Vec<String>,
+    /// Questions whose pinned notes changed since their gold was written, with the circle and
+    /// both stamps: not scored, not failed, listed for the eval-file owner.
+    pub stale: Vec<(String, String)>,
 }
 
 /// A gold item that no longer holds at its question's revision.
