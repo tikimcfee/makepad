@@ -801,6 +801,13 @@ pub trait Extract {
     /// ([`workers::fan_out`]): one result per file, in order, each what `extract_file` returns
     /// for it (`parent` indexes that file's own chunks); the first failing file's error.
     fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error>;
+    /// The crate cards a worktree's `changes` over `base` alter (changed files read under
+    /// `root`): one full card chunk per package whose card differs from the base build's or
+    /// whose manifest changed, at its manifest path, as a base build of the worktree's tree gives
+    /// it. The overlay lets each one be its path's whole [`OverlayFile`], in place of
+    /// [`Extract::extract_file`]'s manifest-only card. Empty, with nothing read, unless a change
+    /// touches a `Cargo.toml` or the app registry, or adds or deletes a `.rs` file.
+    fn extract_cards(&mut self, circle: &CircleName, def: &BaseCircle, base: &Rev, root: &Path, changes: &[Change], repo: &mut dyn Repo) -> Result<Vec<Chunk>, Error>;
 }
 
 pub trait Tokenize {

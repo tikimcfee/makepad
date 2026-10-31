@@ -897,6 +897,9 @@ pub(crate) mod fakes {
         fn extract_files(&mut self, circle: &CircleName, def: &BaseCircle, files: &[(String, Vec<u8>)]) -> Result<Vec<Vec<Chunk>>, Error> {
             files.iter().map(|(p, b)| self.extract_file(circle, def, p, b)).collect()
         }
+        fn extract_cards(&mut self, _: &CircleName, _: &BaseCircle, _: &Rev, _: &Path, _: &[Change], _: &mut dyn Repo) -> Result<Vec<Chunk>, Error> {
+            Ok(Vec::new())
+        }
     }
 
     /// Lowercased words of name and body.
