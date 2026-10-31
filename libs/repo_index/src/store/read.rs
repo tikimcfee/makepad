@@ -10,7 +10,6 @@ use crate::{ChunkId, ChunkView, CircleStats, Detail, Edge, Error, Key, Keys, Kin
 use makepad_git::oid::ObjectHasher;
 use makepad_git::ObjectId;
 use makepad_shared_bytes::{MappedBytes, SharedBytes};
-use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,42 +21,6 @@ pub struct Segment {
     count: u32,
     /// (offset, len) per section id.
     sections: [(usize, usize); 16],
-}
-
-/// One sorted dictionary of a segment.
-struct Dict<'a> {
-    entries: &'a [u8],
-    keys: &'a [u8],
-    values: &'a [u8],
-}
-
-impl<'a> Dict<'a> {
-    fn len(&self) -> usize {
-        self.entries.len() / DICT_ENTRY_LEN - 1
-    }
-    fn entry(&self, i: usize) -> (usize, usize, u32) {
-        let at = i * DICT_ENTRY_LEN;
-        (le_u32(self.entries, at) as usize, le_u32(self.entries, at + 4) as usize, le_u32(self.entries, at + 8))
-    }
-    /// Entry `i`: key bytes, value bytes and count; `None` when its offsets are out of bounds.
-    fn get(&self, i: usize) -> Option<(&'a [u8], &'a [u8], u32)> {
-        let (k0, v0, n) = self.entry(i);
-        let (k1, v1, _) = self.entry(i + 1);
-        Some((self.keys.get(k0..k1)?, self.values.get(v0..v1)?, n))
-    }
-    fn find(&self, key: &[u8]) -> Option<(&'a [u8], u32)> {
-        let (mut lo, mut hi) = (0, self.len());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (k, v, n) = self.get(mid)?;
-            match k.cmp(key) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Greater => hi = mid,
-                Ordering::Equal => return Some((v, n)),
-            }
-        }
-        None
-    }
 }
 
 /// Postings of one term, decoded as iterated.
@@ -156,18 +119,9 @@ impl Segment {
         if s(sec::OIDS).len() % 20 != 0 {
             return Err(bad("oid table length is not a multiple of 20"));
         }
-        for (e, k, v) in [
-            (sec::TERM_ENTRIES, sec::TERM_KEYS, sec::TERM_VALUES),
-            (sec::KEY_ENTRIES, sec::KEY_KEYS, sec::KEY_VALUES),
-            (sec::CITE_ENTRIES, sec::CITE_KEYS, sec::CITE_VALUES),
-        ] {
-            let ent = s(e);
-            if ent.len() < DICT_ENTRY_LEN || ent.len() % DICT_ENTRY_LEN != 0 {
-                return Err(bad(&format!("dictionary {e} has a bad entry table")));
-            }
-            let last = ent.len() - DICT_ENTRY_LEN;
-            if le_u32(ent, last) as usize != s(k).len() || le_u32(ent, last + 4) as usize != s(v).len() {
-                return Err(bad(&format!("dictionary {e} does not span its keys and values")));
+        for d in [sec::TERMS, sec::KEYS, sec::CITES] {
+            if DictView::new(s(d), s(d + 1), s(d + 2)).is_none() {
+                return Err(bad(&format!("dictionary {d}'s index does not span its blocks")));
             }
         }
         Ok(Segment { path: path.to_path_buf(), bytes, key, stats, count, sections })
@@ -198,8 +152,8 @@ impl Segment {
         &self.bytes.as_slice()[off..off + len]
     }
 
-    fn dict(&self, entries: u32) -> Dict<'_> {
-        Dict { entries: self.sec(entries), keys: self.sec(entries + 1), values: self.sec(entries + 2) }
+    fn dict(&self, d: u32) -> DictView<'_> {
+        DictView::new(self.sec(d), self.sec(d + 1), self.sec(d + 2)).expect("checked at open")
     }
 
     fn str(&self, id: u32) -> &str {
@@ -218,6 +172,7 @@ impl Segment {
             }
         }
     }
+
 
     fn oid(&self, id: u32) -> Option<Oid> {
         if id == NONE {
@@ -259,8 +214,17 @@ impl Segment {
             Kind::File
         });
         let mut field_lengths = [0u32; 5];
+        let mut long = false;
         for (i, l) in field_lengths.iter_mut().enumerate() {
-            *l = u(rec::LENGTHS + i * 4);
+            let v = u16::from_le_bytes([r[rec::LENGTHS + i * 2], r[rec::LENGTHS + i * 2 + 1]]);
+            long |= v == LONG;
+            *l = v as u32;
+        }
+        if long {
+            match self.extra(id).lengths {
+                Some(exact) => field_lengths = exact,
+                None => self.corrupt(&format!("chunk {} has a long field length but no exact one", id.0)),
+            }
         }
         let package = u(rec::PACKAGE);
         let parent = u(rec::PARENT);
@@ -331,15 +295,13 @@ impl Segment {
     }
 
     /// Every term (form byte and text) with its postings, in key order (merges).
-    pub fn all_terms(&self) -> impl Iterator<Item = (&[u8], Postings<'_>)> {
-        let d = self.dict(sec::TERM_ENTRIES);
-        (0..d.len()).filter_map(move |i| match d.get(i) {
-            Some((k, v, n)) => Some((k, self.postings_of(v, n))),
-            None => {
-                self.corrupt(&format!("term entry {i} out of bounds"));
-                None
-            }
-        })
+    pub fn all_terms(&self) -> Vec<(Vec<u8>, Postings<'_>)> {
+        let d = self.dict(sec::TERMS);
+        let all: Vec<_> = d.iter().map(|(k, v, n)| (k, self.postings_of(v, n))).collect();
+        if all.len() != d.len() {
+            self.corrupt(&format!("term entry {} does not decode", all.len()));
+        }
+        all
     }
 
     fn ids(&self, value: &[u8], count: u32) -> Vec<ChunkId> {
@@ -383,10 +345,10 @@ impl SegmentRead for Segment {
         self.count
     }
     fn df(&self, form: TermForm, term: &str) -> u32 {
-        self.dict(sec::TERM_ENTRIES).find(&term_key(form, term)).map_or(0, |(_, n)| n)
+        self.dict(sec::TERMS).find(&term_key(form, term)).map_or(0, |(_, n)| n)
     }
     fn postings(&self, form: TermForm, term: &str) -> Box<dyn Iterator<Item = Posting> + '_> {
-        match self.dict(sec::TERM_ENTRIES).find(&term_key(form, term)) {
+        match self.dict(sec::TERMS).find(&term_key(form, term)) {
             Some((v, n)) => Box::new(self.postings_of(v, n)),
             None => Box::new(std::iter::empty()),
         }
@@ -402,7 +364,7 @@ impl SegmentRead for Segment {
     }
     /// A `Path` with a line names the chunks whose own path it is and whose lines hold it.
     fn chunks_with(&self, key: &Key) -> Vec<ChunkId> {
-        let Some((v, n)) = self.dict(sec::KEY_ENTRIES).find(&key_lookup_bytes(key)) else { return Vec::new() };
+        let Some((v, n)) = self.dict(sec::KEYS).find(&key_lookup_bytes(key)) else { return Vec::new() };
         let ids = self.ids(v, n);
         match key {
             Key::Path { path, line: Some(l) } => ids
@@ -417,7 +379,7 @@ impl SegmentRead for Segment {
     }
     /// A `Path` without a line matches edges to any line of it; with one, edges to that line.
     fn cited_by(&self, key: &Key) -> Vec<(ChunkId, Edge)> {
-        let Some((v, n)) = self.dict(sec::CITE_ENTRIES).find(&key_lookup_bytes(key)) else { return Vec::new() };
+        let Some((v, n)) = self.dict(sec::CITES).find(&key_lookup_bytes(key)) else { return Vec::new() };
         let mut r = Reader::new(v);
         let mut out = Vec::new();
         let mut prev = 0u32;

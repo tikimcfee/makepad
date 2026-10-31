@@ -9,6 +9,7 @@ use super::{io_err, log};
 use crate::{Chunk, ChunkId, CircleStats, Detail, Error, FieldTerms, Flags, Key, Keys, Kind, Lines, Oid, SegmentId, SegmentKey, SegmentSink, Span};
 use makepad_git::oid::ObjectHasher;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -32,11 +33,52 @@ pub struct RecordIn<'a> {
     pub text: Option<&'a str>,
 }
 
+/// FxHash (rustc's): fast for the short keys a build hashes millions of times; in memory only.
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        let mut tail = 0u64;
+        for (i, &b) in rest.iter().enumerate() {
+            tail |= (b as u64) << (i * 8);
+        }
+        self.add(tail ^ (bytes.len() as u64) << 56);
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Fx {
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+
 #[derive(Default)]
 struct Strings {
     bytes: Vec<u8>,
     offs: Vec<u32>,
-    ids: HashMap<Box<str>, u32>,
+    ids: FxMap<Box<str>, u32>,
 }
 
 impl Strings {
@@ -70,14 +112,39 @@ pub struct Builder {
     key: SegmentKey,
     strings: Strings,
     oids: Vec<Oid>,
-    oid_ids: HashMap<Oid, u32>,
+    oid_ids: FxMap<Oid, u32>,
     chunks: Vec<u8>,
     extra: Vec<u8>,
-    terms: HashMap<Vec<u8>, List>,
-    keys: HashMap<Vec<u8>, List>,
-    cites: HashMap<Vec<u8>, List>,
+    terms: FxMap<Vec<u8>, List>,
+    keys: FxMap<Vec<u8>, List>,
+    cites: FxMap<Vec<u8>, List>,
     stats: CircleStats,
     count: u32,
+    /// Scratch for lookup keys, reused across chunks.
+    probe: Vec<u8>,
+}
+
+/// The list under `key`, created (and the key allocated) only when it is new.
+fn append<'m>(map: &'m mut FxMap<Vec<u8>, List>, key: &[u8]) -> &'m mut List {
+    if map.get(key).is_none() {
+        map.insert(key.to_vec(), List::default());
+    }
+    map.get_mut(key).expect("just inserted")
+}
+
+/// Appends a posting to the list under `key`: one lookup when the term is known.
+fn post(map: &mut FxMap<Vec<u8>, List>, key: &[u8], id: u32, tf: &[u32; 5]) {
+    let fresh;
+    let list = match map.get_mut(key) {
+        Some(list) => list,
+        None => {
+            fresh = map.entry(key.to_vec()).or_default();
+            fresh
+        }
+    };
+    put_posting(&mut list.bytes, list.last, id, tf);
+    list.last = Some(id);
+    list.count += 1;
 }
 
 impl Builder {
@@ -86,14 +153,15 @@ impl Builder {
             key,
             strings: Strings::new(),
             oids: Vec::new(),
-            oid_ids: HashMap::new(),
+            oid_ids: FxMap::default(),
             chunks: Vec::new(),
             extra: Vec::new(),
-            terms: HashMap::new(),
-            keys: HashMap::new(),
-            cites: HashMap::new(),
+            terms: FxMap::default(),
+            keys: FxMap::default(),
+            cites: FxMap::default(),
             stats: CircleStats::default(),
             count: 0,
+            probe: Vec::new(),
         }
     }
 
@@ -136,21 +204,24 @@ impl Builder {
             detail: &chunk.detail,
             text: notes.then_some(chunk.fields.body.as_str()),
         })?;
-        let mut tfs: HashMap<(u8, &str), [u32; 5]> = HashMap::new();
-        for t in &terms.terms {
-            tfs.entry((form_code(t.form), t.text.as_str())).or_default()[field_index(t.field)] += t.tf;
-        }
-        for ((form, text), tf) in tfs {
+        // one posting per (form, text), its tfs summed per field
+        let mut occ: Vec<(u8, &str, usize, u32)> = terms.terms.iter().map(|t| (form_code(t.form), t.text.as_str(), field_index(t.field), t.tf)).collect();
+        occ.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let mut i = 0;
+        while i < occ.len() {
+            let (form, text) = (occ[i].0, occ[i].1);
+            let mut tf = [0u32; 5];
+            while i < occ.len() && occ[i].0 == form && occ[i].1 == text {
+                tf[occ[i].2] += occ[i].3;
+                i += 1;
+            }
             if tf.iter().all(|&t| t == 0) {
                 continue;
             }
-            let mut k = Vec::with_capacity(1 + text.len());
-            k.push(form);
-            k.extend_from_slice(text.as_bytes());
-            let list = self.terms.entry(k).or_default();
-            put_posting(&mut list.bytes, list.last, id, &tf);
-            list.last = Some(id);
-            list.count += 1;
+            self.probe.clear();
+            self.probe.push(form);
+            self.probe.extend_from_slice(text.as_bytes());
+            post(&mut self.terms, &self.probe, id, &tf);
         }
         Ok(ChunkId(id))
     }
@@ -208,6 +279,9 @@ impl Builder {
             Detail::Commit(c) => DetailIds::Commit { time: c.time, parents: c.parents.iter().map(|p| self.oid(*p)).collect() },
         };
         x.text = r.text.map_or(0, |t| self.strings.id(t) + 1);
+        if r.lengths.iter().any(|&l| l >= LONG as u32) {
+            x.lengths = Some(r.lengths);
+        }
 
         let extra_at = self.extra.len() as u32;
         encode_extra(&mut self.extra, &x);
@@ -227,20 +301,23 @@ impl Builder {
             c.extend_from_slice(&v.to_le_bytes());
         }
         for v in r.lengths {
-            c.extend_from_slice(&v.to_le_bytes());
+            c.extend_from_slice(&u16::try_from(v).ok().filter(|&v| v < LONG).unwrap_or(LONG).to_le_bytes());
         }
         for v in [blob, commit, extra_at] {
             c.extend_from_slice(&v.to_le_bytes());
         }
 
-        let mut keyed: Vec<Vec<u8>> = Vec::new();
-        keyed.extend(k.paths.iter().map(|p| key_lookup_bytes(&Key::Path { path: p.clone(), line: None })));
-        keyed.extend(k.commit.map(|o| key_lookup_bytes(&Key::Commit(o))));
-        keyed.extend(k.blob.map(|o| key_lookup_bytes(&Key::Blob(o))));
-        keyed.extend(k.idents.iter().map(|i| key_lookup_bytes(&Key::Ident(i.clone()))));
-        keyed.extend(k.package.as_ref().map(|p| key_lookup_bytes(&Key::Package(p.clone()))));
-        for kb in keyed {
-            let list = self.keys.entry(kb).or_default();
+        let mut keyed: Vec<(u8, &[u8])> = Vec::with_capacity(k.paths.len() + k.idents.len() + 3);
+        keyed.extend(k.paths.iter().map(|p| (KEY_PATH, p.as_bytes())));
+        keyed.extend(k.commit.as_ref().map(|o| (KEY_COMMIT, &o.0[..])));
+        keyed.extend(k.blob.as_ref().map(|o| (KEY_BLOB, &o.0[..])));
+        keyed.extend(k.idents.iter().map(|i| (KEY_IDENT, i.as_bytes())));
+        keyed.extend(k.package.as_ref().map(|p| (KEY_PACKAGE, p.as_bytes())));
+        for (tag, payload) in keyed {
+            self.probe.clear();
+            self.probe.push(tag);
+            self.probe.extend_from_slice(payload);
+            let list = append(&mut self.keys, &self.probe);
             if list.last != Some(id) {
                 put_id(&mut list.bytes, list.last, id);
                 list.last = Some(id);
@@ -248,7 +325,7 @@ impl Builder {
             }
         }
         for (i, e) in k.edges.iter().enumerate() {
-            let list = self.cites.entry(key_lookup_bytes(&e.key)).or_default();
+            let list = append(&mut self.cites, &key_lookup_bytes(&e.key));
             put_varint(&mut list.bytes, (id - list.last.unwrap_or(0)) as u64);
             put_varint(&mut list.bytes, i as u64);
             list.last = Some(id);
@@ -289,7 +366,7 @@ impl Builder {
             })?;
         }
         for (k, postings) in seg.all_terms() {
-            let list = self.terms.entry(k.to_vec()).or_default();
+            let list = append(&mut self.terms, &k);
             for p in postings {
                 let id = p.chunk.0 + offset;
                 put_posting(&mut list.bytes, list.last, id, &p.tf);
@@ -330,15 +407,15 @@ impl Builder {
             (sec::OIDS, Part::Bytes(&oids)),
             (sec::CHUNKS, Part::Bytes(&self.chunks)),
             (sec::EXTRA, Part::Bytes(&self.extra)),
-            (sec::TERM_ENTRIES, Part::Bytes(&terms.entries)),
-            (sec::TERM_KEYS, Part::Bytes(&terms.keys)),
-            (sec::TERM_VALUES, Part::Lists(&terms.lists)),
-            (sec::KEY_ENTRIES, Part::Bytes(&keys.entries)),
-            (sec::KEY_KEYS, Part::Bytes(&keys.keys)),
-            (sec::KEY_VALUES, Part::Lists(&keys.lists)),
-            (sec::CITE_ENTRIES, Part::Bytes(&cites.entries)),
-            (sec::CITE_KEYS, Part::Bytes(&cites.keys)),
-            (sec::CITE_VALUES, Part::Lists(&cites.lists)),
+            (sec::TERMS, Part::Bytes(&terms.index)),
+            (sec::TERMS + 1, Part::Bytes(&terms.blocks)),
+            (sec::TERMS + 2, Part::Lists(&terms.lists)),
+            (sec::KEYS, Part::Bytes(&keys.index)),
+            (sec::KEYS + 1, Part::Bytes(&keys.blocks)),
+            (sec::KEYS + 2, Part::Lists(&keys.lists)),
+            (sec::CITES, Part::Bytes(&cites.index)),
+            (sec::CITES + 1, Part::Bytes(&cites.blocks)),
+            (sec::CITES + 2, Part::Lists(&cites.lists)),
         ];
         let mut header = Vec::with_capacity(HEADER_LEN + parts.len() * TABLE_ENTRY_LEN);
         header.extend_from_slice(MAGIC);
@@ -406,33 +483,45 @@ impl Part<'_> {
     }
 }
 
-/// A sorted dictionary ready to write; `None` when an offset overflows u32.
+/// A sorted, front-coded dictionary ready to write, each distinct list stored once; `None`
+/// when an offset overflows u32.
 struct Dict {
-    entries: Vec<u8>,
-    keys: Vec<u8>,
+    index: Vec<u8>,
+    blocks: Vec<u8>,
     lists: Vec<List>,
 }
 
 impl Dict {
-    fn new(map: HashMap<Vec<u8>, List>) -> Option<Dict> {
+    fn new(map: FxMap<Vec<u8>, List>) -> Option<Dict> {
         let mut items: Vec<(Vec<u8>, List)> = map.into_iter().collect();
         items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut d = Dict { entries: Vec::with_capacity((items.len() + 1) * DICT_ENTRY_LEN), keys: Vec::new(), lists: Vec::with_capacity(items.len()) };
-        let mut val_off = 0u64;
-        for (k, list) in items {
-            d.entry(d.keys.len() as u64, val_off, list.count)?;
-            d.keys.extend_from_slice(&k);
-            val_off += list.bytes.len() as u64;
-            d.lists.push(list);
+        let mut at: FxMap<&[u8], u32> = FxMap::default();
+        let mut order: Vec<usize> = Vec::new();
+        let mut entries: Vec<(&[u8], u32, u32)> = Vec::with_capacity(items.len());
+        let mut end = 0u64;
+        for (i, (k, list)) in items.iter().enumerate() {
+            let off = match at.get(list.bytes.as_slice()) {
+                Some(&off) => off,
+                None => {
+                    let off = u32::try_from(end).ok()?;
+                    at.insert(&list.bytes, off);
+                    order.push(i);
+                    end += list.bytes.len() as u64;
+                    off
+                }
+            };
+            entries.push((k, list.count, off));
         }
-        d.entry(d.keys.len() as u64, val_off, 0)?;
-        Some(d)
-    }
-    fn entry(&mut self, key_off: u64, val_off: u64, count: u32) -> Option<()> {
-        self.entries.extend_from_slice(&u32::try_from(key_off).ok()?.to_le_bytes());
-        self.entries.extend_from_slice(&u32::try_from(val_off).ok()?.to_le_bytes());
-        self.entries.extend_from_slice(&count.to_le_bytes());
-        Some(())
+        u32::try_from(end).ok()?;
+        let (index, blocks) = encode_dict(&entries);
+        u32::try_from(blocks.len()).ok()?;
+        drop((at, entries));
+        let mut keep = vec![false; items.len()];
+        for i in order {
+            keep[i] = true;
+        }
+        let lists = items.into_iter().zip(keep).filter(|(_, k)| *k).map(|((_, l), _)| l).collect();
+        Some(Dict { index, blocks, lists })
     }
 }
 

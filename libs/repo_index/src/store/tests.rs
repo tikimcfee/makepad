@@ -412,9 +412,10 @@ fn corruption_is_caught() {
     let dir = store.circle_dir(key.repo, &c).unwrap();
     let good = fs::read(dir.join(&id.0)).unwrap();
 
-    // a flipped byte inside the body: the structure holds, the hash does not
+    // a flipped byte inside the string bytes: the structure holds, the hash does not
     let mut flipped = good.clone();
-    let at = good.len() - segment::FOOTER_LEN - 3;
+    let strings = segment::HEADER_LEN + segment::TABLE_ENTRY_LEN * 2;
+    let at = u64::from_le_bytes(good[strings + 8..strings + 16].try_into().unwrap()) as usize + 1;
     flipped[at] ^= 0x55;
     let path = root.0.join(&id.0);
     fs::write(&path, &flipped).unwrap();
@@ -879,4 +880,28 @@ fn gc_sweeps_only_its_repo() {
     let m = store.manifest(Some(rb), &h).unwrap().expect("B's history circle stays");
     assert_eq!(store.open_segment(Some(rb), &h, &m.segments[0]).unwrap().id(), m.segments[0]);
     assert!(store.manifest(Some(ra), &h).unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Long fields
+
+/// A field length past u16 reads back exactly.
+#[test]
+fn long_field_lengths_read_back_exactly() {
+    let root = Root::new();
+    let store = FsStore::new(root.0.clone());
+    let c = circle("makepad");
+    let mut sink = store.new_segment(&tree_key(&c, "t1")).unwrap();
+    let lengths = [[3, 1, 0, 0, 70_000], [1, 1, 1, 1, 65_535], [1, 1, 1, 1, 65_534]];
+    for (i, l) in lengths.iter().enumerate() {
+        let ch = chunk(&c, Kind::File, &format!("big{i}.rs"), "big");
+        sink.add(&ch, &FieldTerms { terms: vec![TermOcc { field: Field::Body, form: TermForm::Exact, text: "x".into(), tf: 7 }], lengths: *l }).unwrap();
+    }
+    let id = sink.finish().unwrap();
+    let seg = store.segment(Some(RepoId(0xfeed)), &c, &id).unwrap();
+    for (i, l) in lengths.iter().enumerate() {
+        assert_eq!(seg.chunk(ChunkId(i as u32)).field_lengths, *l);
+    }
+    assert_eq!(seg.stats().field_lengths[4], 70_000 + 65_535 + 65_534);
+    assert_eq!(seg.postings(TermForm::Exact, "x").map(|p| p.tf[4]).collect::<Vec<_>>(), vec![7, 7, 7]);
 }
