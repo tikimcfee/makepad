@@ -637,6 +637,8 @@ pub trait SegmentSink {
 /// the lookups composition needs never change the format.
 pub trait SegmentRead {
     fn key(&self) -> &SegmentKey;
+    /// The segment's content name (`circles` and `status` list it).
+    fn id(&self) -> SegmentId;
     fn stats(&self) -> CircleStats;
     fn chunk_count(&self) -> u32;
     fn df(&self, form: TermForm, term: &str) -> u32;
@@ -750,6 +752,9 @@ pub trait Repo {
     /// newest first.
     fn commits(&mut self, tips: &[Oid], hide: &[Oid]) -> Result<Vec<CommitRecord>, Error>;
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error>;
+    /// Every worktree of this repo (the main checkout and each linked one) with its `HEAD`
+    /// commit; GC keeps the bases their merge-bases name.
+    fn worktrees(&mut self) -> Result<Vec<(PathBuf, Oid)>, Error>;
 }
 
 #[derive(Clone, Debug, Default)]
