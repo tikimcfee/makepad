@@ -89,6 +89,8 @@ pub fn walk(dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
 #[derive(Clone, Debug)]
 pub struct Cite {
     pub circle: CircleName,
+    /// The commit the cite was taken at.
+    pub commit: Oid,
     pub paths: HashSet<String>,
     /// Lowercase hexes, sorted.
     pub commits: Vec<(String, Oid)>,
@@ -100,7 +102,7 @@ impl Cite {
         let paths = repo.files(rev.tree)?.into_iter().map(|f| f.path).collect();
         let mut commits: Vec<(String, Oid)> = repo.commits(&[rev.commit], &[])?.into_iter().map(|c| (hex(&c.oid), c.oid)).collect();
         commits.sort();
-        Ok(Cite { circle, paths, commits })
+        Ok(Cite { circle, commit: rev.commit, paths, commits })
     }
 
     fn commit(&self, prefix: &str) -> Option<Oid> {
@@ -178,6 +180,7 @@ mod tests {
         let b = Oid([0x9b; 20]);
         let cite = Cite {
             circle: CircleName("makepad".into()),
+            commit: a,
             paths: ["alpha/src/lib.rs".to_string()].into_iter().collect(),
             commits: vec![(hex(&a), a), (hex(&b), b)],
         };
