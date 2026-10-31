@@ -887,9 +887,10 @@ pub struct Opened {
     pub others: Vec<OpenCircle>,
     /// Registered circles not named and not built: no pointer, listed by `status`.
     pub unbuilt: Vec<CircleName>,
-    /// Reads a blob of the repo the circles were opened in: the branch pointer reads
-    /// [`Visibility::local_files`] through it, only when a block has absent terms. The repo is
-    /// opened on the first read.
+    /// Reads a blob of any repo an opened circle stands on (the caller's first, then each other
+    /// root; a blob id names its content, so the first repo holding it answers): line scoring
+    /// reads hits' files through it, and the branch pointer [`Visibility::local_files`] when a
+    /// block has absent terms. Each repo is opened on its first read.
     pub blobs: Option<BlobReader>,
 }
 
