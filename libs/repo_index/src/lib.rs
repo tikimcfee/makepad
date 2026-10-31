@@ -961,8 +961,12 @@ pub struct CircleBlock {
     pub definitions: u64,
     pub uses: u64,
     pub hits: Vec<Hit>,
-    /// Set when the circle holds no definition or use: absence is an answer.
+    /// `!absent_terms.is_empty()`: absence is an answer.
     pub absent: bool,
+    /// The query's terms this circle holds no match of: each named one (path-shaped, judged in
+    /// tree circles; identifier-shaped, in tree and notes circles; never in history circles),
+    /// or, when nothing in the circle matches, every content word.
+    pub absent_terms: Vec<String>,
     /// The nearest in-circle hits shown under an absence.
     pub nearest: Vec<Hit>,
 }
@@ -1144,8 +1148,8 @@ pub trait Search {
 /// `--json` records, one JSON object per line, every field always present.
 #[derive(Clone, Debug)]
 pub enum Record {
-    /// `{"header":true,"circle","rev","total","definitions","uses","absent"}`
-    Header { circle: CircleName, rev: String, total: u64, definitions: u64, uses: u64, absent: bool },
+    /// `{"header":true,"circle","rev","total","definitions","uses","absent","absent_terms"}`
+    Header { circle: CircleName, rev: String, total: u64, definitions: u64, uses: u64, absent: bool, absent_terms: Vec<String> },
     /// `{"handle","circle","rev","kind","package","path","start","end","name","sig","gist",
     /// "score","why","also_at","overlay","local","nearest"}`
     Hit { circle: CircleName, rev: String, hit: Box<Hit>, nearest: bool },

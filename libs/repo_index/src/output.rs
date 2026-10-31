@@ -46,6 +46,7 @@ impl Render for Renderer {
                         definitions: b.definitions,
                         uses: b.uses,
                         absent: b.absent,
+                        absent_terms: b.absent_terms.clone(),
                     });
                     for (hits, nearest) in [(&b.hits, false), (&b.nearest, true)] {
                         r.extend(hits.iter().map(|h| Record::Hit { circle: b.circle.clone(), rev: b.rev.clone(), hit: Box::new(h.clone()), nearest }));
@@ -134,10 +135,11 @@ fn hit_line(h: &Hit) -> String {
 
 fn block_text(t: &mut String, b: &CircleBlock) {
     let counts = format!("{}, {}", plural(b.definitions, "definition", "definitions"), plural(b.uses, "use", "uses"));
-    if b.absent {
-        push_line(t, &format!("{} · absent: {counts}", at_rev(&b.circle, &b.rev)));
+    let absent = if b.absent_terms.is_empty() { String::new() } else { format!(" · absent: {}", b.absent_terms.join(", ")) };
+    if b.total == 0 {
+        push_line(t, &format!("{} · 0 definitions, 0 uses{absent}", at_rev(&b.circle, &b.rev)));
     } else {
-        push_line(t, &format!("{} · {} of {} · {counts}", at_rev(&b.circle, &b.rev), b.hits.len(), b.total));
+        push_line(t, &format!("{} · {} of {} · {counts}{absent}", at_rev(&b.circle, &b.rev), b.hits.len(), b.total));
     }
     let mut group: Option<&str> = None;
     for h in &b.hits {
@@ -429,7 +431,7 @@ fn hit_json(circle: &CircleName, rev: &str, h: &Hit, nearest: bool) -> Value {
 
 fn record_json(r: &Record) -> Value {
     match r {
-        Record::Header { circle, rev, total, definitions, uses, absent } => obj(vec![
+        Record::Header { circle, rev, total, definitions, uses, absent, absent_terms } => obj(vec![
             ("header", Value::Bool(true)),
             ("circle", s(circle.0.as_str())),
             ("rev", s(rev.as_str())),
@@ -437,6 +439,7 @@ fn record_json(r: &Record) -> Value {
             ("definitions", int(*definitions)),
             ("uses", int(*uses)),
             ("absent", Value::Bool(*absent)),
+            ("absent_terms", strs(absent_terms)),
         ]),
         Record::Hit { circle, rev, hit, nearest } => hit_json(circle, rev, hit, *nearest),
         Record::Pointer(p) => obj(vec![
@@ -556,7 +559,7 @@ mod tests {
         let mut h = hit("alpha/src/lib.rs", "Gizmo::spin", &"y".repeat(80));
         h.handle.target = Target::Lines { path: "a/".repeat(40) + "lib.rs", lines: Lines { start: 1, end: 2 } };
         let text = Renderer.text(&Output::Find(FindOutput {
-            blocks: vec![CircleBlock { circle: circle("makepad"), rev: "9a76551d7".into(), total: 4, definitions: 1, uses: 3, hits: vec![h], absent: false, nearest: Vec::new() }],
+            blocks: vec![CircleBlock { circle: circle("makepad"), rev: "9a76551d7".into(), total: 4, definitions: 1, uses: 3, hits: vec![h], absent: false, absent_terms: Vec::new(), nearest: Vec::new() }],
             pointers: Vec::new(),
         }));
         assert!(text.lines().all(|l| l.chars().count() <= MAX_LINE_CHARS), "{text}");

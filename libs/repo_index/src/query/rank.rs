@@ -201,8 +201,8 @@ pub struct Plan {
     pub paths: Vec<PathWord>,
     /// Package-shaped words: their crate cards are pinned.
     pub packages: Vec<String>,
-    /// Identifier-shaped words (folded whole) judged for absence.
-    pub subjects: Vec<String>,
+    /// Identifier-shaped words judged for absence: (folded whole, as written).
+    pub subjects: Vec<(String, String)>,
 }
 
 impl Plan {
@@ -241,11 +241,11 @@ impl Plan {
                     if let Some(last) = subs.last() {
                         if core.contains("::") {
                             plan.pinned.push((last.to_string(), Some(subs.join("::"))));
-                            plan.subjects.push(makepad_search::fold(last));
+                            plan.subjects.push((makepad_search::fold(last), core.clone()));
                         } else {
                             for sub in &subs {
                                 plan.pinned.push((sub.to_string(), None));
-                                plan.subjects.push(makepad_search::fold(sub));
+                                plan.subjects.push((makepad_search::fold(sub), sub.to_string()));
                             }
                         }
                     }
@@ -544,10 +544,10 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
     // History circles never claim absence: their messages summarize, so a missing mention says
     // nothing.
     if c.visible.is_none() {
-        for s in &plan.subjects {
-            let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, s) > 0) || overlay_has(TermForm::Folded, s);
-            if !present && !absent_terms.contains(s) {
-                absent_terms.push(s.clone());
+        for (folded, written) in &plan.subjects {
+            let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, folded) > 0) || overlay_has(TermForm::Folded, folded);
+            if !present && !absent_terms.contains(written) {
+                absent_terms.push(written.clone());
             }
         }
     }

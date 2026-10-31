@@ -259,6 +259,7 @@ pub(crate) mod tests {
             uses: 0,
             hits,
             absent,
+            absent_terms: if absent { vec![circle.into()] } else { Vec::new() },
             nearest: Vec::new(),
         }
     }
