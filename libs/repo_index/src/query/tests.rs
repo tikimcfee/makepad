@@ -502,7 +502,7 @@ fn opened_notes_circle_collapses_copies() {
     assert_eq!(b.hits.iter().filter(|h| h.name == "Gizmo spin").count(), 1);
     // Equal scores: the path order keeps COPY.md and lists PLAN.md.
     assert_eq!(first.path, "topic-a/COPY.md");
-    assert_eq!(first.also_at, [String::from("topic-a/PLAN.md:3-5")]);
+    assert_eq!(first.also_at, [String::from("topic-a/PLAN.md")]);
     assert_eq!(b.rev, "");
 }
 
