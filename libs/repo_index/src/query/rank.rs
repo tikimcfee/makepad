@@ -331,6 +331,9 @@ pub struct Filter {
     pub kinds: Vec<KindFilter>,
     pub packages: Vec<String>,
     pub paths: Vec<String>,
+    /// History: keep commits the revision does not reach (the branch pointer's local-only
+    /// commits at a pinned upstream revision).
+    pub any_rev: bool,
 }
 
 impl Filter {
@@ -744,7 +747,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         if matches!(at, ChunkAt::Segment { .. }) && shadowed.contains(v.path) {
             continue;
         }
-        if !visible(c, &v) || !filter.admits(&v) {
+        if !(filter.any_rev || visible(c, &v)) || !filter.admits(&v) {
             continue;
         }
         let mut weights = FIELD_WEIGHTS;
