@@ -858,7 +858,7 @@ impl Repository {
 
     /// The commits listed in `<common>/shallow`, treated as parentless by
     /// history walks. Empty for a full clone.
-    fn shallow_boundary(&self) -> Result<std::collections::HashSet<ObjectId>, GitError> {
+    pub(crate) fn shallow_boundary(&self) -> Result<std::collections::HashSet<ObjectId>, GitError> {
         let path = self.common_dir.join("shallow");
         let mut set = std::collections::HashSet::new();
         match std::fs::read_to_string(&path) {
