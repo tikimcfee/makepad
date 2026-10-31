@@ -32,7 +32,6 @@ pub const VERBS: &[(&str, &str, &str)] = &[
     ("def", "def <identifier> [--in <circle>,..] [--rev r] [--json]", "Exact definitions of an identifier"),
     ("refs", "refs <identifier> [--uses] [--rev r] [--json]", "Definitions, re-exports, then uses by name"),
     ("history", "history <path|words..> [--rev r] [--json]", "Commits in makepad:history"),
-    ("stale", "stale [--rev r] [--json]", "Docs and headers naming things that are gone"),
     ("circles", "circles [--json]", "Configured circles, their sources and index state; an `also:` pointer to a notes circle counts files by substring, so it can differ from that circle's ranked totals"),
     ("build", "build [--in <circle>,..] [--rev r]", "Build or refresh the circles' indexes"),
     ("status", "status [--json]", "What is indexed, at which revision, and what the overlay holds"),
@@ -176,10 +175,6 @@ pub fn run(parts: &mut Parts, args: &[String], out: &mut dyn Write, err: &mut dy
             let _ = writeln!(err, "makepad index {verb}: {m}\nusage: makepad index {line}");
             2
         }
-        Err(Failure::NotBuilt(m)) => {
-            let _ = writeln!(err, "makepad index {verb}: not built yet: {m}");
-            2
-        }
         Err(Failure::Error(e)) => {
             let _ = writeln!(err, "makepad index {verb}: {e}");
             1
@@ -189,7 +184,6 @@ pub fn run(parts: &mut Parts, args: &[String], out: &mut dyn Write, err: &mut dy
 
 enum Failure {
     Usage(String),
-    NotBuilt(String),
     Error(Error),
 }
 
@@ -384,7 +378,6 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
             let opened = parts.circles.open(&manifest, &named, &rev_of(&a))?;
             emit(parts, out, &Output::Status(status(&manifest, &opened)), a.has("--json"))
         }
-        "stale" => Err(Failure::NotBuilt("`stale` is reserved; it has no implementation yet".into())),
         "gc" => {
             let a = parse_args(args, &[], &[]).map_err(usage_err)?;
             if !a.words.is_empty() {
@@ -933,8 +926,10 @@ mod tests {
         assert_eq!(call(&mut p, &["find"]).0, 2);
         assert_eq!(call(&mut p, &["find", "x", "--kind", "fnn"]).0, 2);
         assert_eq!(call(&mut p, &["find", "x", "--json"]).1, "{}\n");
+        // a verb not built is not offered: not in the usage, unknown when typed
+        assert!(!usage().contains("stale"), "{}", usage());
         let (code, _, err) = call(&mut p, &["stale"]);
-        assert!(code == 2 && err.contains("not built yet"), "{err}");
+        assert!(code == 2 && err.contains("unknown verb `stale`"), "{err}");
     }
 
     #[test]
