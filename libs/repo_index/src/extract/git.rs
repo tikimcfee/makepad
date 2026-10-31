@@ -1,11 +1,9 @@
-//! [`crate::Repo`] over makepad-git: revision resolution, tree walks, blob reads, worktree
-//! changes against a base, commit walks and merge bases. No shell-outs.
-//!
-//! Abbreviated hexes resolve among the commits reachable from any ref (makepad-git has no
-//! object-prefix lookup yet); a prefix that matches no such commit is an error, never a guess.
+//! [`crate::Repo`] over makepad-git: revision resolution (makepad-git's `rev_parse`, peeled to
+//! a commit), tree walks, blob reads, worktree changes against a base, commit walks and merge
+//! bases. No shell-outs.
 
 use crate::{Change, CommitInfo, CommitRecord, Error, Oid, Repo, RepoId, Rev, RevSpec, TreeFile};
-use makepad_git::{ObjectId, ObjectKind, Repository, TreeChange};
+use makepad_git::{ObjectId, Repository, TreeChange};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -15,8 +13,6 @@ const REGULAR_FILE_MODES: [u32; 2] = [0o100644, 0o100755];
 pub struct GitRepo {
     repo: Repository,
     id: RepoId,
-    /// Commits reachable from any ref, for abbreviated hexes; built on first use.
-    reachable: Option<Vec<ObjectId>>,
 }
 
 fn git_err(context: &str, e: impl std::fmt::Display) -> Error {
@@ -43,10 +39,6 @@ pub fn blob_oid(bytes: &[u8]) -> Oid {
     oid(&makepad_git::oid::hash_object("blob", bytes))
 }
 
-fn is_hex(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 fn change_path(c: TreeChange) -> String {
     match c {
         TreeChange::Added { path, .. } | TreeChange::Deleted { path, .. } | TreeChange::Modified { path, .. } => path,
@@ -62,55 +54,11 @@ impl GitRepo {
             error,
         })?;
         let id = RepoId(hash64(common.to_string_lossy().as_bytes()));
-        Ok(GitRepo { repo, id, reachable: None })
+        Ok(GitRepo { repo, id })
     }
 
     fn commit_tree(&mut self, commit: ObjectId) -> Result<ObjectId, Error> {
         Ok(self.repo.read_commit(&commit).map_err(|e| git_err(&format!("read commit {}", commit.to_hex()), e))?.tree)
-    }
-
-    /// A ref, tag or commit id peeled to the commit it names.
-    fn peel(&mut self, id: ObjectId) -> Result<ObjectId, Error> {
-        self.peel_commit(id)?.ok_or_else(|| Error::Rev(format!("{} names no commit", id.to_hex())))
-    }
-
-    /// `None` when the object (or the tag's target) is a tree or blob.
-    fn peel_commit(&mut self, mut id: ObjectId) -> Result<Option<ObjectId>, Error> {
-        loop {
-            let obj = self.repo.read_object(&id).map_err(|e| git_err(&format!("read {}", id.to_hex()), e))?;
-            match obj.kind {
-                ObjectKind::Commit => return Ok(Some(id)),
-                ObjectKind::Tag => {
-                    let text = String::from_utf8_lossy(&obj.data);
-                    let target = text
-                        .lines()
-                        .find_map(|l| l.strip_prefix("object "))
-                        .ok_or_else(|| Error::Rev(format!("tag {} names no object", id.to_hex())))?;
-                    id = ObjectId::from_hex(target.trim()).map_err(|e| git_err("tag target", e))?;
-                }
-                ObjectKind::Tree | ObjectKind::Blob => return Ok(None),
-            }
-        }
-    }
-
-    fn all_ref_tips(&mut self) -> Result<Vec<ObjectId>, Error> {
-        let refs = makepad_git::refs::list_refs_in(&self.repo.git_dir, &self.repo.common_dir, "refs/")
-            .map_err(|e| git_err("list refs", e))?;
-        let mut tips = Vec::new();
-        if let Ok(head) = self.repo.head_oid() {
-            tips.push(head);
-        }
-        for r in refs {
-            let id = makepad_git::refs::resolve_ref_in(&self.repo.git_dir, &self.repo.common_dir, &r.name)
-                .map_err(|e| git_err(&format!("resolve {}", r.name), e))?;
-            // a ref to a tree or blob names no commit: not a tip
-            if let Some(commit) = self.peel_commit(id)? {
-                tips.push(commit);
-            }
-        }
-        tips.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        tips.dedup();
-        Ok(tips)
     }
 
     /// Every commit reachable from `tips`.
@@ -129,49 +77,6 @@ impl GitRepo {
             }
         }
         Ok(out)
-    }
-
-    fn resolve_abbrev(&mut self, prefix: &str) -> Result<ObjectId, Error> {
-        if self.reachable.is_none() {
-            let tips = self.all_ref_tips()?;
-            let all = self.reachable_from(&tips)?;
-            self.reachable = Some(all.into_iter().map(|(id, _)| id).collect());
-        }
-        let lower = prefix.to_ascii_lowercase();
-        let found: Vec<ObjectId> =
-            self.reachable.iter().flatten().filter(|id| id.to_hex().starts_with(&lower)).copied().collect();
-        match found.len() {
-            1 => Ok(found[0]),
-            0 => Err(Error::Rev(format!("no commit reachable from a ref starts with {prefix}"))),
-            n => Err(Error::Rev(format!("{prefix} is ambiguous: {n} commits start with it"))),
-        }
-    }
-
-    fn resolve_name(&mut self, name: &str) -> Result<ObjectId, Error> {
-        if name == "HEAD" {
-            return self.repo.head_oid().map_err(|e| git_err("HEAD", e));
-        }
-        if name.len() == 40 && is_hex(name) {
-            return ObjectId::from_hex(name).map_err(|e| git_err(name, e));
-        }
-        // gitrevisions order
-        let candidates = [
-            name.to_string(),
-            format!("refs/{name}"),
-            format!("refs/tags/{name}"),
-            format!("refs/heads/{name}"),
-            format!("refs/remotes/{name}"),
-            format!("refs/remotes/{name}/HEAD"),
-        ];
-        for c in &candidates {
-            if let Ok(id) = makepad_git::refs::resolve_ref_in(&self.repo.git_dir, &self.repo.common_dir, c) {
-                return Ok(id);
-            }
-        }
-        if name.len() >= 4 && is_hex(name) {
-            return self.resolve_abbrev(name);
-        }
-        Err(Error::Rev(format!("unknown revision {name}")))
     }
 
     fn worktree_blob(&self, path: &str) -> Result<Option<Oid>, Error> {
@@ -194,11 +99,11 @@ impl Repo for GitRepo {
     }
 
     fn resolve(&mut self, spec: &RevSpec) -> Result<Rev, Error> {
-        let named = match spec {
-            RevSpec::Worktree => self.repo.head_oid().map_err(|e| git_err("HEAD", e))?,
-            RevSpec::Pinned(name) => self.resolve_name(name)?,
+        let name = match spec {
+            RevSpec::Worktree => "HEAD",
+            RevSpec::Pinned(name) => name.as_str(),
         };
-        let commit = self.peel(named)?;
+        let commit = self.repo.rev_parse(&format!("{name}^{{commit}}")).map_err(|e| Error::Rev(e.to_string()))?;
         let tree = self.commit_tree(commit)?;
         Ok(Rev { spec: spec.clone(), commit: oid(&commit), tree: oid(&tree) })
     }
