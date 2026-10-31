@@ -1,0 +1,9 @@
+[package]
+name = "fixture-alpha"
+version = "0.1.0"
+edition = "2021"
+description = "Spinning gizmos for the index fixture"
+publish = false
+
+[dependencies]
+fixture-beta = { path = "../beta" }

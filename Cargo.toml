@@ -58,6 +58,7 @@ workspace.members = [
     "libs/code_arch",
     "libs/code_language",
     "libs/search",
+    "libs/repo_index",
     "libs/lz4",
     "libs/zstd_decode",
     "apps/route",
@@ -446,6 +447,8 @@ workspace.exclude = [
     "libs/linux/wayland-sys",
     "tools/file_router",
     "tools/wasm_strip",
+    # the index's test fixture: a tree of data the tests commit and index, never built
+    "libs/repo_index/fixture",
 ]
 
 workspace.resolver = "2"

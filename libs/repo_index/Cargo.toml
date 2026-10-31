@@ -1,0 +1,23 @@
+[package]
+name = "makepad-repo-index"
+version = "0.1.0"
+edition = "2021"
+description = "makepad index: ranked keyword search over the repo's code, docs, history and notes, kept in separate circles, for agents"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "makepad_repo_index"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makepad-index"
+path = "src/bin/makepad-index.rs"
+
+[dependencies]
+relax-lex = { workspace = true }
+makepad-search = { path = "../search" }
+makepad-toml-parser = { path = "../toml_parser" }
+makepad-shared-bytes = { path = "../shared_bytes" }
+makepad-git = { path = "../git" }
+makepad-strict-json = { workspace = true }
