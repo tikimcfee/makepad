@@ -206,6 +206,7 @@ mod tests {
             span: Default::default(),
             lines: Default::default(),
             name: "Gizmo::spin".into(),
+            gist: String::new(),
             parent: None,
             fields: Fields {
                 name: "Gizmo::spin".into(),

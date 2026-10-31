@@ -17,14 +17,12 @@ struct MemSegment {
     key: SegmentKey,
     chunks: Vec<Chunk>,
     terms: Vec<FieldTerms>,
-    gists: Vec<String>,
     notes: bool,
 }
 
 impl MemSegment {
     fn new(circle: &str, chunks: Vec<Chunk>) -> MemSegment {
         let terms = chunks.iter().map(|c| Terms.chunk_terms(c)).collect();
-        let gists = chunks.iter().map(|c| crate::output::gist(&c.fields.doc).to_string()).collect();
         MemSegment {
             key: SegmentKey {
                 repo: None,
@@ -35,7 +33,6 @@ impl MemSegment {
             },
             chunks,
             terms,
-            gists,
             notes: circle.starts_with("notes:"),
         }
     }
@@ -96,7 +93,7 @@ impl SegmentRead for MemSegment {
             name: &c.name,
             parent: c.parent.map(ChunkId),
             package: c.keys.package.as_deref().unwrap_or(""),
-            gist: &self.gists[id.0 as usize],
+            gist: &c.gist,
             sig: &c.fields.sig,
             blob: c.keys.blob,
             commit: c.keys.commit,
@@ -154,9 +151,11 @@ fn chunk(circle: &str, c: C) -> Chunk {
         circle: CircleName(circle.into()),
         path: c.path.into(),
         label_len: 0,
-        span: Span::default(),
+        // Byte offsets stand in as line × 100: distinct records of one file never share a span.
+        span: Span { lo: c.lines.0 * 100, hi: c.lines.1 * 100 + 99 },
         lines: Lines { start: c.lines.0, end: c.lines.1 },
         name: c.name.into(),
+        gist: first_sentence(c.doc),
         parent: None,
         fields: Fields { name: c.name.into(), path: c.path.into(), sig: c.sig.into(), doc: c.doc.into(), body: c.body.into() },
         keys: Keys {
@@ -169,6 +168,13 @@ fn chunk(circle: &str, c: C) -> Chunk {
         flags: Flags { public: true, documented: !c.doc.is_empty(), definition, ..Default::default() },
         detail: Detail::None,
     }
+}
+
+/// What extraction stores as a gist: the doc's first sentence, at most 80 chars.
+fn first_sentence(doc: &str) -> String {
+    let line = doc.lines().next().unwrap_or("");
+    let line = line.find(". ").map_or(line, |e| &line[..e + 1]);
+    line.chars().take(crate::MAX_GIST_CHARS).collect()
 }
 
 const A: &str = "fixture-alpha";
@@ -311,6 +317,9 @@ fn exact_definition_is_pinned_first() {
     assert!(b.definitions >= 1 && b.uses >= 1, "{} defs {} uses", b.definitions, b.uses);
     assert_eq!(b.total, b.definitions + b.uses);
     assert_eq!(format(&b.hits[0].handle), "alpha/src/lib.rs:14-17");
+    // Every chunk of a file carries the file's blob: distinct records of one file never collapse.
+    assert!(b.hits.iter().filter(|h| h.path == "alpha/src/lib.rs").count() >= 2);
+    assert!(b.hits.iter().all(|h| h.also_at.is_empty()));
 }
 
 #[test]
@@ -414,6 +423,7 @@ fn overlay_shadows_base_chunks_of_changed_paths() {
     c.shadowed = vec!["alpha/src/lib.rs".into()];
     let mut spin = tree_chunks().remove(6);
     spin.fields.doc = "Spins the gizmo twice as fast.".into();
+    spin.gist = first_sentence(&spin.fields.doc);
     let ft = Terms.chunk_terms(&spin);
     c.overlay = vec![OverlayFile { path: "alpha/src/lib.rs".into(), chunks: vec![(spin, ft)] }];
     let o = opened(vec![c], vec![]);
@@ -476,6 +486,9 @@ fn opened_notes_circle_collapses_copies() {
     assert_eq!(first.name, "Gizmo spin");
     assert_eq!(first.also_at.len(), 1, "{:?}", first.also_at);
     assert_eq!(b.hits.iter().filter(|h| h.name == "Gizmo spin").count(), 1);
+    // Equal scores: the path order keeps COPY.md and lists PLAN.md.
+    assert_eq!(first.path, "topic-a/COPY.md");
+    assert_eq!(first.also_at, [String::from("topic-a/PLAN.md:3-5")]);
     assert_eq!(b.rev, "");
 }
 

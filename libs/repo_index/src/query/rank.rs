@@ -177,7 +177,7 @@ pub fn view(c: &OpenCircle, at: ChunkAt) -> ChunkView<'_> {
                 name: &ch.name,
                 parent: ch.parent.map(ChunkId),
                 package: ch.keys.package.as_deref().unwrap_or(""),
-                gist: crate::output::gist(&ch.fields.doc),
+                gist: &ch.gist,
                 sig: &ch.fields.sig,
                 blob: ch.keys.blob,
                 commit: ch.keys.commit,
@@ -413,15 +413,16 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Rank
     Ranked { entries, definitions, near }
 }
 
-/// Byte-identical copies (same blob, same record) collapse into the best-ranked one, which lists
-/// the others' locations.
+/// Byte-identical copies collapse into the best-ranked one, which lists the others' locations.
+/// Every chunk of a file carries the file's blob, so a record is (blob, span), never the blob
+/// alone; kind and name keep apart chunks that share a span (a file and its only item).
 fn collapse(c: &OpenCircle, sorted: Vec<Scored>) -> Vec<Scored> {
     let mut out: Vec<Scored> = Vec::with_capacity(sorted.len());
     let mut seen: HashMap<(crate::Oid, u32, u32, &str, &str), usize> = HashMap::new();
     for e in sorted {
         let v = view(c, e.at);
         if let Some(blob) = v.blob {
-            let record = (blob, v.lines.start, v.lines.end, v.kind.as_str(), v.name);
+            let record = (blob, v.span.lo, v.span.hi, v.kind.as_str(), v.name);
             if let Some(&first) = seen.get(&record) {
                 out[first].also_at.push(location(&v));
                 continue;
