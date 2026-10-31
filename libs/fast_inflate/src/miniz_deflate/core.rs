@@ -196,7 +196,7 @@ pub enum CompressionStrategy {
     /// Don't look for matches, only huffman encode the literals.
     HuffmanOnly = 2,
     /// Only look for matches with a distance of 1, i.e do run-length encoding only.
-    RLE = 3,
+    Rle = 3,
     /// Only use static/fixed blocks. (Blocks using the default huffman codes
     /// specified in the deflate specification.)
     Fixed = 4,
@@ -995,8 +995,8 @@ pub(crate) struct DictOxide {
 
 const fn probes_from_flags(flags: u32) -> [u32; 2] {
     [
-        1 + ((flags & 0xFFF) + 2) / 3,
-        1 + (((flags & 0xFFF) >> 2) + 2) / 3,
+        1 + (flags & 0xFFF).div_ceil(3),
+        1 + ((flags & 0xFFF) >> 2).div_ceil(3),
     ]
 }
 
@@ -1314,9 +1314,6 @@ fn compress_lz_codes(
         if flags & 1 == 1 {
             flags >>= 1;
 
-            let sym;
-            let num_extra_bits;
-
             let match_len = lz_code_buf[i & LZ_CODE_BUF_MASK] as usize;
 
             let match_dist = lz_code_buf[(i + 1) & LZ_CODE_BUF_MASK] as u16
@@ -1336,13 +1333,17 @@ fn compress_lz_codes(
                 u32::from(LEN_EXTRA[match_len]),
             );
 
-            if match_dist < 512 {
-                sym = SMALL_DIST_SYM[match_dist as usize] as usize;
-                num_extra_bits = SMALL_DIST_EXTRA[match_dist as usize] as usize;
+            let (sym, num_extra_bits) = if match_dist < 512 {
+                (
+                    SMALL_DIST_SYM[match_dist as usize] as usize,
+                    SMALL_DIST_EXTRA[match_dist as usize] as usize,
+                )
             } else {
-                sym = LARGE_DIST_SYM[(match_dist >> 8) as usize] as usize;
-                num_extra_bits = LARGE_DIST_EXTRA[(match_dist >> 8) as usize] as usize;
-            }
+                (
+                    LARGE_DIST_SYM[(match_dist >> 8) as usize] as usize,
+                    LARGE_DIST_EXTRA[(match_dist >> 8) as usize] as usize,
+                )
+            };
 
             debug_assert!(huff.code_sizes[1][sym] != 0);
             bb.put_fast(
@@ -1598,7 +1599,7 @@ fn compress_normal(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> boo
             let dictb = &mut d.dict.b;
 
             let mut dst_pos = (lookahead_pos + lookahead_size) & LZ_DICT_SIZE_MASK;
-            let mut ins_pos = lookahead_pos + lookahead_size - 2;
+            let ins_pos = lookahead_pos + lookahead_size - 2;
             // Start the hash value from the first two bytes
             let mut hash = update_hash(
                 u16::from(dictb.dict[ins_pos & LZ_DICT_SIZE_MASK]),
@@ -1607,7 +1608,7 @@ fn compress_normal(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> boo
 
             lookahead_size += num_bytes_to_process;
 
-            for &c in &in_buf[src_pos..src_pos + num_bytes_to_process] {
+            for (ins_pos, &c) in (ins_pos..).zip(&in_buf[src_pos..src_pos + num_bytes_to_process]) {
                 // Add byte to input buffer.
                 dictb.dict[dst_pos] = c;
                 if dst_pos < MAX_MATCH_LEN - 1 {
@@ -1620,7 +1621,6 @@ fn compress_normal(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> boo
                 // and insert it into the hash chain.
                 dictb.hash[hash as usize] = ins_pos as u16;
                 dst_pos = (dst_pos + 1) & LZ_DICT_SIZE_MASK;
-                ins_pos += 1;
             }
 
             src_pos += num_bytes_to_process;
@@ -2142,7 +2142,7 @@ pub fn create_comp_flags_from_zip_params(level: i32, window_bits: i32, strategy:
         comp_flags &= !MAX_PROBES_MASK;
     } else if strategy == CompressionStrategy::Fixed as i32 {
         comp_flags |= TDEFL_FORCE_ALL_STATIC_BLOCKS;
-    } else if strategy == CompressionStrategy::RLE as i32 {
+    } else if strategy == CompressionStrategy::Rle as i32 {
         comp_flags |= TDEFL_RLE_MATCHES;
     }
 

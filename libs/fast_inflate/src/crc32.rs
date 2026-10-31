@@ -236,14 +236,14 @@ fn crc32_slice8(mut crc: u32, data: &[u8]) -> u32 {
         let v2 = u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]);
         let xv1 = crc ^ v1;
 
-        crc = CRC32_SLICE8[0x700 + ((xv1 >> 0) & 0xFF) as usize]
+        crc = CRC32_SLICE8[0x700 + (xv1 & 0xFF) as usize]
             ^ CRC32_SLICE8[0x600 + ((xv1 >> 8) & 0xFF) as usize]
             ^ CRC32_SLICE8[0x500 + ((xv1 >> 16) & 0xFF) as usize]
             ^ CRC32_SLICE8[0x400 + ((xv1 >> 24) & 0xFF) as usize]
-            ^ CRC32_SLICE8[0x300 + ((v2 >> 0) & 0xFF) as usize]
+            ^ CRC32_SLICE8[0x300 + (v2 & 0xFF) as usize]
             ^ CRC32_SLICE8[0x200 + ((v2 >> 8) & 0xFF) as usize]
             ^ CRC32_SLICE8[0x100 + ((v2 >> 16) & 0xFF) as usize]
-            ^ CRC32_SLICE8[0x000 + ((v2 >> 24) & 0xFF) as usize];
+            ^ CRC32_SLICE8[((v2 >> 24) & 0xFF) as usize];
 
         i += 8;
     }
