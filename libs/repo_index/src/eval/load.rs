@@ -43,6 +43,14 @@ fn opt_u32(v: &Value, key: &str, at: &At) -> Result<Option<u32>, Error> {
     }
 }
 
+/// A line number: counted from 1, so 0 is refused.
+fn opt_line(v: &Value, key: &str, at: &At) -> Result<Option<u32>, Error> {
+    match opt_u32(v, key, at)? {
+        Some(0) => Err(at.err(format!("`{key}` counts from 1"))),
+        n => Ok(n),
+    }
+}
+
 fn strings(v: &Value, key: &str, at: &At) -> Result<Vec<String>, Error> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -126,7 +134,7 @@ fn gold(v: &Value, manifest: &CircleManifest, at: &At) -> Result<Gold, Error> {
         let is_note = v.get("note").is_some();
         check_keys(v, &with(&[if is_note { "note" } else { "path" }, "line", "end", "alt_lines"]), "a path item", at)?;
         let path = p.as_str().ok_or_else(|| at.err("a path must be a string"))?.to_string();
-        let (line, end, alt_lines) = (opt_u32(v, "line", at)?, opt_u32(v, "end", at)?, lines_list(v, at)?);
+        let (line, end, alt_lines) = (opt_line(v, "line", at)?, opt_line(v, "end", at)?, lines_list(v, at)?);
         if is_note {
             GoldTarget::Note { path, line, end, alt_lines }
         } else {
@@ -273,6 +281,15 @@ mod tests {
 
     fn manifest() -> CircleManifest {
         crate::circles::manifest_for(Path::new("/r/makepad"), None, Path::new("/h")).unwrap()
+    }
+
+    #[test]
+    fn a_line_counts_from_one() {
+        for bad in [r#""line":0"#, r#""line":3,"end":0"#] {
+            let line = format!(r#"{{"id":"q0","query":"x","rev":"c0ffee123","circles":["makepad"],"type":"where","subtype":"ident","difficulty":"easy","gold":[{{"path":"a.rs",{bad},"rel":2}}]}}"#);
+            let e = question(&line, &QuestionSet::Shipped, &manifest(), "f", 1).unwrap_err().to_string();
+            assert!(e.contains("counts from 1"), "{e}");
+        }
     }
 
     #[test]
