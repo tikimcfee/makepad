@@ -83,13 +83,19 @@ pub enum Role {
     /// A part of a path-shaped word other than its rarest: scored only on chunks the rarest
     /// part found, so the word covers a chunk only when all its parts are there.
     PathPart,
-    /// A part of an identifier prefix ending in `_` (`spin` in `SPIN_`): matched only as a part of
-    /// an identifier, never a word on its own; all parts are needed.
+    /// A part of an identifier prefix ending in `_` (`spin` in `SPIN_`): a placeholder the
+    /// circle replaces by the prefix's real terms ([`Role::PrefixTerm`]).
     PrefixPart,
+    /// A term of this circle that starts with an `_` prefix (`foo_bar_name` for `FOO_BAR_`),
+    /// from the dictionary: any one covers the word.
+    PrefixTerm,
     /// An English inflection of a plain word (`remotely` → `remote`, `guides` → `guide`): an
     /// alternative that covers the word, at [`VARIANT_WEIGHT`].
     Variant,
 }
+
+/// Terms one prefix expands to in a circle, the most frequent first.
+pub const PREFIX_TERMS: usize = 64;
 
 /// Weight of an inflection variant against the word as written.
 pub const VARIANT_WEIGHT: f32 = 0.8;
@@ -636,21 +642,55 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
             absent_terms.push(written.clone());
         }
     }
-    // A prefix is absent when one of its parts occurs nowhere, whole or as a part.
-    for (_, _, parts, written) in &plan.prefixes {
-        let occurs = |p: &str| {
-            c.segments.iter().any(|seg| seg.df(TermForm::Folded, p) > 0 || seg.df(TermForm::Part, p) > 0)
-                || overlay_has(TermForm::Folded, p)
-                || overlay_has(TermForm::Part, p)
-        };
-        if !parts.iter().all(|p| occurs(p)) && !absent_terms.contains(written) {
-            absent_terms.push(written.clone());
+    // An `_` prefix becomes this circle's terms that start with it (the dictionary's range):
+    // the prefix itself is matched, not just its parts. It is absent when no term starts with it.
+    // A `::` prefix (a module) is matched as its word and judged by it.
+    let mut groups: Vec<Group> = plan.groups.clone();
+    for (word, stem, parts, written) in &plan.prefixes {
+        let open = groups.iter().any(|g| g.word == *word && g.role == Role::PrefixPart);
+        if !open {
+            let present = parts.iter().all(|p| c.segments.iter().any(|seg| seg.df(TermForm::Folded, p) > 0) || overlay_has(TermForm::Folded, p));
+            if !present && !absent_terms.contains(written) {
+                absent_terms.push(written.clone());
+            }
+            continue;
+        }
+        groups.retain(|g| !(g.word == *word && g.role == Role::PrefixPart));
+        let start = format!("{stem}_");
+        let mut terms: Vec<(u32, String)> = Vec::new();
+        for seg in &c.segments {
+            for t in seg.terms_with_prefix(TermForm::Folded, &start) {
+                if !terms.iter().any(|(_, x)| *x == t) {
+                    terms.push((0, t));
+                }
+            }
+        }
+        for f in &c.overlay {
+            for (_, ft) in &f.chunks {
+                for t in ft.terms.iter().filter(|t| t.form == TermForm::Folded && t.text.starts_with(&start)) {
+                    if !terms.iter().any(|(_, x)| *x == t.text) {
+                        terms.push((0, t.text.clone()));
+                    }
+                }
+            }
+        }
+        if terms.is_empty() {
+            if !absent_terms.contains(written) {
+                absent_terms.push(written.clone());
+            }
+            continue;
+        }
+        for (df, t) in terms.iter_mut() {
+            *df = c.segments.iter().map(|s| s.df(TermForm::Folded, t)).sum();
+        }
+        terms.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, text) in terms.into_iter().take(PREFIX_TERMS) {
+            groups.push(Group { text, word: *word, role: Role::PrefixTerm, span: 1 });
         }
     }
 
     // Path words: each through its rarest part (by df in this circle) as a text term, and the
     // chunks whose path meets it.
-    let mut groups: Vec<Group> = plan.groups.clone();
     for pw in &plan.paths {
         let rarest = pw
             .parts
@@ -742,6 +782,7 @@ fn forms(role: Role) -> &'static [(TermForm, f32)] {
         Role::Phrase | Role::Run | Role::Variant => &[(TermForm::Folded, 1.0)],
         Role::PathPart => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
         Role::PrefixPart => &[(TermForm::Part, 1.0)],
+        Role::PrefixTerm => &[(TermForm::Folded, 1.0)],
     }
 }
 
@@ -755,7 +796,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
     // circle covers little; the identifier the query names covers much.
     let mut word_idf: HashMap<u16, f32> = HashMap::new();
     for (g, i) in groups.iter().zip(&idfs) {
-        if matches!(g.role, Role::Primary | Role::Phrase | Role::Run | Role::PrefixPart) {
+        if matches!(g.role, Role::Primary | Role::Phrase | Role::Run | Role::PrefixPart | Role::PrefixTerm) {
             let e = word_idf.entry(g.word).or_insert(0.0);
             *e = e.max(*i);
         }
@@ -896,7 +937,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 continue;
             }
             let role_weight = match g.role {
-                Role::Primary | Role::Phrase | Role::Run | Role::PathPart | Role::PrefixPart => 1.0,
+                Role::Primary | Role::Phrase | Role::Run | Role::PathPart | Role::PrefixPart | Role::PrefixTerm => 1.0,
                 Role::Variant => VARIANT_WEIGHT,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
@@ -917,7 +958,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                     run_covered.insert(g.word);
                     in_name = true;
                 }
-                Role::Variant => {
+                Role::Variant | Role::PrefixTerm => {
                     phrase_covered.insert(g.word);
                     in_name |= tf[0] > 0.0;
                 }

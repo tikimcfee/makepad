@@ -46,7 +46,7 @@ fn line_words(c: &OpenCircle, plan: &Plan) -> Vec<LineWord> {
         let mut texts: Vec<String> = plan
             .groups
             .iter()
-            .filter(|g| g.word == w && matches!(g.role, crate::query::rank::Role::Primary | crate::query::rank::Role::Variant | crate::query::rank::Role::PrefixPart))
+            .filter(|g| g.word == w && matches!(g.role, crate::query::rank::Role::Primary | crate::query::rank::Role::Variant))
             .map(|g| g.text.clone())
             .collect();
         for p in plan.paths.iter().filter(|p| p.word == w) {
@@ -54,6 +54,8 @@ fn line_words(c: &OpenCircle, plan: &Plan) -> Vec<LineWord> {
         }
         let prefix = plan.prefixes.iter().find(|p| p.0 == w).map(|p| p.1.clone());
         let module = plan.groups.iter().any(|g| g.word == w && g.role == crate::query::rank::Role::Primary) && prefix.is_some();
+        let prefix_parts: Vec<String> = plan.prefixes.iter().filter(|p| p.0 == w).flat_map(|p| p.2.iter().cloned()).collect();
+        texts.extend(prefix_parts);
         if texts.is_empty() {
             continue;
         }
