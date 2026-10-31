@@ -1,5 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use makepad_shared_bytes::MappedBytes;
 
 use crate::error::GitError;
 use crate::object::{Object, ObjectKind};
@@ -41,12 +44,13 @@ struct DeltaBases {
     used: usize,
 }
 
-/// In-memory representation of a pack index (.idx v2) with cached pack data.
+/// In-memory representation of a pack index (.idx v2) with the pack mapped.
 pub struct PackIndex {
     pub pack_path: PathBuf,
     tables: std::sync::Arc<IdxTables>,
-    /// Cached pack file data — loaded once on first read.
-    pack_data: std::cell::RefCell<Option<Vec<u8>>>,
+    /// The pack file, mapped on first read: pages come in as objects are
+    /// read, so the first read does not wait for the whole file.
+    pack_data: std::cell::RefCell<Option<Arc<MappedBytes>>>,
     read_account: Option<crate::memory::MemoryAccount>,
     read_budget: usize,
     metadata_lease: Option<crate::memory::Reservation>,
@@ -60,6 +64,8 @@ pub struct PackIndex {
 pub struct ReadPhases {
     pub pack_load_ms: f64,
     pub inflate_ms: f64,
+    /// Bytes bounded reads copied out of the pack. A mapped pack pages in
+    /// as it is read and is not counted.
     pub pack_bytes_read: u64,
     pub objects_inflated: u64,
 }
@@ -218,7 +224,7 @@ fn reverse_index(idx_path: &Path, idx: &[u8], offsets: &[u64]) -> Option<Vec<u64
 impl PackIndex {
     pub fn retained_bytes(&self) -> usize {
         let t = &self.tables;
-        t.oids.capacity() * std::mem::size_of::<ObjectId>() + (t.offsets.capacity() + t.sorted_offsets.capacity()) * 8 + self.pack_data.borrow().as_ref().map_or(0, Vec::capacity)
+        t.oids.capacity() * std::mem::size_of::<ObjectId>() + (t.offsets.capacity() + t.sorted_offsets.capacity()) * 8
     }
     pub fn read_phases(&self) -> ReadPhases { self.stats.get() }
     /// Historical readers retain the index, and read one compressed object
@@ -231,16 +237,15 @@ impl PackIndex {
         self.read_budget = bytes;
         Ok(())
     }
-    /// Ensure pack data is loaded into memory (read once, cached).
+    /// Map the pack file (once).
     pub fn ensure_loaded(&self) -> Result<(), GitError> {
         if self.read_account.is_some() { return Err(GitError::InvalidObject("whole-pack loading is disabled for a bounded reader".into())); }
         let mut cache = self.pack_data.borrow_mut();
         if cache.is_none() {
             let start = crate::clock::Stopwatch::start();
-            *cache = Some(fs::read(&self.pack_path)?);
+            *cache = Some(map_pack(&self.pack_path)?);
             let mut stats = self.stats.get();
             stats.pack_load_ms += start.elapsed_ms();
-            stats.pack_bytes_read += cache.as_ref().unwrap().len() as u64;
             self.stats.set(stats);
         }
         Ok(())
@@ -251,7 +256,7 @@ impl PackIndex {
         if self.read_account.is_some() { return self.read_window(offset, 0); }
         self.ensure_loaded()?;
         let cache = self.pack_data.borrow();
-        let data = cache.as_ref().unwrap();
+        let data = cache.as_ref().unwrap().as_slice();
         let start = crate::clock::Stopwatch::start();
         let result = read_pack_object_at(data, offset as usize, self, data);
         let mut stats = self.stats.get();
@@ -347,7 +352,7 @@ impl PackIndex {
         let loaded = self.pack_data.borrow();
         let mut owned = Vec::new();
         let entry: &[u8] = if let Some(data) = loaded.as_ref() {
-            data.get(offset as usize..).ok_or_else(|| GitError::CorruptPack("offset beyond pack data".into()))?
+            data.as_slice().get(offset as usize..).ok_or_else(|| GitError::CorruptPack("offset beyond pack data".into()))?
         } else {
             let mut slot = self.header_file.borrow_mut();
             if slot.is_none() { *slot = Some(fs::File::open(&self.pack_path)?); }
@@ -391,8 +396,8 @@ impl PackIndex {
         }
     }
 
-    /// Get a clone of the cached pack data (for thread-safe sharing).
-    pub fn get_cached_data(&self) -> Option<Vec<u8>> {
+    /// The pack mapping, once loaded (for thread-safe sharing).
+    pub fn get_cached_data(&self) -> Option<Arc<MappedBytes>> {
         self.pack_data.borrow().clone()
     }
 
@@ -631,6 +636,20 @@ fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>, GitErro
         .map_err(|e| GitError::CorruptPack(format!("zlib decompress failed: {}", e)))?;
     buf.truncate(written);
     Ok(buf)
+}
+
+/// The whole pack file, mapped read-only. Pack files are never rewritten in
+/// place (git writes a new pack and renames it in), so the mapping stays
+/// valid while it is held.
+fn map_pack(path: &Path) -> Result<Arc<MappedBytes>, GitError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Ok(Arc::new(MappedBytes::open(path)?))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err(GitError::Io(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("no file mapping on wasm32: {}", path.display()))))
+    }
 }
 
 fn read_u32(data: &[u8], pos: usize) -> u32 {
