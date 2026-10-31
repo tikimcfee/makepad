@@ -150,30 +150,39 @@ impl Repo for GitRepo {
         self.repo.read_blob(&id).map_err(|e| git_err(&format!("read blob {}", id.to_hex()), e))
     }
 
+    /// The index's blob ids are compared with the base tree directly (committed and staged
+    /// changes alike, no HEAD tree needed), and a worktree-only status gives what differs from
+    /// the index (unstaged edits, deletions, untracked files the ignore rules admit). Only files
+    /// that status names are hashed; any other path's content is its index blob.
     fn changes(&mut self, base: &Rev) -> Result<Vec<Change>, Error> {
-        let head = self.repo.head_oid().map_err(|e| git_err("HEAD", e))?;
-        let head_tree = self.commit_tree(head)?;
-        let base_tree = object_id(&base.tree);
-        let mut candidates: Vec<String> = Vec::new();
-        if head_tree != base_tree {
-            let diff = self.repo.diff_trees(&base_tree, &head_tree).map_err(|e| git_err("diff base..HEAD", e))?;
-            candidates.extend(diff.into_iter().map(change_path));
-        }
-        // staged, unstaged, deleted, and untracked files the ignore rules admit
-        let status = self
-            .repo
-            .status_with_options(makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() })
-            .map_err(|e| git_err("status", e))?;
-        candidates.extend(status.entries.into_iter().map(|e| e.path));
-        candidates.sort();
-        candidates.dedup();
         let base_files: HashMap<String, Oid> = self.files(base.tree)?.into_iter().map(|f| (f.path, f.blob)).collect();
+        let index = self.repo.read_index().map_err(|e| git_err("read index", e))?;
+        let opts = makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() };
+        let status = makepad_git::compute_status_worktree_only_with_options(&index, &self.repo.workdir, opts)
+            .map_err(|e| git_err("worktree status", e))?;
+        let off_index: HashSet<String> = status.entries.into_iter().map(|e| e.path).collect();
+        let mut current: HashMap<&str, Option<Oid>> = HashMap::new();
+        // regular files only, as the base side ([`Repo::files`])
+        for e in index.entries.iter().filter(|e| REGULAR_FILE_MODES.contains(&e.mode)) {
+            if !off_index.contains(&e.path) {
+                current.insert(&e.path, Some(oid(&e.oid)));
+            }
+        }
+        let mut candidates: Vec<&str> = current.iter().filter(|(p, o)| base_files.get(**p) != o.as_ref()).map(|(p, _)| *p).collect();
+        candidates.extend(base_files.keys().filter(|p| !current.contains_key(p.as_str())).map(String::as_str));
+        candidates.extend(off_index.iter().map(String::as_str));
+        candidates.sort_unstable();
+        candidates.dedup();
         let mut out = Vec::new();
         for path in candidates {
-            match (base_files.get(&path), self.worktree_blob(&path)?) {
-                (None, Some(_)) => out.push(Change::Added(path)),
-                (Some(old), Some(new)) if *old != new => out.push(Change::Modified(path)),
-                (Some(_), None) => out.push(Change::Deleted(path)),
+            let now = match current.get(path) {
+                Some(index_blob) => *index_blob,
+                None => self.worktree_blob(path)?,
+            };
+            match (base_files.get(path), now) {
+                (None, Some(_)) => out.push(Change::Added(path.to_string())),
+                (Some(old), Some(new)) if *old != new => out.push(Change::Modified(path.to_string())),
+                (Some(_), None) => out.push(Change::Deleted(path.to_string())),
                 _ => {}
             }
         }
@@ -227,5 +236,52 @@ impl Repo for GitRepo {
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error> {
         let m = self.repo.merge_base(&object_id(&a), &object_id(&b)).map_err(|e| git_err("merge-base", e))?;
         Ok(m.map(|id| oid(&id)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parts of `changes` on a real worktree, timed with `time` around each:
+    /// `MAKEPAD_INDEX_REPO=<worktree> MAKEPAD_INDEX_REV=<base> MAKEPAD_INDEX_PART=diff|status|flatten|changes
+    /// <test binary> real_changes_parts --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_changes_parts() {
+        let Some(root) = std::env::var_os("MAKEPAD_INDEX_REPO") else { panic!("set MAKEPAD_INDEX_REPO") };
+        let base_name = std::env::var("MAKEPAD_INDEX_REV").unwrap_or_else(|_| "HEAD".into());
+        let part = std::env::var("MAKEPAD_INDEX_PART").unwrap_or_default();
+        let mut repo = GitRepo::open(Path::new(&root)).unwrap();
+        let base = repo.resolve(&RevSpec::Pinned(base_name)).unwrap();
+        let head = repo.resolve(&RevSpec::Worktree).unwrap();
+        match part.as_str() {
+            "diff" => println!("diff {}", repo.repo.diff_trees(&object_id(&base.tree), &object_id(&head.tree)).unwrap().len()),
+            "status" => println!("status {}", repo.repo.status_with_options(makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() }).unwrap().entries.len()),
+            "status-nocompare" => println!(
+                "status {}",
+                repo.repo
+                    .status_with_options(makepad_git::StatusOptions { skip_target_dirs: true, skip_worktree_content_compare: true, ..Default::default() })
+                    .unwrap()
+                    .entries
+                    .len()
+            ),
+            "flatten" => println!("flatten {}", repo.files(base.tree).unwrap().len()),
+            "index" => println!("index {}", repo.repo.read_index().unwrap().entries.len()),
+            "wtonly" => {
+                let index = repo.repo.read_index().unwrap();
+                let opts = makepad_git::StatusOptions { skip_target_dirs: true, ..Default::default() };
+                println!("wtonly {}", makepad_git::compute_status_worktree_only_with_options(&index, &repo.repo.workdir, opts).unwrap().entries.len())
+            }
+            "changes" => {
+                let mut c: Vec<String> = repo.changes(&base).unwrap().iter().map(|c| format!("{c:?}")).collect();
+                c.sort();
+                println!("changes {}", c.len());
+                if let Some(out) = std::env::var_os("MAKEPAD_INDEX_OUT") {
+                    std::fs::write(out, c.join("\n")).unwrap();
+                }
+            }
+            _ => println!("opened"),
+        }
     }
 }
