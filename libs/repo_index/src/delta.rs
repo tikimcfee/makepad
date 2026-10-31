@@ -33,15 +33,14 @@ pub struct Over<'a> {
     pub package: &'a dyn Fn(&str) -> Option<String>,
 }
 
-/// The overlay of the worktree at `over.root` over `over.base`.
-/// Files are re-extracted one by one; their chunks are then tokenized together across cores
-/// ([`crate::open::tokenize_all`]), so one large file does not hold the rest up.
+/// The overlay of the worktree at `over.root` over `over.base`. The changed files are read,
+/// re-extracted together ([`Extract::extract_files`], on the crate's workers), and their chunks
+/// tokenized together ([`crate::open::tokenize_all`], the same workers), so one large file does
+/// not hold the rest up.
 pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn Tokenize + Sync), over: &Over) -> Result<Overlay, Error> {
     let Over { circle, def, base, root, package } = *over;
     let mut out = Overlay::default();
-    // every file's chunks in one run, with each file's (path, chunk count)
-    let mut all: Vec<Chunk> = Vec::new();
-    let mut files: Vec<(String, usize)> = Vec::new();
+    let mut read: Vec<(String, Vec<u8>)> = Vec::new();
     for change in repo.changes(base)? {
         let (path, shadows) = match &change {
             Change::Added(p) => (p, false),
@@ -57,20 +56,23 @@ pub fn overlay(repo: &mut dyn Repo, extract: &mut dyn Extract, tokenize: &(dyn T
         if matches!(change, Change::Deleted(_)) {
             continue;
         }
-        let bytes = match std::fs::read(root.join(path)) {
-            Ok(b) => b,
+        match std::fs::read(root.join(path)) {
+            Ok(b) => read.push((path.clone(), b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // deleted between the change scan and this read: it shadows, and adds nothing
                 eprintln!("makepad index: overlay: {path} changed and is now gone ({e}); treated as deleted");
                 if !shadows {
                     out.shadowed.push(path.clone());
                 }
-                continue;
             }
             Err(error) => return Err(Error::Io { context: format!("overlay: reading {path}"), error }),
-        };
+        }
+    }
+    // every file's chunks in one run, with each file's (path, chunk count)
+    let mut all: Vec<Chunk> = Vec::new();
+    let mut files: Vec<(String, usize)> = Vec::new();
+    for ((path, _), mut chunks) in read.iter().zip(extract.extract_files(circle, def, &read)?) {
         let pkg = package(path);
-        let mut chunks = extract.extract_file(circle, def, path, &bytes)?;
         for c in &mut chunks {
             if c.keys.package.is_none() {
                 c.keys.package = pkg.clone();
