@@ -905,3 +905,35 @@ fn long_field_lengths_read_back_exactly() {
     assert_eq!(seg.stats().field_lengths[4], 70_000 + 65_535 + 65_534);
     assert_eq!(seg.postings(TermForm::Exact, "x").map(|p| p.tf[4]).collect::<Vec<_>>(), vec![7, 7, 7]);
 }
+
+/// A prefix scan of the term dictionary gives exactly the terms a brute-force filter does, for
+/// every prefix of every term (so across block boundaries), per form, in byte order.
+#[test]
+fn terms_with_prefix_scans_the_dictionary() {
+    let root = Root::new();
+    let store = FsStore::new(root.0.clone());
+    let c = circle("makepad");
+    let chunks = tree_chunks(&c);
+    let id = write_segment(&store, &tree_key(&c, "t1"), &chunks);
+    let seg = store.segment(Some(RepoId(0xfeed)), &c, &id).unwrap();
+    let mut all: HashMap<TermForm, BTreeSet<String>> = HashMap::new();
+    for ch in &chunks {
+        for t in FakeTokens.chunk_terms(ch).terms {
+            all.entry(t.form).or_default().insert(t.text);
+        }
+    }
+    let brute = |form: TermForm, prefix: &str| all.get(&form).map_or(Vec::new(), |s| s.iter().filter(|t| t.starts_with(prefix)).cloned().collect::<Vec<_>>());
+    assert!(all.values().any(|t| t.len() > segment::BLOCK * 3), "enough terms to span blocks");
+    for (form, terms) in &all {
+        assert_eq!(seg.terms_with_prefix(*form, ""), brute(*form, ""), "{form:?}: every term");
+        for t in terms {
+            for end in (0..=t.len()).filter(|&e| t.is_char_boundary(e)) {
+                assert_eq!(seg.terms_with_prefix(*form, &t[..end]), brute(*form, &t[..end]), "{form:?} `{}`", &t[..end]);
+            }
+        }
+    }
+    assert!(seg.terms_with_prefix(TermForm::Exact, "zzzz_no_such").is_empty());
+    assert!(seg.terms_with_prefix(TermForm::Folded, "\u{10ffff}").is_empty());
+    let spin = seg.terms_with_prefix(TermForm::Exact, "sp");
+    assert!(spin.contains(&"spin".to_string()) && spin.iter().all(|t| t.starts_with("sp")));
+}

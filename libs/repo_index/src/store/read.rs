@@ -353,6 +353,17 @@ impl SegmentRead for Segment {
             None => Box::new(std::iter::empty()),
         }
     }
+    fn terms_with_prefix(&self, form: TermForm, prefix: &str) -> Vec<String> {
+        let probe = term_key(form, prefix);
+        let mut out = Vec::new();
+        for (k, _, _) in self.dict(sec::TERMS).with_prefix(&probe) {
+            match String::from_utf8(k[1..].to_vec()) {
+                Ok(t) => out.push(t),
+                Err(_) => self.corrupt("a term is not UTF-8"),
+            }
+        }
+        out
+    }
     fn chunk(&self, id: ChunkId) -> ChunkView<'_> {
         self.view(id)
     }
