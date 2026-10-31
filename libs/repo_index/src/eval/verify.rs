@@ -171,6 +171,17 @@ pub fn has_word(hay: &str, word: &str) -> bool {
         })
 }
 
+/// What a history circle holds of a commit, lowercased: its message and the touched paths
+/// outside the circle's exclusions; `None` for a commit of excluded paths only, which the
+/// history walk never indexes.
+fn history_record(def: &BaseCircle, c: &crate::CommitRecord) -> Option<String> {
+    let kept: Vec<&str> = c.touched.iter().map(String::as_str).filter(|p| circles::excluded(def, p).is_none()).collect();
+    if kept.is_empty() && !c.touched.is_empty() {
+        return None;
+    }
+    Some(format!("{}\n{}", c.message, kept.join("\n")).to_lowercase())
+}
+
 /// A path-shaped term without a `:line` or `:start-end` suffix.
 fn path_term(t: &str) -> &str {
     match t.rsplit_once(':') {
@@ -191,7 +202,7 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
     let root = repo.root();
     // (circle, tree) -> claim indices, for one pass per tree
     let mut by_tree: HashMap<(String, Oid), Vec<usize>> = HashMap::new();
-    let mut by_history: HashMap<Oid, Vec<usize>> = HashMap::new();
+    let mut by_history: HashMap<(String, Oid), Vec<usize>> = HashMap::new();
     let mut by_notes: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, c) in claims.iter().enumerate() {
         let Some(CircleBody::Base(def)) = manifest.defs.iter().find(|d| d.name == c.circle).map(|d| &d.body) else { continue };
@@ -202,7 +213,7 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
             }
             BaseSource::History { root: r, .. } if std::fs::canonicalize(r).ok() == std::fs::canonicalize(&root).ok() => {
                 let rev = repo.resolve(&c.rev)?;
-                by_history.entry(rev.commit).or_default().push(i);
+                by_history.entry((c.circle.0.clone(), rev.commit)).or_default().push(i);
             }
             BaseSource::Notes { .. } => by_notes.entry(c.circle.0.clone()).or_default().push(i),
             _ => eprintln!("makepad index: eval: {}'s absence of `{}` is not checked (another repo)", c.circle.0, c.term),
@@ -240,10 +251,11 @@ pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Cla
             }
         }
     }
-    for (commit, idx) in by_history {
+    for ((circle, commit), idx) in by_history {
+        let Some(def) = def_of(&circle) else { continue };
         let words: Vec<String> = idx.iter().map(|i| claims[*i].term.to_lowercase()).collect();
         for c in repo.commits(&[commit], &[])? {
-            let hay = format!("{}\n{}", c.message, c.touched.join("\n")).to_lowercase();
+            let Some(hay) = history_record(def, &c) else { continue };
             for (k, w) in words.iter().enumerate() {
                 if has_word(&hay, w) {
                     out[idx[k]] += 1;
@@ -346,16 +358,15 @@ pub fn verify(repo: &mut dyn Repo, manifest: &CircleManifest, questions: &[Quest
                 GoldTarget::Absent { semantic: true, .. } | GoldTarget::Dependents { .. } | GoldTarget::Error(_) => {}
                 GoldTarget::Absent { scope, term: Some(t), .. } if q.subtype != "self-exclusion" => {
                     let history = match scope {
-                        Some(AbsentScope::Circle(c)) => is_history(manifest, &c.0),
-                        _ => false,
+                        Some(AbsentScope::Circle(c)) if is_history(manifest, &c.0) => manifest.defs.iter().find(|d| d.name == *c).and_then(|d| match &d.body {
+                            CircleBody::Base(b) => Some(b),
+                            _ => None,
+                        }),
+                        _ => None,
                     };
-                    if history {
+                    if let Some(def) = history {
                         let t = t.to_lowercase();
-                        let hits = repo
-                            .commits(&[rev.commit], &[])?
-                            .iter()
-                            .filter(|c| c.message.to_lowercase().contains(&t) || c.touched.iter().any(|p| p.to_lowercase().contains(&t)))
-                            .count();
+                        let hits = repo.commits(&[rev.commit], &[])?.iter().filter_map(|c| history_record(def, c)).filter(|hay| hay.contains(&t)).count();
                         if hits > 0 {
                             out.push(drift(gi, Drift::NoLongerAbsent { hits: hits as u64 }));
                         }
@@ -511,7 +522,11 @@ mod tests {
                 ("libs/repo_index/eval/questions.jsonl", "bar_term\n"),
             ],
         );
-        repo.commits = vec![CommitRecord { oid: rev.commit, info: CommitInfo { time: 0, parents: vec![] }, message: "fix Baz handling".into(), touched: vec!["q.rs".into()] }];
+        repo.commits = vec![
+            CommitRecord { oid: rev.commit, info: CommitInfo { time: 0, parents: vec![oid(9)] }, message: "fix Baz handling".into(), touched: vec!["q.rs".into(), "libs/repo_index/eval/old.jsonl".into()] },
+            // a commit of eval data only: history never indexes it
+            CommitRecord { oid: oid(9), info: CommitInfo { time: 0, parents: vec![] }, message: "eval: ask about sentinel_q".into(), touched: vec!["libs/repo_index/eval/questions.jsonl".into()] },
+        ];
         let m = circles::manifest_for(&root, None, &root).unwrap();
         let claim = |circle: &str, term: &str| Claim { id: "q".into(), circle: CircleName(circle.into()), rev: RevSpec::Pinned("c0ffee123".into()), term: term.into() };
         let claims = [
@@ -521,8 +536,10 @@ mod tests {
             claim("makepad:history", "baz"),    // in a reachable commit message
             claim("makepad:history", "q.rs"),   // a touched path
             claim("makepad:history", "nowhere"),
+            claim("makepad:history", "sentinel_q"), // only in a commit of eval data: truly absent
+            claim("makepad:history", "old.jsonl"),  // an excluded path of a mixed commit: truly absent
         ];
-        assert_eq!(occurrences(&mut repo, &m, &claims).unwrap(), [1, 0, 0, 1, 1, 0]);
+        assert_eq!(occurrences(&mut repo, &m, &claims).unwrap(), [1, 0, 0, 1, 1, 0, 0, 0]);
         // a path-shaped term is judged on paths: mentioned in a text, but no such file, is absent
         let mut repo2 = FakeRepo::new(&root);
         repo2.rev(&["c0ffee123"], 1, &[("README.md", "see examples/demo/REVIEW.md and push-tree.sh\n"), ("tools/run/push.rs", "x\n"), ("libs/a/b.rs", "x\n")]);

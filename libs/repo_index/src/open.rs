@@ -10,8 +10,10 @@
 //! - A notes circle is current when its manifest records the stamp of its sources as they are on
 //!   disk now; else it is rebuilt whole (`ManifestChange::Replace`). `notes:local` belongs to its
 //!   repo (`SegmentKey::repo` set); other notes circles to the machine.
-//! - A history circle is current when its manifest records the tips of its refs; its
-//!   [`Visibility`] is computed at every open.
+//! - A history circle is current when its manifest records the tips of its refs, plus the
+//!   revision when those tips do not reach it (a branch's own commits, a detached HEAD: walked
+//!   too, so the circle holds what it is labelled at); its [`Visibility`] is computed at every
+//!   open, or read from the visibility cache.
 //! - [`Opened::others`] are opened only when already built, never built, and carry no overlay:
 //!   they serve pointer counts. A notes index older than its sources still serves them, and says
 //!   so on stderr.
@@ -392,28 +394,44 @@ impl Opener {
                         Err(e) => eprintln!("makepad index: {}: local ref {r} not walked: {e}", name.0),
                     }
                 }
-                let repo_key = Some(repo.id());
-                let stamp = SourceStamp::History { tips: tips.clone() };
-                let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
-                let mut fill = |sink: &mut dyn SegmentSink| -> Result<(), Error> {
-                    let mut batch = Batch::new(tokenize.as_ref());
-                    extract.extract(name, &def, Some(&at), &mut *repo, &mut |c: Chunk| batch.push(c, sink))?;
-                    batch.flush(sink)
-                };
-                let Some(segments) = open_manifest_circle(store.as_ref(), key, build, &mut fill)? else { return Ok(None) };
                 let tree = tree_on(manifest, root);
                 let cache = VisCache { dir: visibility_cache.as_deref(), key: vis_key(repo.id(), name, &at, up.commit, &local_tips, tree) };
-                let (reachable, local, local_files) = match cache.read() {
+                let (reachable, local, local_files, ahead) = match cache.read() {
                     Some(v) => v,
                     None => {
                         let reachable: HashSet<Oid> = repo.commit_ids(&[at.commit])?.into_iter().collect();
                         let upstream: HashSet<Oid> = repo.commit_ids(&[up.commit])?.into_iter().collect();
                         let local: HashSet<Oid> = repo.commit_ids(&local_tips)?.into_iter().filter(|c| !upstream.contains(c)).collect();
                         let files = branch_files(repo, &at, &local_tips, tree)?;
-                        cache.write(&reachable, &local, &files);
-                        (reachable, local, files)
+                        // the tips reach exactly `upstream ∪ local`
+                        let ahead = !upstream.contains(&at.commit) && !local.contains(&at.commit);
+                        cache.write(&reachable, &local, &files, ahead);
+                        (reachable, local, files, ahead)
                     }
                 };
+                // A revision the tips do not reach (a branch's own commits, a detached HEAD) is
+                // walked too, so what the circle claims at `at` is what it indexed: the walk
+                // takes it as one more local ref, and the stamp names it.
+                let mut walk = def.clone();
+                if ahead {
+                    tips.push(at.commit);
+                    if let BaseSource::History { local, .. } = &mut walk.source {
+                        local.push(hex(&at.commit));
+                    }
+                }
+                let repo_key = Some(repo.id());
+                let stamp = SourceStamp::History { tips: tips.clone() };
+                let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
+                let mut fill = |sink: &mut dyn SegmentSink| -> Result<(), Error> {
+                    let mut batch = Batch::new(tokenize.as_ref());
+                    let report = extract.extract(name, &walk, Some(&at), &mut *repo, &mut |c: Chunk| batch.push(c, sink))?;
+                    batch.flush(sink)?;
+                    for (path, why) in &report.skipped {
+                        eprintln!("makepad index: {}: skipped {path}: {why}", name.0);
+                    }
+                    Ok(())
+                };
+                let Some(segments) = open_manifest_circle(store.as_ref(), key, build, &mut fill)? else { return Ok(None) };
                 let visible = Visibility { reachable, local, local_refs, local_files };
                 Ok(Some(OpenCircle {
                     name: name.clone(),
@@ -437,7 +455,7 @@ pub fn short_ref(r: &str) -> String {
 
 /// History visibility files kept per directory, newest first.
 pub const VIS_KEEP: usize = 32;
-const VIS_MAGIC: &[u8] = b"makepad-index visibility 1\n";
+const VIS_MAGIC: &[u8] = b"makepad-index visibility 2\n";
 
 /// The key of a history circle's visibility: the repo, the circle, the revision, the upstream
 /// and local tips, and the exclusions its branch files honour. Anything else that moves (a ref)
@@ -450,8 +468,8 @@ fn vis_key(repo: crate::RepoId, name: &CircleName, at: &Rev, up: Oid, local: &[O
     makepad_git::oid::hash_object("blob", text.as_bytes()).to_hex()
 }
 
-/// Reachable and local commit sets plus branch files.
-type VisData = (HashSet<Oid>, HashSet<Oid>, Vec<(String, Oid)>);
+/// Reachable and local commit sets, branch files, and whether the revision is beyond the tips.
+type VisData = (HashSet<Oid>, HashSet<Oid>, Vec<(String, Oid)>, bool);
 
 /// One history circle's visibility on disk: computing it walks the history three times (about
 /// 0.3 s for makepad with touched paths, tens of ms without), reading it is one small file. A
@@ -477,9 +495,10 @@ impl VisCache<'_> {
         v
     }
 
-    fn write(&self, reachable: &HashSet<Oid>, local: &HashSet<Oid>, files: &[(String, Oid)]) {
+    fn write(&self, reachable: &HashSet<Oid>, local: &HashSet<Oid>, files: &[(String, Oid)], ahead: bool) {
         let (Some(dir), Some(path)) = (self.dir, self.path()) else { return };
         let mut out = VIS_MAGIC.to_vec();
+        out.push(u8::from(ahead));
         for set in [reachable, local] {
             let mut ids: Vec<&Oid> = set.iter().collect();
             ids.sort();
@@ -506,7 +525,12 @@ impl VisCache<'_> {
 }
 
 fn decode_vis(bytes: &[u8]) -> Option<VisData> {
-    let mut at = bytes.strip_prefix(VIS_MAGIC)?;
+    let (&flag, mut at) = bytes.strip_prefix(VIS_MAGIC)?.split_first()?;
+    let ahead = match flag {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let mut take = |n: usize| -> Option<&[u8]> {
         let (head, rest) = (at.get(..n)?, at.get(n..)?);
         at = rest;
@@ -533,7 +557,7 @@ fn decode_vis(bytes: &[u8]) -> Option<VisData> {
     }
     let local = sets.pop()?;
     let reachable = sets.pop()?;
-    Some((reachable, local, files))
+    Some((reachable, local, files, ahead))
 }
 
 /// Keeps the [`VIS_KEEP`] newest visibility files of `dir`.
@@ -1252,6 +1276,50 @@ mod tests {
         assert!(opened.open[0].segments.iter().all(|s| s.key().indexer == INDEXER_VERSION));
         let manifest = store.state.borrow().manifests.values().find(|m| m.circle == n("notes:t")).cloned().unwrap();
         assert_eq!((manifest.version, manifest.segments.len()), (2, 1), "replaced, not added beside");
+    }
+
+    #[test]
+    fn history_walks_a_revision_its_tips_do_not_reach_and_skips_own_data() {
+        let root = scratch("ahead").join("makepad");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        let up = repo.rev(&["refs/remotes/upstream/work"], 1, &[("a.rs", "fn a() {}\n")]);
+        let work = repo.rev(&["refs/heads/work"], 2, &[("a.rs", "fn a() {}\n")]);
+        let mine = repo.rev(&["x"], 3, &[("a.rs", "fn a() {}\n")]);
+        let head = repo.rev(&["HEAD"], 4, &[("a.rs", "fn a() {}\n")]);
+        let rec = |r: &Rev, parent: Option<&Rev>, message: &str, touched: &[&str]| CommitRecord {
+            oid: r.commit,
+            info: CommitInfo { time: 0, parents: parent.map(|p| p.commit).into_iter().collect() },
+            message: message.into(),
+            touched: touched.iter().map(|t| t.to_string()).collect(),
+        };
+        repo.commits = vec![
+            rec(&up, None, "upstream start", &["a.rs"]),
+            rec(&work, Some(&up), "work only", &["a.rs"]),
+            rec(&mine, Some(&up), "branch adds monotonic_now", &["a.rs"]),
+            rec(&head, Some(&mine), "eval: sentinel question", &["libs/repo_index/eval/questions.jsonl"]),
+        ];
+        let store = FakeStore::default();
+        let fail: RepoOpener = Rc::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display()))));
+        let mut o = Opener::new(Box::new(repo), fail, Box::new(store.clone()), Box::new(crate::extract::Extractor::new()), Box::new(FakeTokenize), root.join("none.conf"), root.clone());
+        let m = o.manifest().unwrap();
+        let subjects = |c: &OpenCircle| -> Vec<String> {
+            let s = &c.segments[0];
+            let mut v: Vec<String> = (0..s.chunk_count()).map(|i| s.chunk(crate::ChunkId(i))).filter(|v| v.kind == crate::Kind::Commit).map(|v| v.name.to_string()).collect();
+            v.sort();
+            v
+        };
+        let at_head = o.open(&m, &[n("makepad:history")], &RevSpec::Worktree).unwrap();
+        let c = &at_head.open[0];
+        assert_eq!(c.rev.as_ref().unwrap().commit, head.commit, "labelled at HEAD");
+        // HEAD's own commits are walked; the commit of eval data only is not
+        assert_eq!(subjects(c), ["branch adds monotonic_now", "upstream start", "work only"]);
+        assert!(c.visible.as_ref().unwrap().reachable.contains(&mine.commit));
+        assert_eq!(c.segments[0].key().source, SourceStamp::History { tips: vec![up.commit, work.commit, head.commit] });
+        // a revision the tips reach adds nothing to the walk
+        let at_up = o.open(&m, &[n("makepad:history")], &RevSpec::Pinned("refs/remotes/upstream/work".into())).unwrap();
+        assert_eq!(at_up.open[0].segments[0].key().source, SourceStamp::History { tips: vec![up.commit, work.commit] });
+        assert_eq!(subjects(&at_up.open[0]), ["upstream start", "work only"]);
     }
 
     #[test]
