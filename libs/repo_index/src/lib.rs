@@ -978,12 +978,19 @@ pub struct CircleBlock {
     pub hits: Vec<Hit>,
     /// `!absent_terms.is_empty()`: absence is an answer.
     pub absent: bool,
-    /// The query's terms this circle holds no match of: each named one (path-shaped, judged in
-    /// tree circles; identifier-shaped, in tree and notes circles; never in history circles),
-    /// or, when nothing in the circle matches, every content word.
+    /// The query's shaped words this circle holds no live match of, judged before any filter
+    /// (a live match: in the worktree overlay, or in a file the worktree does not shadow).
+    /// Identifier- and prefix-shaped words are judged in every circle (in a history circle: no
+    /// commit the revision reaches names it); path-shaped words in tree circles. When nothing
+    /// in the unfiltered circle matches, every shaped word. Plain words are never absent.
     pub absent_terms: Vec<String>,
     /// The nearest in-circle hits shown under an absence.
     pub nearest: Vec<Hit>,
+    /// The filters this block's hits were held to, as written (`--kind fn`, `--crate p`,
+    /// `--path x`, a derived circle's selector, an overlap's `path shared with c`); empty when
+    /// none. A filtered block with no hits prints "no hits under" them, never an absence of
+    /// its own.
+    pub under: Vec<String>,
 }
 
 /// The unit a pointer counts.
@@ -1163,8 +1170,9 @@ pub trait Search {
 /// `--json` records, one JSON object per line, every field always present.
 #[derive(Clone, Debug)]
 pub enum Record {
-    /// `{"header":true,"circle","rev","total","definitions","uses","absent","absent_terms"}`
-    Header { circle: CircleName, rev: String, total: u64, definitions: u64, uses: u64, absent: bool, absent_terms: Vec<String> },
+    /// `{"header":true,"circle","rev","total","definitions","uses","absent","absent_terms",
+    /// "under"}`
+    Header { circle: CircleName, rev: String, total: u64, definitions: u64, uses: u64, absent: bool, absent_terms: Vec<String>, under: Vec<String> },
     /// `{"handle","circle","rev","kind","package","path","start","end","name","sig","gist",
     /// "score","why","also_at","overlay","local","nearest"}`
     Hit { circle: CircleName, rev: String, hit: Box<Hit>, nearest: bool },
