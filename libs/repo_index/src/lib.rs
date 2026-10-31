@@ -759,6 +759,9 @@ pub trait Repo {
     /// Commits reachable from some `tips` and from none of `hide` (`git rev-list tips ^hide`),
     /// newest first.
     fn commits(&mut self, tips: &[Oid], hide: &[Oid]) -> Result<Vec<CommitRecord>, Error>;
+    /// The ids of the commits reachable from some `tips`, newest first: [`Repo::commits`]
+    /// without messages or touched paths (what a notes cite needs).
+    fn commit_ids(&mut self, tips: &[Oid]) -> Result<Vec<Oid>, Error>;
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error>;
     /// Every worktree of this repo (the main checkout and each linked one) with its `HEAD`
     /// commit; GC keeps the bases their merge-bases name.

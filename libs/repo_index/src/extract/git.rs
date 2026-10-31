@@ -224,6 +224,13 @@ impl Repo for GitRepo {
             .collect())
     }
 
+    fn commit_ids(&mut self, tips: &[Oid]) -> Result<Vec<Oid>, Error> {
+        let tip_ids: Vec<ObjectId> = tips.iter().map(object_id).collect();
+        let mut all = self.reachable_from(&tip_ids)?;
+        all.sort_by(|a, b| b.1.committer.timestamp.cmp(&a.1.committer.timestamp).then(a.0.as_bytes().cmp(b.0.as_bytes())));
+        Ok(all.iter().map(|(id, _)| oid(id)).collect())
+    }
+
     fn merge_base(&mut self, a: Oid, b: Oid) -> Result<Option<Oid>, Error> {
         let m = self.repo.merge_base(&object_id(&a), &object_id(&b)).map_err(|e| git_err("merge-base", e))?;
         Ok(m.map(|id| oid(&id)))
