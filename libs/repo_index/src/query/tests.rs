@@ -9,7 +9,7 @@ use super::*;
 use crate::output::Renderer;
 use crate::{
     Chunk, ChunkId, ChunkView, CircleStats, CrateCard, Detail, Edge, FieldTerms, Fields, Flags, Key, Keys, Lines,
-    OverlayFile, Output, Pointer, PointerUnit, Posting, Render, Rev, SegmentKey, SegmentRead, SourceStamp, Span, TermForm,
+    OverlayFile, Output, Pointer, PointerUnit, Posting, Render, Rev, SegmentId, SegmentKey, SegmentRead, SourceStamp, Span, TermForm,
     Visibility,
 };
 
@@ -60,6 +60,9 @@ fn has(k: &Keys, key: &Key) -> bool {
 impl SegmentRead for MemSegment {
     fn key(&self) -> &SegmentKey {
         &self.key
+    }
+    fn id(&self) -> SegmentId {
+        SegmentId(format!("seg-mem-{}", self.key.circle.0))
     }
     fn stats(&self) -> CircleStats {
         let mut field_lengths = [0u64; 5];
@@ -573,7 +576,7 @@ fn handles_parse_format_round_trip() {
         "alpha/src/lib.rs::Gizmo::spin",
         "crate:makepad-hal",
         "9a76551d7",
-        "notes:glyph3d-makepad/glyph3d-makepad/MAKEPAD_BATCH.md:64-85",
+        "notes:topic/topic/PLAN.md:64-85",
         "makepad:history/2271c0eb3",
         "commercial/apps/x/src/lib.rs:3",
         "alpha/src/lib.rs:14-17@9a76551d7",
