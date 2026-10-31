@@ -75,10 +75,12 @@ pub struct RepoId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevSpec {
     /// The worktree: HEAD plus the query-time overlay of everything between the base and the
-    /// files on disk. The default for every verb but `eval`; a question's `rev: "tip"`.
+    /// files on disk. The default for every verb but `eval`.
     Worktree,
     /// A pinned revision: a full or abbreviated commit hex, `HEAD`, a branch (`work`), a remote
-    /// branch (`upstream/work`) or a full ref name. Read from git objects only; no overlay.
+    /// branch (`upstream/work`) or a full ref name. Read from git objects only; no overlay. A
+    /// question's `rev: "tip"` is `Pinned("HEAD")`: the HEAD of the worktree under test, never
+    /// its uncommitted files (the overlay has its own fixture, EVAL §3.5).
     Pinned(String),
 }
 
@@ -154,12 +156,14 @@ pub enum BaseSource {
 }
 
 /// One directory of a notes circle. Its chunks' paths are `<label>/<path in dir>`, so sources
-/// never collide and a note gold path (EVAL §1.3) is a chunk path as is.
+/// never collide and a note gold path (EVAL §1.3) is a chunk path as is. Labels are unique
+/// within a circle; a duplicate is a `circles.conf` error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotesSource {
     pub dir: PathBuf,
     /// Default: the directory's name for a directory outside a repo (`<topic>`); for one inside
-    /// a repo, the repo directory's name and the path from its root (`makepad/local/plans`).
+    /// a repo, the checkout directory's name and the path from its root (`makepad/local/plans`
+    /// in a checkout named `makepad`).
     pub label: String,
 }
 
@@ -309,7 +313,8 @@ pub enum Kind {
     Commit,
     /// One bullet of a commit message, parented to its commit.
     Bullet,
-    /// One Markdown section of a note.
+    /// One record of a Markdown note, split as [`PointerUnit::Blobs`] says (fences are not
+    /// special, unlike a tree circle's [`Kind::Doc`]).
     Note,
     /// A notes file that is not Markdown: one chunk, the whole file (code, diffs, logs), or its
     /// path alone for a binary file ([`Flags::binary`]).
@@ -430,7 +435,7 @@ pub struct Flags {
     pub generated: bool,
     /// The lexer could not pair it: a file-level bag of identifiers.
     pub fallback: bool,
-    /// A binary notes file: a record of its path only.
+    /// A binary notes file (a NUL in its first 8000 bytes): a record of its path only.
     pub binary: bool,
 }
 
@@ -778,7 +783,11 @@ pub struct OpenCircle {
 /// The circles a query named, plus the registered ones it did not (for pointer counts only).
 pub struct Opened {
     pub open: Vec<OpenCircle>,
+    /// Opened only when already built (a base or manifest exists), never built or rebuilt
+    /// during a query.
     pub others: Vec<OpenCircle>,
+    /// Registered circles not named and not built: no pointer, listed by `status`.
+    pub unbuilt: Vec<CircleName>,
 }
 
 /// The circle registry and the one way to open circles: resolve the revision, take the base
@@ -795,6 +804,8 @@ pub trait Circles {
     fn parse_in(&self, manifest: &CircleManifest, arg: &str) -> Result<Vec<CircleExpr>, Error>;
     /// The SHA-1 of the canonical encoding of families, exclusions, ref names and notes labels.
     fn def_hash(&self, def: &BaseCircle) -> u64;
+    /// Builds what `names` need (bases once, under the store's lock); the other circles are
+    /// opened only if already built ([`Opened::others`]).
     fn open(&mut self, manifest: &CircleManifest, names: &[CircleName], rev: &RevSpec) -> Result<Opened, Error>;
 }
 
@@ -908,14 +919,24 @@ pub struct CircleBlock {
 /// The unit a pointer counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerUnit {
-    /// Distinct blobs (files after collapsing byte-identical copies) of the other circle with at
-    /// least one matching record: a record (one per Markdown section, one per other file) whose
-    /// text or path within its source, lowercased, contains every whitespace-split, lowercased
-    /// query term as a substring (EVAL §1.3; `eval/baseline/pointer_count.py`). Notes circles,
-    /// whose segments keep each record's text for it ([`SegmentRead::record_text`]); for a tree
-    /// circle the same rule is applied to its tokens instead, which no gold depends on.
+    /// Notes circles only. Distinct blobs (byte-identical files count once) with at least one
+    /// matching record; the rule is `eval/baseline/pointer_count.py`'s (EVAL §1.3), exactly:
+    /// - a file is binary when its first 8000 bytes hold a NUL; its one record has empty text;
+    /// - other files are decoded as lossy UTF-8 (`String::from_utf8_lossy`);
+    /// - a `.md` file's records are the pieces of a split before every line that starts with
+    ///   `#{1,6} ` (fences are not special), blank pieces dropped, the whole text if none is
+    ///   left; any other file is one record;
+    /// - a record matches when `lowercase(text) + "\n" + lowercase(path within its source)`
+    ///   contains every term as a substring, the terms being the query split on whitespace and
+    ///   lowercased (`str::to_lowercase`): one term may match the text and another the path.
+    ///
+    /// Notes chunks are exactly these records ([`SegmentRead::record_text`]). The count is a
+    /// substring count over the whole query, so it can differ from the token-ranked totals of
+    /// the same circle's block once it is opened with `--in`.
     Blobs,
-    /// Commits of a history circle with a matching message or touched path.
+    /// Tree circles: chunks matching every query term by token (`find`'s own matching).
+    Chunks,
+    /// History circles: commits with a matching message or touched path, by token.
     Commits,
     /// Files touched by branch-work commits. Every branch pointer.
     Files,
@@ -1131,7 +1152,7 @@ pub struct Question {
     pub agent_prompt: Option<String>,
     pub precondition: Option<Precondition>,
     /// The revision the question is asked at, built from git objects; `"tip"` is
-    /// [`RevSpec::Worktree`] (the overlay included).
+    /// `RevSpec::Pinned("HEAD")`.
     pub rev: RevSpec,
     pub circles: Vec<CircleName>,
     /// `where`, `what`, `why`, `current`, `circle`.

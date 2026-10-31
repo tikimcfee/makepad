@@ -11,7 +11,7 @@ pub const VERBS: &[(&str, &str, &str)] = &[
     ("refs", "refs <identifier> [--uses] [--rev r] [--json]", "Definitions, re-exports, then uses by name"),
     ("history", "history <path|words..> [--rev r] [--json]", "Commits in makepad:history"),
     ("stale", "stale [--rev r] [--json]", "Docs and headers naming things that are gone"),
-    ("circles", "circles [--json]", "Configured circles, their sources and index state"),
+    ("circles", "circles [--json]", "Configured circles, their sources and index state; an `also:` pointer to a notes circle counts files by substring, so it can differ from that circle's ranked totals"),
     ("build", "build [--in <circle>,..] [--rev r]", "Build or refresh the circles' indexes"),
     ("status", "status [--json]", "What is indexed, at which revision, and what the overlay holds"),
     ("gc", "gc", "Remove index data nothing uses any more"),
