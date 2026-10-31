@@ -15,6 +15,7 @@ pub mod oid;
 pub mod pack;
 pub mod refs;
 pub mod repo;
+pub mod rev;
 mod sha1;
 #[doc(hidden)]
 pub mod test_support;
@@ -40,7 +41,7 @@ pub use http_sync::{
 pub use index::{Index, IndexEntry};
 pub use merge::{find_merge_base, merge3_text, merge_trees, MergeResult, TreeMergeEntry};
 pub use object::{Object, ObjectKind};
-pub use oid::ObjectId;
+pub use oid::{ObjectId, ObjectIdPrefix};
 pub use refs::{Ref, RefTarget};
 pub use repo::{repository_paths, resolve_commondir, resolve_gitfile, FirstParents, Repository, RepositoryPaths};
 pub use tree::{Tree, TreeEntry};
