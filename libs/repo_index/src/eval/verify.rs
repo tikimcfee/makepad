@@ -16,7 +16,7 @@
 //! circles that are not configured here are not checked.
 
 use crate::{
-    circles, eval::pointer, AbsentScope, Anchor, BaseCircle, BaseSource, CircleBody, CircleManifest, Drift, Error, GoldDrift,
+    circles, eval::pointer, AbsentScope, Anchor, BaseCircle, BaseSource, CircleBody, CircleManifest, CircleName, Drift, Error, GoldDrift,
     GoldTarget, Oid, Question, Repo, RevSpec, TreeFile, INDEX_OWN_DATA,
 };
 use std::collections::HashMap;
@@ -150,6 +150,127 @@ struct Needle {
     as_fn: bool,
     /// Matched case-insensitively (`text` is lowercase): an absence's `term`.
     fold: bool,
+}
+
+/// A block's claim that a term occurs nowhere in its circle at a revision.
+#[derive(Clone, Debug)]
+pub struct Claim {
+    pub id: String,
+    pub circle: CircleName,
+    pub rev: RevSpec,
+    pub term: String,
+}
+
+/// Whether `hay` (lowercase) holds `word` (lowercase) as a whole word: not inside a longer
+/// identifier (letters, digits and `_` around it), so `overlay` is not in `run_overlay_used`.
+pub fn has_word(hay: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    !word.is_empty()
+        && hay.match_indices(word).any(|(i, _)| {
+            !hay[..i].chars().next_back().is_some_and(ident) && !hay[i + word.len()..].chars().next().is_some_and(ident)
+        })
+}
+
+/// A path-shaped term without a `:line` or `:start-end` suffix.
+fn path_term(t: &str) -> &str {
+    match t.rsplit_once(':') {
+        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '-') => p,
+        _ => t,
+    }
+}
+
+/// For each claim, how many of its circle's records at its revision hold the term: in a tree
+/// circle, a path-shaped term (query's rule) counts the files whose path is it, lies under it
+/// or ends with it, and any other term the files whose text or path holds it as a whole word,
+/// case-insensitively (the circle's exclusions apply; one pass per tree for all its claims); in
+/// a history circle, the reachable commits whose message or touched paths hold it as a word; in
+/// a notes circle, the files whose text or path does. A circle of another repo is not checked
+/// here (0, said on stderr).
+pub fn occurrences(repo: &mut dyn Repo, manifest: &CircleManifest, claims: &[Claim]) -> Result<Vec<u64>, Error> {
+    let mut out = vec![0u64; claims.len()];
+    let root = repo.root();
+    // (circle, tree) -> claim indices, for one pass per tree
+    let mut by_tree: HashMap<(String, Oid), Vec<usize>> = HashMap::new();
+    let mut by_history: HashMap<Oid, Vec<usize>> = HashMap::new();
+    let mut by_notes: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in claims.iter().enumerate() {
+        let Some(CircleBody::Base(def)) = manifest.defs.iter().find(|d| d.name == c.circle).map(|d| &d.body) else { continue };
+        match &def.source {
+            BaseSource::Tree { root: r } if std::fs::canonicalize(r).ok() == std::fs::canonicalize(&root).ok() => {
+                let rev = repo.resolve(&c.rev)?;
+                by_tree.entry((c.circle.0.clone(), rev.tree)).or_default().push(i);
+            }
+            BaseSource::History { root: r, .. } if std::fs::canonicalize(r).ok() == std::fs::canonicalize(&root).ok() => {
+                let rev = repo.resolve(&c.rev)?;
+                by_history.entry(rev.commit).or_default().push(i);
+            }
+            BaseSource::Notes { .. } => by_notes.entry(c.circle.0.clone()).or_default().push(i),
+            _ => eprintln!("makepad index: eval: {}'s absence of `{}` is not checked (another repo)", c.circle.0, c.term),
+        }
+    }
+    let def_of = |name: &str| match manifest.defs.iter().find(|d| d.name.0 == name).map(|d| &d.body) {
+        Some(CircleBody::Base(b)) => Some(b),
+        _ => None,
+    };
+    for ((circle, tree), idx) in by_tree {
+        let Some(def) = def_of(&circle) else { continue };
+        // a path-shaped term (query's own rule) is absent when no file's path is it, lies under
+        // it or ends with it; any other term when no file's text or path holds it as a word
+        let (paths, texts): (Vec<usize>, Vec<usize>) = idx.iter().partition(|i| crate::query::rank::path_shaped(path_term(&claims[**i].term)));
+        let words: Vec<String> = texts.iter().map(|i| claims[*i].term.to_lowercase()).collect();
+        for f in repo.files(tree)? {
+            if circles::excluded(def, &f.path).is_some() {
+                continue;
+            }
+            for i in &paths {
+                let p = path_term(&claims[*i].term).trim_end_matches('/');
+                if f.path == p || f.path.starts_with(&format!("{p}/")) || f.path.ends_with(&format!("/{p}")) {
+                    out[*i] += 1;
+                }
+            }
+            if words.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&repo.read_blob(f.blob)?).to_lowercase();
+            let path = f.path.to_lowercase();
+            for (k, w) in words.iter().enumerate() {
+                if has_word(&text, w) || has_word(&path, w) {
+                    out[texts[k]] += 1;
+                }
+            }
+        }
+    }
+    for (commit, idx) in by_history {
+        let words: Vec<String> = idx.iter().map(|i| claims[*i].term.to_lowercase()).collect();
+        for c in repo.commits(&[commit], &[])? {
+            let hay = format!("{}\n{}", c.message, c.touched.join("\n")).to_lowercase();
+            for (k, w) in words.iter().enumerate() {
+                if has_word(&hay, w) {
+                    out[idx[k]] += 1;
+                }
+            }
+        }
+    }
+    for (circle, idx) in by_notes {
+        let Some(def @ BaseCircle { source: BaseSource::Notes { sources }, .. }) = def_of(&circle) else { continue };
+        let words: Vec<String> = idx.iter().map(|i| claims[*i].term.to_lowercase()).collect();
+        for s in sources {
+            for (rel, full) in crate::open::walk_files(&s.dir)? {
+                if circles::excluded(def, &rel).is_some() {
+                    continue;
+                }
+                let bytes = std::fs::read(&full).map_err(|error| Error::Io { context: format!("absence check {}", full.display()), error })?;
+                let text = String::from_utf8_lossy(&bytes).to_lowercase();
+                let path = rel.to_lowercase();
+                for (k, w) in words.iter().enumerate() {
+                    if has_word(&text, w) || has_word(&path, w) {
+                        out[idx[k]] += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Re-resolves every gold item.
@@ -374,6 +495,46 @@ mod tests {
         let got: Vec<String> = verify(&mut repo, &m, &questions).unwrap().iter().map(|d| format!("{}#{} {:?}", d.id, d.gold, d.drift)).collect();
         // case-insensitive; the eval data is never searched; history looks at messages, not files
         assert_eq!(got, ["files#0 NoLongerAbsent { hits: 1 }", "hist#0 NoLongerAbsent { hits: 1 }"]);
+    }
+
+    #[test]
+    fn a_claimed_absence_is_checked_against_the_circle_at_its_revision() {
+        let root = std::env::temp_dir().join(format!("repo-index-occurs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        let rev = repo.rev(
+            &["9a76551d7"],
+            1,
+            &[
+                ("a.rs", "// Uses FOO_ here, and run_overlay_used\n"),
+                ("libs/repo_index/eval/questions.jsonl", "bar_term\n"),
+            ],
+        );
+        repo.commits = vec![CommitRecord { oid: rev.commit, info: CommitInfo { time: 0, parents: vec![] }, message: "fix Baz handling".into(), touched: vec!["q.rs".into()] }];
+        let m = circles::manifest_for(&root, None, &root).unwrap();
+        let claim = |circle: &str, term: &str| Claim { id: "q".into(), circle: CircleName(circle.into()), rev: RevSpec::Pinned("9a76551d7".into()), term: term.into() };
+        let claims = [
+            claim("makepad", "foo_"),           // occurs (case-insensitive): a false absence
+            claim("makepad", "overlay"),        // only inside an identifier: truly absent
+            claim("makepad", "bar_term"),       // only in the index's own eval data: truly absent
+            claim("makepad:history", "baz"),    // in a reachable commit message
+            claim("makepad:history", "q.rs"),   // a touched path
+            claim("makepad:history", "nowhere"),
+        ];
+        assert_eq!(occurrences(&mut repo, &m, &claims).unwrap(), [1, 0, 0, 1, 1, 0]);
+        // a path-shaped term is judged on paths: mentioned in a text, but no such file, is absent
+        let mut repo2 = FakeRepo::new(&root);
+        repo2.rev(&["9a76551d7"], 1, &[("README.md", "see examples/demo/REVIEW.md and push-tree.sh\n"), ("tools/run/push.rs", "x\n"), ("libs/a/b.rs", "x\n")]);
+        let paths = [
+            claim("makepad", "examples/demo/REVIEW.md"), // only mentioned: truly absent
+            claim("makepad", "push-tree.sh"),            // only mentioned: truly absent
+            claim("makepad", "push.rs"),                 // a file ends with it
+            claim("makepad", "libs/a"),                  // a directory holds files
+            claim("makepad", "a/b.rs:12"),               // with a line suffix
+        ];
+        assert_eq!(occurrences(&mut repo2, &m, &paths).unwrap(), [0, 0, 1, 1, 1]);
+        assert!(has_word("a b_c d", "b_c") && !has_word("ab_c", "b_c") && !has_word("x", ""));
     }
 
     #[test]

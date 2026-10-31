@@ -215,7 +215,7 @@ pub fn classify(raw: &str) -> (String, Class) {
 
 /// `a/b`, `a/`, or `name.ext` (a stem of two or more characters, an extension of one to eight
 /// alphanumerics holding a letter).
-fn path_shaped(s: &str) -> bool {
+pub(crate) fn path_shaped(s: &str) -> bool {
     if s.contains('/') {
         return !s.contains("::");
     }

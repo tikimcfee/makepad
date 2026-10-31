@@ -81,7 +81,15 @@ struct RunCtx<'a> {
 }
 
 impl Eval<'_> {
-    fn run_group(&mut self, ctx: &RunCtx, rev: &RevSpec, circles_of: &[CircleName], group: &[&Question], report: &mut EvalReport) {
+    fn run_group(
+        &mut self,
+        ctx: &RunCtx,
+        rev: &RevSpec,
+        circles_of: &[CircleName],
+        group: &[&Question],
+        report: &mut EvalReport,
+        claims: &mut Vec<verify::Claim>,
+    ) {
         let RunCtx { manifest, configured, opts, stale } = *ctx;
         let opened = match self.circles.open(manifest, circles_of, rev) {
             Ok(o) => o,
@@ -125,8 +133,8 @@ impl Eval<'_> {
             if stale.contains(&q.id) {
                 continue;
             }
-            if scored.false_absence {
-                report.failures.push(format!("{}: false absence (absent claimed, gold exists)", q.id));
+            for (circle, term) in scored.absent_claims {
+                claims.push(verify::Claim { id: q.id.clone(), circle, rev: rev.clone(), term });
             }
             if scored.rows.is_empty() {
                 report.failures.push(format!("{}: no block for {:?}", q.id, names(&q.circles)));
@@ -287,8 +295,22 @@ impl Harness for Eval<'_> {
         }
         let stale: Vec<String> = report.stale.iter().map(|(id, _)| id.clone()).collect();
         let ctx = RunCtx { manifest: &manifest, configured: &configured, opts, stale: &stale };
+        let mut claims: Vec<verify::Claim> = Vec::new();
         for ((rev, circles_of), group) in &groups {
-            self.run_group(&ctx, rev, circles_of, group, &mut report);
+            self.run_group(&ctx, rev, circles_of, group, &mut report, &mut claims);
+        }
+        // a false absence is a named absent term that does occur in its circle at the revision
+        let counts = verify::occurrences(self.repo, &manifest, &claims)?;
+        for (c, n) in claims.iter().zip(counts) {
+            if n > 0 {
+                report.failures.push(format!(
+                    "{}: false absence: {} says `{}` is absent at {}, but {n} of its records hold it",
+                    c.id,
+                    c.circle.0,
+                    c.term,
+                    rev_text(&c.rev)
+                ));
+            }
         }
         if let Some(save) = &opts.save {
             let previous = latest_run(save)?;
@@ -652,6 +674,13 @@ mod tests {
         }
     }
 
+    /// The harness's own repo in a test: the same revisions as the circles' repo.
+    fn mirror(root: &Path, files: &[(&str, &str)]) -> FakeRepo {
+        let mut r = FakeRepo::new(root);
+        r.rev(&["9a76551d7", "HEAD", "refs/remotes/upstream/work", "refs/heads/work"], 1, files);
+        r
+    }
+
     fn path(p: &str, line: Option<u32>) -> GoldTarget {
         GoldTarget::Path { path: p.into(), line, end: None, alt_lines: Vec::new() }
     }
@@ -666,15 +695,22 @@ mod tests {
         let (mut circles, _) = opener(repo, &root.join("none.conf"));
         let mut answers = HashMap::new();
         answers.insert("alpha".into(), FindOutput { blocks: vec![block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false)], pointers: vec![] });
-        answers.insert("beta".into(), FindOutput { blocks: vec![block("makepad", vec![hit("b.rs", 1, Kind::Fn, "b")], true)], pointers: vec![] });
+        let mut wrong = block("makepad", vec![hit("b.rs", 1, Kind::Fn, "b")], true);
+        wrong.absent_terms = vec!["a".into()]; // a.rs holds `a`: a false absence
+        answers.insert("beta".into(), FindOutput { blocks: vec![wrong], pointers: vec![] });
+        // real hits and a true absence together: no failure
+        let mut truthful = block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], true);
+        truthful.absent_terms = vec!["zz_nowhere".into()];
+        answers.insert("gamma".into(), FindOutput { blocks: vec![truthful], pointers: vec![] });
         let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
-        let mut verify_repo = FakeRepo::new(&root);
+        let mut verify_repo = mirror(&root, &[("a.rs", "fn a() {}\n")]);
         let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut verify_repo, root: root.clone() };
         let mut pre = Question { precondition: Some(Precondition::Unconfigured(CircleName("makepad:history".into()))), ..q("pre", &["makepad"], vec![(2, path("a.rs", None))]) };
         pre.query = "alpha".into();
         let questions = vec![
             Question { query: "alpha".into(), ..q("w1", &["makepad"], vec![(2, path("a.rs", Some(1)))]) },
             Question { query: "beta".into(), ..q("w2", &["makepad"], vec![(2, path("a.rs", None))]) },
+            Question { query: "gamma".into(), ..q("w3", &["makepad"], vec![(2, path("a.rs", Some(1)))]) },
             Question { query: "x".into(), ..q("n05", &["notes:nope"], vec![(2, GoldTarget::Error("unconfigured circle".into()))]) },
             Question { query: "x".into(), ..q("loc", &["notes:topic"], vec![(2, path("a.md", None))]) },
             pre,
@@ -682,12 +718,12 @@ mod tests {
         let runs = root.parent().unwrap().join("runs");
         let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: Some(runs.join("one.jsonl")) };
         let report = eval.run(&questions, &opts).unwrap();
-        assert_eq!(search.calls.borrow().len(), 2, "w1 and w2 share one open of makepad");
+        assert_eq!(search.calls.borrow().len(), 3, "w1, w2 and w3 share one open of makepad");
         let skipped: Vec<&str> = report.skipped.iter().map(|(i, _)| i.as_str()).collect();
         assert_eq!(skipped, ["loc", "pre"]);
         let solved: Vec<(&str, bool)> = report.rows.iter().map(|r| (r.id.as_str(), r.solved)).collect();
-        assert_eq!(solved, [("n05", true), ("w1", true), ("w2", false)]);
-        assert_eq!(report.failures, ["w2: false absence (absent claimed, gold exists)"]);
+        assert_eq!(solved, [("n05", true), ("w1", true), ("w2", false), ("w3", true)]);
+        assert_eq!(report.failures, ["w2: false absence: makepad says `a` is absent at 9a76551d7, but 1 of its records hold it"]);
         assert!(report_text(&report, &|_| "where".into()).contains("FAIL w2"));
         // a later run that ranks worse fails against the saved one
         let mut worse = report.clone();
@@ -733,7 +769,7 @@ mod tests {
             }
         }
         let spy = Spy(&search, &others);
-        let mut r = FakeRepo::new(&root);
+        let mut r = mirror(&root, &[]);
         let mut eval = Eval { circles: &mut circles, search: &spy, render: &LenRender, repo: &mut r, root: root.clone() };
         let pointer = GoldTarget::Pointer { circle: CircleName("notes:t".into()), count: None, unit: crate::PointerUnit::Blobs };
         let opts = EvalOpts { mode: EvalMode::Retrieval, sets: vec![], circles: vec![], k: 10, json: false, save: None };
@@ -757,7 +793,7 @@ mod tests {
         let mut answers = HashMap::new();
         answers.insert("alpha".into(), FindOutput { blocks: vec![block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false)], pointers: vec![] });
         let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
-        let mut r = FakeRepo::new(&root);
+        let mut r = mirror(&root, &[]);
         let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
         let questions: Vec<Question> =
             ["w1", "w2"].iter().map(|id| Question { query: "alpha".into(), ..q(id, &["makepad"], vec![(2, path("a.rs", Some(1)))]) }).collect();
@@ -784,7 +820,7 @@ mod tests {
         let mut answers = HashMap::new();
         answers.insert("x".to_string(), FindOutput { blocks: vec![block("makepad", vec![], true)], pointers: vec![] });
         let search = TableSearch { answers, calls: RefCell::new(Vec::new()) };
-        let mut r = FakeRepo::new(&root);
+        let mut r = mirror(&root, &[]);
         let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
         let m = eval.circles.manifest().unwrap();
         let pinned = notes_stamps(&m).unwrap()[0].1;
@@ -801,7 +837,7 @@ mod tests {
         let mut leaking = HashMap::new();
         leaking.insert("x".to_string(), FindOutput { blocks: vec![block("makepad", vec![hit("local/agent_state/port/g.rs", 1, Kind::Fn, "g")], false)], pointers: vec![] });
         let search2 = TableSearch { answers: leaking, calls: RefCell::new(Vec::new()) };
-        let mut r2 = FakeRepo::new(&root);
+        let mut r2 = mirror(&root, &[]);
         let (mut circles2, _) = opener(
             {
                 let mut repo = FakeRepo::new(&root);
@@ -826,7 +862,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (mut circles, _) = opener(FakeRepo::new(&root), &root.join("none.conf"));
         let search = TableSearch { answers: HashMap::new(), calls: RefCell::new(Vec::new()) };
-        let mut r = FakeRepo::new(&root);
+        let mut r = mirror(&root, &[]);
         let mut eval = Eval { circles: &mut circles, search: &search, render: &LenRender, repo: &mut r, root: root.clone() };
         let opts = EvalOpts { mode: EvalMode::Agent, sets: vec![], circles: vec![], k: 10, json: false, save: None };
         let report = eval.run(&[q("a", &["makepad"], vec![(2, path("a", None))])], &opts).unwrap();

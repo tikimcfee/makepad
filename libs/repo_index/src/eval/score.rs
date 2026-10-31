@@ -11,8 +11,13 @@
 //! - `dependents` need the `crate` card, so retrieval mode skips them, reported as skipped.
 //!
 //! An item whose `requires` circle is not configured is skipped. A question is solved when all
-//! its scorable rel-2 items match in some block. Any absent item, of any rel, exempts the
-//! question from the false-absence gate.
+//! its scorable rel-2 items match in some block.
+//!
+//! Absence is judged per term ([`CircleBlock::absent_terms`]): a block may rank real hits and
+//! truthfully say a named term occurs nowhere in its circle. So the scorer only collects each
+//! block's named absent terms ([`Scored::absent_claims`]); whether a claim is false (the term
+//! does occur in that circle at the revision) is checked lexically by the harness
+//! ([`crate::eval::verify::occurrences`]), whatever the gold says.
 
 use crate::{AbsentScope, CircleBlock, CircleName, FindOutput, Gold, GoldTarget, Hit, Kind, Lines, Question, QuestionRow, Target};
 
@@ -155,8 +160,8 @@ fn ndcg(hits: &[&Hit], gold: &[(u8, &GoldTarget)]) -> f32 {
 pub struct Scored {
     pub rows: Vec<QuestionRow>,
     pub solved: bool,
-    /// Absent was claimed though no gold item is an absence.
-    pub false_absence: bool,
+    /// Each block's named absent terms, as (circle, term), for the false-absence check.
+    pub absent_claims: Vec<(CircleName, String)>,
     pub forbidden: u32,
 }
 
@@ -223,8 +228,15 @@ pub fn score(q: &Question, out: &FindOutput, k: usize, bytes: u32, ms: f32, conf
     for r in &mut rows {
         r.solved = solved;
     }
-    let has_absent = q.gold.iter().any(|g| matches!(g.target, GoldTarget::Absent { .. }));
-    Scored { rows, solved, false_absence: !has_absent && blocks.iter().any(|b| b.absent), forbidden: forbidden_total }
+    let mut absent_claims: Vec<(CircleName, String)> = Vec::new();
+    for b in &blocks {
+        for t in &b.absent_terms {
+            if !absent_claims.iter().any(|(c, x)| c == &b.circle && x == t) {
+                absent_claims.push((b.circle.clone(), t.clone()));
+            }
+        }
+    }
+    Scored { rows, solved, absent_claims, forbidden: forbidden_total }
 }
 
 #[cfg(test)]
@@ -336,7 +348,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn absence_pointers_requires_and_the_false_absence_gate() {
+    fn absence_pointers_requires_and_absent_claims() {
         let n = |s: &str| CircleName(s.into());
         let pointer = Pointer { circle: Some(n("notes:t")), branch: None, count: 9, unit: PointerUnit::Blobs, commits: 0, sample: String::new() };
         let mut question = q(
@@ -349,7 +361,8 @@ pub(crate) mod tests {
         );
         let absent = FindOutput { blocks: vec![block("makepad", vec![], true)], pointers: vec![pointer.clone()] };
         let s = score(&question, &absent, 10, 0, 0.0, &mk());
-        assert!(s.solved && !s.false_absence);
+        assert!(s.solved);
+        assert_eq!(s.absent_claims, [(n("makepad"), "makepad".to_string())], "the block's named absent terms, once");
         let wrong_count = FindOutput { pointers: vec![Pointer { count: 8, ..pointer.clone() }], ..absent.clone() };
         assert!(!score(&question, &wrong_count, 10, 0, 0.0, &mk()).solved);
         // an item that needs an unconfigured circle is skipped, not failed
@@ -357,14 +370,18 @@ pub(crate) mod tests {
         let s = score(&question, &FindOutput { pointers: vec![], ..absent.clone() }, 10, 0, 0.0, &mk());
         assert!(s.solved);
         assert_eq!(s.rows[0].skipped_items, 1);
-        // absent claimed with no absent gold: a false absence
+        // a block can rank real hits and still name an absent term: both are reported
+        let mut both = block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false);
+        both.absent = true;
+        both.absent_terms = vec!["FOO_".into()];
         let plain = q("w", &["makepad"], vec![(2, path("a.rs", None))]);
-        assert!(score(&plain, &absent, 10, 0, 0.0, &mk()).false_absence);
-        // a premise absence (rel 1) exempts the question, and a fn scope looks at definitions
+        let s = score(&plain, &FindOutput { blocks: vec![both], pointers: vec![] }, 10, 0, 0.0, &mk());
+        assert!(s.solved);
+        assert_eq!(s.absent_claims, [(n("makepad"), "FOO_".to_string())]);
+        // a fn scope looks at definitions
         let premise = q("w22", &["makepad"], vec![(2, path("jit.rs", Some(1243))), (1, GoldTarget::Absent { scope: Some(AbsentScope::Fn("unit_here".into())), semantic: false, term: None })]);
         let out = FindOutput { blocks: vec![block("makepad", vec![hit("jit.rs", 1243, Kind::Fn, "cur_unit")], true)], pointers: vec![] };
-        let s = score(&premise, &out, 10, 0, 0.0, &mk());
-        assert!(s.solved && !s.false_absence);
+        assert!(score(&premise, &out, 10, 0, 0.0, &mk()).solved);
     }
 
     #[test]
