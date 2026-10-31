@@ -224,3 +224,6 @@ impl Store for FsStore {
         gc::run(self, live_bases, live_circles)
     }
 }
+
+#[cfg(test)]
+mod tests;
