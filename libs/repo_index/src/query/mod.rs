@@ -58,8 +58,10 @@ struct BlockRank {
     name: CircleName,
     rev: String,
     entries: Vec<Scored>,
+    total: u64,
     definitions: u64,
     near: Vec<Scored>,
+    absent_terms: Vec<String>,
 }
 
 fn circle_rev(c: &OpenCircle) -> String {
@@ -111,8 +113,8 @@ impl Engine {
             CircleExpr::Circle(name) => {
                 let ci = circle_index(opened, name)?;
                 let c = &opened.open[ci];
-                let Ranked { entries, definitions, near } = rank(c, ci, plan, filter);
-                vec![BlockRank { name: name.clone(), rev: circle_rev(c), entries, definitions, near }]
+                let Ranked { entries, total, definitions, near, absent_terms, .. } = rank(c, ci, plan, filter, rank::KEEP);
+                vec![BlockRank { name: name.clone(), rev: circle_rev(c), entries, total, definitions, near, absent_terms }]
             }
             CircleExpr::Select { of, by } => {
                 let mut f = filter.clone();
@@ -145,6 +147,8 @@ impl Engine {
                     };
                     b.entries.retain(|e| shares(e));
                     b.near.retain(|e| shares(e));
+                    // Counted over the ranked entries kept, not the whole circle.
+                    b.total = b.entries.len() as u64;
                     b.definitions = b.entries.iter().filter(|e| e.definition).count() as u64;
                     b.name = CircleName(format!("{} & {}", b.name.0, rights.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join("+")));
                     out.push(b);
@@ -160,7 +164,7 @@ impl Engine {
         let limit = if query.limit == 0 { crate::DEFAULT_LIMIT } else { query.limit };
         let def_mode = query.mode == Mode::Def;
         let (pool, nearest_pool): (Vec<&Scored>, Vec<&Scored>) = if def_mode {
-            let defs: Vec<&Scored> = b.entries.iter().filter(|e| e.pinned).collect();
+            let defs: Vec<&Scored> = b.entries.iter().filter(|e| matches!(e.pin, 2 | 3)).collect();
             let near: Vec<&Scored> = if defs.is_empty() { b.entries.iter().chain(b.near.iter()).take(rank::NEAREST).collect() } else { Vec::new() };
             (defs, near)
         } else {
@@ -169,7 +173,7 @@ impl Engine {
         let selected = group(opened, &pool, limit);
         let hits = selected.into_iter().map(|e| build_hit(opened, e, ctx)).collect();
         let nearest = nearest_pool.into_iter().take(rank::NEAREST).map(|e| build_hit(opened, e, ctx)).collect();
-        let total = b.entries.len() as u64;
+        let total = b.total;
         CircleBlock {
             circle: b.name,
             rev: b.rev,
@@ -177,7 +181,7 @@ impl Engine {
             definitions: b.definitions,
             uses: total - b.definitions,
             hits,
-            absent: total == 0,
+            absent: total == 0 || !b.absent_terms.is_empty(),
             nearest,
         }
     }
@@ -193,7 +197,17 @@ fn group<'a>(opened: &Opened, ranked: &[&'a Scored], limit: usize) -> Vec<&'a Sc
         if picked.len() >= limit {
             break;
         }
-        let key = (e.circle, view(&opened.open[e.circle], e.at).package.to_string());
+        // Chunks with no package (docs, notes, splash outside a crate) group by their file.
+        let v = view(&opened.open[e.circle], e.at);
+        // A chunk with neither (a commit) is a group of its own.
+        let key = (
+            e.circle,
+            match (v.package.is_empty(), v.path.is_empty()) {
+                (false, _) => v.package.to_string(),
+                (true, false) => v.path.to_string(),
+                (true, true) => format!("#{}", picked.len()),
+            },
+        );
         let n = per.entry(key.clone()).or_insert(0);
         if *n >= crate::HITS_PER_GROUP {
             continue;
@@ -212,6 +226,12 @@ fn fuse_by_rank(blocks: Vec<BlockRank>) -> BlockRank {
     let name = CircleName(blocks.iter().map(|b| b.name.0.as_str()).collect::<Vec<_>>().join("+"));
     let rev = blocks.iter().map(|b| b.rev.as_str()).find(|r| !r.is_empty()).unwrap_or("").to_string();
     let definitions = blocks.iter().map(|b| b.definitions).sum();
+    let total = blocks.iter().map(|b| b.total).sum();
+    let mut absent_terms: Vec<String> = Vec::new();
+    for b in &blocks {
+        absent_terms.extend(b.absent_terms.iter().filter(|t| blocks.iter().all(|o| o.absent_terms.contains(t))).cloned());
+    }
+    absent_terms.dedup();
     let mut entries = Vec::new();
     let mut near = Vec::new();
     for b in blocks {
@@ -224,11 +244,11 @@ fn fuse_by_rank(blocks: Vec<BlockRank>) -> BlockRank {
             near.push(e);
         }
     }
-    let by = |a: &Scored, b: &Scored| b.pinned.cmp(&a.pinned).then(b.score.total_cmp(&a.score)).then(a.circle.cmp(&b.circle));
+    let by = |a: &Scored, b: &Scored| b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score)).then(a.circle.cmp(&b.circle));
     entries.sort_by(by);
     near.sort_by(by);
     near.truncate(rank::NEAREST);
-    BlockRank { name, rev, entries, definitions, near }
+    BlockRank { name, rev, entries, total, definitions, near, absent_terms }
 }
 
 fn base_names(expr: &CircleExpr) -> Vec<CircleName> {

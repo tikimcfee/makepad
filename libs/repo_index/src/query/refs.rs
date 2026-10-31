@@ -26,7 +26,7 @@ pub fn refs(opened: &Opened, ident: &str, uses: bool) -> Result<RefsOutput, Erro
         covered: 1,
         primary: true,
         definition: true,
-        pinned: true,
+        pin: 2,
         why: Vec::new(),
         also_at: Vec::new(),
     };
