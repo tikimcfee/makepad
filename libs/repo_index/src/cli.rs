@@ -5,9 +5,8 @@
 //! A verb runs over [`Parts`]: the circle registry and opener, ranking, rendering, and git reads
 //! in the repo the caller stands in. Every query names its circles with `--in`, or takes the
 //! default scope of the directory it runs in; a circle that is not configured is an error, never
-//! an empty answer (PLAN §2). Handles are what hits print (PLAN §5): `path:line[-end]`,
-//! `path::Item`, `crate:<package>`, a commit's hex, any of them prefixed by `<circle>/` and
-//! suffixed by `@<rev>`.
+//! an empty answer (PLAN §2). Handles are what hits print (PLAN §5), parsed by
+//! [`crate::query::handle::parse`]; `--kind` words by [`crate::query::kind_filter`].
 
 use crate::{
     circles, eval, ChunkAt, CircleExpr, CircleManifest, CircleName, CircleStatus, Circles, CrateView, Detail, Error, EvalMode,
@@ -18,7 +17,7 @@ use crate::{
 use crate::extract::{git::GitRepo, notes::Cite, Extractor};
 use crate::open::{Opener, RepoOpener};
 use crate::output::Renderer;
-use crate::query::Engine;
+use crate::query::{self, Engine};
 use crate::store::{index_root, FsStore};
 use crate::terms::Terms;
 use std::collections::HashMap;
@@ -165,55 +164,6 @@ pub fn parse_args(args: &[String], valued: &[&'static str], boolean: &[&'static 
     Ok(out)
 }
 
-/// Parses a handle as hits print it; `circles` are the configured names (for the prefix).
-pub fn parse_handle(text: &str, manifest: &CircleManifest) -> Result<Handle, String> {
-    let bad = || format!("`{text}` is not a handle (path:line[-end], path::Item, crate:<package> or a commit hex)");
-    let (body, rev) = match text.rsplit_once('@') {
-        Some((b, r)) if !r.is_empty() && !r.contains('/') => (b, Some(r.to_string())),
-        _ => (text, None),
-    };
-    let mut circle = None;
-    let mut rest = body;
-    let mut best = 0;
-    for d in &manifest.defs {
-        if let Some(r) = body.strip_prefix(&format!("{}/", d.name.0)) {
-            if d.name.0.len() > best {
-                best = d.name.0.len();
-                circle = Some(d.name.clone());
-                rest = r;
-            }
-        }
-    }
-    if rest.is_empty() {
-        return Err(bad());
-    }
-    let target = if let Some(pkg) = rest.strip_prefix("crate:") {
-        Target::Crate(pkg.to_string())
-    } else if rest.len() >= 7 && rest.len() <= 40 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Target::Commit(rest.to_ascii_lowercase())
-    } else if let Some((path, item)) = rest.split_once("::") {
-        if path.is_empty() || item.is_empty() {
-            return Err(bad());
-        }
-        Target::Item { path: path.to_string(), item: item.to_string() }
-    } else {
-        let (path, range) = rest.rsplit_once(':').ok_or_else(bad)?;
-        let num = |s: &str| s.parse::<u32>().ok().filter(|n| *n > 0);
-        let lines = match range.split_once('-') {
-            Some((a, b)) => Lines { start: num(a).ok_or_else(bad)?, end: num(b).ok_or_else(bad)? },
-            None => {
-                let n = num(range).ok_or_else(bad)?;
-                Lines { start: n, end: n }
-            }
-        };
-        if path.is_empty() || lines.end < lines.start {
-            return Err(bad());
-        }
-        Target::Lines { path: path.to_string(), lines }
-    };
-    Ok(Handle { circle, target, rev })
-}
-
 /// Runs one verb (`args[0]`), writing its answer to `out` and errors to `err`.
 pub fn run(parts: &mut Parts, args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let verb = args.first().map(String::as_str).unwrap_or("");
@@ -309,7 +259,7 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
                 _ => (Mode::Find, None),
             };
             let kinds: Vec<KindFilter> = match a.value("--kind") {
-                Some(k) => circles::parse_kinds(k).map_err(usage_err)?,
+                Some(k) => k.split(',').map(|w| query::kind_filter(w.trim()).ok_or_else(|| usage_err(format!("unknown kind `{w}`")))).collect::<Result<_, _>>()?,
                 None => Vec::new(),
             };
             let limit = match a.value("-n") {
@@ -342,7 +292,11 @@ fn dispatch(parts: &mut Parts, verb: &str, args: &[String], out: &mut dyn Write)
                 None => 0,
             };
             let manifest = parts.circles.manifest()?;
-            let handle = parse_handle(handle_text, &manifest).map_err(usage_err)?;
+            let bare: Vec<CircleName> = manifest.defs.iter().map(|d| d.name.clone()).filter(|n| !n.0.contains(':')).collect();
+            let handle = query::handle::parse(handle_text, &bare).map_err(|e| match e {
+                Error::Parse { message, .. } => usage_err(message),
+                e => Failure::Error(e),
+            })?;
             let exprs = match &handle.circle {
                 Some(c) => vec![CircleExpr::Circle(c.clone())],
                 None => scope(parts, &manifest, &a, None)?,
@@ -840,7 +794,8 @@ mod tests {
         assert!(parse_args(&["--bogus".into()], &[], &[]).is_err());
         assert!(parse_args(&["--in".into()], &["--in"], &[]).is_err());
         let m = circles::manifest_for(Path::new("/r/makepad"), Some((Path::new("c"), "notes:t = notes /n/t\n")), Path::new("/h")).unwrap();
-        let h = |s: &str| parse_handle(s, &m);
+        let bare: Vec<CircleName> = m.defs.iter().map(|d| d.name.clone()).filter(|n| !n.0.contains(':')).collect();
+        let h = |s: &str| query::handle::parse(s, &bare);
         assert_eq!(h("src/a.rs:3-9").unwrap().target, Target::Lines { path: "src/a.rs".into(), lines: Lines { start: 3, end: 9 } });
         assert_eq!(h("src/a.rs::Gizmo::spin").unwrap().target, Target::Item { path: "src/a.rs".into(), item: "Gizmo::spin".into() });
         assert_eq!(h("crate:makepad-hal").unwrap().target, Target::Crate("makepad-hal".into()));
@@ -849,7 +804,8 @@ mod tests {
         assert_eq!((n.circle.unwrap().0, n.rev.unwrap()), ("notes:t".to_string(), "9a76551d7".to_string()));
         assert!(matches!(n.target, Target::Lines { ref path, .. } if path == "t/PLAN.md"));
         assert_eq!(h("makepad:history/abc1234").unwrap().circle, Some(CircleName("makepad:history".into())));
-        for bad in ["src/a.rs", "a.rs:0", "a.rs:9-3", "a.rs:x", "::x", "notes:t/"] {
+        assert_eq!(h("src/a.rs").unwrap().target, Target::Lines { path: "src/a.rs".into(), lines: Lines::default() }, "a bare path is the whole file");
+        for bad in ["a.rs:0", "a.rs:9-3", "a.rs:x", "::x", "a.rs::", "notes:t/"] {
             assert!(h(bad).is_err(), "{bad}");
         }
     }
@@ -881,7 +837,7 @@ mod tests {
         assert_eq!(out, "src/a.rs:2-4\n// b\nfn alpha() {}\n// d\n");
         let (code, _, err) = call(&mut p, &["show", "src/nothing.rs:1"]);
         assert!(code == 1 && err.contains("no record at"), "{err}");
-        assert_eq!(call(&mut p, &["show", "not-a-handle"]).0, 2);
+        assert_eq!(call(&mut p, &["show", "src/a.rs:x"]).0, 2);
     }
 
     #[test]

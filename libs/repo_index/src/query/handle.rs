@@ -32,6 +32,9 @@ pub fn parse(text: &str, known: &[CircleName]) -> Result<Handle, Error> {
     } else if (7..=40).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_hexdigit()) && !rest.contains('/') {
         Target::Commit(rest.to_ascii_lowercase())
     } else if let Some((path, item)) = rest.split_once("::") {
+        if path.is_empty() || item.is_empty() {
+            return Err(usage());
+        }
         Target::Item { path: path.to_string(), item: item.to_string() }
     } else if let Some((path, range)) = rest.rsplit_once(':') {
         let lines = match range.split_once('-') {

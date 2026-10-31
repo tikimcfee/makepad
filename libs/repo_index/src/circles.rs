@@ -27,8 +27,8 @@
 //! built-in names cannot be redefined. A derived circle may name circles defined after it.
 
 use crate::{
-    BaseCircle, BaseSource, CircleBody, CircleDef, CircleExpr, CircleManifest, CircleName, Error, Exclusion, Family, Fuse,
-    Kind, KindFilter, KeyKind, NotesSource, Origin, Provenance, Selector, INDEX_OWN_DATA,
+    query, BaseCircle, BaseSource, CircleBody, CircleDef, CircleExpr, CircleManifest, CircleName, Error, Exclusion, Family,
+    Fuse, KeyKind, NotesSource, Origin, Provenance, Selector, INDEX_OWN_DATA,
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -48,32 +48,6 @@ pub const COMMERCIAL_LOCAL: &[&str] = &["refs/heads/main"];
 pub const TREE_FAMILIES: &[Family] = &[Family::Crate, Family::File, Family::Item, Family::Doc, Family::Splash];
 pub const HISTORY_FAMILIES: &[Family] = &[Family::Commit];
 pub const NOTES_FAMILIES: &[Family] = &[Family::Note];
-
-/// Every kind, for `--kind` and `select .. kind`.
-pub const KINDS: &[Kind] = &[
-    Kind::Crate,
-    Kind::File,
-    Kind::Fn,
-    Kind::Method,
-    Kind::Struct,
-    Kind::Enum,
-    Kind::Union,
-    Kind::Trait,
-    Kind::Impl,
-    Kind::Mod,
-    Kind::Type,
-    Kind::Const,
-    Kind::Static,
-    Kind::Macro,
-    Kind::Doc,
-    Kind::Splash,
-    Kind::Commit,
-    Kind::Bullet,
-    Kind::Note,
-    Kind::NoteFile,
-];
-pub const FAMILIES: &[Family] =
-    &[Family::Crate, Family::File, Family::Item, Family::Doc, Family::Splash, Family::Commit, Family::Note];
 
 /// `~/.makepad/index` (`MAKEPAD_HOME` moves `~/.makepad`, as for devhub).
 pub fn index_home() -> Result<PathBuf, Error> {
@@ -277,7 +251,12 @@ fn parse_conf(
             }
             "select" => {
                 let by = match args {
-                    [_, "kind", kinds] => Selector::Kinds(parse_kinds(kinds).map_err(|m| parse_err(file, line, m))?),
+                    [_, "kind", kinds] => Selector::Kinds(
+                        kinds
+                            .split(',')
+                            .map(|w| query::kind_filter(w.trim()).ok_or_else(|| parse_err(file, line, format!("unknown kind `{w}`"))))
+                            .collect::<Result<_, _>>()?,
+                    ),
                     [_, "path", prefix] => Selector::PathPrefix(prefix.to_string()),
                     [_, "package", pkg] => Selector::Package(pkg.to_string()),
                     _ => {
@@ -386,25 +365,6 @@ fn add_notes(defs: &mut Vec<CircleDef>, existing: Option<usize>, cname: &CircleN
         }
     }
     Ok(())
-}
-
-/// `fn,struct,item`: kind names and family names; `crate`, `file`, `doc`, `splash` and `commit`
-/// mean the family.
-pub fn parse_kinds(list: &str) -> Result<Vec<KindFilter>, String> {
-    let mut out = Vec::new();
-    for w in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
-        if let Some(f) = FAMILIES.iter().find(|f| f.as_str() == w) {
-            out.push(KindFilter::Family(*f));
-        } else if let Some(k) = KINDS.iter().find(|k| k.as_str() == w) {
-            out.push(KindFilter::Kind(*k));
-        } else {
-            return Err(format!("unknown kind `{w}`"));
-        }
-    }
-    if out.is_empty() {
-        return Err("no kind given".into());
-    }
-    Ok(out)
 }
 
 /// The circle names an expression mentions, each once, in order.
