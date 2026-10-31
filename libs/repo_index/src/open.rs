@@ -18,7 +18,7 @@
 
 use crate::{
     circles, delta, BaseCircle, BaseSource, Chunk, CircleBody, CircleExpr, CircleManifest, CircleName, CircleStats, Circles,
-    Error, Extract, ManifestChange, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
+    Error, Extract, Key, ManifestChange, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
     SegmentSink, SourceStamp, Store, Tokenize, Visibility, INDEXER_VERSION,
 };
 use std::path::{Path, PathBuf};
@@ -79,6 +79,29 @@ fn repo_at<'a>(
         }
     };
     Ok(others[at].1.as_mut())
+}
+
+/// The package a path belongs to in a base: that of its own chunks, else of the nearest
+/// enclosing directory's `Cargo.toml` card (a file added since the base).
+pub fn base_package(segment: &dyn SegmentRead, path: &str) -> Option<String> {
+    let of = |p: &str| {
+        segment
+            .chunks_with(&Key::Path { path: p.to_string(), line: None })
+            .into_iter()
+            .map(|id| segment.chunk(id).package.to_string())
+            .find(|s| !s.is_empty())
+    };
+    if let Some(p) = of(path) {
+        return Some(p);
+    }
+    let mut dir = path;
+    while let Some((up, _)) = dir.rsplit_once('/') {
+        if let Some(p) = of(&format!("{up}/Cargo.toml")) {
+            return Some(p);
+        }
+        dir = up;
+    }
+    of("Cargo.toml")
 }
 
 fn sum_stats(segments: &[Box<dyn SegmentRead>]) -> CircleStats {
@@ -204,7 +227,9 @@ impl Opener {
                 };
                 let (overlay, shadowed) = match overlay_from.filter(|_| build) {
                     Some(base) => {
-                        let o = delta::overlay(repo, extract.as_mut(), tokenize.as_ref(), name, &def, &base, root)?;
+                        let package = |p: &str| base_package(segment.as_ref(), p);
+                        let over = delta::Over { circle: name, def: &def, base: &base, root, package: &package };
+                        let o = delta::overlay(repo, extract.as_mut(), tokenize.as_ref(), &over)?;
                         (o.files, o.shadowed)
                     }
                     None => (Vec::new(), Vec::new()),
@@ -276,11 +301,13 @@ impl Opener {
                 let up = repo.resolve(&RevSpec::Pinned(upstream.clone()))?;
                 let mut tips = vec![up.commit];
                 let mut local_tips = Vec::new();
+                let mut local_refs = Vec::new();
                 for r in local {
                     match repo.resolve(&RevSpec::Pinned(r.clone())) {
                         Ok(x) => {
                             tips.push(x.commit);
                             local_tips.push(x.commit);
+                            local_refs.push(short_ref(r));
                         }
                         Err(e) => eprintln!("makepad index: {}: local ref {r} not walked: {e}", name.0),
                     }
@@ -312,6 +339,7 @@ impl Opener {
                 let visible = Visibility {
                     reachable: repo.commits(&[at.commit], &[])?.into_iter().map(|c| c.oid).collect(),
                     local: repo.commits(&local_tips, &[up.commit])?.into_iter().map(|c| c.oid).collect(),
+                    local_refs,
                 };
                 let segments = manifest_now
                     .segments
@@ -330,6 +358,12 @@ impl Opener {
             }
         }
     }
+}
+
+/// A ref's short name: `refs/heads/work` is `work`, `refs/remotes/upstream/work` is
+/// `upstream/work`.
+pub fn short_ref(r: &str) -> String {
+    r.strip_prefix("refs/heads/").or_else(|| r.strip_prefix("refs/remotes/")).or_else(|| r.strip_prefix("refs/")).unwrap_or(r).to_string()
 }
 
 /// HEAD's base: its merge-base with `upstream`. An upstream ref that does not resolve, or no
@@ -522,11 +556,13 @@ pub(crate) mod fakes {
     pub struct FakeExtract;
 
     impl FakeExtract {
-        fn chunks(circle: &CircleName, path: &str, text: &str) -> Vec<Chunk> {
+        fn chunks(circle: &CircleName, path: &str, text: &str, label_len: u16) -> Vec<Chunk> {
             let mut out = vec![Chunk {
-                kind: Kind::File,
+                kind: if label_len > 0 { Kind::NoteFile } else { Kind::File },
                 circle: circle.clone(),
                 path: path.into(),
+                label_len,
+                gist: String::new(),
                 span: Span::default(),
                 lines: Lines { start: 1, end: text.lines().count().max(1) as u32 },
                 name: path.into(),
@@ -591,7 +627,8 @@ pub(crate) mod fakes {
                     continue;
                 }
                 report.files += 1;
-                for c in Self::chunks(circle, &path, &String::from_utf8_lossy(&bytes)) {
+                let label_len = if path == rel { 0 } else { (path.len() - rel.len() - 1) as u16 };
+                for c in Self::chunks(circle, &path, &String::from_utf8_lossy(&bytes), label_len) {
                     report.chunks += 1;
                     sink(c)?;
                 }
@@ -602,7 +639,7 @@ pub(crate) mod fakes {
             if crate::circles::excluded(def, path).is_some() {
                 return Ok(Vec::new());
             }
-            Ok(Self::chunks(circle, path, &String::from_utf8_lossy(bytes)))
+            Ok(Self::chunks(circle, path, &String::from_utf8_lossy(bytes), 0))
         }
     }
 
@@ -673,6 +710,7 @@ pub(crate) mod fakes {
                 commit: c.keys.commit,
                 flags: c.flags,
                 field_lengths: [0; 5],
+                label_len: c.label_len,
             }
         }
         fn keys(&self, id: ChunkId) -> Keys {
@@ -795,7 +833,7 @@ pub(crate) mod fakes {
             let (key, chunks) = st.segments.get(&id.0).ok_or_else(|| Error::Corrupt { path: PathBuf::from(&id.0), message: "missing".into() })?;
             Ok(Box::new(FakeSegment { key: key.clone(), chunks: chunks.clone() }))
         }
-        fn gc(&self, _live: &[SegmentKey]) -> Result<GcReport, Error> {
+        fn gc(&self, _live: &[SegmentKey], _circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
             Ok(GcReport::default())
         }
     }

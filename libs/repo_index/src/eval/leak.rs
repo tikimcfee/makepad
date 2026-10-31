@@ -6,38 +6,27 @@
 //!   path, a host or a person (EVAL R8; makepad is public). The terms are assembled at run time,
 //!   so this file does not hold them itself.
 
-use crate::{circles, BaseCircle, BaseSource, CircleBody, CircleManifest, ChunkId, OpenCircle, Opened};
+use crate::{circles, BaseCircle, CircleBody, CircleManifest, ChunkId, OpenCircle, Opened};
 use std::path::Path;
-
-/// The path a circle's exclusions are written against: source-root-relative (a notes chunk's
-/// path loses its `<label>/`).
-fn source_path<'a>(def: &BaseCircle, chunk_path: &'a str) -> &'a str {
-    match &def.source {
-        BaseSource::Notes { sources } => sources
-            .iter()
-            .filter_map(|s| chunk_path.strip_prefix(s.label.as_str()).and_then(|r| r.strip_prefix('/')))
-            .min_by_key(|r| r.len())
-            .unwrap_or(chunk_path),
-        _ => chunk_path,
-    }
-}
 
 /// Every chunk of `c` an exclusion of its definition covers, as `path (prefix)`.
 pub fn containment_of(c: &OpenCircle, def: &BaseCircle) -> Vec<String> {
     let mut out = Vec::new();
-    let mut check = |path: &str, where_: &str| {
-        if let Some(e) = circles::excluded(def, source_path(def, path)) {
+    // exclusions are written against the path within the source (a note loses its label)
+    let mut check = |path: &str, in_source: &str, where_: &str| {
+        if let Some(e) = circles::excluded(def, in_source) {
             out.push(format!("{}: {where_} chunk {path} is under the exclusion {}", c.name.0, e.prefix));
         }
     };
     for s in &c.segments {
         for i in 0..s.chunk_count() {
-            check(s.chunk(ChunkId(i)).path, "segment");
+            let v = s.chunk(ChunkId(i));
+            check(v.path, v.path_in_source(), "segment");
         }
     }
     for f in &c.overlay {
         for (ch, _) in &f.chunks {
-            check(&ch.path, "overlay");
+            check(&ch.path, &ch.path[ch.label_len as usize + usize::from(ch.label_len > 0)..], "overlay");
         }
     }
     out
