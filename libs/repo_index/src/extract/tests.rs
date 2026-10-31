@@ -442,6 +442,43 @@ fn history_drops_eval_only_commits() {
     assert!(report.excluded.iter().any(|(p, n)| p == "excluded/" && *n >= 2));
 }
 
+/// Every tracked file outside the exclusions has a chunk, in the base build and in
+/// [`Extract::extract_file`] alike (an overlay that re-extracts a file never deletes it), and a
+/// file the extractors find nothing in is its path chunk in both.
+#[test]
+fn every_file_has_a_chunk_in_the_base_and_the_overlay() {
+    let tmp = fixture_repo();
+    let dir = tmp.path();
+    fs::create_dir_all(dir.join("scripts")).unwrap();
+    fs::write(dir.join("scripts/deploy.sh"), "#!/bin/sh\necho deploy\n").unwrap();
+    fs::write(dir.join("ui/empty.splash"), "// no definitions here\n").unwrap();
+    fs::write(dir.join("docs/empty.md"), "").unwrap();
+    commit_all(dir, "files without items", 1_700_000_050);
+    let mut repo = GitRepo::open(dir).unwrap();
+    let rev = repo.resolve(&RevSpec::Pinned("HEAD".into())).unwrap();
+    let def = tree_def(dir, CODE.to_vec());
+    let (base, _) = extract(&def, "fixture", Some(&rev), &mut repo, &mut Extractor::new());
+    let mut files = Vec::new();
+    files_under(dir, "", &mut files);
+    let mut ex = Extractor::new();
+    let c = circle("fixture");
+    for path in files.iter().filter(|p| !p.starts_with(".git/") && !p.starts_with("excluded/") && !p.starts_with("notes/")) {
+        let bytes = fs::read(dir.join(path)).unwrap();
+        let overlay = ex.extract_file(&c, &def, path, &bytes).unwrap();
+        assert!(!overlay.is_empty(), "the overlay drops {path}");
+        let card = overlay.iter().any(|c| c.kind == Kind::Crate);
+        assert!(card || base.iter().any(|b| &b.path == path), "the base drops {path}");
+    }
+    for path in ["Cargo.toml", "scripts/deploy.sh", "ui/empty.splash", "docs/empty.md", "libs/app_registry/apps.json"] {
+        let bytes = fs::read(dir.join(path)).unwrap();
+        let overlay = ex.extract_file(&c, &def, path, &bytes).unwrap();
+        let in_base: Vec<&Chunk> = base.iter().filter(|b| b.path == path).collect();
+        assert_eq!((overlay.len(), in_base.len()), (1, 1), "{path}");
+        let (o, b) = (&overlay[0], in_base[0]);
+        assert_eq!((o.kind, o.name.as_str(), &o.fields.path, &o.keys.paths, o.keys.blob), (Kind::File, b.name.as_str(), &b.fields.path, &b.keys.paths, b.keys.blob), "{path}");
+    }
+}
+
 #[test]
 fn worktree_changes_and_file_overlay() {
     let tmp = fixture_repo();

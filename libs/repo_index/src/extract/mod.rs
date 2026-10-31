@@ -4,8 +4,9 @@
 //!
 //! A tree circle streams, per package (by directory): its crate card, then each of its files
 //! (`.rs` as a file chunk and its items, `.md` as sections, `.splash` as definitions, any other
-//! tracked file but the card's own `Cargo.toml` as one path-only file chunk); then the files no
-//! package owns. Files of a crates.io port or with a generated header are skeletons.
+//! tracked file but the card's own `Cargo.toml`, and one these find nothing in, as one path-only
+//! file chunk); then the files no package owns. Every tracked file outside the exclusions has a
+//! chunk, in the base and the overlay alike. Files of a crates.io port or with a generated header are skeletons.
 //! Every chunk of a file carries that file's blob, so a hit's copies are found by
 //! (blob, span). Chunks outside the circle's families are not emitted, and a parent that is not
 //! emitted becomes the next emitted ancestor's index (or none).
@@ -219,6 +220,17 @@ fn path_chunk(circle: &CircleName, path: &str, blob: Oid, package: Option<&str>,
     c
 }
 
+/// A file's batch, or its path chunk when extraction found nothing in it (an empty `.md`, a
+/// `.splash` without definitions, a `[workspace]`-only `Cargo.toml`, any other file): every
+/// tracked file outside the exclusions has a chunk, in the base and in the overlay alike.
+fn or_path(batch: Batch, circle: &CircleName, path: &str, blob: Oid, package: Option<&str>, vendored: bool) -> Batch {
+    if batch.is_empty() {
+        vec![path_chunk(circle, path, blob, package, vendored)]
+    } else {
+        batch
+    }
+}
+
 fn doc_batch(circle: &CircleName, path: &str, bytes: &[u8], blob: Option<Oid>, package: Option<&str>) -> Batch {
     let text = String::from_utf8_lossy(bytes);
     markdown::doc_sections(&text)
@@ -355,11 +367,11 @@ impl Extractor {
                 if excluded(path, &def.exclude).is_some() {
                     return Ok(Vec::new());
                 }
-                let blob = Some(git::blob_oid(bytes));
-                match ext(path) {
-                    "rs" => rust_batch(circle, path, bytes, blob, None, rust::is_generated(bytes), &mut ExtractReport::default()).0,
-                    "md" => doc_batch(circle, path, bytes, blob, None),
-                    "splash" => splash_batch(circle, path, bytes, blob, None),
+                let blob = git::blob_oid(bytes);
+                let batch = match ext(path) {
+                    "rs" => rust_batch(circle, path, bytes, Some(blob), None, rust::is_generated(bytes), &mut ExtractReport::default()).0,
+                    "md" => doc_batch(circle, path, bytes, Some(blob), None),
+                    "splash" => splash_batch(circle, path, bytes, Some(blob), None),
                     _ if file_name(path) == "Cargo.toml" => {
                         let text = String::from_utf8_lossy(bytes);
                         match cargo::written_card(path, &text) {
@@ -369,7 +381,8 @@ impl Extractor {
                         }
                     }
                     _ => Vec::new(),
-                }
+                };
+                or_path(batch, circle, path, blob, None, false)
             }
             BaseSource::Notes { sources } => {
                 let Some((src, rel)) = sources.iter().find_map(|s| path.strip_prefix(&format!("{}/", s.label)).map(|rel| (s, rel))) else {
@@ -464,7 +477,7 @@ impl Extractor {
                     "md" => doc_batch(circle, &f.path, &bytes, Some(f.blob), package.as_deref()),
                     _ => splash_batch(circle, &f.path, &bytes, Some(f.blob), package.as_deref()),
                 };
-                batches.push(batch);
+                batches.push(or_path(batch, circle, &f.path, f.blob, package.as_deref(), vendored));
             }
             let card = match pkg {
                 Some(i) => emit.batch(vec![crate_chunk(circle, &graph.packages[i].name, graph.card(i, modules), vendored)], None)?,
