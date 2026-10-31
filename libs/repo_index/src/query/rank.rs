@@ -1,15 +1,27 @@
 //! BM25F within one opened circle: candidates from the circle's segments and overlay, scored
 //! with that circle's own statistics only.
 //!
-//! A query word's whole fold is its primary term (matched as a whole word or an identifier
-//! part); its parts are expansions; its exact spelling is a bonus. Per term, each field's tf is
-//! normalized by that field's length (`b`), weighted, summed, then saturated once (`k1`): BM25F,
-//! not a sum of per-field BM25 scores. The score is then scaled by query-word coverage and by
-//! the chunk's prior (definitions above uses, crate cards up, generated and fallback files down).
+//! A query is read word by word ([`Plan`]):
+//! - function words (`what`, `is`, `the`, ...) are dropped, unless the query has nothing else;
+//! - a path-shaped word (`libs/code_arch`, `push-tree.sh`, `lower.rs:11369`) is matched as a
+//!   path: chunks whose path is it, lies under it or ends with it, found through its rarest part;
+//! - a package-shaped word (`makepad-hal`) pins that package's crate card;
+//! - an identifier-shaped word (`KeyCode`, `HOST_CACHED`, `ids!`, `unit_here()`, `A::b`) is a
+//!   subject: its exact definitions are pinned first, a kind word in the query (`enum`, `macro`)
+//!   orders them, and the word is absent when the circle holds no whole-word match of it;
+//! - every other word scores as text.
+//!
+//! A word's whole fold is its primary term (matched as a whole word or an identifier part); its
+//! exact spelling is a bonus. Per term, each field's tf is normalized by that field's length
+//! (`b`), weighted, summed, then saturated once (`k1`): BM25F, not a sum of per-field BM25
+//! scores. The score is then scaled by word coverage (a word with several parts covers a chunk
+//! when all of them match) and by the chunk's prior (definitions above uses, crate cards up,
+//! generated and fallback files down). A word's parts are looked up only when nothing matched,
+//! to rank the nearest hits of an absence.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::terms::{field_index, identifier_shaped, words};
+use crate::terms::{field_index, function_word, identifier_shaped, words};
 use crate::{
     ChunkAt, ChunkId, ChunkView, Family, Field, Key, KeyKind, Keys, Kind, KindFilter, OpenCircle, QueryTerm, TermForm,
     Why,
@@ -19,8 +31,8 @@ use crate::{
 pub const K1: f32 = 1.2;
 /// BM25 length normalization.
 pub const B: f32 = 0.75;
-/// Field weights, in [`Field::ALL`] order: name and path carry Sourcegraph's ×5 symbol and
-/// filename boost on name; path, signature and doc ×2; body ×1.
+/// Field weights, in [`Field::ALL`] order: name ×5 (Sourcegraph's symbol boost); path,
+/// signature and doc ×2; body ×1.
 pub const FIELD_WEIGHTS: [f32; 5] = [5.0, 2.0, 2.0, 2.0, 1.0];
 /// A commit's path field holds every touched path: low weight (PLAN §3).
 pub const COMMIT_PATH_WEIGHT: f32 = 0.3;
@@ -35,70 +47,263 @@ pub const DEFINITION_PRIOR: f32 = 1.3;
 pub const CRATE_PRIOR: f32 = 1.3;
 pub const GENERATED_PRIOR: f32 = 0.3;
 pub const FALLBACK_PRIOR: f32 = 0.6;
+/// A chunk of a kind the query names (`enum`, `macro`, `crate`).
+pub const KIND_PRIOR: f32 = 1.5;
+/// A chunk at or under a path the query names.
+pub const PATH_PRIOR: f32 = 1.5;
 /// Nearest hits shown under an absence.
 pub const NEAREST: usize = 3;
+/// Entries ranked in full; the rest are counted, not ordered.
+pub const KEEP: usize = 300;
+/// Documented files under a directory the query names, pinned after its crate card.
+pub const DIR_PINS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Primary,
     Expansion,
     Exact,
+    /// Consecutive query words written as one identifier (`memory type` → `memory_type`,
+    /// `memorytype`): covers all of them.
+    Phrase,
 }
 
 /// One scored term of the query.
 #[derive(Clone, Debug)]
 pub struct Group {
     pub text: String,
+    /// The (first) query word it came from.
     pub word: u16,
     pub role: Role,
+    /// Query words it covers, from `word` on (a phrase covers several).
+    pub span: u16,
 }
 
-/// The query's terms, grouped, plus what the short-circuit looks up.
+/// A path-shaped query word.
+#[derive(Clone, Debug)]
+pub struct PathWord {
+    pub word: u16,
+    /// As written, without `./`, leading and trailing `/`, or a `:line` suffix.
+    pub token: String,
+    /// Its folded parts; the circle's rarest one finds the candidates.
+    pub parts: Vec<String>,
+}
+
+/// How a query word reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Class {
+    Function,
+    Path,
+    Package,
+    /// Identifier-shaped: pinned definitions and an absence check.
+    Subject { call: bool, macro_call: bool },
+    Plain,
+}
+
+/// A query word without its sentence punctuation, quoting and `:line` suffix, and how it reads.
+pub fn classify(raw: &str) -> (String, Class) {
+    let quotes = |c: char| matches!(c, '`' | '"' | '\'' | '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}' | ',' | ';' | '?' | '[' | ']' | '{' | '}' | '<' | '>' | '*');
+    let mut s = raw.trim_matches(quotes);
+    s = s.strip_prefix('(').unwrap_or(s);
+    let call = s.ends_with("()");
+    if call {
+        s = &s[..s.len() - 2];
+    } else if s.ends_with(')') && !s.contains('(') {
+        s = &s[..s.len() - 1];
+    }
+    for possessive in ["'s", "\u{2019}s"] {
+        s = s.strip_suffix(possessive).unwrap_or(s);
+    }
+    s = s.trim_end_matches([':', '.']);
+    if let Some((head, tail)) = s.rsplit_once(':') {
+        let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+        if digits(tail) || tail.split_once('-').is_some_and(|(a, b)| digits(a) && digits(b)) {
+            s = head;
+        }
+    }
+    let macro_call = s.ends_with('!');
+    let s = s.trim_end_matches('!').trim_matches(quotes);
+    let core = s.to_string();
+    if core.is_empty() || !core.chars().any(char::is_alphanumeric) {
+        return (core, Class::Function);
+    }
+    let class = if path_shaped(&core) {
+        Class::Path
+    } else if core.contains('-') && core.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        Class::Package
+    } else if macro_call || call || core.contains("::") || words(&core).any(identifier_shaped) {
+        Class::Subject { call, macro_call }
+    } else if words(&core).count() == 1 && core.chars().all(|c| !c.is_uppercase()) && function_word(&core) {
+        Class::Function
+    } else {
+        Class::Plain
+    };
+    (core, class)
+}
+
+/// `a/b`, `a/`, or `name.ext` (a stem of two or more characters, an extension of one to eight
+/// alphanumerics holding a letter).
+fn path_shaped(s: &str) -> bool {
+    if s.contains('/') {
+        return !s.contains("::");
+    }
+    match s.rsplit_once('.') {
+        Some((stem, ext)) => {
+            stem.chars().count() >= 2
+                && (1..=8).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
+}
+
+/// The kind a query word names: an item kind's name, or `crate` / `package` (Cargo's word for a
+/// crate) for crate cards. It orders pinned definitions and raises chunks of that kind.
+fn kind_word(w: &str) -> Option<Kind> {
+    const KINDS: [Kind; 13] = [
+        Kind::Crate, Kind::Fn, Kind::Method, Kind::Struct, Kind::Enum, Kind::Union, Kind::Trait, Kind::Impl, Kind::Mod,
+        Kind::Type, Kind::Const, Kind::Static, Kind::Macro,
+    ];
+    if w == "package" || w == "packages" || w == "crates" {
+        return Some(Kind::Crate);
+    }
+    KINDS.iter().copied().find(|k| k.as_str() == w)
+}
+
+/// Longest run of consecutive query words joined into one identifier.
+pub const MAX_PHRASE: usize = 3;
+
+/// The query's terms, grouped, plus what the short-circuits look up.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
+    /// Primary and exact terms of the text words.
     pub groups: Vec<Group>,
-    /// Distinct query words with a primary term (coverage's denominator).
+    /// Parts of compound words, looked up only when nothing matched (nearest hits).
+    pub expansions: Vec<Group>,
+    /// Content words: coverage's denominator.
     pub words: u16,
-    /// Identifiers whose exact definitions are pinned first, with the `A::b` path the query
-    /// wrote, if any.
+    /// Identifiers whose exact definitions are pinned, with the `A::b` path the query wrote.
     pub pinned: Vec<(String, Option<String>)>,
+    /// Kinds the query names; they order pinned definitions.
+    pub kinds: Vec<Kind>,
+    pub paths: Vec<PathWord>,
+    /// Package-shaped words: their crate cards are pinned.
+    pub packages: Vec<String>,
+    /// Identifier-shaped words (folded whole) judged for absence.
+    pub subjects: Vec<String>,
 }
 
 impl Plan {
     pub fn new(raw_words: &[String], terms: &[QueryTerm]) -> Plan {
-        let mut groups: Vec<Group> = Vec::new();
-        for t in terms {
+        let classes: Vec<(String, Class)> = raw_words.iter().map(|w| classify(w)).collect();
+        let only_function = classes.iter().all(|(_, c)| *c == Class::Function);
+        let mut plan = Plan::default();
+        let mut kept: HashSet<u16> = HashSet::new();
+        for (i, (core, class)) in classes.iter().enumerate() {
+            let word = i.min(u16::MAX as usize) as u16;
+            if (*class == Class::Function && !only_function) || core.is_empty() {
+                continue;
+            }
+            if let Some(k) = kind_word(core) {
+                plan.kinds.push(k);
+            }
+            match class {
+                Class::Path => {
+                    let token = core.trim_start_matches("./").trim_matches('/').to_string();
+                    let parts: Vec<String> = words(&token).map(makepad_search::fold).collect();
+                    if !parts.is_empty() {
+                        plan.paths.push(PathWord { word, token, parts });
+                        kept.insert(word);
+                    }
+                    continue;
+                }
+                Class::Package => plan.packages.push(core.clone()),
+                Class::Subject { call, macro_call } => {
+                    if *call {
+                        plan.kinds.extend([Kind::Fn, Kind::Method]);
+                    }
+                    if *macro_call {
+                        plan.kinds.push(Kind::Macro);
+                    }
+                    let subs: Vec<&str> = words(core).collect();
+                    if let Some(last) = subs.last() {
+                        if core.contains("::") {
+                            plan.pinned.push((last.to_string(), Some(subs.join("::"))));
+                            plan.subjects.push(makepad_search::fold(last));
+                        } else {
+                            for sub in &subs {
+                                plan.pinned.push((sub.to_string(), None));
+                                plan.subjects.push(makepad_search::fold(sub));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            kept.insert(word);
+        }
+        // A query of one text word pins its definitions too.
+        if kept.len() == 1 && plan.paths.is_empty() && plan.packages.is_empty() && plan.pinned.is_empty() {
+            if let Some((core, _)) = kept.iter().next().map(|w| &classes[*w as usize]) {
+                for sub in words(core) {
+                    plan.pinned.push((sub.to_string(), None));
+                }
+            }
+        }
+        let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).collect();
+        for t in terms.iter().filter(|t| kept.contains(&t.word) && !path_words.contains(&t.word)) {
             let role = match t.form {
                 TermForm::Folded => Role::Primary,
                 TermForm::Part => Role::Expansion,
                 TermForm::Exact => Role::Exact,
             };
-            if !groups.iter().any(|g| g.text == t.text && g.role == role) {
-                groups.push(Group { text: t.text.clone(), word: t.word, role });
+            let list = if role == Role::Expansion { &mut plan.expansions } else { &mut plan.groups };
+            if !list.iter().any(|g| g.text == t.text && g.role == role && g.word == t.word) {
+                list.push(Group { text: t.text.clone(), word: t.word, role, span: 1 });
             }
         }
-        // A part that is itself a primary term of another word is scored as primary only.
-        let primaries: HashSet<String> =
-            groups.iter().filter(|g| g.role == Role::Primary).map(|g| g.text.clone()).collect();
-        groups.retain(|g| g.role != Role::Expansion || !primaries.contains(&g.text));
-        let word_count = groups.iter().filter(|g| g.role == Role::Primary).map(|g| g.word).collect::<HashSet<_>>().len() as u16;
-
-        let subwords: Vec<&str> = raw_words.iter().flat_map(|w| words(w)).collect();
-        let mut pinned = Vec::new();
-        for raw in raw_words {
-            let subs: Vec<&str> = words(raw).collect();
-            let Some(last) = subs.last() else { continue };
-            if raw.contains("::") {
-                pinned.push((last.to_string(), Some(subs.join("::"))));
+        // A long identifier's inner runs of parts (`VK_EXT_memory_budget` → `memory_budget`,
+        // `ext_memory`), as the shorter identifiers code names the same thing by.
+        for (i, (core, class)) in classes.iter().enumerate() {
+            if !kept.contains(&(i as u16)) || !matches!(class, Class::Subject { .. }) {
                 continue;
             }
-            for sub in subs {
-                if subwords.len() == 1 || identifier_shaped(sub) {
-                    pinned.push((sub.to_string(), None));
+            for sub in words(core) {
+                let parts = crate::terms::split_parts(sub);
+                for len in 2..parts.len() {
+                    for run in parts.windows(len) {
+                        for text in [run.join("_"), run.concat()] {
+                            if !plan.groups.iter().any(|g| g.text == text) {
+                                plan.groups.push(Group { text, word: i as u16, role: Role::Phrase, span: 1 });
+                            }
+                        }
+                    }
                 }
             }
         }
-        Plan { groups, words: word_count, pinned }
+        // Runs of adjacent single-part words, as the identifiers they would spell.
+        let simple: Vec<Option<String>> = classes
+            .iter()
+            .enumerate()
+            .map(|(i, (core, class))| {
+                let one = words(core).count() == 1 && core.chars().all(char::is_alphanumeric);
+                (kept.contains(&(i as u16)) && matches!(class, Class::Plain | Class::Subject { .. }) && one)
+                    .then(|| makepad_search::fold(core))
+            })
+            .collect();
+        for i in 0..simple.len() {
+            for len in 2..=MAX_PHRASE {
+                let Some(run) = simple.get(i..i + len).and_then(|w| w.iter().cloned().collect::<Option<Vec<String>>>()) else { break };
+                for text in [run.join("_"), run.concat()] {
+                    plan.groups.push(Group { text, word: i as u16, role: Role::Phrase, span: len as u16 });
+                }
+            }
+        }
+        let primaries: HashSet<String> = plan.groups.iter().filter(|g| g.role == Role::Primary).map(|g| g.text.clone()).collect();
+        plan.expansions.retain(|g| !primaries.contains(&g.text));
+        plan.words = kept.len() as u16;
+        plan
     }
 }
 
@@ -129,13 +334,16 @@ pub struct Scored {
     pub circle: usize,
     pub at: ChunkAt,
     pub score: f32,
-    /// Query words matched by a primary term.
+    /// Query words that cover the chunk.
     pub covered: u16,
-    /// Matched a primary term (counts toward totals); else only expansions (nearest).
+    /// Matched a content word (counts toward totals); else only expansions (nearest).
     pub primary: bool,
     /// A definition of a query word: matched in the name, or pinned.
     pub definition: bool,
-    pub pinned: bool,
+    /// Pinned ahead of every scored chunk, highest first: 6 a named package's card, 5 the crate
+    /// card of a named directory, 4 the record of a named path, 3 an exact definition of the
+    /// kind the query names, 2 an exact definition; 0 not pinned.
+    pub pin: u8,
     pub why: Vec<Why>,
     pub also_at: Vec<String>,
 }
@@ -143,11 +351,17 @@ pub struct Scored {
 /// One circle's ranking.
 #[derive(Clone, Debug, Default)]
 pub struct Ranked {
-    /// Primary matches, best first, copies collapsed.
+    /// Content matches, best first, copies collapsed; at most the `keep` asked for.
     pub entries: Vec<Scored>,
+    /// Content matches in all, before `keep` and the collapse of copies.
+    pub total: u64,
     pub definitions: u64,
-    /// Expansion-only matches, best first.
+    /// Content matches covering every content word.
+    pub all_words: u64,
+    /// Expansion-only matches, best first (only when there are no content matches).
     pub near: Vec<Scored>,
+    /// The query's identifier- and path-shaped words this circle holds no match of.
+    pub absent_terms: Vec<String>,
 }
 
 /// A candidate's weighted tf per field, per query term group.
@@ -250,43 +464,177 @@ fn idf(n: f32, df: f32) -> f32 {
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln().max(0.01)
 }
 
-/// Ranks one circle for `plan` under `filter`. `circle` is its index, carried into each entry.
-pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Ranked {
-    let n = c.stats.chunks.max(1) as f32;
-    let avg: Vec<f32> = c.stats.field_lengths.iter().map(|l| *l as f32 / n).collect();
-    let forms = |role: Role| -> &'static [(TermForm, f32)] {
-        match role {
-            Role::Primary | Role::Expansion => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
-            Role::Exact => &[(TermForm::Exact, 1.0)],
-        }
-    };
-    let idfs: Vec<f32> = plan
-        .groups
-        .iter()
-        .map(|g| {
-            let df: u32 = c
-                .segments
-                .iter()
-                .map(|s| forms(g.role).iter().map(|(form, _)| s.df(*form, &g.text)).sum::<u32>())
-                .sum();
-            idf(n, (df as f32).min(n))
-        })
-        .collect();
+/// How a chunk's path meets a path the query names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PathMatch {
+    /// Ends with it, or holds it as inner components.
+    Mention,
+    /// Lies under it.
+    Under,
+    /// Is it (a crate card: its directory is it).
+    Exact,
+}
 
-    // Per candidate: (group, weighted tf per field).
-    let mut acc: HashMap<AtKey, (ChunkAt, GroupTfs)> = HashMap::new();
-    let mut add = |at: ChunkAt, gi: usize, tf: [f32; 5]| {
-        let list = &mut acc.entry(at_key(at)).or_insert_with(|| (at, Vec::new())).1;
-        match list.iter_mut().find(|(g, _)| *g == gi) {
-            Some((_, t)) => (0..5).for_each(|f| t[f] += tf[f]),
-            None => list.push((gi, tf)),
-        }
+/// How a chunk meets a path the query names: by its own path (a crate card: its directory), or
+/// for a commit, the best of its touched paths (it touched the thing, or something under it).
+fn path_match(c: &OpenCircle, at: ChunkAt, v: &ChunkView<'_>, token: &str) -> Option<PathMatch> {
+    match v.kind.family() {
+        Family::Commit => keys(c, at).paths.iter().filter_map(|p| match_one(p, token)).max().map(|m| m.max(PathMatch::Under)),
+        _ => match_one(
+            match v.kind {
+                Kind::Crate => v.path.strip_suffix("/Cargo.toml").unwrap_or(""),
+                _ => v.path_in_source(),
+            },
+            token,
+        ),
+    }
+}
+
+fn match_one(path: &str, token: &str) -> Option<PathMatch> {
+    let (p, t) = (path.to_ascii_lowercase(), token.to_ascii_lowercase());
+    if p == t {
+        Some(PathMatch::Exact)
+    } else if p.starts_with(&format!("{t}/")) {
+        Some(PathMatch::Under)
+    } else if p.ends_with(&format!("/{t}")) || p.contains(&format!("/{t}/")) {
+        Some(PathMatch::Mention)
+    } else {
+        None
+    }
+}
+
+/// Ranks one circle for `plan` under `filter`, ordering at most `keep` entries. `circle` is its
+/// index, carried into each entry.
+pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: usize) -> Ranked {
+    let n = c.stats.chunks.max(1) as f32;
+    let mut x = Ctx {
+        c,
+        circle,
+        plan,
+        filter,
+        path_hits: HashMap::new(),
+        path_idf: HashMap::new(),
+        shadowed: c.shadowed.iter().map(String::as_str).collect(),
+        avg: c.stats.field_lengths.iter().map(|l| *l as f32 / n).collect(),
+        n,
     };
-    for (gi, g) in plan.groups.iter().enumerate() {
+    let overlay_has = |form: TermForm, text: &str| {
+        c.overlay.iter().any(|f| f.chunks.iter().any(|(_, ft)| ft.terms.iter().any(|t| t.form == form && t.text == text)))
+    };
+    let tree = c.rev.is_some() && c.visible.is_none();
+    let mut absent_terms = Vec::new();
+    // History circles never claim absence: their messages summarize, so a missing mention says
+    // nothing.
+    if c.visible.is_none() {
+        for s in &plan.subjects {
+            let present = c.segments.iter().any(|seg| seg.df(TermForm::Folded, s) > 0) || overlay_has(TermForm::Folded, s);
+            if !present && !absent_terms.contains(s) {
+                absent_terms.push(s.clone());
+            }
+        }
+    }
+
+    // Path words: each through its rarest part (by df in this circle) as a text term, and the
+    // chunks whose path meets it.
+    let mut groups: Vec<Group> = plan.groups.clone();
+    for pw in &plan.paths {
+        let rarest = pw
+            .parts
+            .iter()
+            .map(|p| (p, x.df(Role::Primary, p)))
+            .filter(|(_, df)| *df > 0)
+            .min_by_key(|(_, df)| *df);
+        let mut found = false;
+        if let Some((part, df)) = rarest {
+            x.path_idf.insert(pw.word, idf(n, df as f32));
+            let path_hits = &mut x.path_hits;
+            groups.push(Group { text: part.clone(), word: pw.word, role: Role::Primary, span: 1 });
+            let mut consider = |at: ChunkAt| {
+                let v = view(c, at);
+                if let Some(m) = path_match(c, at, &v, &pw.token) {
+                    found = true;
+                    let e = path_hits.entry(at_key(at)).or_insert((at, m, pw.word));
+                    if m > e.1 {
+                        *e = (at, m, pw.word);
+                    }
+                }
+            };
+            for (si, seg) in c.segments.iter().enumerate() {
+                for form in [TermForm::Folded, TermForm::Part] {
+                    for p in seg.postings(form, part) {
+                        if p.tf[field_index(Field::Path)] > 0 {
+                            consider(ChunkAt::Segment { segment: si, chunk: p.chunk });
+                        }
+                    }
+                }
+            }
+            for (fi, file) in c.overlay.iter().enumerate() {
+                for ci in 0..file.chunks.len() {
+                    consider(ChunkAt::Overlay { file: fi, chunk: ci });
+                }
+            }
+        }
+        if tree && !found && !absent_terms.contains(&pw.token) {
+            absent_terms.push(pw.token.clone());
+        }
+    }
+
+    let first = score_groups(&x, &groups);
+    let (mut primary, mut near): (Vec<Scored>, Vec<Scored>) = first.into_iter().partition(|e| e.primary);
+    if primary.is_empty() && !plan.expansions.is_empty() {
+        x.path_hits.clear();
+        near.extend(score_groups(&x, &plan.expansions));
+    }
+    let total = primary.len() as u64;
+    let definitions = primary.iter().filter(|e| e.definition).count() as u64;
+    let all_words = primary.iter().filter(|e| e.covered >= plan.words).count() as u64;
+    order(c, &mut primary, keep);
+    order(c, &mut near, NEAREST * 4);
+    let entries = collapse(c, primary);
+    let mut near = collapse(c, near);
+    near.truncate(NEAREST);
+    Ranked { entries, total, definitions, all_words, near, absent_terms }
+}
+
+/// What scoring one circle needs besides the groups.
+struct Ctx<'a> {
+    c: &'a OpenCircle,
+    circle: usize,
+    plan: &'a Plan,
+    filter: &'a Filter,
+    path_hits: HashMap<AtKey, (ChunkAt, PathMatch, u16)>,
+    path_idf: HashMap<u16, f32>,
+    shadowed: HashSet<&'a str>,
+    avg: Vec<f32>,
+    n: f32,
+}
+
+impl Ctx<'_> {
+    fn df(&self, role: Role, text: &str) -> u32 {
+        self.c.segments.iter().map(|s| forms(role).iter().map(|(form, _)| s.df(*form, text)).sum::<u32>()).sum()
+    }
+}
+
+fn forms(role: Role) -> &'static [(TermForm, f32)] {
+    match role {
+        Role::Primary | Role::Expansion => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
+        Role::Exact => &[(TermForm::Exact, 1.0)],
+        Role::Phrase => &[(TermForm::Folded, 1.0)],
+    }
+}
+
+/// Scores the candidates of `groups` (plus pinned and path-matched chunks).
+fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
+    let (c, circle, plan, filter, path_hits, path_idf, shadowed, avg, n) =
+        (x.c, x.circle, x.plan, x.filter, &x.path_hits, &x.path_idf, &x.shadowed, &x.avg, x.n);
+    let idfs: Vec<f32> = groups.iter().map(|g| idf(n, (x.df(g.role, &g.text) as f32).min(n))).collect();
+    let mut acc: HashMap<AtKey, (ChunkAt, GroupTfs)> = HashMap::new();
+    for (gi, g) in groups.iter().enumerate() {
         for (si, seg) in c.segments.iter().enumerate() {
             for (form, w) in forms(g.role) {
                 for p in seg.postings(*form, &g.text) {
-                    add(ChunkAt::Segment { segment: si, chunk: p.chunk }, gi, p.tf.map(|t| t as f32 * w));
+                    let at = ChunkAt::Segment { segment: si, chunk: p.chunk };
+                    add(&mut acc, at, gi, p.tf.map(|t| t as f32 * w));
                 }
             }
         }
@@ -294,34 +642,76 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Rank
             for (ci, (_, ft)) in file.chunks.iter().enumerate() {
                 let mut tf = [0f32; 5];
                 for t in &ft.terms {
-                    if let Some((_, w)) = forms(g.role).iter().find(|(form, _)| *form == t.form) {
-                        if t.text == g.text {
+                    if t.text == g.text {
+                        if let Some((_, w)) = forms(g.role).iter().find(|(form, _)| *form == t.form) {
                             tf[field_index(t.field)] += t.tf as f32 * w;
                         }
                     }
                 }
                 if tf.iter().any(|t| *t > 0.0) {
-                    add(ChunkAt::Overlay { file: fi, chunk: ci }, gi, tf);
+                    add(&mut acc, ChunkAt::Overlay { file: fi, chunk: ci }, gi, tf);
                 }
             }
         }
     }
 
-    let mut pinned: HashSet<AtKey> = HashSet::new();
+    // Pins: package cards, then the record of a named path, then exact definitions.
+    let mut pins: HashMap<AtKey, u8> = HashMap::new();
+    let mut pin = |acc: &mut HashMap<AtKey, (ChunkAt, GroupTfs)>, at: ChunkAt, rank: u8| {
+        let e = pins.entry(at_key(at)).or_insert(0);
+        *e = (*e).max(rank);
+        acc.entry(at_key(at)).or_insert_with(|| (at, Vec::new()));
+    };
+    for p in &plan.packages {
+        for at in chunks_with(c, &Key::Package(p.clone())) {
+            if view(c, at).kind == Kind::Crate {
+                pin(&mut acc, at, 6);
+            }
+        }
+    }
+    let mut dir_files: Vec<(usize, ChunkAt)> = Vec::new();
+    for (at, m, _) in path_hits.values() {
+        let v = view(c, *at);
+        acc.entry(at_key(*at)).or_insert_with(|| (*at, Vec::new()));
+        match (m, v.kind) {
+            (PathMatch::Exact, Kind::Crate) => pin(&mut acc, *at, 5),
+            (PathMatch::Exact | PathMatch::Mention, Kind::File) => pin(&mut acc, *at, 4),
+            (PathMatch::Exact | PathMatch::Mention, Kind::Doc | Kind::Note | Kind::NoteFile) if v.lines.start <= 1 => pin(&mut acc, *at, 4),
+            (PathMatch::Under, Kind::File | Kind::Doc) if v.flags.documented && v.lines.start <= 1 => {
+                dir_files.push((v.path.matches('/').count(), *at));
+            }
+            _ => {}
+        }
+    }
+    // Shallowest first; at one depth, a crate root or README (the file that says what the
+    // directory is) before its siblings.
+    let root = |at: ChunkAt| {
+        let p = view(c, at).path;
+        let name = p.rsplit('/').next().unwrap_or(p);
+        !matches!(name, "lib.rs" | "main.rs" | "mod.rs" | "README.md")
+    };
+    dir_files.sort_by(|a, b| a.0.cmp(&b.0).then(root(a.1).cmp(&root(b.1))).then(view(c, a.1).path.cmp(view(c, b.1).path)));
+    for (_, at) in dir_files.into_iter().take(DIR_PINS) {
+        pin(&mut acc, at, 4);
+    }
     for (ident, path) in &plan.pinned {
         for at in chunks_with(c, &Key::Ident(ident.clone())) {
             let v = view(c, at);
             if path.as_ref().is_none_or(|p| v.name == p || v.name.ends_with(&format!("::{p}"))) {
-                pinned.insert(at_key(at));
-                acc.entry(at_key(at)).or_insert_with(|| (at, Vec::new()));
+                pin(&mut acc, at, if plan.kinds.contains(&v.kind) { 3 } else { 2 });
             }
         }
     }
 
-    let shadowed: HashSet<&str> = c.shadowed.iter().map(String::as_str).collect();
-    let mut primary = Vec::new();
-    let mut near = Vec::new();
-    for (_, (at, tfs)) in acc {
+    // Words with several primary terms cover a chunk only when all of them match.
+    let mut need: HashMap<u16, usize> = HashMap::new();
+    for g in groups.iter().filter(|g| g.role == Role::Primary) {
+        *need.entry(g.word).or_insert(0) += 1;
+    }
+    let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).collect();
+
+    let mut out = Vec::with_capacity(acc.len());
+    for (key, (at, tfs)) in acc {
         let v = view(c, at);
         if matches!(at, ChunkAt::Segment { .. }) && shadowed.contains(v.path) {
             continue;
@@ -333,28 +723,40 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Rank
         if v.kind.family() == Family::Commit {
             weights[1] = COMMIT_PATH_WEIGHT;
         }
-        let norm: Vec<f32> = (0..5)
-            .map(|f| if avg[f] > 0.0 { 1.0 - B + B * v.field_lengths[f] as f32 / avg[f] } else { 1.0 })
-            .collect();
         let mut score = 0.0;
-        let mut covered: HashSet<u16> = HashSet::new();
+        let mut matched: HashMap<u16, usize> = HashMap::new();
         let mut in_name = false;
+        let mut phrase_covered: HashSet<u16> = HashSet::new();
         let mut why = Vec::new();
         for (gi, tf) in &tfs {
-            let g = &plan.groups[*gi];
-            let pseudo: f32 = (0..5).map(|f| weights[f] * tf[f] / norm[f]).sum();
+            let g = &groups[*gi];
+            let pseudo: f32 = (0..5)
+                .map(|f| {
+                    let norm = if avg[f] > 0.0 { 1.0 - B + B * v.field_lengths[f] as f32 / avg[f] } else { 1.0 };
+                    weights[f] * tf[f] / norm
+                })
+                .sum();
             if pseudo <= 0.0 {
                 continue;
             }
             let role_weight = match g.role {
-                Role::Primary => 1.0,
+                Role::Primary | Role::Phrase => 1.0,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
             };
             score += role_weight * idfs[*gi] * pseudo / (K1 + pseudo);
-            if g.role == Role::Primary {
-                covered.insert(g.word);
-                in_name |= tf[0] > 0.0;
+            match g.role {
+                Role::Primary => {
+                    *matched.entry(g.word).or_insert(0) += 1;
+                    in_name |= tf[0] > 0.0 && !path_words.contains(&g.word);
+                }
+                Role::Phrase => {
+                    for w in g.word..g.word.saturating_add(g.span) {
+                        phrase_covered.insert(w);
+                    }
+                    in_name |= tf[0] > 0.0;
+                }
+                _ => {}
             }
             for (f, field) in Field::ALL.iter().enumerate() {
                 if tf[f] > 0.0 && !why.iter().any(|w: &Why| w.field == *field && w.term == g.text) {
@@ -362,11 +764,26 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Rank
                 }
             }
         }
-        let is_pinned = pinned.contains(&at_key(at));
+        let mut covered: HashSet<u16> =
+            matched.iter().filter(|(w, m)| need.get(w).is_some_and(|n| *m >= n)).map(|(w, _)| *w).collect();
+        covered.extend(phrase_covered);
+        let mut prior = 1.0;
+        if plan.kinds.contains(&v.kind) {
+            prior *= KIND_PRIOR;
+        }
+        if let Some((_, m, word)) = path_hits.get(&key) {
+            covered.insert(*word);
+            let w = if *m == PathMatch::Mention { 0.5 } else { 1.0 };
+            score += w * path_idf.get(word).copied().unwrap_or(1.0);
+            if *m != PathMatch::Mention {
+                prior *= PATH_PRIOR;
+            }
+            why.push(Why { field: Field::Path, term: plan.paths.iter().find(|p| p.word == *word).map(|p| p.token.clone()).unwrap_or_default() });
+        }
+        let pin_rank = pins.get(&key).copied().unwrap_or(0);
         let covered = covered.len() as u16;
         let coverage = (1.0 + covered as f32) / (1.0 + plan.words as f32);
-        let definition = is_pinned || in_name;
-        let mut prior = 1.0;
+        let definition = pin_rank >= 2 && pin_rank != 4 || in_name;
         if definition {
             prior *= DEFINITION_PRIOR;
         }
@@ -379,38 +796,50 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter) -> Rank
         if v.flags.fallback {
             prior *= FALLBACK_PRIOR;
         }
-        let entry = Scored {
+        let expansions_only = groups.iter().all(|g| g.role == Role::Expansion);
+        out.push(Scored {
             circle,
             at,
             score: score * coverage * coverage * prior,
             covered,
-            primary: covered > 0 || is_pinned,
+            primary: !expansions_only && (covered > 0 || pin_rank > 0),
             definition,
-            pinned: is_pinned,
+            pin: pin_rank,
             why,
             also_at: Vec::new(),
-        };
-        if entry.primary {
-            primary.push(entry);
-        } else {
-            near.push(entry);
-        }
+        });
     }
-    let order = |a: &Scored, b: &Scored| {
-        let (va, vb) = (view(c, a.at), view(c, b.at));
-        b.pinned
-            .cmp(&a.pinned)
-            .then(b.score.total_cmp(&a.score))
-            .then(va.path.cmp(vb.path))
-            .then(va.lines.start.cmp(&vb.lines.start))
-    };
-    primary.sort_by(order);
-    near.sort_by(order);
-    let entries = collapse(c, primary);
-    let mut near = collapse(c, near);
-    near.truncate(NEAREST);
-    let definitions = entries.iter().filter(|e| e.definition).count() as u64;
-    Ranked { entries, definitions, near }
+    out
+}
+
+fn add(acc: &mut HashMap<AtKey, (ChunkAt, GroupTfs)>, at: ChunkAt, gi: usize, tf: [f32; 5]) {
+    let list = &mut acc.entry(at_key(at)).or_insert_with(|| (at, Vec::new())).1;
+    match list.iter_mut().find(|(g, _)| *g == gi) {
+        Some((_, t)) => (0..5).for_each(|f| t[f] += tf[f]),
+        None => list.push((gi, tf)),
+    }
+}
+
+/// Orders entries best first (pins first, by pin rank), ties by path and line, and keeps the
+/// best `keep`; only those are sorted.
+fn order(c: &OpenCircle, entries: &mut Vec<Scored>, keep: usize) {
+    let by_score = |a: &Scored, b: &Scored| b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score));
+    if entries.len() > keep {
+        entries.select_nth_unstable_by(keep, by_score);
+        entries.truncate(keep);
+    }
+    let mut keyed: Vec<(u8, f32, &str, u32, usize)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let v = view(c, e.at);
+            (e.pin, e.score, v.path, v.lines.start, i)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(b.2)).then(a.3.cmp(&b.3)));
+    let order: Vec<usize> = keyed.into_iter().map(|k| k.4).collect();
+    let mut taken: Vec<Option<Scored>> = std::mem::take(entries).into_iter().map(Some).collect();
+    *entries = order.into_iter().filter_map(|i| taken[i].take()).collect();
 }
 
 /// Byte-identical copies collapse into the best-ranked one, which lists the others' locations.

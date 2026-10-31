@@ -160,7 +160,14 @@ fn chunk(circle: &str, c: C) -> Chunk {
         name: c.name.into(),
         gist: first_sentence(c.doc),
         parent: None,
-        fields: Fields { name: c.name.into(), path: c.path.into(), sig: c.sig.into(), doc: c.doc.into(), body: c.body.into() },
+        // As extraction does: a crate card's path field is its directory.
+        fields: Fields {
+            name: c.name.into(),
+            path: if c.kind == Kind::Crate { c.path.trim_end_matches("/Cargo.toml").into() } else { c.path.into() },
+            sig: c.sig.into(),
+            doc: c.doc.into(),
+            body: c.body.into(),
+        },
         keys: Keys {
             paths: vec![c.path.into()],
             blob: (c.blob > 0).then(|| oid(c.blob)),
@@ -186,8 +193,8 @@ const B: &str = "fixture-beta";
 fn tree_chunks() -> Vec<Chunk> {
     let m = "makepad";
     let mut v = vec![
-        chunk(m, C { kind: Kind::Crate, path: "alpha", lines: (1, 9), name: "fixture-alpha", package: A, sig: "", doc: "Spinning gizmos for the index fixture", body: "", idents: &[], blob: 1 }),
-        chunk(m, C { kind: Kind::Crate, path: "beta", lines: (1, 6), name: "fixture-beta", package: B, sig: "", doc: "", body: "", idents: &[], blob: 2 }),
+        chunk(m, C { kind: Kind::Crate, path: "alpha/Cargo.toml", lines: (1, 9), name: "fixture-alpha", package: A, sig: "", doc: "Spinning gizmos for the index fixture", body: "", idents: &[], blob: 1 }),
+        chunk(m, C { kind: Kind::Crate, path: "beta/Cargo.toml", lines: (1, 6), name: "fixture-beta", package: B, sig: "", doc: "", body: "", idents: &[], blob: 2 }),
         chunk(m, C { kind: Kind::File, path: "alpha/src/lib.rs", lines: (1, 44), name: "alpha/src/lib.rs", package: A, sig: "MAX_TURN Gizmo Tick gizmo_count count_two tables", doc: "Spinning gizmos: a gizmo turns by a step each tick.", body: "", idents: &[], blob: 3 }),
         chunk(m, C { kind: Kind::Const, path: "alpha/src/lib.rs", lines: (6, 6), name: "MAX_TURN", package: A, sig: "pub const MAX_TURN: u32 = 8", doc: "Turns per tick, at most.", body: "", idents: &["MAX_TURN"], blob: 3 }),
         chunk(m, C { kind: Kind::Struct, path: "alpha/src/lib.rs", lines: (9, 11), name: "Gizmo", package: A, sig: "pub struct Gizmo", doc: "A gizmo that spins.", body: "pub angle: u32,", idents: &["Gizmo"], blob: 3 }),
@@ -391,15 +398,18 @@ fn grouping_caps_three_per_package_and_orders_groups_by_best_hit() {
     let o = opened(vec![makepad()], vec![]);
     let out = find(&o, &query("gizmo", &["makepad"]));
     let b = &out.blocks[0];
-    let mut seen: Vec<&str> = Vec::new();
+    // A chunk with no package groups by its file.
+    let group = |h: &Hit| if h.package.is_empty() { h.path.clone() } else { h.package.clone() };
+    let mut seen: Vec<String> = Vec::new();
     for h in &b.hits {
-        if seen.last() != Some(&h.package.as_str()) {
-            assert!(!seen.contains(&h.package.as_str()), "a package's hits are contiguous");
-            seen.push(&h.package);
+        let g = group(h);
+        if seen.last() != Some(&g) {
+            assert!(!seen.contains(&g), "a group's hits are contiguous");
+            seen.push(g);
         }
     }
-    for p in &seen {
-        assert!(b.hits.iter().filter(|h| h.package == *p).count() <= crate::HITS_PER_GROUP);
+    for g in &seen {
+        assert!(b.hits.iter().filter(|h| group(h) == *g).count() <= crate::HITS_PER_GROUP);
     }
     assert!(b.total > b.hits.len() as u64);
 }
@@ -672,4 +682,124 @@ fn find_json_lines_have_every_field() {
         }
     }
     assert_eq!(kinds.len(), 3);
+}
+
+#[test]
+fn function_words_drop_unless_they_are_all_there_is() {
+    let o = opened(vec![makepad()], vec![]);
+    let plain = find(&o, &query("gizmo spin", &["makepad"]));
+    let asked = find(&o, &query("what is the gizmo spin", &["makepad"]));
+    assert_eq!(names(&plain.blocks[0]), names(&asked.blocks[0]));
+    assert_eq!(plain.blocks[0].total, asked.blocks[0].total);
+    // Only function words: they are the query.
+    let only = find(&o, &query("by the", &["makepad"]));
+    assert!(!only.blocks[0].absent);
+    assert!(!only.blocks[0].hits.is_empty());
+}
+
+#[test]
+fn classify_reads_paths_packages_and_identifiers() {
+    use rank::{classify, Class};
+    let path = |w: &str| classify(w);
+    assert_eq!(path("libs/code_arch"), ("libs/code_arch".into(), Class::Path));
+    assert_eq!(path("(local/plans/run-from-git.md)"), ("local/plans/run-from-git.md".into(), Class::Path));
+    assert_eq!(path("lower.rs:11369-11374"), ("lower.rs".into(), Class::Path));
+    assert_eq!(path("push-tree.sh"), ("push-tree.sh".into(), Class::Path));
+    assert_eq!(path("apps/commercial:"), ("apps/commercial".into(), Class::Path));
+    // All capitals read as an identifier (`HAL`, `README`): judged for absence, never pinned
+    // unless something defines it.
+    assert_eq!(path("README's"), ("README".into(), Class::Subject { call: false, macro_call: false }));
+    assert_eq!(path("makepad-hal"), ("makepad-hal".into(), Class::Package));
+    assert_eq!(path("ids!"), ("ids".into(), Class::Subject { call: false, macro_call: true }));
+    assert_eq!(path("unit_here()"), ("unit_here".into(), Class::Subject { call: true, macro_call: false }));
+    assert_eq!(path("`KeyCode`"), ("KeyCode".into(), Class::Subject { call: false, macro_call: false }));
+    assert_eq!(path("Vulkan"), ("Vulkan".into(), Class::Plain));
+    assert_eq!(path("what"), ("what".into(), Class::Function));
+    assert_eq!(path("e.g."), ("e.g".into(), Class::Plain));
+    assert_eq!(path("Device::memory_type"), ("Device::memory_type".into(), Class::Subject { call: false, macro_call: false }));
+}
+
+#[test]
+fn a_named_directory_pins_its_crate_card_then_its_root_file() {
+    let o = opened(vec![makepad()], vec![]);
+    let out = find(&o, &query("what is alpha/ and who uses it", &["makepad"]));
+    let b = &out.blocks[0];
+    assert_eq!(b.hits[0].kind, Kind::Crate);
+    assert_eq!(b.hits[0].name, "fixture-alpha");
+    assert_eq!((b.hits[1].kind, b.hits[1].path.as_str()), (Kind::File, "alpha/src/lib.rs"));
+    assert!(!b.absent);
+}
+
+#[test]
+fn a_named_file_pins_its_record() {
+    let o = opened(vec![makepad()], vec![]);
+    let b = &find(&o, &query("does docs/guide.md still say spin", &["makepad"])).blocks[0];
+    assert_eq!((b.hits[0].path.as_str(), b.hits[0].lines.start), ("docs/guide.md", 1));
+    let b = &find(&o, &query("broken.rs", &["makepad"])).blocks[0];
+    assert_eq!(b.hits[0].path, "beta/src/broken.rs");
+}
+
+#[test]
+fn a_named_package_pins_its_card() {
+    let o = opened(vec![makepad()], vec![]);
+    let b = &find(&o, &query("who depends on fixture-beta", &["makepad"])).blocks[0];
+    assert_eq!((b.hits[0].kind, b.hits[0].name.as_str()), (Kind::Crate, "fixture-beta"));
+}
+
+#[test]
+fn a_missing_named_thing_is_absent_beside_present_words() {
+    let o = opened(vec![makepad(), notes(), history()], vec![]);
+    // A path the tree lacks, next to one it has.
+    let b = &find(&o, &query("alpha/src/lib.rs points at alpha/src/gone.rs", &["makepad"])).blocks[0];
+    assert!(b.absent);
+    assert!(!b.hits.is_empty(), "the present words still rank");
+    // An identifier with no whole-word match, next to present words.
+    let b = &find(&o, &query("is spin_wheel_limit in gizmo", &["makepad"])).blocks[0];
+    assert!(b.absent);
+    // Present things are never absent.
+    for q in ["alpha/src/lib.rs", "clamp_turn in beta", "what is fixture-beta", "MAX_TURN"] {
+        assert!(!find(&o, &query(q, &["makepad"])).blocks[0].absent, "{q}");
+    }
+    // Paths are judged in tree circles only; history never claims absence.
+    assert!(!find(&o, &query("alpha/src/gone.rs", &["notes:topic-a"])).blocks[0].absent);
+    assert!(!find(&o, &query("spin_wheel_limit spin", &["makepad:history"])).blocks[0].absent);
+}
+
+#[test]
+fn identifier_phrases_and_inner_runs() {
+    let o = opened(vec![makepad()], vec![]);
+    // Two words spelling one identifier.
+    let b = &find(&o, &query("where do we clamp the turn", &["makepad"])).blocks[0];
+    assert_eq!(b.hits[0].name, "clamp_turn");
+    // An absent long identifier still reaches its inner run.
+    let b = &find(&o, &query("FIXTURE_CLAMP_TURN_V2 step", &["makepad"])).blocks[0];
+    assert!(b.absent);
+    assert!(b.hits.iter().take(3).any(|h| h.name == "clamp_turn"), "{:?}", names(b));
+}
+
+#[test]
+fn kind_words_order_definitions() {
+    let o = opened(vec![makepad()], vec![]);
+    let b = &find(&o, &query("gizmo_count! macro definition", &["makepad"])).blocks[0];
+    assert_eq!((b.hits[0].kind, b.hits[0].name.as_str()), (Kind::Macro, "gizmo_count"));
+    let b = &find(&o, &query("Gizmo struct", &["makepad"])).blocks[0];
+    assert_eq!((b.hits[0].kind, b.hits[0].name.as_str()), (Kind::Struct, "Gizmo"));
+    // A kind word raises chunks of that kind, against the same hits without it.
+    let ratio = |q: &str| {
+        let b = find(&o, &query(q, &["makepad"])).blocks.remove(0);
+        let score = |k: Kind| b.hits.iter().find(|h| h.kind == k).map(|h| h.score).unwrap();
+        score(Kind::Crate) / score(Kind::Doc)
+    };
+    let (plain, asked) = (ratio("spinning"), ratio("spinning crate"));
+    assert!((asked / plain - rank::KIND_PRIOR).abs() < 1e-3, "{asked} / {plain}");
+}
+
+#[test]
+fn commits_meet_a_named_path_through_their_touched_paths() {
+    let o = opened(vec![history()], vec![]);
+    let b = &find(&o, &query("which commit touched beta/src", &["makepad:history"])).blocks[0];
+    assert_eq!(b.hits[0].name, "beta: clamp the turn harder");
+    // Each commit is a group of its own: no cap of three.
+    let b = &find(&o, &query("a", &["makepad:history"])).blocks[0];
+    assert!(b.hits.len() <= 3 || b.hits.iter().all(|h| h.package.is_empty()));
 }

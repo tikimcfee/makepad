@@ -107,13 +107,36 @@ pub fn word_terms(word: &str) -> Vec<(TermForm, String)> {
     out
 }
 
-/// True when a query word reads as an identifier rather than an English word: it has `_`, an
-/// upper-case letter, or a digit next to letters. Such words take part in the exact definition
-/// short-circuit even inside a multi-word query.
+/// True when a word reads as an identifier rather than an English word: it has `_`, an
+/// upper-case letter after its first character (`KeyCode`, `HAL`, `ReBAR`), or a digit next to
+/// letters (`vec3`). A capitalized English word (`Vulkan`) is not one.
 pub fn identifier_shaped(word: &str) -> bool {
     word.contains('_')
-        || word.chars().any(char::is_uppercase)
+        || word.chars().skip(1).any(char::is_uppercase)
         || (word.chars().any(char::is_numeric) && word.chars().any(char::is_alphabetic))
+}
+
+/// The standard English function words (NLTK's English stop-word list), lower case. A query
+/// drops them unless it is made of nothing else; a chunk keeps them (they cost no ranking).
+pub const FUNCTION_WORDS: &[&str] = &[
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", "yourself",
+    "yourselves", "he", "him", "his", "himself", "she", "her", "hers", "herself", "it", "its", "itself",
+    "they", "them", "their", "theirs", "themselves", "what", "which", "who", "whom", "this", "that",
+    "these", "those", "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "having", "do", "does", "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as",
+    "until", "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", "through",
+    "during", "before", "after", "above", "below", "to", "from", "up", "down", "in", "out", "on", "off",
+    "over", "under", "again", "further", "then", "once", "here", "there", "when", "where", "why", "how",
+    "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor", "not",
+    "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", "should",
+    "now", "d", "ll", "m", "o", "re", "ve", "y", "ain", "aren", "couldn", "didn", "doesn", "hadn",
+    "hasn", "haven", "isn", "ma", "mightn", "mustn", "needn", "shan", "shouldn", "wasn", "weren", "won",
+    "wouldn",
+];
+
+/// A lower-case English function word ([`FUNCTION_WORDS`]).
+pub fn function_word(word: &str) -> bool {
+    FUNCTION_WORDS.contains(&word)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,8 +270,11 @@ mod tests {
     fn identifier_shape() {
         assert!(identifier_shaped("memory_type"));
         assert!(identifier_shaped("KeyCode"));
+        assert!(identifier_shaped("HAL"));
         assert!(identifier_shaped("vec3"));
         assert!(!identifier_shaped("memory"));
+        assert!(!identifier_shaped("Vulkan"));
         assert!(!identifier_shaped("2026"));
+        assert!(function_word("what") && function_word("the") && !function_word("vulkan"));
     }
 }

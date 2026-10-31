@@ -25,14 +25,15 @@ pub fn count(opened: &Opened, words: &[String], plan: &Plan) -> Vec<Pointer> {
             }
             continue;
         }
-        let ranked = rank(c, ci, plan, &Filter::default());
-        let all: Vec<_> = ranked.entries.iter().filter(|e| e.covered == plan.words).collect();
         let Some(vis) = &c.visible else {
-            if !all.is_empty() {
-                out.push(pointer(c, all.len() as u64, PointerUnit::Chunks));
+            let ranked = rank(c, ci, plan, &Filter::default(), 0);
+            if ranked.all_words > 0 {
+                out.push(pointer(c, ranked.all_words, PointerUnit::Chunks));
             }
             continue;
         };
+        let ranked = rank(c, ci, plan, &Filter::default(), usize::MAX);
+        let all: Vec<_> = ranked.entries.iter().filter(|e| e.covered >= plan.words).collect();
         let mut commits: Vec<crate::Oid> = Vec::new();
         for e in &all {
             if let Some(oid) = view(c, e.at).commit {
