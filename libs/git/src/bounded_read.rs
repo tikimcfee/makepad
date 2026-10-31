@@ -87,7 +87,7 @@ fn loose(path: &Path, expected: ObjectKind, scratch: &Scratch, bytes_read: &mut 
                 let end = raw.data.iter().position(|b| *b == 0).ok_or_else(|| invalid("no object header"))?;
                 let header = std::str::from_utf8(&raw.data[..end]).map_err(|_| invalid("invalid object header"))?;
                 let (kind, length) = header.split_once(' ').ok_or_else(|| invalid("invalid object header"))?;
-                check_kind(ObjectKind::from_str(kind)?, expected, scratch)?;
+                check_kind(kind.parse()?, expected, scratch)?;
                 let length: usize = length.parse().map_err(|_| invalid("invalid object size"))?;
                 if length != written - end - 1 { return Err(invalid("object size mismatch")); }
                 raw.data.copy_within(end + 1.., 0);
@@ -157,8 +157,8 @@ impl DiskIndex {
             let count = (self.count - i).min(1024);
             self.file.seek(SeekFrom::Start(1032 + self.count * 24 + i * 4))?;
             self.file.read_exact(&mut chunk[..count as usize * 4])?;
-            for value in chunk[..count as usize * 4].chunks_exact(4) {
-                let offset = self.offset(u32::from_be_bytes(value.try_into().unwrap()))?;
+            for value in chunk[..count as usize * 4].as_chunks::<4>().0 {
+                let offset = self.offset(u32::from_be_bytes(*value))?;
                 if offset > start { end = end.min(offset); }
             }
             i += count;
@@ -186,10 +186,17 @@ fn varint(data: &[u8], pos: &mut usize) -> Result<usize, GitError> {
     Err(invalid("size overflow"))
 }
 
-fn packed(file: &mut File, index: &mut DiskIndex, offset: u64, expected: ObjectKind,
+/// A pack file and its index, read through bounded windows.
+struct DiskPack {
+    file: File,
+    index: DiskIndex,
+}
+
+fn packed(pack: &mut DiskPack, offset: u64, expected: ObjectKind,
     scratch: &Scratch, bytes_read: &mut u64, depth: usize, cancel: &dyn Fn() -> bool)
     -> Result<Bytes, GitError>
 {
+    let DiskPack { file, index } = pack;
     if cancel() { return Err(GitError::Cancelled); }
     if depth >= 64 { return Err(invalid("pack delta chain too deep")); }
     let _frame = scratch.reserve(8192)?;
@@ -238,7 +245,7 @@ fn packed(file: &mut File, index: &mut DiskIndex, offset: u64, expected: ObjectK
     let base_len = varint(&delta.data, &mut pos)?;
     let result_len = varint(&delta.data, &mut pos)?;
     let mut result = Bytes::zeroed(result_len, scratch)?;
-    let base = packed(file, index, base_offset, expected, scratch, bytes_read, depth + 1, cancel)?;
+    let base = packed(pack, base_offset, expected, scratch, bytes_read, depth + 1, cancel)?;
     if base_len != base.data.len() { return Err(invalid("delta base size mismatch")); }
     let mut out = 0usize;
     while pos < delta.data.len() {
@@ -285,8 +292,8 @@ fn in_objects(objects: &Path, oid: &ObjectId, expected: ObjectKind, scratch: &Sc
         if path.extension().is_none_or(|ext| ext != "idx") { continue; }
         let mut index = DiskIndex::open(&path)?;
         if let Some(offset) = index.find(oid)? {
-            let mut file = File::open(path.with_extension("pack"))?;
-            return packed(&mut file, &mut index, offset, expected, scratch, bytes_read, 0, cancel).map(Some);
+            let mut pack = DiskPack { file: File::open(path.with_extension("pack"))?, index };
+            return packed(&mut pack, offset, expected, scratch, bytes_read, 0, cancel).map(Some);
         }
     }
     Ok(None)

@@ -73,7 +73,7 @@ impl Sha1 {
         self.update(&bit_len.to_be_bytes());
 
         let mut out = [0u8; 20];
-        for (chunk, &v) in out.chunks_exact_mut(4).zip(self.state.iter()) {
+        for (chunk, &v) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state.iter()) {
             chunk.copy_from_slice(&v.to_be_bytes());
         }
         out
@@ -579,8 +579,8 @@ fn compress_soft(state: &mut [u32; 5], blocks: &[[u8; BLOCK_SIZE]]) {
     let mut block_u32 = [0u32; BLOCK_SIZE / 4];
     let mut state_cpy = *state;
     for block in blocks.iter() {
-        for (o, chunk) in block_u32.iter_mut().zip(block.chunks_exact(4)) {
-            *o = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (o, chunk) in block_u32.iter_mut().zip(block.as_chunks::<4>().0) {
+            *o = u32::from_be_bytes(*chunk);
         }
         sha1_digest_block_u32(&mut state_cpy, &block_u32);
     }

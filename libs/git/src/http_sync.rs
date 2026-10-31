@@ -706,7 +706,7 @@ fn parse_and_resolve(
         }
 
         match type_num {
-            1 | 2 | 3 | 4 => {
+            1..=4 => {
                 let kind = ObjectKind::from_type_num(type_num)?;
                 let (data, consumed) = decompress_object_data(&pack_data[pos..], size)?;
                 pos += consumed;

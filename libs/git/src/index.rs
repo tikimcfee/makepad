@@ -100,7 +100,7 @@ pub fn parse_index(data: &[u8]) -> Result<Index, GitError> {
         return Err(GitError::InvalidIndex(format!("bad signature: {:?}", sig)));
     }
     let version = r.read_u32()?;
-    if version < 2 || version > 4 {
+    if !(2..=4).contains(&version) {
         return Err(GitError::InvalidIndex(format!(
             "unsupported version: {}",
             version
@@ -231,9 +231,7 @@ pub fn serialize_index(index: &Index) -> Result<Vec<u8>, GitError> {
         let entry_len = buf.len() - entry_start;
         let padded_len = (entry_len + 8) & !7;
         let pad = padded_len - entry_len;
-        for _ in 0..pad {
-            buf.push(0);
-        }
+        buf.resize(buf.len() + pad, 0);
     }
 
     // Trailing checksum (SHA-1 of everything)

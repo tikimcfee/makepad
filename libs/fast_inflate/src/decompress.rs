@@ -99,11 +99,7 @@ const FASTLOOP_PRELOADABLE_NBITS: u32 = if UNALIGNED_ACCESS_IS_FAST {
     CONSUMABLE_NBITS
 };
 
-const PRELOAD_SLACK: u32 = if FASTLOOP_PRELOADABLE_NBITS > MAX_BITSLEFT {
-    FASTLOOP_PRELOADABLE_NBITS - MAX_BITSLEFT
-} else {
-    0
-};
+const PRELOAD_SLACK: u32 = FASTLOOP_PRELOADABLE_NBITS.saturating_sub(MAX_BITSLEFT);
 
 const LENGTH_MAXBITS: u32 = DEFLATE_MAX_LITLEN_CODEWORD_LEN + DEFLATE_MAX_EXTRA_LENGTH_BITS;
 const OFFSET_MAXBITS: u32 = DEFLATE_MAX_OFFSET_CODEWORD_LEN + DEFLATE_MAX_EXTRA_OFFSET_BITS;
@@ -215,8 +211,8 @@ static LITLEN_DECODE_RESULTS: [u32; DEFLATE_NUM_LITLEN_SYMS] = {
         t[257 + i as usize] = (length_bases[i as usize] << 16) | length_extra[i as usize];
         i += 1;
     }
-    t[286] = (258 << 16) | 0;
-    t[287] = (258 << 16) | 0;
+    t[286] = 258 << 16;
+    t[287] = 258 << 16;
     t
 };
 
@@ -279,16 +275,40 @@ fn make_decode_table_entry(decode_results: &[u32], sym: u32, len: u32) -> u32 {
     decode_results[sym as usize] + (len << 8) + len
 }
 
+/// The fixed parameters of one Huffman code's decode table.
+struct CodeSpec {
+    decode_results: &'static [u32],
+    table_bits: u32,
+    max_codeword_len: u32,
+}
+
+static PRECODE_SPEC: CodeSpec = CodeSpec {
+    decode_results: &PRECODE_DECODE_RESULTS,
+    table_bits: PRECODE_TABLEBITS,
+    max_codeword_len: DEFLATE_MAX_PRE_CODEWORD_LEN,
+};
+static LITLEN_SPEC: CodeSpec = CodeSpec {
+    decode_results: &LITLEN_DECODE_RESULTS,
+    table_bits: LITLEN_TABLEBITS,
+    max_codeword_len: DEFLATE_MAX_LITLEN_CODEWORD_LEN,
+};
+static OFFSET_SPEC: CodeSpec = CodeSpec {
+    decode_results: &OFFSET_DECODE_RESULTS,
+    table_bits: OFFSET_TABLEBITS,
+    max_codeword_len: DEFLATE_MAX_OFFSET_CODEWORD_LEN,
+};
+
 fn build_decode_table(
     decode_table: &mut [u32],
     lens: &[u8],
     num_syms: usize,
-    decode_results: &[u32],
-    mut table_bits: u32,
-    max_codeword_len: u32,
+    spec: &CodeSpec,
     sorted_syms: &mut [u16],
     actual_table_bits: Option<&mut u32>,
 ) -> bool {
+    let decode_results = spec.decode_results;
+    let mut table_bits = spec.table_bits;
+    let max_codeword_len = spec.max_codeword_len;
     let mut len_counts = [0u32; DEFLATE_MAX_CODEWORD_LEN as usize + 2];
     let mut offsets = [0u32; DEFLATE_MAX_CODEWORD_LEN as usize + 2];
 
@@ -300,8 +320,8 @@ fn build_decode_table(
     for l in 0..=max_codeword_len as usize {
         offsets[l + 1] = offsets[l] + len_counts[l];
     }
-    for sym in 0..num_syms {
-        let l = lens[sym] as usize;
+    for (sym, &l) in lens[..num_syms].iter().enumerate() {
+        let l = l as usize;
         if l != 0 {
             sorted_syms[offsets[l] as usize] = sym as u16;
             offsets[l] += 1;
@@ -312,16 +332,12 @@ fn build_decode_table(
 
     if num_used <= 1 {
         if num_used == 0 {
-            for i in 0..(1u32 << table_bits) as usize {
-                decode_table[i] = 0;
-            }
+            decode_table[..(1u32 << table_bits) as usize].fill(0);
         } else {
             let sym_idx = len_counts[0] as usize;
             let sym = sorted_syms[sym_idx] as u32;
             let entry = make_decode_table_entry(decode_results, sym, 1);
-            for i in 0..(1u32 << table_bits) as usize {
-                decode_table[i] = entry;
-            }
+            decode_table[..(1u32 << table_bits) as usize].fill(entry);
         }
         if let Some(bits) = actual_table_bits {
             *bits = table_bits;
@@ -647,34 +663,32 @@ fn deflate_decompress_with(
                 bitbuf >>= 20;
                 bitsleft -= 20;
                 refill_bits!();
-                for i in 1..num_explicit_precode_lens {
-                    d.precode_lens[PRECODE_PERM[i] as usize] = (bitbuf & bitmask(3)) as u8;
+                for &perm in &PRECODE_PERM[1..num_explicit_precode_lens] {
+                    d.precode_lens[perm as usize] = (bitbuf & bitmask(3)) as u8;
                     bitbuf >>= 3;
                     bitsleft -= 3;
                 }
             } else {
                 bitbuf >>= 17;
                 bitsleft -= 17;
-                for i in 0..num_explicit_precode_lens {
+                for &perm in &PRECODE_PERM[..num_explicit_precode_lens] {
                     if (bitsleft as u8) < 3 {
                         refill_bits!();
                     }
-                    d.precode_lens[PRECODE_PERM[i] as usize] = (bitbuf & bitmask(3)) as u8;
+                    d.precode_lens[perm as usize] = (bitbuf & bitmask(3)) as u8;
                     bitbuf >>= 3;
                     bitsleft -= 3;
                 }
             }
-            for i in num_explicit_precode_lens..DEFLATE_NUM_PRECODE_SYMS {
-                d.precode_lens[PRECODE_PERM[i] as usize] = 0;
+            for &perm in &PRECODE_PERM[num_explicit_precode_lens..DEFLATE_NUM_PRECODE_SYMS] {
+                d.precode_lens[perm as usize] = 0;
             }
 
             safety_check!(build_decode_table(
                 &mut d.precode_decode_table,
                 &d.precode_lens,
                 DEFLATE_NUM_PRECODE_SYMS,
-                &PRECODE_DECODE_RESULTS,
-                PRECODE_TABLEBITS,
-                DEFLATE_MAX_PRE_CODEWORD_LEN,
+                &PRECODE_SPEC,
                 &mut d.sorted_syms,
                 None,
             ));
@@ -733,9 +747,7 @@ fn deflate_decompress_with(
                 &mut d.offset_decode_table,
                 &d.lens[num_litlen_syms..],
                 num_offset_syms,
-                &OFFSET_DECODE_RESULTS,
-                OFFSET_TABLEBITS,
-                DEFLATE_MAX_OFFSET_CODEWORD_LEN,
+                &OFFSET_SPEC,
                 &mut d.sorted_syms,
                 None,
             ));
@@ -743,9 +755,7 @@ fn deflate_decompress_with(
                 &mut d.litlen_decode_table,
                 &d.lens,
                 num_litlen_syms,
-                &LITLEN_DECODE_RESULTS,
-                LITLEN_TABLEBITS,
-                DEFLATE_MAX_LITLEN_CODEWORD_LEN,
+                &LITLEN_SPEC,
                 &mut d.sorted_syms,
                 Some(&mut d.litlen_tablebits),
             ));
@@ -763,7 +773,7 @@ fn deflate_decompress_with(
             let nlen = read_le16(input, in_pos + 2);
             in_pos += 4;
 
-            safety_check!(len == (!nlen & 0xFFFF) as usize);
+            safety_check!(len == (!nlen) as usize);
             if len > out_len - out_pos {
                 return Err(DecompressError::InsufficientSpace);
             }
@@ -814,9 +824,7 @@ fn deflate_decompress_with(
                     &mut d.offset_decode_table,
                     &d.lens[288..],
                     32,
-                    &OFFSET_DECODE_RESULTS,
-                    OFFSET_TABLEBITS,
-                    DEFLATE_MAX_OFFSET_CODEWORD_LEN,
+                    &OFFSET_SPEC,
                     &mut d.sorted_syms,
                     None,
                 ));
@@ -824,9 +832,7 @@ fn deflate_decompress_with(
                     &mut d.litlen_decode_table,
                     &d.lens,
                     288,
-                    &LITLEN_DECODE_RESULTS,
-                    LITLEN_TABLEBITS,
-                    DEFLATE_MAX_LITLEN_CODEWORD_LEN,
+                    &LITLEN_SPEC,
                     &mut d.sorted_syms,
                     Some(&mut d.litlen_tablebits),
                 ));
@@ -1147,7 +1153,9 @@ fn deflate_decompress_with(
     bitsleft = bitsleft as u8 as u32;
     safety_check!(overread_count <= (bitsleft >> 3) as usize);
 
-    let actual_in_pos = in_pos - (bitsleft >> 3) as usize + overread_count;
+    // Unread whole bytes still in the bit buffer, less the zero bytes
+    // padded in past the end of a short input, go back to the input.
+    let actual_in_pos = in_pos - ((bitsleft >> 3) as usize - overread_count);
     Ok((actual_in_pos, out_pos - start))
 }
 
@@ -1176,7 +1184,7 @@ fn zlib_decompress_with(
     }
 
     let hdr = read_be16(input, 0);
-    if (hdr % 31) != 0 {
+    if !hdr.is_multiple_of(31) {
         return Err(DecompressError::BadData);
     }
     if ((hdr >> 8) & 0xF) as u8 != ZLIB_CM_DEFLATE {
@@ -1576,7 +1584,7 @@ mod tests {
             data.push((i.wrapping_mul(7) ^ i.wrapping_mul(13)) as u8);
         }
         for _ in 0..2 {
-            data.extend_from_slice(&data[0..32768].to_vec());
+            data.extend_from_within(0..32768);
         }
         roundtrip_zlib(&data, 6);
         roundtrip_zlib(&data, 10);
@@ -1644,7 +1652,7 @@ mod tests {
         let size = 1_000_000;
         let mut data = Vec::with_capacity(size);
         while data.len() < size {
-            if rng.next() % 4 != 0 {
+            if !rng.next().is_multiple_of(4) {
                 data.extend_from_slice(
                     b"Makepad is a creative software development platform built in Rust. ",
                 );

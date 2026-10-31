@@ -14,9 +14,9 @@ fn find_pack_file() -> Option<std::path::PathBuf> {
             for entry in std::fs::read_dir(&pack_dir).ok()? {
                 let entry = entry.ok()?;
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "pack") {
+                if path.extension().is_some_and(|e| e == "pack") {
                     let size = entry.metadata().ok()?.len();
-                    if largest.as_ref().map_or(true, |(s, _)| size > *s) {
+                    if largest.as_ref().is_none_or(|(s, _)| size > *s) {
                         largest = Some((size, path));
                     }
                 }
