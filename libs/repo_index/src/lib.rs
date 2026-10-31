@@ -35,6 +35,7 @@ pub mod output;
 pub mod query;
 pub mod store;
 pub mod terms;
+pub mod workers;
 
 use std::collections::HashSet;
 use std::fmt;

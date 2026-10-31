@@ -91,30 +91,19 @@ fn repo_at<'a>(
 
 /// Chunks per batch a build tokenizes at once.
 pub const BATCH: usize = 8192;
-/// Fewer chunks than this per thread are tokenized on the calling thread.
-pub const MIN_PER_THREAD: usize = 256;
+/// Chunks per fan-out index when tokenizing.
+pub const TOKENIZE_PART: usize = 64;
 
-/// The terms of `chunks`, in order, tokenized on every core (most of a build's time is here).
+/// The terms of `chunks`, in order, tokenized on every core ([`crate::workers::fan_out`]; most
+/// of a build's time is here).
 pub fn tokenize_all(tokenize: &(dyn Tokenize + Sync), chunks: &[Chunk]) -> Vec<FieldTerms> {
-    let cores = match std::thread::available_parallelism() {
-        Ok(n) => n.get(),
-        Err(e) => {
-            eprintln!("makepad index: the core count is unknown ({e}); tokenizing on one thread");
-            1
-        }
-    };
-    let threads = cores.min(chunks.len() / MIN_PER_THREAD).max(1);
-    if threads == 1 {
-        return chunks.iter().map(|c| tokenize.chunk_terms(c)).collect();
-    }
-    let per = chunks.len().div_ceil(threads);
-    std::thread::scope(|s| {
-        let parts: Vec<_> = chunks
-            .chunks(per)
-            .map(|part| s.spawn(move || part.iter().map(|c| tokenize.chunk_terms(c)).collect::<Vec<_>>()))
-            .collect();
-        parts.into_iter().flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+    let parts = chunks.len().div_ceil(TOKENIZE_PART);
+    crate::workers::fan_out(parts, |p| {
+        chunks[p * TOKENIZE_PART..((p + 1) * TOKENIZE_PART).min(chunks.len())].iter().map(|c| tokenize.chunk_terms(c)).collect::<Vec<_>>()
     })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Chunks on their way to a sink: tokenized [`BATCH`] at a time across cores, added in stream
@@ -1206,7 +1195,7 @@ mod tests {
             CircleBody::Base(b) => b.clone(),
             _ => unreachable!(),
         }).unwrap(), "a.rs", text.as_bytes()).unwrap();
-        assert!(chunks.len() > 2 * MIN_PER_THREAD);
+        assert!(chunks.len() > 2 * TOKENIZE_PART);
         let par = tokenize_all(&FakeTokenize, &chunks);
         let seq: Vec<FieldTerms> = chunks.iter().map(|c| FakeTokenize.chunk_terms(c)).collect();
         assert_eq!(par.len(), seq.len());
