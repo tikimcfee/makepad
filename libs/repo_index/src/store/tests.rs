@@ -276,6 +276,7 @@ fn segment_round_trip() {
     seg.verify().unwrap();
     assert_eq!(seg.key(), &key);
     assert_eq!(seg.chunk_count(), chunks.len() as u32);
+    assert_eq!(seg.id(), id);
 
     let mut expect: HashMap<(TermForm, String), Vec<Posting>> = HashMap::new();
     let mut lengths = [0u64; 5];
@@ -631,14 +632,14 @@ fn gc_keeps_what_is_live_or_young() {
     fs::write(hdir.join("tmp-1-1.mpx.tmp"), b"half").unwrap();
 
     // within the grace period nothing goes
-    let r = store.gc(std::slice::from_ref(&live), &[(repo, h.clone())]).unwrap();
+    let r = store.gc(RepoId(0xfeed), std::slice::from_ref(&live), &[(repo, h.clone())]).unwrap();
     assert!(r.removed.is_empty(), "{:?}", r.removed);
     assert!(r.deferred.iter().any(|(p, _)| p.ends_with(base_name(&dead))));
     assert!(r.deferred.iter().any(|(p, _)| p.ends_with(&stray.0)));
 
     // past it, only the live base, the newest manifest and their segments stay
     let store = FsStore::with_grace(root.0.clone(), Duration::ZERO);
-    let r = store.gc(std::slice::from_ref(&live), &[(repo, h.clone())]).unwrap();
+    let r = store.gc(RepoId(0xfeed), std::slice::from_ref(&live), &[(repo, h.clone())]).unwrap();
     assert!(r.deferred.is_empty(), "{:?}", r.deferred);
     assert!(store.open_base(&live).unwrap().is_some());
     assert!(store.open_base(&dead).unwrap().is_none());
@@ -837,14 +838,45 @@ fn gc_drops_unconfigured_circles() {
         let id = write_segment(&store, &key, &notes_chunks(c));
         store.commit(None, c, ManifestChange::Replace(id)).unwrap();
     }
-    let r = store.gc(&[], &[(None, a.clone())]).unwrap();
+    let r = store.gc(RepoId(0xfeed), &[], &[(None, a.clone())]).unwrap();
     assert!(r.removed.is_empty());
     assert!(r.deferred.iter().any(|(p, _)| p.ends_with("notes-topic-b")));
     let store = FsStore::with_grace(root.0.clone(), Duration::ZERO);
-    let r = store.gc(&[], &[(None, a.clone())]).unwrap();
+    let r = store.gc(RepoId(0xfeed), &[], &[(None, a.clone())]).unwrap();
     assert!(r.removed.iter().any(|p| p.ends_with("notes-topic-b")), "{:?}", r.removed);
     assert!(!root.0.join("notes-topic-b").exists());
     assert!(store.manifest(None, &b).unwrap().is_none());
     let m = store.manifest(None, &a).unwrap().unwrap();
     store.open_segment(None, &a, &m.segments[0]).unwrap();
+}
+
+/// A gc from repo A sweeps A's dead bases after the grace period and leaves every base and
+/// manifest circle of repo B alone, live or not: B's worktrees are not known to A.
+#[test]
+fn gc_sweeps_only_its_repo() {
+    let root = Root::new();
+    let store = FsStore::with_grace(root.0.clone(), Duration::ZERO);
+    let c = circle("makepad");
+    let h = circle("makepad:history");
+    let (ra, rb) = (RepoId(0xa), RepoId(0xb));
+    let base = |repo: RepoId, tree: &str| SegmentKey { repo: Some(repo), ..tree_key(&c, tree) };
+    let mut one = |sink: &mut dyn SegmentSink| {
+        let ch = chunk(&c, Kind::File, "only.rs", "only.rs");
+        sink.add(&ch, &FakeTokens.chunk_terms(&ch)).map(|_| ())
+    };
+    for key in [base(ra, "dead"), base(ra, "live"), base(rb, "b")] {
+        drop(store.build_base(&key, &mut one).unwrap());
+    }
+    for repo in [ra, rb] {
+        let key = SegmentKey { repo: Some(repo), ..history_key(&h, "x") };
+        let id = write_segment(&store, &key, &commit_chunks(&h, "x", 1));
+        store.commit(Some(repo), &h, ManifestChange::Add(id)).unwrap();
+    }
+    store.gc(ra, &[base(ra, "live")], &[(Some(ra), h.clone())]).unwrap();
+    assert!(store.open_base(&base(ra, "dead")).unwrap().is_none(), "A's dead base is swept");
+    assert!(store.open_base(&base(ra, "live")).unwrap().is_some());
+    assert!(store.open_base(&base(rb, "b")).unwrap().is_some(), "B's base is never A's to sweep");
+    let m = store.manifest(Some(rb), &h).unwrap().expect("B's history circle stays");
+    assert_eq!(store.open_segment(Some(rb), &h, &m.segments[0]).unwrap().id(), m.segments[0]);
+    assert!(store.manifest(Some(ra), &h).unwrap().is_some());
 }

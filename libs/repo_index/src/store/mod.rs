@@ -220,8 +220,8 @@ impl Store for FsStore {
         Ok(Box::new(self.segment(repo, circle, id)?))
     }
 
-    fn gc(&self, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
-        gc::run(self, live_bases, live_circles)
+    fn gc(&self, repo: RepoId, live_bases: &[SegmentKey], live_circles: &[(Option<RepoId>, CircleName)]) -> Result<GcReport, Error> {
+        gc::run(self, repo, live_bases, live_circles)
     }
 }
 
