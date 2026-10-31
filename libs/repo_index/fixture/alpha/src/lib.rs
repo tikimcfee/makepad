@@ -39,3 +39,5 @@ macro_rules! gizmo_count {
 pub fn count_two() -> u32 {
     gizmo_count!(1, 2)
 }
+
+pub mod tables;
