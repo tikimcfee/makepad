@@ -72,7 +72,7 @@ impl Search for Engine {
     fn find(&self, opened: &Opened, query: &Query) -> Result<FindOutput, Error> {
         let terms = self.terms.query_terms(&query.words);
         let plan = Plan::new(&query.words, &terms);
-        let filter = Filter { kinds: query.kinds.clone(), packages: query.packages.clone(), paths: query.paths.clone() };
+        let filter = Filter { kinds: query.kinds.clone(), packages: query.packages.clone(), paths: query.paths.clone(), any_rev: false };
         let ctx = HitCtx { first: query.circles.first().and_then(first_name), pinned: matches!(query.rev, RevSpec::Pinned(_)) };
         let mut ranked = Vec::new();
         for expr in &query.circles {
@@ -84,8 +84,19 @@ impl Search for Engine {
         // A block with nothing to rank (its words are absent there) takes no share.
         let sharing = ranked.iter().filter(|b| !b.entries.is_empty()).count().max(1);
         let share = limit.div_ceil(sharing).max(crate::HITS_PER_GROUP);
-        let blocks = ranked.into_iter().map(|b| self.block(opened, b, query, &ctx, share)).collect();
-        let pointers = if query.pointers { pointers::count(opened, &query.words, &plan) } else { Vec::new() };
+        let blocks: Vec<CircleBlock> = ranked.into_iter().map(|b| self.block(opened, b, query, &ctx, share)).collect();
+        let absent: Vec<String> = {
+            let mut a: Vec<String> = Vec::new();
+            for b in &blocks {
+                for t in &b.absent_terms {
+                    if !a.contains(t) {
+                        a.push(t.clone());
+                    }
+                }
+            }
+            a
+        };
+        let pointers = if query.pointers { pointers::count(opened, &query.words, &plan, &absent) } else { Vec::new() };
         Ok(FindOutput { blocks, pointers })
     }
 

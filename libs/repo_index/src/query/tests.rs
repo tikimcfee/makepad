@@ -811,3 +811,45 @@ fn commits_meet_a_named_path_through_their_touched_paths() {
     let b = &find(&o, &query("a", &["makepad:history"])).blocks[0];
     assert!(b.hits.len() <= 3 || b.hits.iter().all(|h| h.package.is_empty()));
 }
+
+#[test]
+fn branch_pointer_counts_local_commits_the_pinned_rev_does_not_reach() {
+    let mut h = history();
+    // Pinned at upstream: the local commit c2 is not reachable from the revision.
+    if let Some(vis) = &mut h.visible {
+        vis.reachable.remove(&oid(0xc2));
+    }
+    let o = opened(vec![makepad()], vec![h]);
+    let out = find(&o, &query("clamp", &["makepad"]));
+    let br = out.pointers.iter().find(|p| p.branch.is_some()).expect("a branch pointer");
+    assert_eq!((br.count, br.commits, br.branch.as_deref()), (2, 1, Some("work")));
+    // The commits pointer stays what the revision reaches.
+    let hist = out.pointers.iter().find(|p| p.unit == PointerUnit::Commits);
+    assert!(hist.is_none(), "c2 is the only commit naming clamp, and the rev does not reach it");
+}
+
+#[test]
+fn branch_pointer_reads_changed_files_only_for_absent_terms() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let mut h = history();
+    if let Some(vis) = &mut h.visible {
+        vis.local_files = vec![("alpha/src/wheel.rs".into(), oid(0xd1)), ("beta/src/lib.rs".into(), oid(0xd2))];
+    }
+    let reads = Rc::new(Cell::new(0));
+    let counter = reads.clone();
+    let mut o = opened(vec![makepad()], vec![h]);
+    o.blobs = Some(Box::new(move |blob: Oid| {
+        counter.set(counter.get() + 1);
+        Ok(if blob == oid(0xd1) { b"pub const SPIN_WHEEL_LIMIT: u32 = 4; // spin_wheel_limit".to_vec() } else { b"fn clamp_turn() {}".to_vec() })
+    }));
+    let out = find(&o, &query("spin_wheel_limit", &["makepad"]));
+    assert!(out.blocks[0].absent);
+    let br = out.pointers.iter().find(|p| p.branch.is_some()).expect("a branch pointer");
+    assert_eq!((br.count, br.commits, br.unit), (1, 0, PointerUnit::Files));
+    assert_eq!(reads.get(), 2);
+    // Nothing absent: the changed files are never read.
+    reads.set(0);
+    let _ = find(&o, &query("spin", &["makepad"]));
+    assert_eq!(reads.get(), 0);
+}
