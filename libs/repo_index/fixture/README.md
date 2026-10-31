@@ -34,6 +34,6 @@ What each part exercises:
   - Markdown sections citing `alpha/src/lib.rs:15` and the item `Gizmo::spin`;
   - `COPY.md`, byte-identical to `PLAN.md`, which must collapse into one hit;
   - `spin.rs`, a non-Markdown note: one `note-file` chunk;
-  - `pixel.bin`, binary: skipped and reported.
+  - `pixel.bin`, binary: a record of its path only.
 - **`notes/local-a/spin.rs`:** the same file name as `topic-a/spin.rs` but different content.
   The label prefixes keep their paths and handles apart.
