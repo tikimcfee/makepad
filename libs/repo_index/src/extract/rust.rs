@@ -34,7 +34,8 @@ pub struct RustFile {
     /// The file's `//!` header.
     pub header: String,
     pub items: Vec<RustItem>,
-    /// Names of `mod` items at the top level.
+    /// Names of `mod` items at the top level, once each (`#[cfg]` arms declare one module
+    /// several times), in declaration order.
     pub mods: Vec<String>,
     pub lines: u32,
     /// Why the file could not be scanned (lex error, unpaired delimiters); `items` is empty.
@@ -220,14 +221,20 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// From `from`, the body brace (stopping at a `;`), skipping parens and brackets.
+    /// From `from`, the body brace (stopping at a `;`), skipping parens, brackets and the braces
+    /// of a generic argument (`impl Holder<{ N + 1 }>`).
     fn find_body(&self, from: usize, hi: usize) -> (Option<usize>, usize) {
         let mut j = from;
+        let mut angle = 0usize;
         while j < hi {
             match self.toks[j].kind {
-                T::OpenBrace => return (Some(j), self.ends[j] as usize),
+                T::OpenBrace if angle == 0 => return (Some(j), self.ends[j] as usize),
                 T::Semi => return (None, j),
-                T::OpenParen | T::OpenBracket => j = self.ends[j] as usize,
+                T::OpenBrace | T::OpenParen | T::OpenBracket => j = self.ends[j] as usize,
+                T::Lt => angle += 1,
+                T::Shl => angle += 2,
+                T::Gt => angle = angle.saturating_sub(1),
+                T::Shr => angle = angle.saturating_sub(2),
                 _ => {}
             }
             j += 1;
@@ -456,7 +463,7 @@ impl<'a> Scanner<'a> {
                     let display = if kind == Kind::Method { member(&name) } else { name.clone() };
                     let keep_body = matches!(kind, Kind::Fn | Kind::Method | Kind::Struct | Kind::Enum);
                     let idx = self.push(Decl { kind, name: display, ident: name.clone(), sig_from: sig_start, start: item_start, body, end, public, parent, keep_body }, &docs);
-                    if kind == Kind::Mod && matches!(container, Container::File) {
+                    if kind == Kind::Mod && matches!(container, Container::File) && !self.out.mods.contains(&name) {
                         self.out.mods.push(name.clone());
                     }
                     if let Some(b) = body {
@@ -543,6 +550,28 @@ mod tests {
 
     fn find<'a>(f: &'a RustFile, name: &str) -> &'a RustItem {
         f.items.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("no item {name}: {:?}", f.items.iter().map(|i| &i.name).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn generic_argument_braces_are_not_the_body() {
+        let src = "pub struct Holder<const N: usize>;\n\
+impl Holder<{ 1 + 1 }> {\n    pub fn hidden_const_generic_method() {}\n}\n\
+impl<T> Show for Wrap<Vec<<T as Base>::Out>, { N }> where T: Fn() -> u8 {\n    fn show(&self) {}\n}\n\
+pub fn after() -> Holder<{ 2 }> { Holder }\n";
+        let f = scan(src.as_bytes(), false);
+        assert!(f.fallback.is_none());
+        let imp = find(&f, "impl Holder");
+        assert_eq!((imp.lines.start, imp.lines.end), (2, 4));
+        assert_eq!(find(&f, "Holder::hidden_const_generic_method").kind, Kind::Method);
+        assert_eq!(find(&f, "Wrap::show").kind, Kind::Method);
+        let after = find(&f, "after");
+        assert_eq!((after.kind, after.lines.start), (Kind::Fn, 8));
+    }
+
+    #[test]
+    fn cfg_arms_declare_a_module_once() {
+        let src = "#[cfg(target_os = \"linux\")]\nmod main_loop;\n#[cfg(target_os = \"macos\")]\n#[path = \"mac.rs\"]\nmod main_loop;\nmod other;\n#[cfg(windows)]\nmod main_loop;\n";
+        assert_eq!(scan(src.as_bytes(), false).mods, vec!["main_loop".to_string(), "other".to_string()]);
     }
 
     #[test]
