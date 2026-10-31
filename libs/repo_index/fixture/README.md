@@ -1,7 +1,7 @@
 # repo_index fixture
 
 A tiny tree for the unit tests of `libs/repo_index`. It is committed test data, under PLAN
-§11.4: Ivan's decision that the index's tests and eval set go in the repo.
+§11.4: the decision that the index's tests and eval set go in the repo.
 
 The tests use it two ways:
 
