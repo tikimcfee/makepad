@@ -74,12 +74,17 @@ impl Search for Engine {
         let plan = Plan::new(&query.words, &terms);
         let filter = Filter { kinds: query.kinds.clone(), packages: query.packages.clone(), paths: query.paths.clone() };
         let ctx = HitCtx { first: query.circles.first().and_then(first_name), pinned: matches!(query.rev, RevSpec::Pinned(_)) };
-        let mut blocks = Vec::new();
+        let mut ranked = Vec::new();
         for expr in &query.circles {
-            for b in self.eval(opened, expr, &plan, &filter)? {
-                blocks.push(self.block(opened, b, query, &ctx));
-            }
+            ranked.extend(self.eval(opened, expr, &plan, &filter)?);
         }
+        // The hit limit is the whole answer's: blocks share it, so a two-circle find costs about
+        // what a one-circle find does (PLAN §1's byte budget).
+        let limit = if query.limit == 0 { crate::DEFAULT_LIMIT } else { query.limit };
+        // A block with nothing to rank (its words are absent there) takes no share.
+        let sharing = ranked.iter().filter(|b| !b.entries.is_empty()).count().max(1);
+        let share = limit.div_ceil(sharing).max(crate::HITS_PER_GROUP);
+        let blocks = ranked.into_iter().map(|b| self.block(opened, b, query, &ctx, share)).collect();
         let pointers = if query.pointers { pointers::count(opened, &query.words, &plan) } else { Vec::new() };
         Ok(FindOutput { blocks, pointers })
     }
@@ -160,8 +165,7 @@ impl Engine {
 
     /// Selects and groups a block's hits: at most [`crate::HITS_PER_GROUP`] per package, up to
     /// the limit, groups ordered by their best hit.
-    fn block(&self, opened: &Opened, b: BlockRank, query: &Query, ctx: &HitCtx) -> CircleBlock {
-        let limit = if query.limit == 0 { crate::DEFAULT_LIMIT } else { query.limit };
+    fn block(&self, opened: &Opened, b: BlockRank, query: &Query, ctx: &HitCtx, limit: usize) -> CircleBlock {
         let def_mode = query.mode == Mode::Def;
         let (pool, nearest_pool): (Vec<&Scored>, Vec<&Scored>) = if def_mode {
             let defs: Vec<&Scored> = b.entries.iter().filter(|e| matches!(e.pin, 2 | 3)).collect();

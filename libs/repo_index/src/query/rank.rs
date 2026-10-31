@@ -64,8 +64,12 @@ pub enum Role {
     Expansion,
     Exact,
     /// Consecutive query words written as one identifier (`memory type` → `memory_type`,
-    /// `memorytype`): covers all of them.
+    /// `memorytype`), or a long identifier's inner run (`memory_budget` in
+    /// `VK_EXT_memory_budget`): covers the words it spans.
     Phrase,
+    /// A part of a path-shaped word other than its rarest: scored only on chunks the rarest
+    /// part found, so the word covers a chunk only when all its parts are there.
+    PathPart,
 }
 
 /// One scored term of the query.
@@ -548,7 +552,11 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
         if let Some((part, df)) = rarest {
             x.path_idf.insert(pw.word, idf(n, df as f32));
             let path_hits = &mut x.path_hits;
-            groups.push(Group { text: part.clone(), word: pw.word, role: Role::Primary, span: 1 });
+            // The rarest part finds the candidates (it comes first); the others must be there too.
+            groups.insert(0, Group { text: part.clone(), word: pw.word, role: Role::Primary, span: 1 });
+            for other in pw.parts.iter().filter(|p| *p != part) {
+                groups.push(Group { text: other.clone(), word: pw.word, role: Role::PathPart, span: 1 });
+            }
             let mut consider = |at: ChunkAt| {
                 let v = view(c, at);
                 if let Some(m) = path_match(c, at, &v, &pw.token) {
@@ -620,6 +628,7 @@ fn forms(role: Role) -> &'static [(TermForm, f32)] {
         Role::Primary | Role::Expansion => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
         Role::Exact => &[(TermForm::Exact, 1.0)],
         Role::Phrase => &[(TermForm::Folded, 1.0)],
+        Role::PathPart => &[(TermForm::Folded, 1.0), (TermForm::Part, PART_TF)],
     }
 }
 
@@ -630,10 +639,14 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
     let idfs: Vec<f32> = groups.iter().map(|g| idf(n, (x.df(g.role, &g.text) as f32).min(n))).collect();
     let mut acc: HashMap<AtKey, (ChunkAt, GroupTfs)> = HashMap::new();
     for (gi, g) in groups.iter().enumerate() {
+        let restrict = g.role == Role::PathPart;
         for (si, seg) in c.segments.iter().enumerate() {
             for (form, w) in forms(g.role) {
                 for p in seg.postings(*form, &g.text) {
                     let at = ChunkAt::Segment { segment: si, chunk: p.chunk };
+                    if restrict && !acc.contains_key(&at_key(at)) {
+                        continue;
+                    }
                     add(&mut acc, at, gi, p.tf.map(|t| t as f32 * w));
                 }
             }
@@ -648,8 +661,9 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                         }
                     }
                 }
-                if tf.iter().any(|t| *t > 0.0) {
-                    add(&mut acc, ChunkAt::Overlay { file: fi, chunk: ci }, gi, tf);
+                let at = ChunkAt::Overlay { file: fi, chunk: ci };
+                if tf.iter().any(|t| *t > 0.0) && !(restrict && !acc.contains_key(&at_key(at))) {
+                    add(&mut acc, at, gi, tf);
                 }
             }
         }
@@ -705,7 +719,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
 
     // Words with several primary terms cover a chunk only when all of them match.
     let mut need: HashMap<u16, usize> = HashMap::new();
-    for g in groups.iter().filter(|g| g.role == Role::Primary) {
+    for g in groups.iter().filter(|g| matches!(g.role, Role::Primary | Role::PathPart)) {
         *need.entry(g.word).or_insert(0) += 1;
     }
     let path_words: HashSet<u16> = plan.paths.iter().map(|p| p.word).collect();
@@ -740,13 +754,13 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
                 continue;
             }
             let role_weight = match g.role {
-                Role::Primary | Role::Phrase => 1.0,
+                Role::Primary | Role::Phrase | Role::PathPart => 1.0,
                 Role::Expansion => EXPANSION_WEIGHT,
                 Role::Exact => EXACT_WEIGHT,
             };
             score += role_weight * idfs[*gi] * pseudo / (K1 + pseudo);
             match g.role {
-                Role::Primary => {
+                Role::Primary | Role::PathPart => {
                     *matched.entry(g.word).or_insert(0) += 1;
                     in_name |= tf[0] > 0.0 && !path_words.contains(&g.word);
                 }
