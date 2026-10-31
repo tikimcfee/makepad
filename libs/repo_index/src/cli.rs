@@ -68,7 +68,7 @@ fn wire() -> Result<Parts, Error> {
     let repo = GitRepo::open(&cwd)?;
     let index = index_root()?;
     let open_repo: RepoOpener = std::rc::Rc::new(|root: &Path| Ok(Box::new(GitRepo::open(root)?) as Box<dyn Repo>));
-    let opener = Opener::new(
+    let mut opener = Opener::new(
         Box::new(GitRepo::open(&cwd)?),
         open_repo,
         Box::new(FsStore::new(index.clone())),
@@ -77,6 +77,7 @@ fn wire() -> Result<Parts, Error> {
         circles::conf_path()?,
         circles::user_home()?,
     );
+    opener.visibility_cache = Some(index.join("visibility"));
     Ok(Parts {
         circles: Box::new(opener),
         search: Box::new(Engine::default()),

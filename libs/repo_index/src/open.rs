@@ -22,7 +22,7 @@ use crate::{
     SegmentSink, SourceStamp, Store, Tokenize, Visibility, INDEXER_VERSION,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -43,6 +43,9 @@ pub struct Opener {
     pub conf: PathBuf,
     /// `~` in `circles.conf`.
     pub home: PathBuf,
+    /// Where history visibility is kept between calls ([`VisCache`]); `None` computes it every
+    /// open.
+    pub visibility_cache: Option<PathBuf>,
     /// Other repos opened so far, by root.
     others: Vec<(PathBuf, Box<dyn Repo>)>,
 }
@@ -57,7 +60,7 @@ impl Opener {
         conf: PathBuf,
         home: PathBuf,
     ) -> Self {
-        Opener { repo, open_repo, store, extract, tokenize, conf, home, others: Vec::new() }
+        Opener { repo, open_repo, store, extract, tokenize, conf, home, visibility_cache: None, others: Vec::new() }
     }
 }
 
@@ -300,7 +303,7 @@ impl Opener {
         };
         let def_hash = circles::def_hash(&def);
         let main_id = self.repo.id();
-        let Opener { repo, open_repo, store, extract, tokenize, others, .. } = self;
+        let Opener { repo, open_repo, store, extract, tokenize, others, visibility_cache, .. } = self;
         match &def.source {
             BaseSource::Tree { root } => {
                 let repo = repo_at(repo, others, open_repo, root)?;
@@ -408,13 +411,20 @@ impl Opener {
                     batch.flush(sink)
                 };
                 let Some(segments) = open_manifest_circle(store.as_ref(), key, build, &mut fill)? else { return Ok(None) };
-                let local_files = branch_files(repo, &at, &local_tips, tree_on(manifest, root))?;
-                let visible = Visibility {
-                    reachable: repo.commits(&[at.commit], &[])?.into_iter().map(|c| c.oid).collect(),
-                    local: repo.commits(&local_tips, &[up.commit])?.into_iter().map(|c| c.oid).collect(),
-                    local_refs,
-                    local_files,
+                let tree = tree_on(manifest, root);
+                let cache = VisCache { dir: visibility_cache.as_deref(), key: vis_key(repo.id(), name, &at, up.commit, &local_tips, tree) };
+                let (reachable, local, local_files) = match cache.read() {
+                    Some(v) => v,
+                    None => {
+                        let reachable: HashSet<Oid> = repo.commit_ids(&[at.commit])?.into_iter().collect();
+                        let upstream: HashSet<Oid> = repo.commit_ids(&[up.commit])?.into_iter().collect();
+                        let local: HashSet<Oid> = repo.commit_ids(&local_tips)?.into_iter().filter(|c| !upstream.contains(c)).collect();
+                        let files = branch_files(repo, &at, &local_tips, tree)?;
+                        cache.write(&reachable, &local, &files);
+                        (reachable, local, files)
+                    }
                 };
+                let visible = Visibility { reachable, local, local_refs, local_files };
                 Ok(Some(OpenCircle {
                     name: name.clone(),
                     rev: Some(at),
@@ -433,6 +443,123 @@ impl Opener {
 /// `upstream/work`.
 pub fn short_ref(r: &str) -> String {
     r.strip_prefix("refs/heads/").or_else(|| r.strip_prefix("refs/remotes/")).or_else(|| r.strip_prefix("refs/")).unwrap_or(r).to_string()
+}
+
+/// History visibility files kept per directory, newest first.
+pub const VIS_KEEP: usize = 32;
+const VIS_MAGIC: &[u8] = b"makepad-index visibility 1\n";
+
+/// The key of a history circle's visibility: the repo, the circle, the revision, the upstream
+/// and local tips, and the exclusions its branch files honour. Anything else that moves (a ref)
+/// gives a new key; nothing is ever updated in place.
+fn vis_key(repo: crate::RepoId, name: &CircleName, at: &Rev, up: Oid, local: &[Oid], tree: Option<&BaseCircle>) -> String {
+    let mut text = format!("repo {:016x}\ncircle {}\nat {}\nup {}\n", repo.0, name.0, hex(&at.commit), hex(&up));
+    let mut tips: Vec<String> = local.iter().map(hex).collect();
+    tips.sort();
+    text.push_str(&format!("local {}\nexclusions {:016x}\n", tips.join(" "), tree.map_or(0, circles::def_hash)));
+    makepad_git::oid::hash_object("blob", text.as_bytes()).to_hex()
+}
+
+/// Reachable and local commit sets plus branch files.
+type VisData = (HashSet<Oid>, HashSet<Oid>, Vec<(String, Oid)>);
+
+/// One history circle's visibility on disk: computing it walks the history three times (about
+/// 0.3 s for makepad with touched paths, tens of ms without), reading it is one small file. A
+/// file that is missing or does not decode is recomputed (said on stderr when it does not
+/// decode); written to a tmp name and renamed, so readers never see half a file.
+struct VisCache<'a> {
+    dir: Option<&'a Path>,
+    key: String,
+}
+
+impl VisCache<'_> {
+    fn path(&self) -> Option<PathBuf> {
+        self.dir.map(|d| d.join(format!("{}.vis", self.key)))
+    }
+
+    fn read(&self) -> Option<VisData> {
+        let path = self.path()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let v = decode_vis(&bytes);
+        if v.is_none() {
+            eprintln!("makepad index: {} does not decode; visibility is recomputed", path.display());
+        }
+        v
+    }
+
+    fn write(&self, reachable: &HashSet<Oid>, local: &HashSet<Oid>, files: &[(String, Oid)]) {
+        let (Some(dir), Some(path)) = (self.dir, self.path()) else { return };
+        let mut out = VIS_MAGIC.to_vec();
+        for set in [reachable, local] {
+            let mut ids: Vec<&Oid> = set.iter().collect();
+            ids.sort();
+            out.extend((ids.len() as u32).to_le_bytes());
+            for o in ids {
+                out.extend(o.0);
+            }
+        }
+        out.extend((files.len() as u32).to_le_bytes());
+        for (p, o) in files {
+            out.extend((p.len() as u32).to_le_bytes());
+            out.extend(p.as_bytes());
+            out.extend(o.0);
+        }
+        let tmp = dir.join(format!(".{}.{}.tmp", self.key, std::process::id()));
+        let written = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&tmp, &out)).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("makepad index: visibility not kept in {} ({e}); the next call recomputes it", dir.display());
+            return;
+        }
+        prune_vis(dir);
+    }
+}
+
+fn decode_vis(bytes: &[u8]) -> Option<VisData> {
+    let mut at = bytes.strip_prefix(VIS_MAGIC)?;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let (head, rest) = (at.get(..n)?, at.get(n..)?);
+        at = rest;
+        Some(head)
+    };
+    let mut sets = Vec::new();
+    for _ in 0..2 {
+        let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let mut set = HashSet::with_capacity(n);
+        for _ in 0..n {
+            set.insert(Oid(take(20)?.try_into().ok()?));
+        }
+        sets.push(set);
+    }
+    let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let mut files = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let p = String::from_utf8(take(len)?.to_vec()).ok()?;
+        files.push((p, Oid(take(20)?.try_into().ok()?)));
+    }
+    if !at.is_empty() {
+        return None;
+    }
+    let local = sets.pop()?;
+    let reachable = sets.pop()?;
+    Some((reachable, local, files))
+}
+
+/// Keeps the [`VIS_KEEP`] newest visibility files of `dir`.
+fn prune_vis(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "vis"))
+        .map(|e| (e.metadata().and_then(|m| m.modified()).ok(), e.path()))
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    for (_, p) in files.into_iter().skip(VIS_KEEP) {
+        if let Err(e) = std::fs::remove_file(&p) {
+            eprintln!("makepad index: an old visibility file {} stays ({e})", p.display());
+        }
+    }
 }
 
 /// The tree circle on `root`, whose exclusions the branch files honour.
@@ -657,13 +784,25 @@ pub(crate) mod fakes {
             Ok(self.commits(tips, &[])?.into_iter().map(|c| c.oid).collect())
         }
         fn commits(&mut self, tips: &[Oid], hide: &[Oid]) -> Result<Vec<CommitRecord>, Error> {
-            Ok(self
-                .commits
-                .iter()
-                .filter(|c| tips.contains(&c.oid) || c.info.parents.iter().any(|p| tips.contains(p)))
-                .filter(|c| !hide.contains(&c.oid))
-                .cloned()
-                .collect())
+            // the recorded commits reachable from some tip through parents, minus those
+            // reachable from a hidden one
+            let walk = |from: &[Oid]| {
+                let mut seen: Vec<Oid> = Vec::new();
+                let mut stack = from.to_vec();
+                while let Some(o) = stack.pop() {
+                    if seen.contains(&o) {
+                        continue;
+                    }
+                    seen.push(o);
+                    if let Some(c) = self.commits.iter().find(|c| c.oid == o) {
+                        stack.extend(c.info.parents.iter().copied());
+                    }
+                }
+                seen
+            };
+            let hidden = walk(hide);
+            let shown = walk(tips);
+            Ok(self.commits.iter().filter(|c| shown.contains(&c.oid) && !hidden.contains(&c.oid)).cloned().collect())
         }
         fn worktrees(&mut self) -> Result<Vec<(PathBuf, Oid)>, Error> {
             Ok(self.worktrees.clone())
@@ -1114,6 +1253,46 @@ mod tests {
         assert!(opened.open[0].segments.iter().all(|s| s.key().indexer == INDEXER_VERSION));
         let manifest = store.state.borrow().manifests.values().find(|m| m.circle == n("notes:t")).cloned().unwrap();
         assert_eq!((manifest.version, manifest.segments.len()), (2, 1), "replaced, not added beside");
+    }
+
+    #[test]
+    fn history_visibility_is_kept_and_reused() {
+        let root = scratch("viscache").join("makepad");
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = root.parent().unwrap().join("vis");
+        let make = |root: &Path| {
+            let mut repo = FakeRepo::new(root);
+            let up = repo.rev(&["refs/remotes/upstream/work", "HEAD"], 1, &[("a.rs", "fn a() {}\n")]);
+            let tip = repo.rev(&["refs/heads/work"], 2, &[("a.rs", "fn b() {}\n")]);
+            repo.commits = vec![
+                CommitRecord { oid: up.commit, info: CommitInfo { time: 0, parents: vec![] }, message: "u".into(), touched: vec![] },
+                CommitRecord { oid: tip.commit, info: CommitInfo { time: 1, parents: vec![up.commit] }, message: "w".into(), touched: vec![] },
+            ];
+            repo
+        };
+        let (mut o, store1) = opener(make(&root), &root.join("none.conf"));
+        o.visibility_cache = Some(cache.clone());
+        let m = o.manifest().unwrap();
+        let first = o.open(&m, &[n("makepad:history")], &RevSpec::Pinned("HEAD".into())).unwrap();
+        let v1 = first.open[0].visible.clone().unwrap();
+        assert_eq!(v1.local, [oid(2)].into_iter().collect());
+        let kept: Vec<_> = std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(kept.len(), 1, "one file per (circle, revision, tips)");
+        // a repo whose history walk is empty: the visibility can only come from the file
+        let mut bare = make(&root);
+        bare.commits.clear();
+        let fail: RepoOpener = Rc::new(|p: &Path| Err(Error::Git(format!("no other repo at {}", p.display()))));
+        let mut o2 = Opener::new(Box::new(bare), fail, Box::new(store1.clone()), Box::new(FakeExtract), Box::new(FakeTokenize), root.join("none.conf"), root.clone());
+        o2.visibility_cache = Some(cache.clone());
+        let again = o2.open(&m, &[n("makepad:history")], &RevSpec::Pinned("HEAD".into())).unwrap();
+        let v2 = again.open[0].visible.clone().unwrap();
+        assert_eq!((v2.reachable, v2.local, v2.local_files), (v1.reachable, v1.local, v1.local_files));
+        // a file that does not decode is recomputed, not trusted
+        std::fs::write(kept[0].path(), b"garbage").unwrap();
+        let (mut o3, _) = opener(make(&root), &root.join("none.conf"));
+        o3.visibility_cache = Some(cache);
+        let third = o3.open(&m, &[n("makepad:history")], &RevSpec::Pinned("HEAD".into())).unwrap();
+        assert_eq!(third.open[0].visible.as_ref().unwrap().local, [oid(2)].into_iter().collect());
     }
 
     #[test]
