@@ -15,19 +15,27 @@ pub fn trigrams(text: &str) -> Vec<[char; 3]> {
     out.dedup();
     out
 }
+/// How [`matching_terms`] compares: against the term's spelling or its
+/// folded form, and by prefix only or by substring too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchMode {
+    pub case_sensitive: bool,
+    pub substring: bool,
+}
+
 /// Scope's verified term-level trigram matcher. `ordered` sorts folded terms.
 /// Returns None on cancellation; scores are exact=1, prefix=2, substring=3.
 /// Trigrams only select candidates: every candidate is verified against text.
 pub fn matching_terms<'a>(
     atom: &str,
-    case_sensitive: bool,
-    substring: bool,
+    mode: MatchMode,
     ordered: &[u32],
     len: usize,
     term: impl Fn(u32) -> (&'a str, &'a str),
     posting: impl Fn(&[char; 3]) -> Option<&'a [u32]>,
     cancel: impl Fn() -> bool,
 ) -> Option<Vec<(u32, u8)>> {
+    let MatchMode { case_sensitive, substring } = mode;
     let needle = fold(atom);
     let grams = trigrams(&needle);
     let start = ordered.partition_point(|id| term(*id).1 < needle.as_str());
@@ -164,8 +172,7 @@ impl TextIndex {
         }
         let terms = matching_terms(
             atom,
-            false,
-            true,
+            MatchMode { case_sensitive: false, substring: true },
             &self.ordered,
             self.words.len(),
             |id| {
