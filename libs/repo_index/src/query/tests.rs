@@ -970,3 +970,19 @@ fn a_prefix_word_matches_identifiers_that_start_with_it() {
     let b = &find(&o, &query("WOMBAT_YODEL_", &["makepad"])).blocks[0];
     assert_eq!(b.absent_terms, ["WOMBAT_YODEL_"]);
 }
+
+#[test]
+fn a_prefix_matches_the_start_of_identifiers_only() {
+    let m = "makepad";
+    let chunks = vec![
+        chunk(m, C { kind: Kind::Fn, path: "a/src/lib.rs", lines: (1, 3), name: "starts", package: A, sig: "fn starts()", doc: "", body: "let r = SPIN_RATE_MAX;", idents: &["starts"], blob: 21 }),
+        chunk(m, C { kind: Kind::Fn, path: "a/src/lib.rs", lines: (5, 7), name: "inside", package: A, sig: "fn inside()", doc: "", body: "let r = REVERSE_SPIN_RATE;", idents: &["inside"], blob: 21 }),
+        chunk(m, C { kind: Kind::Fn, path: "a/src/lib.rs", lines: (9, 11), name: "apart", package: A, sig: "fn apart()", doc: "", body: "spin at a rate", idents: &["apart"], blob: 21 }),
+    ];
+    let o = opened(vec![open("makepad", Some(rev(0x9a)), chunks, None)], vec![]);
+    let b = &find(&o, &query("SPIN_RATE_", &["makepad"])).blocks[0];
+    assert_eq!(names(b), ["starts"]);
+    assert!(!b.absent);
+    let b = &find(&o, &query("RATE_", &["makepad"])).blocks[0];
+    assert!(b.absent, "no identifier starts with rate_");
+}
