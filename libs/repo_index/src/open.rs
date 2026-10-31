@@ -18,7 +18,7 @@
 
 use crate::{
     circles, delta, BaseCircle, BaseSource, Chunk, CircleBody, CircleExpr, CircleManifest, CircleName, CircleStats, Circles,
-    BlobReader, Error, Extract, FieldTerms, Key, ManifestChange, Oid, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
+    BlobReader, Error, Extract, FieldTerms, Key, ManifestChange, Oid, SegmentManifest, NotesSource, OpenCircle, Opened, Repo, Rev, RevSpec, SegmentKey, SegmentRead,
     SegmentSink, SourceStamp, Store, Tokenize, Visibility, INDEXER_VERSION,
 };
 use std::cell::RefCell;
@@ -139,6 +139,57 @@ impl<'a> Batch<'a> {
         }
         Ok(())
     }
+}
+
+/// A manifest circle (notes, history) at the stamp `key` names: its segments when its manifest
+/// records the stamp and every segment is this indexer's; else, with `build`, rebuilt whole by
+/// `fill` (`Replace` when a manifest exists, so another indexer's segments never sit beside new
+/// ones); else a stale index that still reads, said on stderr; else `None`.
+fn open_manifest_circle(
+    store: &dyn Store,
+    key: SegmentKey,
+    build: bool,
+    fill: &mut dyn FnMut(&mut dyn SegmentSink) -> Result<(), Error>,
+) -> Result<Option<Vec<Box<dyn SegmentRead>>>, Error> {
+    let (repo_key, name) = (key.repo, key.circle.clone());
+    let existing = store.manifest(repo_key, &name)?;
+    let usable = existing.as_ref().and_then(|m| segments_now(store, &key, m).map(|s| (m.sources.contains(&key.source), s)));
+    match usable {
+        Some((true, segments)) => Ok(Some(segments)),
+        _ if build => {
+            let mut sink = store.new_segment(&key)?;
+            fill(sink.as_mut())?;
+            let id = sink.finish()?;
+            let change = if existing.is_some() { ManifestChange::Replace(id) } else { ManifestChange::Add(id) };
+            let m = store.commit(repo_key, &name, change)?;
+            Ok(Some(m.segments.iter().map(|id| store.open_segment(repo_key, &name, id)).collect::<Result<Vec<_>, _>>()?))
+        }
+        Some((false, segments)) => {
+            eprintln!("makepad index: {}: index is older than its sources; pointers may lag until `makepad index build --in {}`", name.0, name.0);
+            Ok(Some(segments))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A manifest's segments when every one opens and is this indexer's; `None` (said on stderr)
+/// when one is another indexer's or does not open, so it is rebuilt rather than read.
+fn segments_now(store: &dyn Store, key: &SegmentKey, m: &SegmentManifest) -> Option<Vec<Box<dyn SegmentRead>>> {
+    let mut out = Vec::new();
+    for id in &m.segments {
+        match store.open_segment(key.repo, &key.circle, id) {
+            Ok(s) if s.key().indexer == INDEXER_VERSION => out.push(s),
+            Ok(s) => {
+                eprintln!("makepad index: {}: segment {} is indexer {}, not {}; unused until rebuilt", key.circle.0, id.0, s.key().indexer, INDEXER_VERSION);
+                return None;
+            }
+            Err(e) => {
+                eprintln!("makepad index: {}: segment {} does not open ({e}); unused until rebuilt", key.circle.0, id.0);
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The package a path belongs to in a base: that of its own chunks, else of the nearest
@@ -307,39 +358,17 @@ impl Opener {
             BaseSource::Notes { sources } => {
                 let repo_key = (name.0 == circles::NOTES_LOCAL).then_some(main_id);
                 let stamp = SourceStamp::Notes { content: notes_stamp(sources, &def)? };
-                let current = store.manifest(repo_key, name)?;
-                let manifest_now = match current {
-                    Some(m) if m.sources.contains(&stamp) => m,
-                    stale if build => {
-                        let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
-                        let mut sink = store.new_segment(&key)?;
-                        let mut batch = Batch::new(tokenize.as_ref());
-                        let report = extract.extract(name, &def, None, repo.as_mut(), &mut |c: Chunk| batch.push(c, sink.as_mut()))?;
-                        batch.flush(sink.as_mut())?;
-                        for (path, why) in &report.skipped {
-                            eprintln!("makepad index: {}: skipped {path}: {why}", name.0);
-                        }
-                        let id = sink.finish()?;
-                        let change = match stale {
-                            Some(_) => ManifestChange::Replace(id),
-                            None => ManifestChange::Add(id),
-                        };
-                        store.commit(repo_key, name, change)?
+                let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
+                let mut fill = |sink: &mut dyn SegmentSink| -> Result<(), Error> {
+                    let mut batch = Batch::new(tokenize.as_ref());
+                    let report = extract.extract(name, &def, None, repo.as_mut(), &mut |c: Chunk| batch.push(c, sink))?;
+                    batch.flush(sink)?;
+                    for (path, why) in &report.skipped {
+                        eprintln!("makepad index: {}: skipped {path}: {why}", name.0);
                     }
-                    Some(m) => {
-                        eprintln!(
-                            "makepad index: {}: index is older than its sources (manifest {}); pointer counts may lag until `makepad index build --in {}`",
-                            name.0, m.version, name.0
-                        );
-                        m
-                    }
-                    None => return Ok(None),
+                    Ok(())
                 };
-                let segments = manifest_now
-                    .segments
-                    .iter()
-                    .map(|id| store.open_segment(repo_key, name, id))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let Some(segments) = open_manifest_circle(store.as_ref(), key, build, &mut fill)? else { return Ok(None) };
                 Ok(Some(OpenCircle {
                     name: name.clone(),
                     rev: None,
@@ -372,27 +401,13 @@ impl Opener {
                 }
                 let repo_key = Some(repo.id());
                 let stamp = SourceStamp::History { tips: tips.clone() };
-                let manifest_now = match store.manifest(repo_key, name)? {
-                    Some(m) if m.sources.contains(&stamp) => m,
-                    stale if build => {
-                        let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
-                        let mut sink = store.new_segment(&key)?;
-                        let mut batch = Batch::new(tokenize.as_ref());
-                        extract.extract(name, &def, Some(&at), repo, &mut |c: Chunk| batch.push(c, sink.as_mut()))?;
-                        batch.flush(sink.as_mut())?;
-                        let id = sink.finish()?;
-                        let change = match stale {
-                            Some(_) => ManifestChange::Replace(id),
-                            None => ManifestChange::Add(id),
-                        };
-                        store.commit(repo_key, name, change)?
-                    }
-                    Some(m) => {
-                        eprintln!("makepad index: {}: index predates its refs' tips; run `makepad index build --in {}`", name.0, name.0);
-                        m
-                    }
-                    None => return Ok(None),
+                let key = SegmentKey { repo: repo_key, circle: name.clone(), source: stamp, def_hash, indexer: INDEXER_VERSION };
+                let mut fill = |sink: &mut dyn SegmentSink| -> Result<(), Error> {
+                    let mut batch = Batch::new(tokenize.as_ref());
+                    extract.extract(name, &def, Some(&at), &mut *repo, &mut |c: Chunk| batch.push(c, sink))?;
+                    batch.flush(sink)
                 };
+                let Some(segments) = open_manifest_circle(store.as_ref(), key, build, &mut fill)? else { return Ok(None) };
                 let local_files = branch_files(repo, &at, &local_tips, tree_on(manifest, root))?;
                 let visible = Visibility {
                     reachable: repo.commits(&[at.commit], &[])?.into_iter().map(|c| c.oid).collect(),
@@ -400,11 +415,6 @@ impl Opener {
                     local_refs,
                     local_files,
                 };
-                let segments = manifest_now
-                    .segments
-                    .iter()
-                    .map(|id| store.open_segment(repo_key, name, id))
-                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Some(OpenCircle {
                     name: name.clone(),
                     rev: Some(at),
@@ -1076,6 +1086,34 @@ mod tests {
             .unwrap();
         assert_eq!(seg.chunk_count() as usize, chunks.len());
         assert!((0..seg.chunk_count()).all(|i| seg.chunk(crate::ChunkId(i)).name == chunks[i as usize].name));
+    }
+
+    #[test]
+    fn a_manifest_of_another_indexer_is_rebuilt_whole() {
+        let top = scratch("indexer");
+        let root = top.join("makepad");
+        std::fs::create_dir_all(top.join("mail/t")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(top.join("mail/t/a.md"), "# a\n").unwrap();
+        let conf = top.join("c.conf");
+        std::fs::write(&conf, format!("notes:t = notes {}\n", top.join("mail/t").display())).unwrap();
+        let mut repo = FakeRepo::new(&root);
+        repo.rev(&["HEAD", "refs/remotes/upstream/work"], 1, &[]);
+        let (mut o, store) = opener(repo, &conf);
+        let m = o.manifest().unwrap();
+        o.open(&m, &[n("notes:t")], &RevSpec::Worktree).unwrap();
+        // the same sources, but a segment of another indexer
+        for (key, _) in store.state.borrow_mut().segments.values_mut() {
+            key.indexer = INDEXER_VERSION + 1;
+        }
+        let pointer_only = o.open(&m, &[n("makepad")], &RevSpec::Worktree).unwrap();
+        assert!(pointer_only.unbuilt.contains(&n("notes:t")), "never read, never built for pointers");
+        let builds = store.state.borrow().builds;
+        let opened = o.open(&m, &[n("notes:t")], &RevSpec::Worktree).unwrap();
+        assert_eq!(store.state.borrow().builds, builds + 1, "rebuilt once");
+        assert!(opened.open[0].segments.iter().all(|s| s.key().indexer == INDEXER_VERSION));
+        let manifest = store.state.borrow().manifests.values().find(|m| m.circle == n("notes:t")).cloned().unwrap();
+        assert_eq!((manifest.version, manifest.segments.len()), (2, 1), "replaced, not added beside");
     }
 
     #[test]
