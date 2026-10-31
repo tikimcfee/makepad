@@ -8,8 +8,10 @@
 //! - an absence is met in the circles its scope names (a circle scope: that circle's block; no
 //!   scope or a descriptive one: every queried block): each must name its term absent
 //!   ([`CircleBlock::absent_terms`]; the term is `term`, else the query when it is one token, else
-//!   the block's absent flag stands for it). A `path:`, `package:` or `fn` scope is met when no
-//!   ranked hit is of that path, package or function. A semantic absence is for agent mode only;
+//!   the block's absent flag stands for it). A `path:`, `package:` or `fn` scope is a fact about
+//!   the circle, judged by the harness against its files ([`crate::eval::verify::scopes_hold`])
+//!   and passed in, never against the hits a query happened to print. A semantic absence is for
+//!   agent mode only;
 //! - a pointer matches a pointer line to its circle, with the same count when the item has one;
 //! - `dependents` need the `crate` card, so retrieval mode skips them, reported as skipped.
 //!
@@ -90,7 +92,7 @@ fn one_token(query: &str) -> Option<&str> {
     words.next().is_none().then_some(first)
 }
 
-fn need(g: &Gold, query: &str, out: &FindOutput, blocks: &[&CircleBlock], configured: &[CircleName]) -> Need {
+fn need(g: &Gold, query: &str, out: &FindOutput, blocks: &[&CircleBlock], configured: &[CircleName], held: &[(AbsentScope, bool)]) -> Need {
     if g.requires.as_ref().is_some_and(|c| !configured.contains(c)) {
         return Need::Skip;
     }
@@ -111,7 +113,6 @@ fn need(g: &Gold, query: &str, out: &FindOutput, blocks: &[&CircleBlock], config
         GoldTarget::Dependents { .. } | GoldTarget::Error(_) => Need::Skip,
         GoldTarget::Absent { semantic: true, .. } => Need::Skip,
         GoldTarget::Absent { scope, term, .. } => {
-            let hits = || blocks.iter().flat_map(|b| b.hits.iter());
             let term = term.as_deref().or_else(|| one_token(query));
             let says = |b: &CircleBlock| match term {
                 Some(t) => b.absent_terms.iter().any(|x| x.eq_ignore_ascii_case(t)),
@@ -120,11 +121,7 @@ fn need(g: &Gold, query: &str, out: &FindOutput, blocks: &[&CircleBlock], config
             Need::Met(match scope {
                 None | Some(AbsentScope::Text(_)) => !blocks.is_empty() && blocks.iter().all(|b| says(b)),
                 Some(AbsentScope::Circle(c)) => blocks.iter().any(|b| &b.circle == c && says(b)),
-                Some(AbsentScope::Path(p)) => !hits().any(|h| hit_paths(h).any(|x| path_in(p, x, h.kind) || x.ends_with(&format!("/{p}")))),
-                Some(AbsentScope::Package(n)) => !hits().any(|h| &h.package == n),
-                Some(AbsentScope::Fn(f)) => !hits().any(|h| {
-                    matches!(h.kind, Kind::Fn | Kind::Method) && (h.name == *f || h.name.ends_with(&format!("::{f}")))
-                }),
+                Some(s @ (AbsentScope::Path(_) | AbsentScope::Package(_) | AbsentScope::Fn(_))) => held.iter().any(|(x, h)| x == s && *h),
             })
         }
         GoldTarget::Pointer { circle, count, unit } => Need::Met(out.pointers.iter().any(|p| {
@@ -181,10 +178,12 @@ pub struct Scored {
     pub forbidden: u32,
 }
 
-/// Scores `out` for `q`. `bytes` and `ms` are the rendered output's size and the query's time.
-pub fn score(q: &Question, out: &FindOutput, k: usize, bytes: u32, ms: f32, configured: &[CircleName]) -> Scored {
+/// Scores `out` for `q`. `bytes` and `ms` are the rendered output's size and the query's time;
+/// `held` says which of its `path:`, `package:` and `fn` absence scopes hold in the circle (one
+/// not listed does not).
+pub fn score(q: &Question, out: &FindOutput, k: usize, bytes: u32, ms: f32, configured: &[CircleName], held: &[(AbsentScope, bool)]) -> Scored {
     let blocks: Vec<&CircleBlock> = out.blocks.iter().filter(|b| q.circles.contains(&b.circle)).collect();
-    let needs: Vec<(usize, Need)> = q.gold.iter().enumerate().map(|(i, g)| (i, need(g, &q.query, out, &blocks, configured))).collect();
+    let needs: Vec<(usize, Need)> = q.gold.iter().enumerate().map(|(i, g)| (i, need(g, &q.query, out, &blocks, configured, held))).collect();
     let skipped = needs.iter().filter(|(_, n)| matches!(n, Need::Skip)).count() as u32;
     let rankable: Vec<(u8, &GoldTarget)> = needs
         .iter()
@@ -329,15 +328,15 @@ pub(crate) mod tests {
             blocks: vec![block("makepad", vec![hit("a/x.rs", 1, Kind::Fn, "x"), hit("a/b.rs", 86, Kind::Fn, "y"), hit("a/c.rs", 3, Kind::Fn, "z")], false)],
             pointers: Vec::new(),
         };
-        let s = score(&question, &out, 10, 900, 3.0, &mk());
+        let s = score(&question, &out, 10, 900, 3.0, &mk(), &[]);
         assert!(s.solved);
         assert_eq!(s.rows[0].ranks_of_rel2, [Some(2)]);
         assert!(s.rows[0].ndcg > 0.5 && s.rows[0].ndcg < 1.0);
         // 84 + 2 < 100 - 15: out of tolerance
         let far = FindOutput { blocks: vec![block("makepad", vec![hit("a/b.rs", 70, Kind::Fn, "y")], false)], pointers: Vec::new() };
-        assert!(!score(&question, &far, 10, 0, 0.0, &mk()).solved);
+        assert!(!score(&question, &far, 10, 0, 0.0, &mk(), &[]).solved);
         // k cuts the list
-        assert!(!score(&question, &out, 1, 0, 0.0, &mk()).solved);
+        assert!(!score(&question, &out, 1, 0, 0.0, &mk(), &[]).solved);
     }
 
     #[test]
@@ -361,7 +360,7 @@ pub(crate) mod tests {
             blocks: vec![block("makepad", vec![card, copy], false), block("makepad:history", vec![commit], false)],
             pointers: Vec::new(),
         };
-        assert!(score(&question, &out, 10, 0, 0.0, &[CircleName("makepad".into()), CircleName("makepad:history".into())]).solved);
+        assert!(score(&question, &out, 10, 0, 0.0, &[CircleName("makepad".into()), CircleName("makepad:history".into())], &[]).solved);
     }
 
     #[test]
@@ -377,14 +376,14 @@ pub(crate) mod tests {
             ],
         );
         let absent = FindOutput { blocks: vec![block("makepad", vec![], true)], pointers: vec![pointer.clone()] };
-        let s = score(&question, &absent, 10, 0, 0.0, &mk());
+        let s = score(&question, &absent, 10, 0, 0.0, &mk(), &[]);
         assert!(s.solved);
         assert_eq!(s.absent_claims, [(n("makepad"), "x".to_string())], "the block's named absent terms, once");
         let wrong_count = FindOutput { pointers: vec![Pointer { count: 8, ..pointer.clone() }], ..absent.clone() };
-        assert!(!score(&question, &wrong_count, 10, 0, 0.0, &mk()).solved);
+        assert!(!score(&question, &wrong_count, 10, 0, 0.0, &mk(), &[]).solved);
         // an item that needs an unconfigured circle is skipped, not failed
         question.gold[1].requires = Some(n("notes:t"));
-        let s = score(&question, &FindOutput { pointers: vec![], ..absent.clone() }, 10, 0, 0.0, &mk());
+        let s = score(&question, &FindOutput { pointers: vec![], ..absent.clone() }, 10, 0, 0.0, &mk(), &[]);
         assert!(s.solved);
         assert_eq!(s.rows[0].skipped_items, 1);
         // a block can rank real hits and still name an absent term: both are reported
@@ -392,13 +391,13 @@ pub(crate) mod tests {
         both.absent = true;
         both.absent_terms = vec!["FOO_".into()];
         let plain = q("w", &["makepad"], vec![(2, path("a.rs", None))]);
-        let s = score(&plain, &FindOutput { blocks: vec![both], pointers: vec![] }, 10, 0, 0.0, &mk());
+        let s = score(&plain, &FindOutput { blocks: vec![both], pointers: vec![] }, 10, 0, 0.0, &mk(), &[]);
         assert!(s.solved);
         assert_eq!(s.absent_claims, [(n("makepad"), "FOO_".to_string())]);
         // a fn scope looks at definitions
         let premise = q("w22", &["makepad"], vec![(2, path("jit.rs", Some(1243))), (1, GoldTarget::Absent { scope: Some(AbsentScope::Fn("unit_here".into())), semantic: false, term: None })]);
         let out = FindOutput { blocks: vec![block("makepad", vec![hit("jit.rs", 1243, Kind::Fn, "cur_unit")], true)], pointers: vec![] };
-        assert!(score(&premise, &out, 10, 0, 0.0, &mk()).solved);
+        assert!(score(&premise, &out, 10, 0, 0.0, &mk(), &[]).solved);
     }
 
     #[test]
@@ -407,12 +406,12 @@ pub(crate) mod tests {
         let gold: Vec<(u8, GoldTarget)> = ["a.rs", "b.rs", "c.rs", "d.rs"].iter().map(|p| (2, path(p, None))).collect();
         let question = q("n", &["makepad"], gold);
         let out = FindOutput { blocks: vec![block("makepad", vec![hit("a.rs", 1, Kind::Fn, "a")], false)], pointers: vec![] };
-        let s = score(&question, &out, 10, 0, 0.0, &mk());
+        let s = score(&question, &out, 10, 0, 0.0, &mk(), &[]);
         let idcg: f32 = (0..4).map(|i| 2.0 / (i as f32 + 2.0).log2()).sum();
         assert!((s.rows[0].ndcg - 2.0 / idcg).abs() < 1e-4, "{}", s.rows[0].ndcg);
         assert!(s.rows[0].ndcg < 0.5);
         // k cuts the ideal too: at k = 1 the one right hit is the ideal
-        assert!((score(&question, &out, 1, 0, 0.0, &mk()).rows[0].ndcg - 1.0).abs() < 1e-4);
+        assert!((score(&question, &out, 1, 0, 0.0, &mk(), &[]).rows[0].ndcg - 1.0).abs() < 1e-4);
     }
 
     #[test]
@@ -433,19 +432,19 @@ pub(crate) mod tests {
             blocks: vec![says("makepad", &[], vec![hit("a.rs", 1, Kind::Fn, "publish_instances")]), says("makepad:history", &["publish_instances"], vec![])],
             pointers: vec![],
         };
-        assert!(!score(&question, &split, 10, 0, 0.0, &both).solved);
+        assert!(!score(&question, &split, 10, 0, 0.0, &both, &[]).solved);
         // a circle scope: only that circle's block counts
         question.gold[0].target = absent(Some(AbsentScope::Circle(n("makepad:history"))), None);
-        assert!(score(&question, &split, 10, 0, 0.0, &both).solved);
+        assert!(score(&question, &split, 10, 0, 0.0, &both, &[]).solved);
         question.gold[0].target = absent(Some(AbsentScope::Circle(n("makepad"))), None);
-        assert!(!score(&question, &split, 10, 0, 0.0, &both).solved);
+        assert!(!score(&question, &split, 10, 0, 0.0, &both, &[]).solved);
         // `term` names the needle among several words: the block ranks KeyCode and names zz_absent
         let mut two = q("a2", &["makepad"], vec![(2, absent(None, Some("zz_absent")))]);
         two.query = "KeyCode zz_absent".into();
         let out = FindOutput { blocks: vec![says("makepad", &["zz_absent"], vec![hit("k.rs", 1, Kind::Enum, "KeyCode")])], pointers: vec![] };
-        assert!(score(&two, &out, 10, 0, 0.0, &mk()).solved);
+        assert!(score(&two, &out, 10, 0, 0.0, &mk(), &[]).solved);
         two.gold[0].target = absent(None, Some("KeyCode"));
-        assert!(!score(&two, &out, 10, 0, 0.0, &mk()).solved);
+        assert!(!score(&two, &out, 10, 0, 0.0, &mk(), &[]).solved);
     }
 
     #[test]
@@ -456,7 +455,7 @@ pub(crate) mod tests {
         let mut tagged = hit("x.md", 1, Kind::Note, "n");
         tagged.handle.circle = Some(CircleName("notes:t".into()));
         let out = FindOutput { blocks: vec![block("makepad", vec![leak, tagged, hit("ok.rs", 1, Kind::Fn, "f")], false)], pointers: vec![] };
-        let s = score(&question, &out, 10, 0, 0.0, &mk());
+        let s = score(&question, &out, 10, 0, 0.0, &mk(), &[]);
         assert_eq!(s.forbidden, 2);
         // a notes path under its label is not `local/agent_state/` at the root of makepad
         assert!(forbidden("local/plans/*", &CircleName("notes:t".into()), &hit("makepad/local/plans/p.md", 1, Kind::Note, "p")));
@@ -467,7 +466,7 @@ pub(crate) mod tests {
             blocks: vec![block("makepad", vec![hit("terminal.rs", 1027, Kind::Enum, "KeyCode"), hit("key_code/src/lib.rs", 36, Kind::Enum, "KeyCode")], false)],
             pointers: vec![],
         };
-        let s = score(&d, &out, 10, 0, 0.0, &mk());
+        let s = score(&d, &out, 10, 0, 0.0, &mk(), &[]);
         assert!(s.solved && s.rows[0].distractor_above);
     }
 }
