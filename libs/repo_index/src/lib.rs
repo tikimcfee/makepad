@@ -220,6 +220,11 @@ pub struct Visibility {
     /// The short names of the local refs `local` was computed from (`work`), for
     /// [`Pointer`]'s branch.
     pub local_refs: Vec<String>,
+    /// The files that differ between the opened revision's tree and the local refs' tips, as
+    /// (path, blob at the tip): added or modified at a tip (a deleted file has no text). Paths
+    /// the tree circle on the same root excludes are left out. The branch pointer counts those
+    /// whose text holds the query's absent terms, read through [`Opened::blobs`].
+    pub local_files: Vec<(String, Oid)>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -824,7 +829,14 @@ pub struct Opened {
     pub others: Vec<OpenCircle>,
     /// Registered circles not named and not built: no pointer, listed by `status`.
     pub unbuilt: Vec<CircleName>,
+    /// Reads a blob of the repo the circles were opened in: the branch pointer reads
+    /// [`Visibility::local_files`] through it, only when a block has absent terms. The repo is
+    /// opened on the first read.
+    pub blobs: Option<BlobReader>,
 }
+
+/// A lazy blob reader ([`Opened::blobs`]).
+pub type BlobReader = Box<dyn Fn(Oid) -> Result<Vec<u8>, Error>>;
 
 /// The circle registry and the one way to open circles: resolve the revision, take the base
 /// for its merge-base with upstream (`Store::open_base`, else `build_base` through
