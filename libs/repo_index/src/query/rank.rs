@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::terms::{field_index, function_word, identifier_shaped, words};
 use crate::{
-    ChunkAt, ChunkId, ChunkView, Family, Field, Key, KeyKind, Keys, Kind, KindFilter, OpenCircle, QueryTerm, TermForm,
+    BlobReader, ChunkAt, ChunkId, ChunkView, Family, Field, Key, KeyKind, Keys, Kind, KindFilter, OpenCircle, QueryTerm, TermForm,
     Why,
 };
 
@@ -378,6 +378,8 @@ pub struct Scored {
     pub pin: u8,
     pub why: Vec<Why>,
     pub also_at: Vec<String>,
+    /// The line that matched best, when line scoring read its file: the hit reports it.
+    pub line: Option<u32>,
 }
 
 /// One circle's ranking.
@@ -537,7 +539,7 @@ fn match_one(path: &str, token: &str) -> Option<PathMatch> {
 
 /// Ranks one circle for `plan` under `filter`, ordering at most `keep` entries. `circle` is its
 /// index, carried into each entry.
-pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: usize) -> Ranked {
+pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: usize, blobs: Option<&BlobReader>) -> Ranked {
     let n = c.stats.chunks.max(1) as f32;
     let mut x = Ctx {
         c,
@@ -622,6 +624,8 @@ pub fn rank(c: &OpenCircle, circle: usize, plan: &Plan, filter: &Filter, keep: u
     let total = primary.len() as u64;
     let definitions = primary.iter().filter(|e| e.definition).count() as u64;
     let all_words = primary.iter().filter(|e| e.covered >= plan.words).count() as u64;
+    order(c, &mut primary, keep);
+    super::lines::refine(c, circle, plan, &mut primary, blobs);
     order(c, &mut primary, keep);
     order(c, &mut near, NEAREST * 4);
     let entries = collapse(c, primary);
@@ -857,8 +861,12 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
         let weight = |w: &u16| word_weight.get(w).copied().unwrap_or(1.0);
         let all: f32 = plan.content.iter().map(weight).sum();
         // A word met only through an inner run counts half: the whole token beats a part of it.
-        let partial: f32 = run_covered.iter().filter(|w| !covered.contains(*w)).map(|w| weight(w) * RUN_COVER).sum();
-        let coverage = (COVER_FLOOR + covered.iter().map(weight).sum::<f32>() + partial) / (COVER_FLOOR + all);
+        // Summed in query-word order: a set's order changes per process, and so would the
+        // float sum's last bits, and with them near-ties.
+        let partial: f32 =
+            plan.content.iter().filter(|w| run_covered.contains(*w) && !covered.contains(*w)).map(|w| weight(w) * RUN_COVER).sum();
+        let full: f32 = plan.content.iter().filter(|w| covered.contains(*w)).map(weight).sum();
+        let coverage = (COVER_FLOOR + full + partial) / (COVER_FLOOR + all);
         let covered_any = !covered.is_empty() || !run_covered.is_empty();
         let covered = covered.len() as u16;
         let definition = pin_rank >= 2 && pin_rank != 4 || in_name;
@@ -888,6 +896,7 @@ fn score_groups(x: &Ctx<'_>, groups: &[Group]) -> Vec<Scored> {
             pin: pin_rank,
             why,
             also_at: Vec::new(),
+            line: None,
         });
     }
     out
@@ -904,7 +913,7 @@ fn add(acc: &mut HashMap<AtKey, (ChunkAt, GroupTfs)>, at: ChunkAt, gi: usize, tf
 /// Orders entries best first (pins first, by pin rank), ties by path and line, and keeps the
 /// best `keep`; only those are sorted.
 fn order(c: &OpenCircle, entries: &mut Vec<Scored>, keep: usize) {
-    let by_score = |a: &Scored, b: &Scored| b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score));
+    let by_score = |a: &Scored, b: &Scored| b.pin.cmp(&a.pin).then(b.score.total_cmp(&a.score)).then(at_key(a.at).cmp(&at_key(b.at)));
     if entries.len() > keep {
         entries.select_nth_unstable_by(keep, by_score);
         entries.truncate(keep);
@@ -917,7 +926,15 @@ fn order(c: &OpenCircle, entries: &mut Vec<Scored>, keep: usize) {
             (e.pin, e.score, v.path, v.lines.start, i)
         })
         .collect();
-    keyed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(b.2)).then(a.3.cmp(&b.3)));
+    // Ties end on the chunk's place in its segment: the same order in every process (commits
+    // have no path or line to tell them apart).
+    keyed.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.total_cmp(&a.1))
+            .then(a.2.cmp(b.2))
+            .then(a.3.cmp(&b.3))
+            .then(at_key(entries[a.4].at).cmp(&at_key(entries[b.4].at)))
+    });
     let order: Vec<usize> = keyed.into_iter().map(|k| k.4).collect();
     let mut taken: Vec<Option<Scored>> = std::mem::take(entries).into_iter().map(Some).collect();
     *entries = order.into_iter().filter_map(|i| taken[i].take()).collect();

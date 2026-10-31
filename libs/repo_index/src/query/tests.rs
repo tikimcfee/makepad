@@ -848,8 +848,17 @@ fn branch_pointer_reads_changed_files_only_for_absent_terms() {
     let counter = reads.clone();
     let mut o = opened(vec![makepad()], vec![h]);
     o.blobs = Some(Box::new(move |blob: Oid| {
-        counter.set(counter.get() + 1);
-        Ok(if blob == oid(0xd1) { b"pub const SPIN_WHEEL_LIMIT: u32 = 4; // spin_wheel_limit".to_vec() } else { b"fn zz_branch_only() {}".to_vec() })
+        // Count the branch's files only (line scoring reads the tree's files too).
+        if blob == oid(0xd1) || blob == oid(0xd2) {
+            counter.set(counter.get() + 1);
+        }
+        Ok(if blob == oid(0xd1) {
+            b"pub const SPIN_WHEEL_LIMIT: u32 = 4; // spin_wheel_limit".to_vec()
+        } else if blob == oid(0xd2) {
+            b"fn zz_branch_only() {}".to_vec()
+        } else {
+            Vec::new()
+        })
     }));
     let out = find(&o, &query("spin_wheel_limit", &["makepad"]));
     assert!(out.blocks[0].absent);
@@ -865,4 +874,52 @@ fn branch_pointer_reads_changed_files_only_for_absent_terms() {
     reads.set(0);
     let _ = find(&o, &query("spin", &["makepad"]));
     assert_eq!(reads.get(), 0);
+}
+
+/// The fixture's real sources by blob, for line scoring.
+fn fixture_blobs() -> crate::BlobReader {
+    Box::new(|blob: Oid| {
+        Ok(match blob.0[0] {
+            3 => include_str!("../../fixture/alpha/src/lib.rs").as_bytes().to_vec(),
+            5 => include_str!("../../fixture/beta/src/lib.rs").as_bytes().to_vec(),
+            7 => include_str!("../../fixture/docs/guide.md").as_bytes().to_vec(),
+            _ => Vec::new(),
+        })
+    })
+}
+
+#[test]
+fn line_scoring_reports_the_line_inside_an_item() {
+    let mut o = opened(vec![makepad()], vec![]);
+    o.blobs = Some(fixture_blobs());
+    let b = &find(&o, &query("angle wrapping_add", &["makepad"])).blocks[0];
+    let spin = b.hits.iter().find(|h| h.name == "Gizmo::spin").expect("spin");
+    // Its handle points at the body line; the hit still spans the item.
+    assert_eq!(format(&spin.handle), "alpha/src/lib.rs:16");
+    assert_eq!((spin.lines.start, spin.lines.end), (14, 17));
+}
+
+#[test]
+fn line_scoring_lifts_a_line_between_items() {
+    let mut o = opened(vec![makepad()], vec![]);
+    o.blobs = Some(fixture_blobs());
+    // `use fixture_beta::clamp_turn;` sits between items: only the file chunk holds it.
+    let b = &find(&o, &query("fixture_beta clamp_turn", &["makepad"])).blocks[0];
+    let file = b.hits.iter().find(|h| h.kind == Kind::File && h.path == "alpha/src/lib.rs").expect("the file chunk");
+    assert_eq!(format(&file.handle), "alpha/src/lib.rs:3");
+    // Without a blob reader nothing is read and nothing moves.
+    let o = opened(vec![makepad()], vec![]);
+    let b = &find(&o, &query("fixture_beta clamp_turn", &["makepad"])).blocks[0];
+    assert!(!b.hits.iter().any(|h| format(&h.handle) == "alpha/src/lib.rs:3"));
+}
+
+#[test]
+fn line_scoring_leaves_one_word_scores_alone() {
+    let mut with = opened(vec![makepad()], vec![]);
+    with.blobs = Some(fixture_blobs());
+    let without = opened(vec![makepad()], vec![]);
+    let a = find(&with, &query("angle", &["makepad"]));
+    let b = find(&without, &query("angle", &["makepad"]));
+    let scores = |o: &FindOutput| o.blocks[0].hits.iter().map(|h| (h.name.clone(), h.score)).collect::<Vec<_>>();
+    assert_eq!(scores(&a), scores(&b));
 }

@@ -29,6 +29,7 @@ pub fn refs(opened: &Opened, ident: &str, uses: bool) -> Result<RefsOutput, Erro
         pin: 2,
         why: Vec::new(),
         also_at: Vec::new(),
+        line: None,
     };
     let mut def_at = chunks_with(c, &Key::Ident(ident.to_string()));
     def_at.sort_by(|a, b| {
