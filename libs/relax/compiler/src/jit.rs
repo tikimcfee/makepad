@@ -23,7 +23,7 @@ use relax_backend::x64;
 use crate::os;
 use crate::owner;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FnKey {
@@ -455,7 +455,8 @@ pub struct Unit {
     /// file version -> the patch generation that made it (invalid.rs: code built later from a
     /// version's source is that generation's code)
     pub file_gen: crate::fxhash::HashMap<u32, u32>,
-    /// bytes of the per-thread block handed out by `tls_alloc`
+    /// the end of this unit's part of the per-thread block (`tls_alloc`; offsets are handed
+    /// out per process, so a unit's variables need not start at TLS_FIRST_FREE)
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
     missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
@@ -747,6 +748,9 @@ const TLS_CAP: usize = 1 << 20;
 /// slot 2 separates compiler initializer execution from runtime coverage.
 const TLS_COVERAGE_DISABLED: u32 = 16;
 const TLS_FIRST_FREE: u32 = 24;
+/// The next free offset of the thread-local blocks, shared by every unit of the process
+/// (Unit::tls_alloc): offsets are never reused, so no unit's code sees another's values.
+static TLS_NEXT: AtomicU32 = AtomicU32::new(TLS_FIRST_FREE);
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 thread_local! {
@@ -4515,14 +4519,26 @@ impl Unit {
     }
 
     /// Reserves `size` bytes of every thread's thread-local block (zeroed per thread on
-    /// first use); returns the offset for `Inst::TlsAddr`.
+    /// first use); returns the offset for `Inst::TlsAddr`. Offsets are handed out per process
+    /// (`TLS_NEXT`), not per unit: a thread has one block whichever unit's code it runs, so a
+    /// proc-macro world that ran on the main thread before the program would otherwise leave its
+    /// values at the offsets the program gives its own variables (glyph3d-makepad: the program's
+    /// `next_keys::KEYS` at 0x18 read the macro world's `proc_macro::CALL_SITE` as its
+    /// `Option` tag and trapped in the match's unreachable arm).
     pub fn tls_alloc(&mut self, size: u32, align: u32) -> u32 {
         let a = align.max(1);
-        let at = (self.tls_next + a - 1) / a * a;
-        if (at + size) as usize > TLS_CAP {
-            panic!("thread-local block full");
-        }
-        self.tls_next = at + size;
+        let mut cur = TLS_NEXT.load(Ordering::Relaxed);
+        let at = loop {
+            let at = (cur + a - 1) / a * a;
+            if (at + size) as usize > TLS_CAP {
+                panic!("thread-local block full");
+            }
+            match TLS_NEXT.compare_exchange_weak(cur, at + size, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break at,
+                Err(c) => cur = c,
+            }
+        };
+        self.tls_next = self.tls_next.max(at + size);
         at
     }
 
