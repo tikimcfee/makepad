@@ -392,20 +392,17 @@ impl QueryCx {
 
     // Lead design rounds 47-48. Nightly resolve_bound_vars.rs:253-285,430-442
     // traverses whole owners. File-relative nodes require the entire edited file
-    // to change, including unchanged siblings; declarations keep their own input.
+    // to change, including unchanged siblings. That holds for an owner without a
+    // body too: a body edit retargets every item of the file to the new version
+    // (Program::retarget_file), so the items below the edit move, and the lifetime
+    // names of a struct or impl are keyed by their spans (LifetimeKey::Named). With
+    // only the declarations input, its cached names kept the old spans while a
+    // resolve_bound_vars computed after the edit read the new ones: a miss
+    // ("no entry found for key", glyph3d's derived Copy impls of G3StaticTables<'a>
+    // below a shader edit). Every owner reads its file's input.
     fn read_owner(&self, prog: &Program, owner: DefId) -> Result<(), QueryError> {
         self.read_def_declarations(prog, owner)?;
-        let def = prog.def(owner);
-        let pf = &prog.files[def.file as usize];
-        let has_body = match def.kind {
-            crate::program::DefKind::AnonConst | crate::program::DefKind::Closure => true,
-            _ => match pf.ast.item(def.item).kind {
-                crate::ast::ItemKind::Fn(sig, body, _) => body.is_some() || pf.ast.fn_sig(sig).lazy_body.is_some(),
-                crate::ast::ItemKind::Const(_, body) | crate::ast::ItemKind::Static(_, _, body) => body.is_some(),
-                _ => false,
-            },
-        };
-        if has_body { self.engine.input(FILE_BODIES, def.file)?; }
+        self.engine.input(FILE_BODIES, prog.def(owner).file)?;
         Ok(())
     }
 
