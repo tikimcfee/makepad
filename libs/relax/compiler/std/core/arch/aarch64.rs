@@ -3593,11 +3593,13 @@ pub unsafe fn vzip2q_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
     vx::vx_binary(a, b, 18, 8)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     vx::vx_unary(a, 1, 8, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     vx::vx_unary(a, 3, 8, N)
@@ -3613,6 +3615,7 @@ pub unsafe fn vbicq_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vx::vx_binary(a, b, 9, 16)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s16<const N: i32>(a: int16x8_t) -> int16x8_t {
     vx::vx_unary(a, 1, 16, N)
@@ -3648,11 +3651,13 @@ pub unsafe fn vzip2q_s64(a: int64x2_t, b: int64x2_t) -> int64x2_t {
     vx::vx_binary(a, b, 18, 64)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     vx::vx_unary(a, 1, 64, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     vx::vx_unary(a, 3, 64, N)
@@ -3683,11 +3688,13 @@ pub unsafe fn vzip2q_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     vx::vx_binary(a, b, 18, 8)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     vx::vx_unary(a, 1, 8, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     vx::vx_unary(a, 2, 8, N)
@@ -3708,11 +3715,13 @@ pub unsafe fn vzip2q_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
     vx::vx_binary(a, b, 18, 16)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     vx::vx_unary(a, 1, 16, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     vx::vx_unary(a, 2, 16, N)
@@ -3743,11 +3752,13 @@ pub unsafe fn vzip1q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
     vx::vx_binary(a, b, 17, 64)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     vx::vx_unary(a, 1, 64, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     vx::vx_unary(a, 2, 64, N)
@@ -3766,4 +3777,173 @@ pub unsafe fn vst1q_u64(a: *mut u64, b: uint64x2_t) {
 #[inline(always)]
 pub unsafe fn vmaxq_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vx::vx_binary(a, b, 14, 32)
+}
+
+// ---------------------------------------------------------------- operations zmij (float formatting) and simdutf8 import:
+// signed compares with zero, 64-bit-vector multiply-accumulate and saturating doubling high
+// multiplies by a scalar, combines and reinterprets, byte reversal in 64-bit halves, widening
+// and narrow shifts, and the byte extract simdutf8's `prev` lookback uses
+
+pub unsafe fn vcgtzq_s8(a: int8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if a.0[i] > 0 { 255 } else { 0 };
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+pub unsafe fn vcombine_s32(a: int32x2_t, b: int32x2_t) -> int32x4_t {
+    int32x4_t([a.0[0], a.0[1], b.0[0], b.0[1]])
+}
+
+pub unsafe fn vcreate_u64(a: u64) -> uint64x1_t {
+    uint64x1_t([a])
+}
+
+pub unsafe fn vdup_n_s32(value: i32) -> int32x2_t {
+    int32x2_t([value; 2])
+}
+
+pub unsafe fn vmovq_n_u8(value: u8) -> uint8x16_t {
+    uint8x16_t([value; 16])
+}
+
+// a + b * c, lanes wrapping (MLA)
+pub unsafe fn vmla_n_s32(a: int32x2_t, b: int32x2_t, c: i32) -> int32x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int32x2_t(r)
+}
+
+pub unsafe fn vmlaq_n_s16(a: int16x8_t, b: int16x8_t, c: i16) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+pub unsafe fn vmlaq_n_s32(a: int32x4_t, b: int32x4_t, c: i32) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+// SQDMULH: the high half of 2 * a * b, saturated (only MIN * MIN overflows, to MAX)
+fn qdmulh_s16(a: i16, b: i16) -> i16 {
+    let p = (2 * a as i32 as i64 * b as i32 as i64) >> 16;
+    if p > i16::MAX as i64 { i16::MAX } else { p as i16 }
+}
+
+fn qdmulh_s32(a: i32, b: i32) -> i32 {
+    let p = (2 * a as i128 * b as i128) >> 32;
+    if p > i32::MAX as i128 { i32::MAX } else { p as i32 }
+}
+
+pub unsafe fn vqdmulh_n_s32(a: int32x2_t, b: i32) -> int32x2_t {
+    int32x2_t([qdmulh_s32(a.0[0], b), qdmulh_s32(a.0[1], b)])
+}
+
+pub unsafe fn vqdmulhq_n_s16(a: int16x8_t, b: i16) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = qdmulh_s16(a.0[i], b);
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+pub unsafe fn vqdmulhq_n_s32(a: int32x4_t, b: i32) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = qdmulh_s32(a.0[i], b);
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+pub unsafe fn vreinterpretq_u16_s8(a: int8x16_t) -> uint16x8_t {
+    crate::ptr::read_unaligned(&a as *const int8x16_t as *const uint16x8_t)
+}
+
+pub unsafe fn vreinterpretq_u8_s16(a: int16x8_t) -> uint8x16_t {
+    crate::ptr::read_unaligned(&a as *const int16x8_t as *const uint8x16_t)
+}
+
+pub unsafe fn vreinterpretq_u8_u64(a: uint64x2_t) -> uint8x16_t {
+    crate::ptr::read_unaligned(&a as *const uint64x2_t as *const uint8x16_t)
+}
+
+pub unsafe fn vreinterpret_s32_u32(a: uint32x2_t) -> int32x2_t {
+    crate::ptr::read_unaligned(&a as *const uint32x2_t as *const int32x2_t)
+}
+
+pub unsafe fn vreinterpret_s32_u64(a: uint64x1_t) -> int32x2_t {
+    crate::ptr::read_unaligned(&a as *const uint64x1_t as *const int32x2_t)
+}
+
+pub unsafe fn vreinterpret_u16_s32(a: int32x2_t) -> uint16x4_t {
+    crate::ptr::read_unaligned(&a as *const int32x2_t as *const uint16x4_t)
+}
+
+pub unsafe fn vreinterpret_u32_s32(a: int32x2_t) -> uint32x2_t {
+    crate::ptr::read_unaligned(&a as *const int32x2_t as *const uint32x2_t)
+}
+
+// REV64: the bytes of each 64-bit half in reverse order
+pub unsafe fn vrev64q_u8(a: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[(i & !7) + 7 - (i & 7)];
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+// USHLL: each lane widened, then shifted left by N (0..=16)
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vshll_n_u16<const N: i32>(a: uint16x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = (a.0[i] as u32) << N;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+// USHR: N is 1..=32; a shift by the lane width gives 0
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vshr_n_u32<const N: i32>(a: uint32x2_t) -> uint32x2_t {
+    if N >= 32 {
+        return uint32x2_t([0; 2]);
+    }
+    uint32x2_t([a.0[0] >> N, a.0[1] >> N])
+}
+
+// EXT: bytes N..N+16 of the 32-byte concatenation a:b (N is 0..=15)
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn vextq_u8<const N: i32>(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if i + (N as usize) < 16 { a.0[i + N as usize] } else { b.0[i + N as usize - 16] };
+        i += 1;
+    }
+    uint8x16_t(r)
 }
