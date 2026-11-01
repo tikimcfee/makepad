@@ -331,8 +331,9 @@ pub enum Policy {
     Sandboxed,
 }
 
-/// 0 = Sandboxed (the default when no entry point chose), 1 = Open
-static POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 0 = Sandboxed (the default when no entry point chose), 1 = Open; in relax-session, where
+/// `Options::fingerprint` reads it (what a run expands and compiles depends on the policy)
+use relax_session::options::PROC_MACRO_POLICY as POLICY;
 
 /// The entry point's proc-macro policy, before any crate graph loads.
 pub fn set_policy(p: Policy) {

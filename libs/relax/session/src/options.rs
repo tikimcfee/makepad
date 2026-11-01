@@ -3,6 +3,14 @@
 //! compiler/rustc_session/src/options.rs:222-259 (whole-options dependency hash).
 use crate::sip::Sip128;
 
+/// The proc-macro trust policy of this process (the compiler's `pmhost::set_policy`): 0 =
+/// registry/git macro crates sandboxed (`makepad run`, and the default), 1 = open (bare `relax`).
+/// One per process, chosen by the entry point before any crate graph loads. Not an `Options`
+/// field (no option chooses it), but `Options::fingerprint` folds it in: a sandboxed macro's
+/// refusal stands in for its output, so what one policy expanded and compiled must not serve the
+/// other from the caches.
+pub static PROC_MACRO_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// The error inline assembly in crate `krate` gets under `--no-asm`.
 pub fn asm_blocked(krate: &str) -> String {
     format!("inline assembly (asm!, global_asm!, naked_asm!) in crate `{}` is blocked by `--no-asm` (MAKEPAD_RUN_NO_ASM=1)", krate)
@@ -828,6 +836,13 @@ impl Options {
         h.str(target);
         let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512 } = cpu;
         for b in [avx, bmi2, popcnt, lzcnt, bmi1, fma, avx2, avx512] { h.u8(*b as u8); }
+        // the process's proc-macro policy (PROC_MACRO_POLICY): a sandboxed macro's refusal and an
+        // open run's expansion are different programs, front images and code alike (only when
+        // open: the sandboxed default keeps the key it had)
+        if PROC_MACRO_POLICY.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            h.str("proc_macro_policy_open");
+            h.u8(1);
+        }
         h.finish128()
     }
 }
