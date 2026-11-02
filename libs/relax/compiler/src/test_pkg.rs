@@ -6,6 +6,14 @@
 //! selection all three run (cargo test's default minus doc tests, which are counted and said).
 //! A `harness = false` target runs as a program of its own (`makepad run --plain-test`), as cargo
 //! runs it: its exit status is its verdict.
+//!
+//! As under cargo, each program starts in its package's folder with CARGO_MANIFEST_DIR set to it,
+//! so a test's relative paths mean what they mean under `cargo test`. The workspace stays this
+//! process's (the child gets `--workspace-dir`), so the run dir and its cache are the same as from
+//! the workspace root; the paths this process was given relative to its own folder (`--report-to`,
+//! `--run-dir`, `--workspace-dir`, and the run dir, overlay and cargo path variables) are handed
+//! on absolute. A package on a virtual (git store) workspace has no folder on disk: its programs
+//! run in this process's folder.
 
 pub fn cmd_test_package(args: &[String]) -> i32 {
     // options before the package go to each run unchanged
@@ -153,7 +161,35 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
             return 101;
         }
     };
-    let pkg_dir = crate::resolve::package_dir(&sess, &crate::run::workspace_dir(), &package).unwrap_or_default();
+    let ws = crate::run::workspace_dir();
+    let pkg_dir = crate::resolve::package_dir(&sess, &ws, &package).unwrap_or_default();
+    // cargo starts each test program in its package's folder (module doc)
+    let in_pkg = !pkg_dir.is_empty() && !crate::vfs::is_virtual(&pkg_dir);
+    let mut env: Vec<(&str, String)> = Vec::new();
+    if in_pkg {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let abs = |p: &str| if std::path::Path::new(p).is_absolute() { p.to_string() } else { cwd.join(p).display().to_string() };
+        let mut k = 0;
+        while k + 1 < pre.len() {
+            if matches!(pre[k].as_str(), "--report-to" | "--run-dir" | "--workspace-dir") {
+                pre[k + 1] = abs(&pre[k + 1]);
+                k += 1;
+            }
+            k += 1;
+        }
+        if !pre.iter().any(|o| o == "--workspace-dir") {
+            pre.push("--workspace-dir".to_string());
+            pre.push(abs(&ws));
+        }
+        // read relative to the current folder: the overlay (vfs.rs), the run dir (dirs.rs), cargo's
+        // target dir (resolve::target_dir) and home (git/cargo.rs)
+        for var in ["MAKEPAD_RUN_OVERLAY", "MAKEPAD_RUN_OVERLAY_USED", "MAKEPAD_RUN_CACHE_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_HOME"] {
+            if let Some(v) = std::env::var(var).ok().filter(|v| !v.is_empty() && !std::path::Path::new(v).is_absolute()) {
+                env.push((var, abs(&v)));
+            }
+        }
+        env.push(("CARGO_MANIFEST_DIR", pkg_dir.clone()));
+    }
     let mut code = 0;
     for (sel, plain) in runs {
         let mut a: Vec<String> = vec!["run".to_string()];
@@ -172,7 +208,12 @@ pub fn cmd_test_package(args: &[String]) -> i32 {
         a.extend(sel);
         a.push("--".to_string());
         a.extend(prog.iter().cloned());
-        let status = std::process::Command::new(&exe).args(&a).status();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&a).envs(env.iter().cloned());
+        if in_pkg {
+            cmd.current_dir(&pkg_dir);
+        }
+        let status = cmd.status();
         let c = match status {
             Ok(s) => s.code().unwrap_or(101),
             Err(e) => {
