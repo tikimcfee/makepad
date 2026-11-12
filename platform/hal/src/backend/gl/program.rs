@@ -197,12 +197,7 @@ impl Renderer {
             unsafe {
                 (gl.glGenSamplers)(1, &mut sampler);
                 (gl.glSamplerParameteri)(sampler, sys::TEXTURE_MAG_FILTER, if linear { sys::LINEAR } else { sys::NEAREST } as GLint);
-                // NEAREST_MIPMAP_NEAREST, not NEAREST_MIPMAP_LINEAR, for a nearest sampler: the
-                // latter blends between levels, so it is filtering, and an integer or a 32-bit
-                // float texture (the font service's RGBA32F glyph data, read with texelFetch)
-                // is then incomplete in GLES 3.0 (3.8.13; float32 needs OES_texture_float_linear)
-                // and reads as zeros. Mesa filters float32 and tolerates it; PowerVR does not.
-                (gl.glSamplerParameteri)(sampler, sys::TEXTURE_MIN_FILTER, if linear { sys::LINEAR_MIPMAP_LINEAR } else { sys::NEAREST_MIPMAP_NEAREST } as GLint);
+                (gl.glSamplerParameteri)(sampler, sys::TEXTURE_MIN_FILTER, if linear { sys::LINEAR_MIPMAP_LINEAR } else { sys::NEAREST_MIPMAP_LINEAR } as GLint);
                 for p in [sys::TEXTURE_WRAP_S, sys::TEXTURE_WRAP_T, sys::TEXTURE_WRAP_R] { (gl.glSamplerParameteri)(sampler, p, wrap as GLint) }
                 // a shadow sampler (shape 3) compares; every other shape reads plain values
                 if t.shape == 3 {
