@@ -13,6 +13,37 @@ use crate::ledger::Kind;
 use crate::session::{LentRef, Session, TextureObj};
 use crate::types::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+
+/// Diagnosis (not for upstream as is). MAKEPAD_GL_TRACE=N: on the Nth frame, every pass's
+/// framebuffer status and attachments, every draw's state, its first instance's floats, its GL
+/// error and the pixels it changed; each pass's colour target to MAKEPAD_GL_TRACE_DIR/passK.ppm.
+/// MAKEPAD_GL_NODEPTH / _NOSCISSOR / _NOCULL / _NOBLEND=1 switch that state off for every draw.
+struct Diag { trace: Option<u32>, dir: Option<std::path::PathBuf>, nodepth: bool, noscissor: bool, nocull: bool, noblend: bool }
+fn diag() -> &'static Diag {
+    static D: OnceLock<Diag> = OnceLock::new();
+    D.get_or_init(|| {
+        let on = |n: &str| std::env::var(n).is_ok_and(|v| v == "1");
+        let d = Diag { trace: std::env::var("MAKEPAD_GL_TRACE").ok().and_then(|v| v.parse().ok()),
+            dir: std::env::var_os("MAKEPAD_GL_TRACE_DIR").map(Into::into),
+            nodepth: on("MAKEPAD_GL_NODEPTH"), noscissor: on("MAKEPAD_GL_NOSCISSOR"), nocull: on("MAKEPAD_GL_NOCULL"), noblend: on("MAKEPAD_GL_NOBLEND") };
+        eprintln!("[gl-diag] trace frame {:?} nodepth {} noscissor {} nocull {} noblend {}", d.trace, d.nodepth, d.noscissor, d.nocull, d.noblend);
+        d
+    })
+}
+static FRAMES: AtomicU32 = AtomicU32::new(0);
+static PASSES: AtomicU32 = AtomicU32::new(0);
+
+/// the bound framebuffer's colour attachment 0 as RGBA8 (None if it is not 8-bit colour)
+unsafe fn read_rgba(gl: &sys::Gl, w: i32, h: i32) -> Vec<u8> {
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    (gl.glReadBuffer)(sys::COLOR_ATTACHMENT0);
+    (gl.glReadPixels)(0, 0, w, h, sys::RGBA, sys::UNSIGNED_BYTE, px.as_mut_ptr() as _);
+    let e = (gl.glGetError)();
+    if e != 0 { eprintln!("[gl-diag]   readback GL error {e:#x}"); }
+    px
+}
 
 pub(super) struct FrameJob {
     pub token: Token,
@@ -458,8 +489,11 @@ impl Renderer {
         if job.instance_words {
             Self::words_texture(&self.ctx.gl, self.instance_arena, job.instances.len() as u64 / 4, &mut self.arena_words);
         }
+        let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        let tracing = diag().trace == Some(n);
+        if tracing { eprintln!("[gl-diag] frame {n}: {} passes, {} uniform bytes, {} instance bytes, words {}", job.passes.len(), job.uniforms.len(), job.instances.len(), job.instance_words); }
         for pass in &job.passes {
-            if let Err(e) = self.run_pass(pass) { eprintln!("[hal-gl] pass: {e}"); }
+            if let Err(e) = self.run_pass(pass, tracing) { eprintln!("[hal-gl] pass: {e}"); }
         }
         let mut window = job.window;
         if let Some((key, image)) = &job.present {
@@ -471,9 +505,28 @@ impl Renderer {
         self.after_gpu(Then::Frame { token: job.token, target: job.target, kind: job.kind, frame: job.frame, window });
     }
 
-    fn run_pass(&mut self, p: &PassJob) -> Result<(), String> {
+    fn run_pass(&mut self, p: &PassJob, tracing: bool) -> Result<(), String> {
         let fbo = self.framebuffer(p.attachments)?;
         let gl = &self.ctx.gl;
+        let dg = diag();
+        // the colour target's size when it can be read back as RGBA8
+        let mut rb: Option<(i32, i32)> = None;
+        if tracing {
+            let k = PASSES.fetch_add(1, Ordering::Relaxed);
+            let status = unsafe { (gl.glBindFramebuffer)(sys::FRAMEBUFFER, fbo); (gl.glCheckFramebufferStatus)(sys::FRAMEBUFFER) };
+            eprintln!("[gl-diag] pass {k}: fbo {fbo} status {status:#x}{} viewport {:?} load {:?} clear0 {:?} clear_depth {} draws {}",
+                if status == sys::FRAMEBUFFER_COMPLETE { " COMPLETE" } else { " INCOMPLETE" }, p.viewport, p.load, p.clear[0], p.clear_depth, p.draws.len());
+            for (i, (key, layer)) in p.attachments.iter().enumerate() {
+                if *key == 0 { continue; }
+                match self.textures.get(key) {
+                    Some(t) => {
+                        eprintln!("[gl-diag]   attachment {i}: tex {} {}x{} {} mips {} layer {layer}", t.name, t.desc.w, t.desc.h, format::name(t.desc.format), t.desc.mips);
+                        if i == 0 && (t.desc.format == format::RGBA8 || t.desc.format == format::BGRA8) { rb = Some((t.desc.w as i32, t.desc.h as i32)); }
+                    }
+                    None => eprintln!("[gl-diag]   attachment {i}: key {key} has no texture"),
+                }
+            }
+        }
         let attached = (0..4).filter(|i| p.attachments[*i].0 != 0).fold(0u32, |m, i| m | 1 << i);
         unsafe {
             (gl.glBindFramebuffer)(sys::FRAMEBUFFER, fbo);
@@ -497,11 +550,38 @@ impl Renderer {
                 else { (gl.glClearBufferfv)(sys::DEPTH, 0, &p.clear_depth) }
             }
             (gl.glViewport)(p.viewport[0], p.viewport[1], p.viewport[2], p.viewport[3]);
-            (gl.glEnable)(sys::SCISSOR_TEST);
-            if depth { (gl.glEnable)(sys::DEPTH_TEST) } else { (gl.glDisable)(sys::DEPTH_TEST) }
+            if !dg.noscissor { (gl.glEnable)(sys::SCISSOR_TEST); }
+            if depth && !dg.nodepth { (gl.glEnable)(sys::DEPTH_TEST) } else { (gl.glDisable)(sys::DEPTH_TEST) }
         }
         let mut bound = Bound { draw_buffers: Some(attached), ..Default::default() };
-        for d in &p.draws { self.run_draw(d, &mut bound); }
+        let mut before = rb.map(|(w, h)| unsafe { read_rgba(&self.ctx.gl, w, h) });
+        if let Some(b) = &before {
+            eprintln!("[gl-diag]   after clear: first pixel {:?}", &b[..4]);
+        }
+        for (i, d) in p.draws.iter().enumerate() {
+            if tracing { self.trace_draw(i, d); }
+            self.run_draw(d, &mut bound);
+            if tracing {
+                let gl = &self.ctx.gl;
+                let e = unsafe { (gl.glGetError)() };
+                if let (Some((w, h)), Some(b)) = (rb, before.as_mut()) {
+                    let now = unsafe { read_rgba(gl, w, h) };
+                    let changed = now.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count();
+                    eprintln!("[gl-diag]     -> GL error {e:#x}, {changed} pixels changed");
+                    *b = now;
+                } else {
+                    eprintln!("[gl-diag]     -> GL error {e:#x}");
+                }
+            }
+        }
+        if let (Some((w, h)), Some(b), Some(dir)) = (rb, &before, &dg.dir) {
+            let k = PASSES.load(Ordering::Relaxed) - 1;
+            let mut ppm = format!("P6 {w} {h} 255\n").into_bytes();
+            for y in (0..h).rev() { for x in 0..w { let o = ((y * w + x) * 4) as usize; ppm.extend_from_slice(&b[o..o + 3]); } }
+            let _ = std::fs::create_dir_all(dir);
+            let path = dir.join(format!("pass{k}.ppm"));
+            match std::fs::write(&path, ppm) { Ok(()) => eprintln!("[gl-diag]   wrote {}", path.display()), Err(e) => eprintln!("[gl-diag]   {}: {e}", path.display()) }
+        }
         let gl = &self.ctx.gl;
         unsafe {
             (gl.glBindVertexArray)(0);
@@ -516,6 +596,48 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    fn trace_draw(&self, i: usize, d: &DrawJob) {
+        let gl = &self.ctx.gl;
+        let Some(program) = self.programs.get(&d.program.key) else {
+            eprintln!("[gl-diag]   draw {i}: program key {} NOT LINKED (skipped)", d.program.key);
+            return;
+        };
+        let texs: Vec<String> = program.targets.iter().enumerate().map(|(unit, target)| {
+            match d.textures.get(unit).and_then(|t| t.as_ref()).and_then(|t| self.textures.get(&t.key)) {
+                Some(g) if g.target == *target => format!("{}:{}x{} {}", g.name, g.desc.w, g.desc.h, format::name(g.desc.format)),
+                Some(g) => format!("{}:WRONG TARGET->fallback", g.name),
+                None => "fallback".into(),
+            }
+        }).collect();
+        let (kind, buf, first) = match &d.instances {
+            Some(Instances::Inline(f)) => ("inline", self.instance_arena, *f),
+            Some(Instances::Buffer(b, f)) => ("buffer", self.buffers.get(&b.key).map_or(0, |g| g.name), *f),
+            None => ("none", 0, 0),
+        };
+        let total: u32 = d.ranges.iter().map(|r| r[1]).sum();
+        eprintln!("[gl-diag]   draw {i}: program {} ({} inst attrs, {} geom attrs, words {:?}) blend {:?} depth_write {} cull {} scissor {:?} blocks {:?} buffers {} textures [{}] instances {kind} buf {buf} first {first} stride {} ranges {:?} ({total}) index {:?} u32 {} vb {}",
+            program.name, program.instance.len(), program.geometry.len(), program.words_unit, d.blend, d.depth_write, d.cull, d.scissor, d.blocks,
+            d.buffers.len(), texs.join(", "), d.stride, d.ranges, d.index, d.index_u32, d.vb.is_some());
+        if buf != 0 && d.stride > 0 {
+            if let Some(r) = d.ranges.iter().find(|r| r[1] > 0) {
+                let at = (first + r[0]) as isize * d.stride as isize;
+                let len = (d.stride as isize).min(128);
+                unsafe {
+                    (gl.glBindBuffer)(sys::COPY_READ_BUFFER, buf);
+                    let ptr = (gl.glMapBufferRange)(sys::COPY_READ_BUFFER, at, len, sys::MAP_READ_BIT) as *const f32;
+                    if ptr.is_null() {
+                        eprintln!("[gl-diag]     first instance: map failed, GL error {:#x}", (gl.glGetError)());
+                    } else {
+                        let v: Vec<String> = (0..len as usize / 4).map(|k| format!("{:.3}", *ptr.add(k))).collect();
+                        eprintln!("[gl-diag]     first instance @{at}: [{}]", v.join(" "));
+                        (gl.glUnmapBuffer)(sys::COPY_READ_BUFFER);
+                    }
+                    (gl.glBindBuffer)(sys::COPY_READ_BUFFER, 0);
+                }
+            }
+        }
     }
 
     fn run_draw(&mut self, d: &DrawJob, bound: &mut Bound) {
@@ -552,7 +674,7 @@ impl Renderer {
                 bound.draw_buffers = Some(d.draw_buffers);
             }
             if bound.blend != Some(d.blend) {
-                match d.blend {
+                match d.blend.filter(|_| !diag().noblend) {
                     Some(max) => {
                         (gl.glEnable)(sys::BLEND);
                         let op = if max { sys::MAX } else { sys::FUNC_ADD };
@@ -567,7 +689,7 @@ impl Renderer {
                 bound.depth_write = Some(d.depth_write);
             }
             if bound.cull != Some(d.cull) {
-                if d.cull { (gl.glEnable)(sys::CULL_FACE) } else { (gl.glDisable)(sys::CULL_FACE) }
+                if d.cull && !diag().nocull { (gl.glEnable)(sys::CULL_FACE) } else { (gl.glDisable)(sys::CULL_FACE) }
                 bound.cull = Some(d.cull);
             }
             (gl.glScissor)(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);

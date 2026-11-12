@@ -247,6 +247,7 @@ pub const STREAM_DRAW: GLenum = 0x88E0;
 pub const STREAM_READ: GLenum = 0x88E1;
 pub const DYNAMIC_DRAW: GLenum = 0x88E8;
 pub const MAP_READ_BIT: GLbitfield = 0x0001;
+pub const COPY_READ_BUFFER: GLenum = 0x8F36;
 // shaders
 pub const VERTEX_SHADER: GLenum = 0x8B31;
 pub const FRAGMENT_SHADER: GLenum = 0x8B30;
