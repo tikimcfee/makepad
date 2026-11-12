@@ -503,6 +503,13 @@ impl Renderer {
                 (gl.glGenTextures)(1, &mut tex.0);
                 (gl.glBindTexture)(sys::TEXTURE_2D, tex.0);
                 (gl.glTexStorage2D)(sys::TEXTURE_2D, 1, sys::R32UI, WORD_ROW as i32, rows as i32);
+                // An integer texture is incomplete unless both filters are NEAREST (GLES 3.0
+                // 3.8.13), and texelFetch from an incomplete texture returns zeros: every program
+                // that fetches its instances by id then draws nothing. The defaults are
+                // NEAREST_MIPMAP_LINEAR / LINEAR, and the draw binds no sampler object for this
+                // unit. Mesa tolerates it; PowerVR (GE8320, GLES 3.2) follows the rule.
+                (gl.glTexParameteri)(sys::TEXTURE_2D, sys::TEXTURE_MIN_FILTER, sys::NEAREST as i32);
+                (gl.glTexParameteri)(sys::TEXTURE_2D, sys::TEXTURE_MAG_FILTER, sys::NEAREST as i32);
                 *tex = (tex.0, rows);
             } else {
                 (gl.glBindTexture)(sys::TEXTURE_2D, tex.0);
