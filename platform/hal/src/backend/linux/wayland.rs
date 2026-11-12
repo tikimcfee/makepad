@@ -503,13 +503,18 @@ impl State {
         });
     }
     fn frame_ready(&mut self, key: Key, next_ns: u64, reason: &str) {
-        self.frame_timers.remove(&key);
+        let scheduled = self.frame_timers.remove(&key);
         let Some(w) = self.windows.get_mut(&key).filter(|w| w.configured && !w.closed)
         else {
             return;
         };
         w.want_frame = false;
-        w.last_frame = Instant::now();
+        let now = Instant::now();
+        let period = Duration::from_secs_f64(1.0 / w.refresh as f64);
+        w.last_frame = match scheduled {
+            Some(due) if due + period > now => due,
+            _ => now,
+        };
         if log_enabled() {
             eprintln!("[hal-wayland] FrameReady key={key:?} recipient={:?} reason={reason} next_ns={next_ns}; queued to session", w.recipient);
         }
@@ -530,8 +535,13 @@ impl State {
         // request committed without a new buffer carries no damage, so compositors (weston)
         // may hold its done event until something else repaints the output; the swapchain's
         // FIFO present already waits on the compositor, so the timer never runs ahead of it.
+        // Advance from the nominal due time so wakeup slack does not accumulate, re-anchoring
+        // to now only when more than a period late (idle or a stall).
         let due = *self.frame_timers.entry(key).or_insert_with(|| {
-            (w.last_frame + Duration::from_secs_f64(1.0 / w.refresh as f64)).max(Instant::now())
+            let now = Instant::now();
+            let period = Duration::from_secs_f64(1.0 / w.refresh as f64);
+            let next = w.last_frame + period;
+            if next + period > now { next } else { now }
         });
         if log_enabled() {
             eprintln!("[hal-wayland] FrameRequest key={key:?}: FrameReady in {:?}", due.saturating_duration_since(Instant::now()));
