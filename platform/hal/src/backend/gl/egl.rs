@@ -138,10 +138,21 @@ impl Context {
             }
             // windows need WINDOW_BIT; the surfaceless platform makes none
             let surface_type = if native.platform == PLATFORM_SURFACELESS { 0 } else { 0x0004 };
-            let attrs = [0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3033, surface_type, 0x3040, 0x0040, NONE];
+            // EGL_OPENGL_ES3_BIT first; some drivers (Android's EGL as seen through libhybris on
+            // Linux phones) create GLES 3 contexts but advertise only EGL_OPENGL_ES2_BIT in their
+            // configs, so fall back to that: the context below still asks for client version 3
+            // and fails cleanly if the driver has no GLES 3.
+            let mut attrs = [0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3033, surface_type, 0x3040, 0x0040, NONE];
             let mut count = 0;
             if (egl.choose_config)(display, attrs.as_ptr(), ptr::null_mut(), 0, &mut count) == 0 || count <= 0 {
-                return Err("no EGL RGBA8 GLES3 config".into());
+                attrs[11] = 0x0004;
+                count = 0;
+                if (egl.choose_config)(display, attrs.as_ptr(), ptr::null_mut(), 0, &mut count) == 0 || count <= 0 {
+                    return Err("no EGL RGBA8 GLES3 config (none with EGL_OPENGL_ES3_BIT or EGL_OPENGL_ES2_BIT)".into());
+                }
+                if super::super::log_enabled() {
+                    eprintln!("[hal-gl] no config advertises EGL_OPENGL_ES3_BIT; using an EGL_OPENGL_ES2_BIT config for a GLES 3 context");
+                }
             }
             let mut configs = vec![ptr::null_mut(); count as usize];
             if (egl.choose_config)(display, attrs.as_ptr(), configs.as_mut_ptr(), count, &mut count) == 0 {
