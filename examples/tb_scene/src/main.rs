@@ -59,9 +59,25 @@ fn mono_ms() -> f64 {
     unsafe { clock_gettime(1, &mut t) };
     t.tv_sec as f64 * 1e3 + t.tv_nsec as f64 / 1e6
 }
+/// every thread's (name, user+system CPU in ms) from /proc/self/task (clock ticks of 10 ms)
+fn thread_cpu() -> String {
+    let mut out = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc/self/task") {
+        for e in dir.flatten() {
+            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else { continue };
+            let (Some(o), Some(c)) = (stat.find('('), stat.rfind(')')) else { continue };
+            let name = stat[o + 1..c].replace(' ', "_");
+            let f: Vec<&str> = stat[c + 2..].split_whitespace().collect();
+            let ticks = f.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) + f.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            if ticks > 0 { out.push(format!("{name}={}", ticks * 10)); }
+        }
+    }
+    out.sort();
+    out.join(" ")
+}
 fn mark(name: &str) {
     let (u, s) = cpu_ms();
-    eprintln!("[tb-scene] mark {name} mono_ms={:.3} cpu_user_ms={u:.1} cpu_sys_ms={s:.1} {}", mono_ms(), pss_kb());
+    eprintln!("[tb-scene] mark {name} mono_ms={:.3} cpu_user_ms={u:.1} cpu_sys_ms={s:.1} {} threads_ms: {}", mono_ms(), pss_kb(), thread_cpu());
 }
 
 const NAMES: [&str; 6] = ["user", "tinybot-m2", "building", "optimizer", "phoc", "presenter"];
