@@ -1,0 +1,9 @@
+[package]
+name = "makepad-example-tb-scene"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "tinybot's measurement scene (not for upstream): a pager-like screen whose redraws are scripted (TB_SCENE=rest|scroll|pulse), with monotonic-clock marks and frame-interval statistics on stderr"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }

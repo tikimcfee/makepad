@@ -168,6 +168,7 @@ workspace.members = [
     "examples/pdf",
     "examples/shader",
     "examples/frame_probe",
+    "examples/tb_scene",
     "examples/fractal_zoom",
     "examples/material_lab",
     "examples/raytrace",
