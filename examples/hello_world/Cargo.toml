@@ -4,6 +4,13 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+# tinybot prototype: the same app as a shared library for a launcher without thread-local storage
+# (see makepad_linux_main in platform/src/app_main.rs)
+[lib]
+name = "makepad_example_hello_world"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
 [features]
 default = ["tweaker"]
 # The design overlay (Shift+F10 with the dev overlays on). On for development

@@ -872,6 +872,19 @@ macro_rules! app_main {
         // A standalone Android app's entry (decided in this crate, which knows the `relax` cfg).
         $crate::android_jni_entry!(app_main);
 
+        // Linux: the same app built as a shared library (a `[lib] crate-type = ["cdylib"]` next
+        // to the binary) and started by a small launcher that dlopens it and calls this. The
+        // app's thread-local storage (Rust's and its crates') then lives in dynamic TLS instead
+        // of the executable's static block right after the thread pointer, which drivers that
+        // keep their own state at fixed thread-pointer offsets (Android's EGL/GLES through
+        // libhybris on Linux phones) would otherwise overwrite.
+        #[cfg(all(target_os = "linux", not(target_os = "android")))]
+        #[no_mangle]
+        pub extern "C" fn makepad_linux_main() -> i32 {
+            $crate::run_app(app_main);
+            0
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         pub fn app_main() {
             // the packager reads this section from the linked binary: `#[used]` is no GC root on
