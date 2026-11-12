@@ -220,7 +220,13 @@ pub(super) fn start(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox) -> Resu
 
 impl Renderer {
     fn new(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox) -> Result<Self, String> {
-        let ctx = Context::new(source)?;
+        let mut ctx = Context::new(source)?;
+        // eglGetProcAddress may answer for a function the context does not support (EGL 1.5
+        // 3.10, and Android's EGL does): parallel links only with the extension listed, or
+        // glGetProgramiv(COMPLETION_STATUS_KHR) is GL_INVALID_ENUM on every poll.
+        if !ctx.gl.extensions().iter().any(|e| e == "GL_KHR_parallel_shader_compile") {
+            ctx.gl.glMaxShaderCompilerThreadsKHR = None;
+        }
         let gl = &ctx.gl;
         let version = gl.string(sys::VERSION);
         if !version.starts_with("OpenGL ES 3") {
