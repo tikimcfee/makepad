@@ -291,6 +291,7 @@ impl Renderer {
         }
         let ext = gl.extensions();
         let has = |name: &str| ext.iter().any(|e| e == name);
+        debug_output(&ctx, &has);
         let mut max_anisotropy = 1.0;
         let core_anisotropy = !version.starts_with("OpenGL ES")
             && (gl.integer(sys::MAJOR_VERSION), gl.integer(sys::MINOR_VERSION)) >= (4, 6);
@@ -821,6 +822,34 @@ pub(super) fn face(target: GLenum, layer: u32) -> GLenum {
 }
 
 /// A cube ([`TextureObj::is_cube`]); other layered textures are arrays.
+/// `MAKEPAD_GL_DEBUG=1`: the driver's own KHR_debug messages, synchronous (so each comes from
+/// inside the call that caused it), on stderr. Errors the backend only sees later through
+/// glGetError are then named by the driver at the call that made them.
+fn debug_output(ctx: &Context, has: &dyn Fn(&str) -> bool) {
+    if std::env::var_os("MAKEPAD_GL_DEBUG").is_none() { return; }
+    extern "C" fn message(source: GLenum, ty: GLenum, id: GLuint, severity: GLenum, length: i32, text: *const std::ffi::c_char, _user: *const std::ffi::c_void) {
+        let text = if text.is_null() { String::new() } else if length >= 0 {
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(text as *const u8, length as usize) }).into_owned()
+        } else { unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned() };
+        eprintln!("[hal-gl] KHR_debug source={source:#x} type={ty:#x} id={id} severity={severity:#x}: {text}");
+    }
+    type Callback = unsafe extern "C" fn(extern "C" fn(GLenum, GLenum, GLuint, GLenum, i32, *const std::ffi::c_char, *const std::ffi::c_void), *const std::ffi::c_void);
+    let s = &ctx.share;
+    let mut f = unsafe { (s.egl.get_proc)(c"glDebugMessageCallback".as_ptr()) };
+    if f.is_null() && has("GL_KHR_debug") { f = unsafe { (s.egl.get_proc)(c"glDebugMessageCallbackKHR".as_ptr()) }; }
+    if f.is_null() { eprintln!("[hal-gl] MAKEPAD_GL_DEBUG: no glDebugMessageCallback in this context"); return; }
+    let gl = &ctx.gl;
+    unsafe {
+        let callback: Callback = std::mem::transmute(f);
+        let stale = (gl.glGetError)();
+        if stale != sys::NO_ERROR { eprintln!("[hal-gl] MAKEPAD_GL_DEBUG: error {stale:#x} pending before debug output was on"); }
+        (gl.glEnable)(0x8242); // DEBUG_OUTPUT_SYNCHRONOUS
+        (gl.glEnable)(0x92E0); // DEBUG_OUTPUT
+        callback(message, std::ptr::null());
+    }
+    eprintln!("[hal-gl] MAKEPAD_GL_DEBUG: KHR_debug output on (synchronous)");
+}
+
 pub(super) fn texture_target(t: &TextureObj) -> GLenum {
     if t.depth == 1 { sys::TEXTURE_2D }
     else if t.is_cube() { sys::TEXTURE_CUBE_MAP }
