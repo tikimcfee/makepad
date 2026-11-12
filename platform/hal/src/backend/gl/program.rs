@@ -90,6 +90,13 @@ impl Renderer {
                 (gl.glAttachShader)(program, shader);
                 shaders[i] = shader;
             }
+            // MAKEPAD_GLSL_DUMP=DIR (diagnosis): each program's two sources, by GL program name
+            if let Some(dir) = std::env::var_os("MAKEPAD_GLSL_DUMP") {
+                let dir = std::path::PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join(format!("prog{program}.vert")), code.vertex.as_bytes());
+                let _ = std::fs::write(dir.join(format!("prog{program}.frag")), code.fragment.as_bytes());
+            }
             (gl.glLinkProgram)(program);
             self.linking.push((Arc::downgrade(state), Linking { program, shaders }));
         }
@@ -126,6 +133,15 @@ impl Renderer {
         let program = linking.program;
         let mut ok = 0;
         unsafe { (gl.glGetProgramiv)(program, sys::LINK_STATUS, &mut ok) };
+        if let Some(dir) = std::env::var_os("MAKEPAD_GLSL_DUMP") {
+            let mut len = 0;
+            unsafe { (gl.glGetProgramiv)(program, sys::INFO_LOG_LENGTH, &mut len) };
+            let mut log = vec![0u8; len.max(1) as usize];
+            unsafe { (gl.glGetProgramInfoLog)(program, len.max(1), std::ptr::null_mut(), log.as_mut_ptr()) };
+            let log = String::from_utf8_lossy(&log).trim_end_matches('\0').trim().to_owned();
+            let _ = std::fs::write(std::path::PathBuf::from(dir).join(format!("prog{program}.link")),
+                format!("link_status {ok}\ninstance_fetch {}\ntextures {}\npick {}\n{log}\n", code.instance_texture, code.textures.len(), code.pick));
+        }
         if ok == 0 {
             let mut len = 0;
             unsafe { (gl.glGetProgramiv)(program, sys::INFO_LOG_LENGTH, &mut len) };

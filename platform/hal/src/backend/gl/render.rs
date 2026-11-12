@@ -235,6 +235,11 @@ impl Renderer {
         let ext = gl.extensions();
         let has = |name: &str| ext.iter().any(|e| e == name);
         debug_output(&ctx, &has);
+        if std::env::var_os("MAKEPAD_GL_DEBUG").is_some() {
+            let q = |n: u32| gl.integer(n);
+            eprintln!("[hal-gl] limits: MAX_VERTEX_ATTRIBS {} MAX_VARYING_VECTORS {} MAX_VARYING_COMPONENTS {} MAX_VERTEX_OUTPUT_COMPONENTS {} MAX_FRAGMENT_INPUT_COMPONENTS {} MAX_VERTEX_TEXTURE_IMAGE_UNITS {} MAX_TEXTURE_IMAGE_UNITS {} MAX_VERTEX_UNIFORM_VECTORS {} MAX_FRAGMENT_UNIFORM_VECTORS {} MAX_UNIFORM_BLOCK_SIZE {} MAX_TEXTURE_SIZE {}",
+                q(0x8869), q(0x8DFC), q(0x8B4B), q(0x9122), q(0x9125), q(0x8B4C), q(0x8872), q(0x8DFB), q(0x8DFD), q(0x8A30), q(0x0D33));
+        }
         let mut formats = [format::RGBA8, format::BGRA8, format::R8, format::RG8, format::RGBA16F, format::RGBA32F,
             format::DEPTH32F, format::DEPTH24_STENCIL8, format::R32F, format::RG16F, format::R16F, format::R32UINT].iter().fold(0u64, |b, f| b | 1 << f);
         if has("GL_EXT_texture_compression_bptc") { formats |= 1 << format::BC7; }
@@ -519,6 +524,35 @@ impl Renderer {
                 *tex = (tex.0, rows);
             } else {
                 (gl.glBindTexture)(sys::TEXTURE_2D, tex.0);
+            }
+            // MAKEPAD_GL_WORDS_CPU=1 (diagnosis): the words through mapped memory and a client-memory
+            // upload instead of the GPU copy through PIXEL_UNPACK_BUFFER
+            if std::env::var_os("MAKEPAD_GL_WORDS_CPU").is_some() && words > 0 {
+                (gl.glBindBuffer)(sys::ARRAY_BUFFER, buffer);
+                let p = (gl.glMapBufferRange)(sys::ARRAY_BUFFER, 0, (words * 4) as isize, sys::MAP_READ_BIT) as *const u8;
+                if !p.is_null() {
+                    let bytes = std::slice::from_raw_parts(p, (words * 4) as usize).to_vec();
+                    (gl.glUnmapBuffer)(sys::ARRAY_BUFFER);
+                    (gl.glBindBuffer)(sys::ARRAY_BUFFER, 0);
+                    let full = (words / WORD_ROW as u64) as i32;
+                    if full > 0 {
+                        (gl.glTexSubImage2D)(sys::TEXTURE_2D, 0, 0, 0, WORD_ROW as i32, full, sys::RED_INTEGER, sys::UNSIGNED_INT, bytes.as_ptr() as *const _);
+                    }
+                    let rest = (words % WORD_ROW as u64) as i32;
+                    if rest > 0 {
+                        let at = full as usize * WORD_ROW as usize * 4;
+                        (gl.glTexSubImage2D)(sys::TEXTURE_2D, 0, 0, full, rest, 1, sys::RED_INTEGER, sys::UNSIGNED_INT, bytes[at..].as_ptr() as *const _);
+                    }
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        let nz = bytes.chunks_exact(4).filter(|w| w.iter().any(|b| *b != 0)).count();
+                        eprintln!("[hal-gl] MAKEPAD_GL_WORDS_CPU: first upload {} words, {} non-zero", words, nz);
+                    });
+                    (gl.glBindTexture)(sys::TEXTURE_2D, 0);
+                    return;
+                }
+                eprintln!("[hal-gl] MAKEPAD_GL_WORDS_CPU: glMapBufferRange failed ({:#x}); GPU copy", (gl.glGetError)());
+                (gl.glBindBuffer)(sys::ARRAY_BUFFER, 0);
             }
             (gl.glBindBuffer)(sys::PIXEL_UNPACK_BUFFER, buffer);
             let full = (words / WORD_ROW as u64) as i32;
