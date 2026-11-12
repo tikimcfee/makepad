@@ -1,5 +1,6 @@
 //! Nonblocking desktop fd pump. The wake socket is the equivalent of SelectTimers' self-pipe;
 //! neither stdin nor a continuously ticking idle timer participates.
+use std::ffi::{c_long, c_ulong, c_void};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -35,8 +36,14 @@ pub(super) mod memory {
         pub fn munmap(address: *mut c_void, length: usize) -> i32;
     }
 }
+#[repr(C)]
+struct Timespec {
+    sec: c_long,
+    nsec: c_long,
+}
 extern "C" {
     pub(crate) fn poll(fds: *mut PollFd, count: usize, timeout: i32) -> i32;
+    fn ppoll(fds: *mut PollFd, count: c_ulong, timeout: *const Timespec, sigmask: *const c_void) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn pipe2(fds: *mut i32, flags: i32) -> i32;
 }
@@ -83,13 +90,15 @@ pub fn wait(wake: i32, fds: &mut [PollFd], deadline: Option<Instant>) -> Result<
         events: p.events,
         revents: 0,
     }));
-    let timeout = deadline.map_or(-1, |d| {
-        d.saturating_duration_since(Instant::now())
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32
+    let timeout = deadline.map(|d| {
+        let rem = d.saturating_duration_since(Instant::now());
+        Timespec {
+            sec: rem.as_secs().min(c_long::MAX as u64) as c_long,
+            nsec: rem.subsec_nanos() as c_long,
+        }
     });
-    if unsafe { poll(all.as_mut_ptr(), all.len(), timeout) } < 0 {
+    let ts = timeout.as_ref().map_or(std::ptr::null(), |t| t as *const Timespec);
+    if unsafe { ppoll(all.as_mut_ptr(), all.len() as c_ulong, ts, std::ptr::null()) } < 0 {
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e.to_string());
