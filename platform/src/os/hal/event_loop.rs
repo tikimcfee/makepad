@@ -252,8 +252,17 @@ impl Cx {
         }
         self.hal_init_session(info);
         // Controllers wake the pump. Linux hosted apps own an evdev reader too.
+        // `MAKEPAD_GAMEPAD=0` (off/false/no) leaves the reader out, for a device that has no
+        // controllers: on Linux its worker lists /dev/input every second and opens every
+        // event node that is not a pad again.
         #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
-        self.hal.frames.w.game_out(0, makepad_hal::media::game_op::ENABLE, 0, 0, 0, 0, &[]);
+        {
+            let off = std::env::var("MAKEPAD_GAMEPAD")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"));
+            if !off {
+                self.hal.frames.w.game_out(0, makepad_hal::media::game_op::ENABLE, 0, 0, 0, 0, &[]);
+            }
+        }
         let display_clock = info.flags & info_flags::DISPLAY_CLOCK != 0;
         // a batch renderer beats as the GPU completes frames, not 60 times a second
         let batch = batch_interval().filter(|_| !display_clock && !hosted);
