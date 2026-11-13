@@ -18,6 +18,45 @@ use std::collections::HashMap;
 mod socket;
 mod wire;
 
+/// Makepad opens its remote-control endpoint (a same-user Unix socket in the temp directory
+/// and its threads) in every app unless `MAKEPAD_REMOTE=0`. The surface is tinybot's home
+/// screen: its one way in is its own socket, so the endpoint stays shut unless the app is
+/// started with `--remote` (tests on the desktop) or the environment already says what it
+/// wants (`MAKEPAD_REMOTE`, never overwritten here).
+///
+/// The endpoint opens when the `Cx` is made, before any code of the app runs, so the default
+/// is set before `main`: glibc calls every `.init_array` function with the process's argc,
+/// argv and envp, in an executable and in a library a launcher loads alike.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod remote_default_off {
+    use std::ffi::{c_char, c_int, CStr};
+
+    extern "C" {
+        fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+    }
+
+    extern "C" fn before_main(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
+        if !argv.is_null() {
+            for i in 1..argc as isize {
+                let arg = unsafe { *argv.offset(i) };
+                if arg.is_null() {
+                    break;
+                }
+                let arg = unsafe { CStr::from_ptr(arg) }.to_bytes();
+                if arg == b"--remote" || arg.starts_with(b"--remote=") {
+                    return;
+                }
+            }
+        }
+        // overwrite 0: a MAKEPAD_REMOTE the launcher set stays as it is
+        unsafe { setenv(c"MAKEPAD_REMOTE".as_ptr(), c"0".as_ptr(), 0) };
+    }
+
+    #[used]
+    #[link_section = ".init_array"]
+    static BEFORE_MAIN: extern "C" fn(c_int, *const *const c_char, *const *const c_char) = before_main;
+}
+
 app_main!(App);
 
 script_mod! {

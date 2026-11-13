@@ -158,6 +158,12 @@ A `set` with the same `surface` and `rev` as on screen is accepted again
   removed on shutdown.
 - After an app restart the screen is idle and the tap queue is empty; the
   agent sees `"surface":null` in `hello` or `status` and sends its `set` again.
+- The surface socket is the app's only socket. Makepad's own remote-control
+  endpoint (`/tmp/makepad-remote-<pid>.sock` and its thread), which every
+  Makepad app opens by default, stays shut here: the app sets
+  `MAKEPAD_REMOTE=0` for itself before `main` unless it is started with
+  `--remote` or the environment already sets `MAKEPAD_REMOTE` (Linux with
+  glibc; elsewhere set `MAKEPAD_REMOTE=0` in the launcher).
 
 ## Driving it in a test
 
