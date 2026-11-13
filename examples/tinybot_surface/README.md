@@ -9,16 +9,19 @@ the phone step is not done.
 - `src/main.rs`: the app and its two widgets (`SurfaceList`, `ButtonRow`).
 - `src/wire.rs`: the protocol's data and the check of a description.
 - `src/socket.rs`: the socket thread.
-- `tb-surface`: the agent's command (Python, standard library only).
+- `src/bin/tb-surface.rs`: the agent's command, the package's second binary
+  `tb-surface` (Rust standard library only; nothing of Makepad is linked in).
+- `tb-surface.py`: the same command in Python (standard library only), for a
+  host that has python3 and no build.
 
 ## Run
 
 ```sh
 cargo build --release -p makepad-example-tinybot-surface
 ./target/release/makepad-example-tinybot-surface            # add --remote to drive it in tests
-examples/tinybot_surface/tb-surface set surface.json
-examples/tinybot_surface/tb-surface wait --timeout 60
-examples/tinybot_surface/tb-surface clear
+./target/release/tb-surface set surface.json
+./target/release/tb-surface wait --timeout 60
+./target/release/tb-surface clear
 ```
 
 The socket is `$XDG_RUNTIME_DIR/tinybot/surface.sock`. The app takes
@@ -42,6 +45,12 @@ ended without a tap; 3 the app cannot be reached; 64 FILE cannot be read.
 
 A turn is usually `set`, then (the same turn or a later one) `wait`, then the
 next `set` or `clear`.
+
+The binary and `tb-surface.py` take the same commands and options and give
+the same lines on stdout and the same exit status. They differ in the wording
+on stderr, and in how `set` passes FILE on: Python reads and rewrites it, the
+binary checks it and sends its members as written (escapes, number spelling
+and repeated keys included), which the app reads to the same surface.
 
 ## What a surface is
 
