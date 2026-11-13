@@ -63,9 +63,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Starts the bridge's worker, once. `NO_AT_BRIDGE=1` (the variable GTK and Qt read for the
+/// same purpose) leaves it out, for a device without assistive technology: when the
+/// accessibility bus does not answer, the worker connects to the session bus again every
+/// five seconds for as long as the process lives.
 pub(crate) fn start() {
     WORKER.get_or_init(|| {
         a11y::set_os_selfcheck(check::selfcheck);
+        if std::env::var("NO_AT_BRIDGE").is_ok_and(|v| v.trim() == "1") {
+            eprintln!("[atspi] off: NO_AT_BRIDGE=1");
+            return None;
+        }
         let result = (|| -> std::io::Result<Arc<Mailbox>> {
             let (read, write) = UnixStream::pair()?;
             read.set_nonblocking(true)?;
