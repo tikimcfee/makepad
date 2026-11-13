@@ -1,0 +1,9 @@
+[package]
+name = "makepad-example-tinybot-surface"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "tinybot's live surface (not for upstream): an app that shows text, toggles and button rows an agent describes over a local Unix socket, and keeps the taps for the agent's next call"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }

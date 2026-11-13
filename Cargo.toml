@@ -186,6 +186,7 @@ workspace.members = [
     "examples/frame_probe",
     "examples/camera_probe",
     "examples/xr_capture_probe",
+    "examples/tinybot_surface",
     "examples/fractal_zoom",
     "examples/material_lab",
     "examples/raytrace",
