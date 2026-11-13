@@ -7,3 +7,8 @@ description = "tinybot's live surface (not for upstream): an app that shows text
 
 [dependencies]
 makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }
+
+# the agent's command: standard library only, nothing of Makepad is linked into it
+[[bin]]
+name = "tb-surface"
+path = "src/bin/tb-surface.rs"
