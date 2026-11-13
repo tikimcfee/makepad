@@ -176,6 +176,12 @@ already set the variable, so a launcher can turn any of them back on:
 | `MAKEPAD_GAMEPAD` | `0` | the game controller reader, which scans `/dev/input` every second |
 | `NO_AT_BRIDGE` | `1` | the AT-SPI accessibility bridge, which retries a missing bus every five seconds |
 
+The same function limits glibc's malloc to one arena (`mallopt(M_ARENA_MAX, 1)`),
+which is where most of the app's memory at rest went on the phone.
+`TB_SURFACE_ARENA_MAX=N` chooses another limit (`0`: glibc's own choice); a
+`GLIBC_TUNABLES` that sets `glibc.malloc.arena_max`, or `MALLOC_ARENA_MAX`,
+is left to decide.
+
 ## Driving it in a test
 
 ```sh
