@@ -165,6 +165,17 @@ A `set` with the same `surface` and `rev` as on screen is accepted again
   `--remote` or the environment already sets `MAKEPAD_REMOTE` (Linux with
   glibc; elsewhere set `MAKEPAD_REMOTE=0` in the launcher).
 
+## What the app switches off for itself
+
+Set before `main` (Linux with glibc), each only when the environment does not
+already set the variable, so a launcher can turn any of them back on:
+
+| Variable | Default here | Leaves out |
+|---|---|---|
+| `MAKEPAD_REMOTE` | `0`, unless started with `--remote` | Makepad's remote-control endpoint |
+| `MAKEPAD_GAMEPAD` | `0` | the game controller reader, which scans `/dev/input` every second |
+| `NO_AT_BRIDGE` | `1` | the AT-SPI accessibility bridge, which retries a missing bus every five seconds |
+
 ## Driving it in a test
 
 ```sh
