@@ -540,7 +540,39 @@ pub struct App {
     #[cfg(unix)]
     #[rust]
     link: Option<socket::Link>,
+    /// one shot, a moment after startup and after each new surface: see `release_free_memory`
+    #[rust]
+    settle: Timer,
+    /// the release after startup runs a second time, for a device that compiles slowly
+    #[rust]
+    settle_again: bool,
 }
+
+/// Gives the memory the allocator holds but no longer uses back to the system. Starting up
+/// and showing a kind of widget for the first time compile scripts and shaders; what that
+/// needed for a moment is freed, but glibc keeps freed memory inside its per-thread arenas,
+/// and the process stays as large as its busiest moment. Called once things have settled.
+/// On monolith1 with the GLES backend and no driver shader cache this returns about 30 MB of
+/// 310 MB after startup and takes 1.4 ms; `TINYBOT_SURFACE_LOG=1` prints the time it took.
+fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        let start = std::time::Instant::now();
+        unsafe { malloc_trim(0) };
+        if std::env::var_os("TINYBOT_SURFACE_LOG").is_some() {
+            eprintln!("[tinybot-surface] malloc_trim took {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
+
+/// How long after startup or a new surface the memory is released: past the first frames and
+/// the shader compiles they start.
+const SETTLE_SECONDS: f64 = 3.0;
+/// The second release after startup.
+const SETTLE_AGAIN_SECONDS: f64 = 10.0;
 
 impl App {
     #[cfg(unix)]
@@ -573,8 +605,10 @@ impl App {
 }
 
 impl MatchEvent for App {
-    fn handle_startup(&mut self, _cx: &mut Cx) {
+    fn handle_startup(&mut self, cx: &mut Cx) {
         self.start_socket();
+        self.settle = cx.start_timeout(SETTLE_SECONDS);
+        self.settle_again = true;
     }
 
     #[cfg(unix)]
@@ -589,6 +623,8 @@ impl MatchEvent for App {
             let Ok(message) = message else {
                 return;
             };
+            cx.stop_timer(self.settle);
+            self.settle = cx.start_timeout(SETTLE_SECONDS);
             let items = self.ui.widget(cx, ids!(items));
             match message {
                 socket::ToUi::Set(spec) => {
@@ -637,6 +673,12 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if self.settle.is_event(event).is_some() {
+            release_free_memory();
+            if std::mem::take(&mut self.settle_again) {
+                self.settle = cx.start_timeout(SETTLE_AGAIN_SECONDS);
+            }
+        }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
     }
