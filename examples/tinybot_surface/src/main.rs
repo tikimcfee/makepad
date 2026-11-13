@@ -18,38 +18,58 @@ use std::collections::HashMap;
 mod socket;
 mod wire;
 
-/// Makepad opens its remote-control endpoint (a same-user Unix socket in the temp directory
-/// and its threads) in every app unless `MAKEPAD_REMOTE=0`. The surface is tinybot's home
-/// screen: its one way in is its own socket, so the endpoint stays shut unless the app is
-/// started with `--remote` (tests on the desktop) or the environment already says what it
-/// wants (`MAKEPAD_REMOTE`, never overwritten here).
+/// What the surface settles before `main`. Makepad starts three things in every app that a
+/// pager's home screen has no use for. Each starts when the `Cx` or its HAL session is made,
+/// before any code of the app runs, and each has an environment switch, so the surface sets
+/// its defaults here:
 ///
-/// The endpoint opens when the `Cx` is made, before any code of the app runs, so the default
-/// is set before `main`: glibc calls every `.init_array` function with the process's argc,
-/// argv and envp, in an executable and in a library a launcher loads alike.
+/// - `MAKEPAD_REMOTE=0`: no remote-control endpoint (a same-user Unix socket in the temp
+///   directory and its thread); the surface's one way in is its own socket. Left unset when
+///   the app is started with `--remote` (tests on the desktop).
+/// - `MAKEPAD_GAMEPAD=0`: no game controller reader, whose worker scans /dev/input every
+///   second.
+/// - `NO_AT_BRIDGE=1`: no AT-SPI accessibility bridge, whose worker tries the session bus
+///   again every five seconds when the accessibility bus does not answer.
+///
+/// A variable the environment already sets is never overwritten, so a launcher can turn any
+/// of them back on. glibc calls every `.init_array` function with the process's argc, argv
+/// and envp, in an executable and in a library a launcher loads alike.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-mod remote_default_off {
+mod before_main {
     use std::ffi::{c_char, c_int, CStr};
 
     extern "C" {
         fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
     }
 
-    extern "C" fn before_main(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
-        if !argv.is_null() {
-            for i in 1..argc as isize {
-                let arg = unsafe { *argv.offset(i) };
-                if arg.is_null() {
-                    break;
-                }
-                let arg = unsafe { CStr::from_ptr(arg) }.to_bytes();
-                if arg == b"--remote" || arg.starts_with(b"--remote=") {
-                    return;
-                }
+    /// Sets `name` unless the environment already has it.
+    fn default_env(name: &CStr, value: &CStr) {
+        unsafe { setenv(name.as_ptr(), value.as_ptr(), 0) };
+    }
+
+    fn started_with_remote(argc: c_int, argv: *const *const c_char) -> bool {
+        if argv.is_null() {
+            return false;
+        }
+        for i in 1..argc as isize {
+            let arg = unsafe { *argv.offset(i) };
+            if arg.is_null() {
+                break;
+            }
+            let arg = unsafe { CStr::from_ptr(arg) }.to_bytes();
+            if arg == b"--remote" || arg.starts_with(b"--remote=") {
+                return true;
             }
         }
-        // overwrite 0: a MAKEPAD_REMOTE the launcher set stays as it is
-        unsafe { setenv(c"MAKEPAD_REMOTE".as_ptr(), c"0".as_ptr(), 0) };
+        false
+    }
+
+    extern "C" fn before_main(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
+        default_env(c"MAKEPAD_GAMEPAD", c"0");
+        default_env(c"NO_AT_BRIDGE", c"1");
+        if !started_with_remote(argc, argv) {
+            default_env(c"MAKEPAD_REMOTE", c"0");
+        }
     }
 
     #[used]
