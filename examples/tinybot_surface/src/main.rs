@@ -34,12 +34,49 @@ mod wire;
 /// A variable the environment already sets is never overwritten, so a launcher can turn any
 /// of them back on. glibc calls every `.init_array` function with the process's argc, argv
 /// and envp, in an executable and in a library a launcher loads alike.
+///
+/// It also limits glibc's malloc to one arena (`mallopt(M_ARENA_MAX, 1)`), while the process
+/// still has one thread. glibc otherwise gives threads arenas of their own, 64 MB
+/// reservations that each keep what their busiest moment needed: the app's thread, the
+/// renderer's and the pool's each held 16 to 34 MB on the phone after the GL driver had
+/// compiled the shaders (PSS 135 MB with the default, 89 MB with one arena, the m2's
+/// measurement of bundle n). `TB_SURFACE_ARENA_MAX=N` chooses another limit (0: glibc's own
+/// choice); a `GLIBC_TUNABLES` that sets `glibc.malloc.arena_max`, or `MALLOC_ARENA_MAX`,
+/// is left to decide.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod before_main {
     use std::ffi::{c_char, c_int, CStr};
 
     extern "C" {
         fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+        fn getenv(name: *const c_char) -> *const c_char;
+        fn mallopt(param: c_int, value: c_int) -> c_int;
+    }
+
+    /// glibc's malloc.h
+    const M_ARENA_MAX: c_int = -8;
+    /// one arena unless told otherwise: the least memory; the allocator's lock is then shared
+    const ARENA_MAX: c_int = 1;
+
+    fn env(name: &CStr) -> Option<&'static [u8]> {
+        let value = unsafe { getenv(name.as_ptr()) };
+        (!value.is_null()).then(|| unsafe { CStr::from_ptr(value) }.to_bytes())
+    }
+
+    /// The arena limit to set, or `None` when the environment has its own or asks for glibc's.
+    fn arena_max() -> Option<c_int> {
+        let tunable = b"glibc.malloc.arena_max";
+        if env(c"GLIBC_TUNABLES").is_some_and(|v| v.windows(tunable.len()).any(|w| w == tunable))
+            || env(c"MALLOC_ARENA_MAX").is_some()
+        {
+            return None;
+        }
+        let asked = env(c"TB_SURFACE_ARENA_MAX").and_then(|v| std::str::from_utf8(v).ok()?.trim().parse::<c_int>().ok());
+        match asked {
+            Some(0) => None,
+            Some(n) if n > 0 => Some(n),
+            _ => Some(ARENA_MAX),
+        }
     }
 
     /// Sets `name` unless the environment already has it.
@@ -65,6 +102,9 @@ mod before_main {
     }
 
     extern "C" fn before_main(argc: c_int, argv: *const *const c_char, _envp: *const *const c_char) {
+        if let Some(n) = arena_max() {
+            unsafe { mallopt(M_ARENA_MAX, n) };
+        }
         default_env(c"MAKEPAD_GAMEPAD", c"0");
         default_env(c"NO_AT_BRIDGE", c"1");
         if !started_with_remote(argc, argv) {
@@ -570,8 +610,8 @@ pub struct App {
 
 /// Gives the memory the allocator holds but no longer uses back to the system. Starting up
 /// and showing a kind of widget for the first time compile scripts and shaders; what that
-/// needed for a moment is freed, but glibc keeps freed memory inside its per-thread arenas,
-/// and the process stays as large as its busiest moment. Called once things have settled.
+/// needed for a moment is freed, but glibc keeps freed memory inside its arenas, and the
+/// process stays as large as its busiest moment. Called once things have settled.
 /// On linux-node with the GLES backend and no driver shader cache this returns about 30 MB of
 /// 310 MB after startup and takes 1.4 ms; `TINYBOT_SURFACE_LOG=1` prints the time it took.
 fn release_free_memory() {
