@@ -17,3 +17,8 @@ makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features 
 [[bin]]
 name = "tb-surface"
 path = "src/bin/tb-surface.rs"
+
+# the panel runner: standard library only, nothing of Makepad is linked into it
+[[bin]]
+name = "tb-panel"
+path = "src/bin/tb-panel/main.rs"
