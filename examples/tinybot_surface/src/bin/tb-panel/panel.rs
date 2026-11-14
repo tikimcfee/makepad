@@ -18,6 +18,8 @@ pub struct Panel {
     pub order: f64,
     /// the all-off: behind the Stop button and behind every lock
     pub stop: Option<Stop>,
+    /// a key (its evdev code) that runs a button's action while it is held
+    pub key: Option<(u16, String)>,
     pub items: Vec<Item>,
 }
 
@@ -72,6 +74,8 @@ pub struct Action {
     pub stop_post: Vec<String>,
     /// the readout, text or heading that shows `rc N · line`
     pub result: Option<String>,
+    /// the readout, text or heading that shows the tool's `LIVE ` lines while it runs
+    pub live: Option<String>,
     /// the words asked for after the try
     pub ask: Vec<String>,
     /// the answers that run Stop and lock the panel
@@ -128,7 +132,7 @@ impl Panel {
 
     pub fn parse(file: &Json) -> Result<Panel, String> {
         let members = file.as_obj().ok_or("a panel is one JSON object")?;
-        known(members, &["panel", "title", "summary", "order", "stop", "items"], "the panel")?;
+        known(members, &["panel", "title", "summary", "order", "stop", "key", "items"], "the panel")?;
         let name = string(file, "panel", "the panel")?.ok_or("panel (the name) is missing")?;
         if !valid_name(&name) {
             return Err(format!("panel {name:?}: a name is 1 to 32 of A-Z a-z 0-9 _ - and does not start with _"));
@@ -150,13 +154,24 @@ impl Panel {
                 Some(Stop { argv: fixed_argv(stop.get("argv"), what)?, timeout_s: seconds(stop, "timeout_s", what)?.ok_or("stop: timeout_s is missing")? })
             }
         };
+        let key = match file.get("key") {
+            None => None,
+            Some(key) => {
+                known(key.as_obj().ok_or("key is not an object")?, &["code", "panel", "button"], "key")?;
+                let code = key.get("code").and_then(|c| c.as_u64()).filter(|c| *c <= u16::MAX as u64).ok_or("key: code is not a key code (a number up to 65535)")?;
+                if key.get("panel").is_some_and(|p| p.as_str() != Some(name.as_str())) {
+                    return Err("key: panel is not this panel".into());
+                }
+                Some((code as u16, string(key, "button", "key")?.ok_or("key: button is missing")?))
+            }
+        };
         let list = file.get("items").and_then(|i| i.as_arr()).ok_or("items is missing or not an array")?;
         let mut ids = HashSet::new();
         let mut items = Vec::new();
         for (n, item) in list.iter().enumerate() {
             items.push(parse_item(item, n, &mut ids)?);
         }
-        let panel = Panel { name, title, summary, order, stop, items };
+        let panel = Panel { name, title, summary, order, stop, key, items };
         panel.check_references()?;
         let page = panel.items.iter().map(|item| item.json(false).to_string().len() + 1).sum::<usize>() + panel.title.len();
         if page > PAGE_BYTES {
@@ -180,18 +195,29 @@ impl Panel {
                     }
                 }
             }
-            if let Some(result) = &action.result {
+            for (field, id) in [("result", &action.result), ("live", &action.live)] {
+                let Some(id) = id else {
+                    continue;
+                };
                 let shows = self.items.iter().any(|item| match item {
-                    Item::Plain { id, json } => id == result && json.get("kind").and_then(|k| k.as_str()) != Some("divider"),
-                    Item::Readout { id, .. } => id == result,
+                    Item::Plain { id: this, json } => this == id && json.get("kind").and_then(|k| k.as_str()) != Some("divider"),
+                    Item::Readout { id: this, .. } => this == id,
                     _ => false,
                 });
                 if !shows {
-                    return Err(format!("{what}: result {result:?} is not the id of a readout, text or heading"));
+                    return Err(format!("{what}: {field} {id:?} is not the id of a readout, text or heading"));
                 }
             }
             if !action.stop_on.is_empty() && self.stop.is_none() {
                 return Err(format!("{what}: on_answer asks for stop, but the panel has no stop"));
+            }
+        }
+        if let Some((_, button)) = &self.key {
+            // a key press is no tap and has no values
+            match self.button(button).map(|b| &b.does) {
+                Some(Does::Action(action)) if action.argv.iter().flatten().all(|part| matches!(part, Part::Text(_))) => {}
+                Some(Does::Action(_)) => return Err(format!("key: the action of button {button} takes values, which a key press does not have")),
+                _ => return Err(format!("key: {button:?} is not a button with an action")),
             }
         }
         Ok(())
@@ -511,7 +537,7 @@ fn parse_action(action: &Json, what: &str) -> Result<Action, String> {
     let what = format!("{what}: action");
     let what = what.as_str();
     let members = action.as_obj().ok_or(format!("{what} is not an object"))?;
-    known(members, &["argv", "as", "timeout_s", "stop_post", "result", "ask", "on_answer", "checks"], what)?;
+    known(members, &["argv", "as", "timeout_s", "stop_post", "result", "live", "ask", "on_answer", "checks"], what)?;
     let as_root = match string(action, "as", what)?.as_deref() {
         None | Some("user") => false,
         Some("root") => true,
@@ -555,6 +581,7 @@ fn parse_action(action: &Json, what: &str) -> Result<Action, String> {
         timeout_s: seconds(action, "timeout_s", what)?.ok_or(format!("{what}: timeout_s is missing"))?,
         stop_post,
         result: string(action, "result", what)?,
+        live: string(action, "live", what)?,
         ask,
         stop_on,
         checks,
