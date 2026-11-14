@@ -29,7 +29,7 @@ mod unix {
     use std::time::{Duration, Instant};
 
     /// The protocol version this tool speaks (`v` in the app's `hello`).
-    const VERSION: u64 = 1;
+    const VERSION: u64 = 2;
 
     const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] {set,wait,clear,status} ...\n";
     const HELP: &str = "\

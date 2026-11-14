@@ -1,15 +1,17 @@
 //! tinybot's live surface (not for upstream): a full-screen app that shows what an agent
-//! describes over a local Unix socket (text, toggles, rows of buttons) and keeps the user's
-//! taps until the agent's next call collects them. No network: the only way in is
+//! describes over a local Unix socket (text, toggles, steppers, text fields, readouts, rows
+//! of buttons) and keeps the user's taps until the agent's next call collects them. No network: the only way in is
 //! `$XDG_RUNTIME_DIR/tinybot/surface.sock`, same user only. The protocol and the `tb-surface`
 //! command are described in the README next to this crate.
 //!
 //! The widgets are a fixed set compiled into the app; a description is data, checked as a
 //! whole before the screen changes (`wire.rs`). The socket has its own thread (`socket.rs`).
-//! At rest nothing runs: no timer, no frame callback.
+//! At rest nothing runs: no timer, no frame callback. The two timers there are run only
+//! while the user holds a stepper's button or a `confirm` button is armed.
 
 pub use makepad_widgets;
 
+use makepad_widgets::makepad_platform::event;
 use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 use std::collections::HashMap;
@@ -191,6 +193,84 @@ script_mod! {
                     draw_text.text_style.font_size: 11
                 }
             }
+            // one of a fixed list of strings: ‹ value ›
+            Stepper := View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 8
+                align: Align{y: 0.5}
+                padding: Inset{left: 16 right: 16 top: 6 bottom: 6}
+                label := Label{
+                    width: Fill
+                    text: ""
+                    draw_text.color: #ccc
+                    draw_text.text_style.font_size: 11
+                }
+                less := Button{
+                    width: 46
+                    height: 42
+                    text: "‹"
+                    draw_text.text_style.font_size: 16
+                }
+                value := Label{
+                    width: 104
+                    align: Align{x: 0.5}
+                    text: ""
+                    draw_text.color: #fff
+                    draw_text.text_style.font_size: 11
+                }
+                more := Button{
+                    width: 46
+                    height: 42
+                    text: "›"
+                    draw_text.text_style.font_size: 16
+                }
+            }
+            // a text field; what is typed is sent as it is
+            Number := View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 12
+                align: Align{y: 0.5}
+                padding: Inset{left: 16 right: 16 top: 6 bottom: 6}
+                label := Label{
+                    width: Fill
+                    text: ""
+                    draw_text.color: #ccc
+                    draw_text.text_style.font_size: 11
+                }
+                input := TextInput{
+                    width: 150
+                    height: Fit
+                    empty_text: ""
+                    draw_text.text_style.font_size: 11
+                }
+            }
+            // a label and a value the agent changes in place
+            Readout := View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 12
+                align: Align{y: 0.5}
+                padding: Inset{left: 16 right: 16 top: 6 bottom: 6}
+                label := Label{
+                    width: Fit
+                    text: ""
+                    draw_text.color: #ccc
+                    draw_text.text_style.font_size: 11
+                }
+                value := Label{
+                    width: Fill
+                    text: ""
+                    draw_text.color: #fff
+                    draw_text +: {
+                        text_style: theme.font_code{font_size: 11}
+                    }
+                }
+            }
             Row := View{
                 width: Fill
                 height: Fit
@@ -333,15 +413,21 @@ impl ScriptHook for ButtonRow {
 }
 
 impl ButtonRow {
-    /// Makes this the row of `buttons`, armed or locked. Called while the list draws.
-    pub fn set_buttons(&mut self, cx: &mut Cx, buttons: &[wire::Button], armed: bool) {
+    /// Makes this the row of `buttons`, armed or locked. `confirming` is the `confirm` button
+    /// that waits for its second tap: it is drawn as a danger button that says so. Called
+    /// while the list draws.
+    pub fn set_buttons(&mut self, cx: &mut Cx, buttons: &[wire::Button], armed: bool, confirming: Option<usize>) {
         self.shown.clear();
         for (index, button) in buttons.iter().enumerate() {
+            let confirming = confirming == Some(index);
             let (template, style) = match button.style {
+                _ if confirming => (id!(Danger), 2),
                 wire::Style::Primary => (id!(Primary), 0),
                 wire::Style::Secondary => (id!(Secondary), 1),
                 wire::Style::Danger => (id!(Danger), 2),
             };
+            // a button that does not lock its row is not locked with it either
+            let armed = armed || !button.lock;
             let key = LiveId(((index as u64) << 2) | style);
             if !self.made.contains_key(&key) {
                 let Some(source) = self.templates.get(&template) else {
@@ -353,7 +439,11 @@ impl ButtonRow {
                 self.made.insert(key, RowButton { widget, template });
             }
             let widget = &self.made[&key].widget;
-            widget.set_text(cx, &button.text);
+            if confirming {
+                widget.set_text(cx, &format!("tap again: {}", button.text));
+            } else {
+                widget.set_text(cx, &button.text);
+            }
             // a locked button takes no press (enabled) and fades to its disabled look
             widget.as_button().set_enabled(cx, armed);
             if widget.disabled(cx) == armed {
@@ -423,13 +513,23 @@ impl Widget for ButtonRow {
 
 /// One line of the list.
 enum Entry {
-    Heading(String),
-    Text(String),
+    Heading { id: String, text: String },
+    Text { id: String, text: String },
     Toggle { id: String, text: String },
+    Stepper { id: String, text: String, values: Vec<String> },
+    Number { id: String, text: String },
+    Readout { id: String, text: String, value: String },
     /// `tapped`: the button that was pressed. The row is locked from then until the agent
-    /// sends the next surface or clears.
-    Row { buttons: Vec<wire::Button>, tapped: Option<usize> },
+    /// sends the next surface, arms the row with an `update`, or clears.
+    Row { id: String, buttons: Vec<wire::Button>, tapped: Option<usize> },
     Divider,
+}
+
+/// What the user set in a toggle, a stepper (a position in its values) or a number.
+enum Held {
+    Bool(bool),
+    Step(usize),
+    Text(String),
 }
 
 /// A button press on its way to the agent.
@@ -437,8 +537,22 @@ pub struct Pressed {
     pub surface: String,
     pub rev: u64,
     pub id: String,
-    pub values: Vec<(String, bool)>,
+    pub values: Vec<(String, wire::Value)>,
 }
+
+/// A press on a stepper's button that has not ended yet.
+struct HeldStep {
+    entry: usize,
+    /// -1 or 1
+    by: isize,
+    /// the steps the hold has made so far
+    repeats: usize,
+}
+
+/// A stepper's button held down: the first repeat comes after this long,
+const REPEAT_DELAY: f64 = 0.45;
+/// and the following ones this far apart.
+const REPEAT_EVERY: f64 = 0.1;
 
 /// The surface on screen: the list and the state the list's recycled rows are drawn from.
 #[derive(Script, ScriptHook, Widget)]
@@ -451,32 +565,67 @@ pub struct SurfaceList {
     rev: u64,
     #[rust]
     entries: Vec<Entry>,
-    /// the toggles' values by id
+    /// what the user set, by item id
     #[rust]
-    values: HashMap<String, bool>,
+    values: HashMap<String, Held>,
+    /// the `confirm` button that waits for its second tap: (entry, button)
+    #[rust]
+    confirming: Option<(usize, usize)>,
+    /// one shot: the armed `confirm` button gives up
+    #[rust]
+    confirm_timer: Timer,
+    /// the stepper button the pointer is down on
+    #[rust]
+    held: Option<HeldStep>,
+    /// one shot, started again after each repeat while the button is held
+    #[rust]
+    repeat_timer: Timer,
 }
 
 impl SurfaceList {
-    /// Replaces what is shown. The toggles keep what the user set when the surface id is the
-    /// same and the description gives no value; every row is armed again.
+    /// Replaces what is shown. A toggle, stepper or number keeps what the user set when the
+    /// surface id is the same and the description gives no value; every row is armed again.
     pub fn set_spec(&mut self, cx: &mut Cx, spec: wire::Spec) {
         let same = spec.surface == self.surface;
-        let mut values = HashMap::new();
+        let kept: HashMap<String, wire::Value> = if same { self.tap_values().into_iter().collect() } else { HashMap::new() };
+        self.disarm(cx);
+        self.stop_repeat(cx);
+        self.values.clear();
         self.entries.clear();
         for item in spec.items {
             self.entries.push(match item {
-                wire::Item::Heading(text) => Entry::Heading(text),
-                wire::Item::Text(text) => Entry::Text(text),
+                wire::Item::Heading { id, text } => Entry::Heading { id, text },
+                wire::Item::Text { id, text } => Entry::Text { id, text },
                 wire::Item::Divider => Entry::Divider,
-                wire::Item::Row(buttons) => Entry::Row { buttons, tapped: None },
+                wire::Item::Row { id, buttons } => Entry::Row { id, buttons, tapped: None },
+                wire::Item::Readout { id, text, value } => Entry::Readout { id, text, value },
                 wire::Item::Toggle { id, text, value } => {
-                    let kept = if same { self.values.get(&id).copied() } else { None };
-                    values.insert(id.clone(), value.or(kept).unwrap_or(false));
+                    let kept = match kept.get(&id) {
+                        Some(wire::Value::Bool(on)) => Some(*on),
+                        _ => None,
+                    };
+                    self.values.insert(id.clone(), Held::Bool(value.or(kept).unwrap_or(false)));
                     Entry::Toggle { id, text }
+                }
+                wire::Item::Stepper { id, text, values, value } => {
+                    // the value the user chose, if the new list still has it
+                    let kept = match kept.get(&id) {
+                        Some(wire::Value::Text(was)) => values.iter().position(|v| v == was),
+                        _ => None,
+                    };
+                    self.values.insert(id.clone(), Held::Step(value.or(kept).unwrap_or(0)));
+                    Entry::Stepper { id, text, values }
+                }
+                wire::Item::Number { id, text, value } => {
+                    let kept = match kept.get(&id) {
+                        Some(wire::Value::Text(was)) => Some(was.clone()),
+                        _ => None,
+                    };
+                    self.values.insert(id.clone(), Held::Text(value.or(kept).unwrap_or_default()));
+                    Entry::Number { id, text }
                 }
             });
         }
-        self.values = values;
         self.surface = spec.surface;
         self.rev = spec.rev;
         if !same {
@@ -485,7 +634,44 @@ impl SurfaceList {
         self.view.redraw(cx);
     }
 
+    /// Changes labels and readouts in place and arms rows again. What the user set, the armed
+    /// `confirm` button and the scroll position stay. The socket thread has checked the ids.
+    pub fn update(&mut self, cx: &mut Cx, update: wire::Update) {
+        for change in update.changes {
+            for entry in &mut self.entries {
+                match entry {
+                    Entry::Heading { id, text } | Entry::Text { id, text } if *id == change.id => {
+                        if let Some(new) = &change.text {
+                            text.clone_from(new);
+                        }
+                    }
+                    Entry::Readout { id, text, value } if *id == change.id => {
+                        if let Some(new) = &change.text {
+                            text.clone_from(new);
+                        }
+                        if let Some(new) = &change.value {
+                            value.clone_from(new);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for name in update.arm {
+            for entry in &mut self.entries {
+                if let Entry::Row { id, buttons, tapped } = entry {
+                    if *id == name || buttons.iter().any(|b| b.id == name) {
+                        *tapped = None;
+                    }
+                }
+            }
+        }
+        self.view.redraw(cx);
+    }
+
     pub fn clear(&mut self, cx: &mut Cx) {
+        self.disarm(cx);
+        self.stop_repeat(cx);
         self.entries.clear();
         self.values.clear();
         self.surface.clear();
@@ -493,41 +679,140 @@ impl SurfaceList {
         self.view.redraw(cx);
     }
 
-    /// Takes the toggles' changes and the button presses out of `actions`. A pressed row
-    /// locks; what comes back goes to the agent.
+    /// The toggles, steppers and numbers as they are now, in the order they are shown.
+    fn tap_values(&self) -> Vec<(String, wire::Value)> {
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            let value = match entry {
+                Entry::Toggle { id, .. } => match self.values.get(id) {
+                    Some(Held::Bool(on)) => (id, wire::Value::Bool(*on)),
+                    _ => continue,
+                },
+                Entry::Stepper { id, values, .. } => match self.values.get(id) {
+                    Some(Held::Step(at)) if *at < values.len() => (id, wire::Value::Text(values[*at].clone())),
+                    _ => continue,
+                },
+                Entry::Number { id, .. } => match self.values.get(id) {
+                    Some(Held::Text(text)) => (id, wire::Value::Text(text.clone())),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            out.push((value.0.clone(), value.1));
+        }
+        out
+    }
+
+    /// The armed `confirm` button, if any, is an ordinary button again.
+    fn disarm(&mut self, cx: &mut Cx) {
+        if self.confirming.take().is_some() {
+            cx.stop_timer(self.confirm_timer);
+            self.view.redraw(cx);
+        }
+    }
+
+    /// Ends a hold on a stepper's button. `true` when the hold has stepped already.
+    fn stop_repeat(&mut self, cx: &mut Cx) -> bool {
+        cx.stop_timer(self.repeat_timer);
+        self.held.take().is_some_and(|held| held.repeats > 0)
+    }
+
+    /// Moves a stepper one value down or up. `false` at the end of its values: a stepper
+    /// does not wrap around, so the lowest value is never one press from the highest.
+    fn step(&mut self, cx: &mut Cx, entry: usize, by: isize) -> bool {
+        let Some(Entry::Stepper { id, values, .. }) = self.entries.get(entry) else {
+            return false;
+        };
+        let at = match self.values.get(id) {
+            Some(Held::Step(at)) => *at,
+            _ => 0,
+        };
+        let next = at.saturating_add_signed(by).min(values.len().saturating_sub(1));
+        if next == at {
+            return false;
+        }
+        self.values.insert(id.clone(), Held::Step(next));
+        self.view.redraw(cx);
+        true
+    }
+
+    /// Takes what the user did out of `actions`: toggles, typing, stepper presses and button
+    /// presses. A pressed row locks; what comes back goes to the agent.
     pub fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) -> Vec<Pressed> {
         let list = self.view.portal_list(cx, ids!(list));
-        let mut ids = Vec::new();
+        let mut clicked = Vec::new();
         for (index, item) in list.items_with_actions(actions) {
-            match self.entries.get_mut(index) {
+            match self.entries.get(index) {
                 Some(Entry::Toggle { id, .. }) => {
                     if let Some(value) = item.check_box(cx, ids!(toggle)).changed(actions) {
-                        self.values.insert(id.clone(), value);
+                        self.values.insert(id.clone(), Held::Bool(value));
                     }
                 }
-                Some(Entry::Row { buttons, tapped }) if tapped.is_none() => {
+                Some(Entry::Number { id, .. }) => {
+                    if let Some(text) = item.text_input(cx, ids!(input)).changed(actions) {
+                        self.values.insert(id.clone(), Held::Text(text));
+                    }
+                }
+                Some(Entry::Stepper { .. }) => {
+                    for (button, by) in [(item.button(cx, ids!(less)), -1), (item.button(cx, ids!(more)), 1)] {
+                        // a held button repeats; a short press is one step when it is let go
+                        if button.pressed(actions) {
+                            self.stop_repeat(cx);
+                            self.held = Some(HeldStep { entry: index, by, repeats: 0 });
+                            self.repeat_timer = cx.start_timeout(REPEAT_DELAY);
+                        }
+                        // a click with no press before it comes from a press made without a
+                        // pointer (accessibility, the remote): one step as well
+                        if button.clicked(actions) && !self.stop_repeat(cx) {
+                            self.step(cx, index, by);
+                        }
+                        if button.released(actions) {
+                            self.stop_repeat(cx);
+                        }
+                    }
+                }
+                Some(Entry::Row { .. }) => {
                     let hit = item.widget(cx, ids!(buttons)).borrow::<ButtonRow>().and_then(|row| row.clicked(actions));
-                    if let Some(button) = hit.and_then(|k| buttons.get(k).map(|b| (k, b))) {
-                        *tapped = Some(button.0);
-                        ids.push(button.1.id.clone());
+                    if let Some(button) = hit {
+                        clicked.push((index, button));
                     }
                 }
                 _ => {}
+            }
+        }
+        let mut ids = Vec::new();
+        for (index, k) in clicked {
+            let Some(Entry::Row { buttons, tapped, .. }) = self.entries.get(index) else {
+                continue;
+            };
+            let Some(button) = buttons.get(k) else {
+                continue;
+            };
+            if tapped.is_some() && button.lock {
+                continue;
+            }
+            if button.confirm && self.confirming != Some((index, k)) {
+                // the first tap: armed until the second one or the timeout
+                self.disarm(cx);
+                self.confirming = Some((index, k));
+                self.confirm_timer = cx.start_timeout(wire::CONFIRM_SECONDS);
+                self.view.redraw(cx);
+                continue;
+            }
+            // a tap on any button ends another button's wait for its second tap
+            self.disarm(cx);
+            if let Some(Entry::Row { buttons, tapped, .. }) = self.entries.get_mut(index) {
+                if buttons[k].lock {
+                    *tapped = Some(k);
+                }
+                ids.push(buttons[k].id.clone());
             }
         }
         if ids.is_empty() {
             return Vec::new();
         }
         self.view.redraw(cx);
-        // the toggles as they are now, in the order they are shown
-        let values: Vec<(String, bool)> = self
-            .entries
-            .iter()
-            .filter_map(|e| match e {
-                Entry::Toggle { id, .. } => Some((id.clone(), self.values.get(id).copied().unwrap_or(false))),
-                _ => None,
-            })
-            .collect();
+        let values = self.tap_values();
         ids.into_iter()
             .map(|id| Pressed { surface: self.surface.clone(), rev: self.rev, id, values: values.clone() })
             .collect()
@@ -544,14 +829,51 @@ impl Widget for SurfaceList {
                         continue;
                     };
                     let row = match entry {
-                        Entry::Heading(text) => {
+                        Entry::Heading { text, .. } => {
                             let row = list.item(cx, index, id!(Heading));
                             row.label(cx, ids!(label)).set_text(cx, text);
                             row
                         }
-                        Entry::Text(text) => {
+                        Entry::Text { text, .. } => {
                             let row = list.item(cx, index, id!(Text));
                             row.label(cx, ids!(label)).set_text(cx, text);
+                            row
+                        }
+                        Entry::Readout { text, value, .. } => {
+                            let row = list.item(cx, index, id!(Readout));
+                            row.label(cx, ids!(label)).set_text(cx, text);
+                            row.label(cx, ids!(value)).set_text(cx, value);
+                            row
+                        }
+                        Entry::Stepper { id, text, values } => {
+                            let row = list.item(cx, index, id!(Stepper));
+                            row.label(cx, ids!(label)).set_text(cx, text);
+                            let at = match self.values.get(id) {
+                                Some(Held::Step(at)) => *at,
+                                _ => 0,
+                            };
+                            row.label(cx, ids!(value)).set_text(cx, values.get(at).map_or("", |v| v.as_str()));
+                            // a button at the end of the values fades; a press there does nothing
+                            for (button, end) in [(ids!(less), 0), (ids!(more), values.len().saturating_sub(1))] {
+                                let button = row.widget(cx, button);
+                                if button.disabled(cx) != (at == end) {
+                                    button.set_disabled(cx, at == end);
+                                }
+                            }
+                            row
+                        }
+                        Entry::Number { id, text } => {
+                            let row = list.item(cx, index, id!(Number));
+                            row.label(cx, ids!(label)).set_text(cx, text);
+                            let input = row.text_input(cx, ids!(input));
+                            let held = match self.values.get(id) {
+                                Some(Held::Text(held)) => held.as_str(),
+                                _ => "",
+                            };
+                            // only when it differs: typing must not be answered with a reset
+                            if input.text() != held {
+                                input.set_text(cx, held);
+                            }
                             row
                         }
                         Entry::Divider => list.item(cx, index, id!(Divider)),
@@ -559,16 +881,17 @@ impl Widget for SurfaceList {
                             let row = list.item(cx, index, id!(Toggle));
                             let toggle = row.check_box(cx, ids!(toggle));
                             toggle.set_text(text);
-                            let value = self.values.get(id).copied().unwrap_or(false);
+                            let value = matches!(self.values.get(id), Some(Held::Bool(true)));
                             if toggle.active(cx) != value {
                                 toggle.set_active(cx, value, Animate::No);
                             }
                             row
                         }
-                        Entry::Row { buttons, tapped } => {
+                        Entry::Row { buttons, tapped, .. } => {
                             let row = list.item(cx, index, id!(Row));
+                            let confirming = self.confirming.filter(|(entry, _)| *entry == index).map(|(_, button)| button);
                             if let Some(mut line) = row.widget(cx, ids!(buttons)).borrow_mut::<ButtonRow>() {
-                                line.set_buttons(cx, buttons, tapped.is_none());
+                                line.set_buttons(cx, buttons, tapped.is_none(), confirming);
                             }
                             let working = row.label(cx, ids!(working));
                             match tapped.and_then(|k| buttons.get(k)) {
@@ -589,6 +912,30 @@ impl Widget for SurfaceList {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.confirm_timer.is_event(event).is_some() {
+            self.disarm(cx);
+        }
+        if self.repeat_timer.is_event(event).is_some() {
+            if let Some((entry, by)) = self.held.as_ref().map(|held| (held.entry, held.by)) {
+                // at the end of the values the hold has nothing more to do
+                if self.step(cx, entry, by) {
+                    self.repeat_timer = cx.start_timeout(REPEAT_EVERY);
+                }
+                if let Some(held) = &mut self.held {
+                    held.repeats += 1;
+                }
+            }
+        }
+        // the repeat ends when the pointer comes up, also when the button itself never
+        // hears of it; the button's own click or release then ends the hold
+        let up = match event {
+            Event::MouseUp(_) => true,
+            Event::TouchUpdate(e) => e.touches.iter().all(|t| matches!(t.state, event::TouchState::Stop | event::TouchState::Cancel)),
+            _ => false,
+        };
+        if up {
+            cx.stop_timer(self.repeat_timer);
+        }
         self.view.handle_event(cx, event, scope);
     }
 }
@@ -683,10 +1030,19 @@ impl MatchEvent for App {
             let Ok(message) = message else {
                 return;
             };
-            cx.stop_timer(self.settle);
-            self.settle = cx.start_timeout(SETTLE_SECONDS);
+            // a new surface (or none) may free memory a moment later; an update in place
+            // does not, and a readout that changes every few seconds must not run a timer
+            if !matches!(message, socket::ToUi::Update(_)) {
+                cx.stop_timer(self.settle);
+                self.settle = cx.start_timeout(SETTLE_SECONDS);
+            }
             let items = self.ui.widget(cx, ids!(items));
             match message {
+                socket::ToUi::Update(update) => {
+                    if let Some(mut list) = items.borrow_mut::<SurfaceList>() {
+                        list.update(cx, update);
+                    }
+                }
                 socket::ToUi::Set(spec) => {
                     let title = if spec.title.is_empty() { "tinybot" } else { spec.title.as_str() };
                     self.ui.label(cx, ids!(title)).set_text(cx, title);
