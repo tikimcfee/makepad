@@ -1,12 +1,13 @@
 //! The surface protocol's data: what an agent may ask for (one JSON object per line) and the
 //! lines the app answers with. A `set` is checked completely here, before anything on screen
-//! changes: a description that fails leaves the last good surface alone.
+//! changes: a description that fails leaves the last good surface alone. An `update` is
+//! checked here for its shape and by the socket thread against the surface on screen.
 
 use makepad_widgets::makepad_platform::makepad_micro_serde::{DeJson, JsonValue};
 use std::collections::HashSet;
 
 /// Protocol version, in `hello`.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 /// The longest request line. A longer one is answered with `too_long` and the connection is
 /// closed, since the framing is lost.
 pub const MAX_LINE: usize = 64 * 1024;
@@ -23,16 +24,90 @@ pub struct Button {
     pub id: String,
     pub text: String,
     pub style: Style,
+    /// the first tap only arms the button; a second one within `CONFIRM_SECONDS` is the tap
+    pub confirm: bool,
+    /// `false`: a tap does not lock the row, and the button stays live in a locked row
+    pub lock: bool,
 }
 
+/// How long a `confirm` button stays armed.
+pub const CONFIRM_SECONDS: f64 = 3.0;
+
+/// The items. An `id` that is optional and was left out is empty. For the three kinds the
+/// user sets (toggle, stepper, number), `value: None` keeps what the user set when the
+/// surface id is unchanged.
 #[derive(Clone, Debug)]
 pub enum Item {
-    Heading(String),
-    Text(String),
-    /// `value: None` keeps what the user set when the surface id is unchanged
+    Heading { id: String, text: String },
+    Text { id: String, text: String },
     Toggle { id: String, text: String, value: Option<bool> },
-    Row(Vec<Button>),
+    /// one of `values`, the device's own steps as strings; `value` is a position in them
+    Stepper { id: String, text: String, values: Vec<String>, value: Option<usize> },
+    /// a text field; what was typed is sent as it is
+    Number { id: String, text: String, value: Option<String> },
+    /// a label and a value the agent changes with `update`
+    Readout { id: String, text: String, value: String },
+    Row { id: String, buttons: Vec<Button> },
     Divider,
+}
+
+/// What a tap says of an item the user sets.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Bool(bool),
+    Text(String),
+}
+
+/// What an `update` may name: an item it can change, or a row to arm again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// heading or text: `text`
+    Label,
+    /// readout: `text` and `value`
+    Readout,
+    /// a row's own id, or the id of one of its buttons
+    Row,
+    /// toggle, stepper, number: the user's, not for `update`
+    Input,
+}
+
+impl Spec {
+    /// Every id of the surface and what an `update` may do with it.
+    pub fn targets(&self) -> Vec<(String, Target)> {
+        let mut out = Vec::new();
+        for item in &self.items {
+            match item {
+                Item::Heading { id, .. } | Item::Text { id, .. } => out.push((id.clone(), Target::Label)),
+                Item::Readout { id, .. } => out.push((id.clone(), Target::Readout)),
+                Item::Toggle { id, .. } | Item::Stepper { id, .. } | Item::Number { id, .. } => out.push((id.clone(), Target::Input)),
+                Item::Row { id, buttons } => {
+                    out.push((id.clone(), Target::Row));
+                    out.extend(buttons.iter().map(|b| (b.id.clone(), Target::Row)));
+                }
+                Item::Divider => {}
+            }
+        }
+        out.retain(|(id, _)| !id.is_empty());
+        out
+    }
+}
+
+/// One item's part of an `update`.
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub id: String,
+    pub text: Option<String>,
+    pub value: Option<String>,
+}
+
+/// A checked `update`: changes to items in place and rows to arm again. Whether the ids
+/// exist is checked against the surface on screen, by the socket thread.
+#[derive(Clone, Debug)]
+pub struct Update {
+    pub surface: String,
+    pub rev: u64,
+    pub changes: Vec<Change>,
+    pub arm: Vec<String>,
 }
 
 /// A checked surface description.
@@ -46,6 +121,7 @@ pub struct Spec {
 
 pub enum Request {
     Set(Spec),
+    Update(Update),
     Clear,
     Status,
     Taps { wait: bool },
@@ -62,14 +138,15 @@ fn err<T>(code: &'static str, msg: impl Into<String>) -> Result<T, WireErr> {
     Err(WireErr { code, msg: msg.into() })
 }
 
-/// A press of a button, with the toggles as they were at that moment (in item order).
+/// A press of a button, with the toggles, steppers and numbers as they were at that moment
+/// (in item order).
 #[derive(Clone, Debug)]
 pub struct Tap {
     pub seq: u64,
     pub surface: String,
     pub rev: u64,
     pub id: String,
-    pub values: Vec<(String, bool)>,
+    pub values: Vec<(String, Value)>,
 }
 
 pub fn parse_request(line: &str) -> Result<Request, WireErr> {
@@ -82,6 +159,7 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
     }
     match value.key("type").and_then(|t| t.as_str()) {
         Some("set") => parse_set(&value).map(Request::Set),
+        Some("update") => parse_update(&value).map(Request::Update),
         Some("clear") => Ok(Request::Clear),
         Some("status") => Ok(Request::Status),
         Some("taps") => match value.key("wait") {
@@ -139,10 +217,32 @@ fn parse_button(v: &JsonValue, what: &str, seen: &mut HashSet<String>) -> Result
         Some("danger") => Style::Danger,
         _ => Style::Secondary,
     };
-    Ok(Button { id, text, style })
+    Ok(Button { id, text, style, confirm: flag_of(v, "confirm", false, what)?, lock: flag_of(v, "lock", true, what)? })
 }
 
-fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
+/// An optional true/false field.
+fn flag_of(v: &JsonValue, name: &str, default: bool, what: &str) -> Result<bool, WireErr> {
+    match v.key(name) {
+        None => Ok(default),
+        Some(flag) => match flag.as_bool() {
+            Some(flag) => Ok(flag),
+            None => err("bad_item", format!("{what}: {name} is not true or false")),
+        },
+    }
+}
+
+/// An optional string field.
+fn string_of(v: &JsonValue, name: &str, what: &str) -> Result<Option<String>, WireErr> {
+    match v.key(name) {
+        None => Ok(None),
+        Some(s) => match s.as_str() {
+            Some(s) => Ok(Some(s.to_string())),
+            None => err("bad_item", format!("{what}: {name} is not a string")),
+        },
+    }
+}
+
+fn surface_and_rev(value: &JsonValue) -> Result<(String, u64), WireErr> {
     let surface = match value.key("surface").and_then(|s| s.as_str()) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return err("bad_set", "surface is missing or not a non-empty string"),
@@ -151,6 +251,41 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
         Some(r) if r >= 1 => r,
         _ => return err("bad_set", "rev is missing or not an integer >= 1"),
     };
+    Ok((surface, rev))
+}
+
+fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
+    let (surface, rev) = surface_and_rev(value)?;
+    let mut changes = Vec::new();
+    if let Some(items) = value.key("items") {
+        let Some(items) = items.as_object() else {
+            return err("bad_request", "update: items is an object of id: {text, value}");
+        };
+        for (id, change) in items {
+            if change.as_object().is_none() {
+                return err("bad_request", format!("update: {id} is not an object"));
+            }
+            let what = format!("update {id}");
+            changes.push(Change { id: id.clone(), text: string_of(change, "text", &what)?, value: string_of(change, "value", &what)? });
+        }
+    }
+    let mut arm = Vec::new();
+    if let Some(list) = value.key("arm") {
+        let Some(list) = list.as_array() else {
+            return err("bad_request", "update: arm is an array of row or button ids");
+        };
+        for id in list {
+            match id.as_str() {
+                Some(id) => arm.push(id.to_string()),
+                None => return err("bad_request", "update: arm is an array of row or button ids"),
+            }
+        }
+    }
+    Ok(Update { surface, rev, changes, arm })
+}
+
+fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
+    let (surface, rev) = surface_and_rev(value)?;
     let title = match value.key("title") {
         None => String::new(),
         Some(t) => match t.as_str() {
@@ -172,14 +307,8 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
         };
         let what = format!("item {n} ({kind})");
         items.push(match kind {
-            "heading" => {
-                id_of(item, &what, false, &mut seen)?;
-                Item::Heading(text_of(item, n, kind)?)
-            }
-            "text" => {
-                id_of(item, &what, false, &mut seen)?;
-                Item::Text(text_of(item, n, kind)?)
-            }
+            "heading" => Item::Heading { id: id_of(item, &what, false, &mut seen)?, text: text_of(item, n, kind)? },
+            "text" => Item::Text { id: id_of(item, &what, false, &mut seen)?, text: text_of(item, n, kind)? },
             "divider" => {
                 id_of(item, &what, false, &mut seen)?;
                 Item::Divider
@@ -195,9 +324,38 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
                 };
                 Item::Toggle { id, text: text_of(item, n, kind)?, value }
             }
-            "button" => Item::Row(vec![parse_button(item, &what, &mut seen)?]),
+            "stepper" => {
+                let id = id_of(item, &what, true, &mut seen)?;
+                let mut values = Vec::new();
+                for v in item.key("values").and_then(|v| v.as_array()).map(|v| v.as_slice()).unwrap_or_default() {
+                    match v.as_str() {
+                        Some(v) => values.push(v.to_string()),
+                        None => return err("bad_item", format!("{what}: values holds something that is not a string")),
+                    }
+                }
+                if values.is_empty() {
+                    return err("bad_item", format!("{what}: values is missing or not a non-empty array of strings"));
+                }
+                let value = match string_of(item, "value", &what)? {
+                    None => None,
+                    Some(value) => match values.iter().position(|v| *v == value) {
+                        Some(at) => Some(at),
+                        None => return err("bad_item", format!("{what}: value is not one of values")),
+                    },
+                };
+                Item::Stepper { id, text: text_of(item, n, kind)?, values, value }
+            }
+            "number" => {
+                let id = id_of(item, &what, true, &mut seen)?;
+                Item::Number { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)? }
+            }
+            "readout" => {
+                let id = id_of(item, &what, true, &mut seen)?;
+                Item::Readout { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)?.unwrap_or_default() }
+            }
+            "button" => Item::Row { id: String::new(), buttons: vec![parse_button(item, &what, &mut seen)?] },
             "row" => {
-                id_of(item, &what, false, &mut seen)?;
+                let id = id_of(item, &what, false, &mut seen)?;
                 let Some(buttons) = item.key("buttons").and_then(|b| b.as_array()) else {
                     return err("bad_item", format!("{what}: buttons is missing or not an array"));
                 };
@@ -208,9 +366,8 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
                 for (k, b) in buttons.iter().enumerate() {
                     row.push(parse_button(b, &format!("item {n} (row) button {k}"), &mut seen)?);
                 }
-                Item::Row(row)
+                Item::Row { id, buttons: row }
             }
-            "input" => return err("unsupported", format!("item {n}: kind input is not built yet")),
             other => return err("bad_item", format!("item {n}: unknown kind: {other}")),
         });
     }
@@ -252,7 +409,14 @@ impl WireErr {
 
 impl Tap {
     pub fn line(&self) -> String {
-        let values: Vec<String> = self.values.iter().map(|(id, v)| format!("{}:{v}", json_str(id))).collect();
+        let values: Vec<String> = self
+            .values
+            .iter()
+            .map(|(id, v)| match v {
+                Value::Bool(v) => format!("{}:{v}", json_str(id)),
+                Value::Text(v) => format!("{}:{}", json_str(id), json_str(v)),
+            })
+            .collect();
         format!(
             "{{\"type\":\"tap\",\"seq\":{},{},\"id\":{},\"values\":{{{}}}}}\n",
             self.seq,
