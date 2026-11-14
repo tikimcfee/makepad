@@ -126,8 +126,28 @@ pub enum Request {
     Update(Update),
     Clear,
     Status,
-    Taps { wait: bool },
+    /// `layers`: a waiting request is also answered when the layers change
+    Taps { wait: bool, layers: bool },
     Done { seq: u64 },
+    /// root only: which layer is on screen
+    Show(Layer),
+}
+
+/// The app holds two surfaces, and one of them is on screen: root's (set by a uid-0 peer,
+/// the panel runner) and the agent's (set by a peer of the app's own user).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layer {
+    Root,
+    Agent,
+}
+
+impl Layer {
+    pub fn name(self) -> &'static str {
+        match self {
+            Layer::Root => "root",
+            Layer::Agent => "agent",
+        }
+    }
 }
 
 /// A refused request: `{"type":"err","code":CODE,"msg":MSG}`.
@@ -149,7 +169,7 @@ pub struct Tap {
     pub rev: u64,
     pub id: String,
     pub values: Vec<(String, Value)>,
-    /// the tap's surface was set by root: only root's peers are given it
+    /// the tap was made on root's layer: only root's peers are given it
     pub privileged: bool,
 }
 
@@ -166,12 +186,17 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
         Some("update") => parse_update(&value).map(Request::Update),
         Some("clear") => Ok(Request::Clear),
         Some("status") => Ok(Request::Status),
-        Some("taps") => match value.key("wait") {
-            None => Ok(Request::Taps { wait: false }),
-            Some(w) => match w.as_bool() {
-                Some(wait) => Ok(Request::Taps { wait }),
-                None => err("bad_request", "taps: wait is true or false"),
-            },
+        Some("taps") => {
+            let flag = |name: &str| match value.key(name) {
+                None => Ok(false),
+                Some(flag) => flag.as_bool().ok_or(WireErr { code: "bad_request", msg: format!("taps: {name} is true or false") }),
+            };
+            Ok(Request::Taps { wait: flag("wait")?, layers: flag("layers")? })
+        }
+        Some("show") => match value.key("layer").and_then(|l| l.as_str()) {
+            Some("root") => Ok(Request::Show(Layer::Root)),
+            Some("agent") => Ok(Request::Show(Layer::Agent)),
+            _ => err("bad_request", "show: layer is \"root\" or \"agent\""),
         },
         Some("done") => match value.key("seq").and_then(|s| s.as_u64()) {
             Some(seq) => Ok(Request::Done { seq }),
