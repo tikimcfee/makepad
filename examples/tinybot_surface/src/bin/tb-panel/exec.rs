@@ -234,7 +234,11 @@ pub fn systemd_run(unit: &Unit) -> Command {
         command.args(["-p", &format!("ExecStopPost={}", stop_post_line(unit.name, unit.stop_post))]);
     }
     if let Some(uid) = unit.uid {
+        // as the app's user, and with that user's runtime directory, so that a tool can
+        // reach the session's services (the compositor, notifications); nothing else of
+        // the user's environment is handed on
         command.arg(format!("--uid={uid}"));
+        command.args(["-p", &format!("Environment=XDG_RUNTIME_DIR=/run/user/{uid}")]);
     }
     command.arg("--").args(unit.argv);
     command

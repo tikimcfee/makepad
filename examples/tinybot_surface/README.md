@@ -298,7 +298,7 @@ An action:
 | Field | Meaning |
 |---|---|
 | `argv` | the program (an absolute path) and its arguments. `{id}` in an argument is the tap's value of the toggle, stepper or number `id`; `{{` is a literal brace. No shell, no PATH: each value stays inside its one argument whatever it holds. |
-| `as` | `user` (the default: the app's user) or `root` |
+| `as` | `user` (the default: the app's user, with `XDG_RUNTIME_DIR=/run/user/UID` and nothing else of the user's environment) or `root` |
 | `timeout_s` | required: the unit's RuntimeMaxSec |
 | `stop_post` | an argv without placeholders, the unit's ExecStopPost: it runs however the try ends |
 | `result` | the id of the readout, text or heading that shows `rc N · last line` |
@@ -317,7 +317,7 @@ they run never depends on what was typed.
   again (a stepper's value is one of its `values`; a number is 1 to 64 bytes
   without NUL or newline), else the result reads `refused: stale value`.
 - **A try** runs as
-  `systemd-run --unit=tb-panel-NAME-SEQ --wait --pipe --quiet --expand-environment=no -p RuntimeMaxSec=T -p TimeoutStopSec=2 [-p ExecStopPost=…] [--uid=UID] -- argv…`.
+  `systemd-run --unit=tb-panel-NAME-SEQ --wait --pipe --quiet --expand-environment=no -p RuntimeMaxSec=T -p TimeoutStopSec=2 [-p ExecStopPost=…] [--uid=UID -p Environment=XDG_RUNTIME_DIR=/run/user/UID] -- argv…`.
   Without `--expand-environment=no` systemd-run replaces `$NAME` in the
   arguments. The all-off in ExecStopPost runs under `systemd-cat`, so that
   its output goes to the journal and not into the try's stdout.
