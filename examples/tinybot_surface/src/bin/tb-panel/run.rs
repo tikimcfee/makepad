@@ -26,6 +26,8 @@ pub struct Options {
     /// panel directories, later ones win over earlier ones for the same name
     pub dirs: Vec<PathBuf>,
     pub socket: Option<String>,
+    /// an agent's new page comes straight up while Home is on screen and nothing runs
+    pub agent_direct: bool,
     pub state_dir: PathBuf,
     pub tries_dir: PathBuf,
     /// the file that reads `off` while the phone's panel is dark
@@ -45,7 +47,9 @@ const DIRECT_LIMIT: Duration = Duration::from_secs(2);
 enum Event {
     /// The app is there: a connection for requests, a handle on the taps connection, the
     /// app's uid and gid, and the rev of what it shows.
-    Connected { conn: Conn, taps: UnixStream, user: Option<(u32, u32)>, shown_rev: u64 },
+    Connected { conn: Conn, taps: UnixStream, user: Option<(u32, u32)>, shown_rev: u64, layers: Json },
+    /// the layer on screen or the agent's layer changed (a `layers` line, or the hello)
+    Layers(Json),
     Disconnected(String),
     /// taps that waited in the app before the runner showed its own page: never run
     Dropped(Vec<Json>),
@@ -191,6 +195,11 @@ struct Runner {
     waiters: Vec<(String, UnixStream)>,
     /// counts questions, for their ids
     asked: u64,
+
+    /// the agent's layer in the app: its surface, its title and who set it
+    agent: Option<(String, String, String)>,
+    /// the agent's page is the one on screen, not the runner's
+    agent_front: bool,
 }
 
 fn shown(text: &str) -> String {
@@ -250,13 +259,15 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg)
 }
 
-/// The taps of one answer to a `taps` request, confirmed.
-fn read_taps(conn: &mut Conn, first: Json) -> std::io::Result<Vec<Json>> {
+/// The taps of one answer to a `taps` request, confirmed. A line about the layers that
+/// came with them is handed on at once.
+fn read_taps(conn: &mut Conn, first: Json, events: &Sender<Event>) -> std::io::Result<Vec<Json>> {
     let mut taps = Vec::new();
     let mut line = first;
     loop {
         match line.get("type").and_then(|t| t.as_str()) {
             Some("tap") => taps.push(line),
+            Some("layers") => drop(events.send(Event::Layers(line))),
             Some("taps") => break,
             _ => return Err(io_err(format!("unexpected answer to taps: {line}"))),
         }
@@ -276,19 +287,19 @@ fn attach(socket: &Option<String>, events: &Sender<Event>) -> std::io::Result<()
     // what waited in the app before this runner's page was shown is not run
     taps.send(&Json::obj([("type", "taps".into()), ("wait", false.into())]))?;
     let first = taps.read(Some(Duration::from_secs(10)))?;
-    let old = read_taps(&mut taps, first)?;
+    let old = read_taps(&mut taps, first, events)?;
     let (conn, hello) = Conn::connect(&path)?;
     let user = conn.peer();
     let shown_rev = hello.get("rev").and_then(|r| r.as_u64()).unwrap_or(0);
-    let _ = events.send(Event::Connected { conn, taps: taps.handle()?, user, shown_rev });
+    let _ = events.send(Event::Connected { conn, taps: taps.handle()?, user, shown_rev, layers: hello });
     if !old.is_empty() {
         let _ = events.send(Event::Dropped(old));
     }
     let ended = (|| -> std::io::Result<()> {
         loop {
-            taps.send(&Json::obj([("type", "taps".into()), ("wait", true.into())]))?;
+            taps.send(&Json::obj([("type", "taps".into()), ("wait", true.into()), ("layers", true.into())]))?;
             let first = taps.read(None)?;
-            for tap in read_taps(&mut taps, first)? {
+            for tap in read_taps(&mut taps, first, events)? {
                 let _ = events.send(Event::Tap(tap));
             }
         }
@@ -408,7 +419,7 @@ pub fn run(options: Options) -> i32 {
     let spawn = |name: &str, body: Box<dyn FnOnce() + Send>| std::thread::Builder::new().name(name.into()).spawn(body).map(|_| ());
     let started = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(&options.state_dir)?;
-        let listener = ask::bind(&options.state_dir.join("runner.sock"))?;
+        let listener = ask::bind(&options.state_dir.join("ask.sock"))?;
         on_terminate(events.clone())?;
         let (socket, to) = (options.socket.clone(), events.clone());
         spawn("tb-panel-taps", Box::new(move || taps_thread(socket, to)))?;
@@ -459,6 +470,8 @@ pub fn run(options: Options) -> i32 {
         answered: HashMap::new(),
         waiters: Vec::new(),
         asked: 0,
+        agent: None,
+        agent_front: false,
     };
     runner.restore();
     // units a runner that died left running are stopped, with their all-off
@@ -599,6 +612,11 @@ impl Runner {
             ("page", page.into()),
             ("panels", Json::Arr(panels)),
             ("refused", Json::Arr(refused)),
+            ("agent", match &self.agent {
+                Some((surface, title, from)) => Json::obj([("surface", surface.as_str().into()), ("title", title.as_str().into()), ("from", from.as_str().into())]),
+                None => Json::Null,
+            }),
+            ("front", if self.agent_front { "agent" } else { "root" }.into()),
             ("keys", Json::Arr(keys)),
             ("running", running),
             ("questions", Json::Arr(self.questions.iter().map(Question::json).collect())),
@@ -702,6 +720,11 @@ impl Runner {
             1 => items.push(button_item("_questions", "1 question waiting", "primary", false)),
             n => items.push(button_item("_questions", &format!("{n} questions waiting"), "primary", false)),
         }
+        // an agent's page waits behind root's pages until it is opened from here
+        if let Some((_, title, from)) = &self.agent {
+            items.push(button_item("_agent", &format!("Agent: {}", if title.is_empty() { "a page" } else { title.as_str() }), "secondary", false));
+            items.push(text_item("_agent_from", &format!("from {from}")));
+        }
         if let Some(run) = &self.running {
             items.push(text_item("_running", &format!("running: {}/{}", run.panel, run.button)));
             if self.panels.get(&run.panel).is_some_and(|p| p.stop.is_some()) {
@@ -785,6 +808,10 @@ impl Runner {
             Json::obj([("kind", "heading".into()), ("text", format!("{} asks", question.from).into())]),
             Json::obj([("kind", "text".into()), ("text", question.text.as_str().into())]),
         ];
+        // the name above is the asker's word; this is what the socket says of it
+        if let Some(asked_by) = question.asked_by() {
+            items.push(Json::obj([("kind", "readout".into()), ("id", "_asked_by".into()), ("text", "asked by".into()), ("value", asked_by.into())]));
+        }
         for (path, sha) in &question.covers {
             items.push(Json::obj([("kind", "readout".into()), ("id", format!("_cover_{}", items.len()).into()), ("text", path.as_str().into()), ("value", sha[..sha.len().min(16)].into())]));
         }
@@ -938,6 +965,7 @@ impl Runner {
         match (self.page.clone(), id.as_str()) {
             (_, "_home") => self.open(Page::Home),
             (Page::Home, "_questions") => self.open(Page::Question),
+            (Page::Home, "_agent") => self.send(&Json::obj([("type", "show".into()), ("layer", "agent".into())])),
             (Page::Home, "_stop") => {
                 if let Some(panel) = self.running.as_ref().map(|run| run.panel.clone()) {
                     self.stop(&panel);
@@ -1290,6 +1318,34 @@ impl Runner {
         self.open(if self.questions.is_empty() { Page::Home } else { Page::Question });
     }
 
+    // ---- the agent's layer ----
+
+    /// What the app says of its layers. An agent's page is listed on Home; a new one comes
+    /// straight up only while Home is on screen and nothing runs, and never when the user
+    /// has just left it.
+    fn layers(&mut self, layers: &Json) {
+        let agent = layers.get("agent").filter(|a| a.as_obj().is_some()).map(|agent| {
+            let field = |name: &str| agent.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            (field("surface"), field("title"), field("from"))
+        });
+        let was_front = self.agent_front;
+        self.agent_front = layers.get("front").and_then(|f| f.as_str()) == Some("agent");
+        let new_page = agent.is_some() && agent != self.agent;
+        let changed = agent != self.agent;
+        self.agent = agent;
+        self.write_state();
+        if self.agent_front {
+            return;
+        }
+        if changed && self.page == Page::Home {
+            self.show(true);
+        }
+        let quiet = self.page == Page::Home && self.running.is_none() && self.stopping.is_none();
+        if self.options.agent_direct && new_page && !was_front && quiet {
+            self.send(&Json::obj([("type", "show".into()), ("layer", "agent".into())]));
+        }
+    }
+
     // ---- readouts ----
 
     /// The readouts that are due. With the phone's panel off nothing is read.
@@ -1298,7 +1354,8 @@ impl Runner {
         let Page::Panel(panel) = self.page.clone() else {
             return;
         };
-        let off = std::fs::read_to_string(&self.options.panel_state).is_ok_and(|state| state.trim() == "off");
+        // behind an agent's page the runner's page is not on screen either
+        let off = self.agent_front || std::fs::read_to_string(&self.options.panel_state).is_ok_and(|state| state.trim() == "off");
         let mut read = Vec::new();
         for readout in self.readouts.iter_mut().filter(|r| r.due <= now) {
             readout.due = now + readout.every;
@@ -1354,7 +1411,11 @@ impl Runner {
             };
             match event {
                 None => return 1,
-                Some(Event::Connected { conn, taps, user, shown_rev }) => {
+                Some(Event::Layers(layers)) => self.layers(&layers),
+                Some(Event::Connected { conn, taps, user, shown_rev, layers }) => {
+                    self.agent = None;
+                    self.agent_front = false;
+                    self.layers(&layers);
                     self.conn = Some(conn);
                     self.taps = Some(taps);
                     self.user = user;
@@ -1404,7 +1465,7 @@ impl Runner {
                     self.send(&Json::obj([("type", "clear".into())]));
                     self.conn = None;
                     self.write_state();
-                    let _ = std::fs::remove_file(self.options.state_dir.join("runner.sock"));
+                    let _ = std::fs::remove_file(self.options.state_dir.join("ask.sock"));
                     return 0;
                 }
             }
