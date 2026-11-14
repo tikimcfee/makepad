@@ -953,6 +953,36 @@ pub struct App {
     /// the release after startup runs a second time, for a device that compiles slowly
     #[rust]
     settle_again: bool,
+    /// the service manager has been told the app is up
+    #[rust]
+    ready_sent: bool,
+}
+
+/// Tells the service manager that the app is up, for a unit of `Type=notify`: one datagram
+/// `READY=1` to the socket `NOTIFY_SOCKET` names (systemd's sd_notify protocol). Sent once
+/// the surface socket is bound and the first frame is drawn, so that what waits for the
+/// surface waits on the unit's state and not on a line in a log. Without `NOTIFY_SOCKET`
+/// (started by hand) nothing is sent.
+fn notify_ready() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        let Some(name) = std::env::var_os("NOTIFY_SOCKET") else {
+            return;
+        };
+        // '@name' is a socket in the abstract namespace, '/path' one in the file system
+        let addr = match name.as_bytes() {
+            [b'@', name @ ..] => SocketAddr::from_abstract_name(name),
+            [b'/', ..] => SocketAddr::from_pathname(&name),
+            _ => return,
+        };
+        let sent = addr.and_then(|addr| UnixDatagram::unbound()?.send_to_addr(b"READY=1", &addr));
+        if let Err(e) = sent {
+            eprintln!("[tinybot-surface] cannot tell the service manager the app is ready: {e}");
+        }
+    }
 }
 
 /// Gives the memory the allocator holds but no longer uses back to the system. Starting up
@@ -1101,5 +1131,9 @@ impl AppMain for App {
         }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        // the first frame is drawn, and the socket was bound at startup (or the app left)
+        if matches!(event, Event::Draw(_)) && !std::mem::replace(&mut self.ready_sent, true) {
+            notify_ready();
+        }
     }
 }
