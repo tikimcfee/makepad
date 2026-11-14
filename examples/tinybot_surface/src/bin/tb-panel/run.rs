@@ -41,9 +41,9 @@ const SHOWN_CHARS: usize = 120;
 const DIRECT_LIMIT: Duration = Duration::from_secs(2);
 
 enum Event {
-    /// The app is there: a connection for requests, a handle on the taps connection, and
-    /// the app's uid and gid.
-    Connected { conn: Conn, taps: UnixStream, user: Option<(u32, u32)> },
+    /// The app is there: a connection for requests, a handle on the taps connection, the
+    /// app's uid and gid, and the rev of what it shows.
+    Connected { conn: Conn, taps: UnixStream, user: Option<(u32, u32)>, shown_rev: u64 },
     Disconnected(String),
     /// taps that waited in the app before the runner showed its own page: never run
     Dropped(Vec<Json>),
@@ -263,9 +263,10 @@ fn attach(socket: &Option<String>, events: &Sender<Event>) -> std::io::Result<()
     taps.send(&Json::obj([("type", "taps".into()), ("wait", false.into())]))?;
     let first = taps.read(Some(Duration::from_secs(10)))?;
     let old = read_taps(&mut taps, first)?;
-    let (conn, _) = Conn::connect(&path)?;
+    let (conn, hello) = Conn::connect(&path)?;
     let user = conn.peer();
-    let _ = events.send(Event::Connected { conn, taps: taps.handle()?, user });
+    let shown_rev = hello.get("rev").and_then(|r| r.as_u64()).unwrap_or(0);
+    let _ = events.send(Event::Connected { conn, taps: taps.handle()?, user, shown_rev });
     if !old.is_empty() {
         let _ = events.send(Event::Dropped(old));
     }
@@ -1218,10 +1219,13 @@ impl Runner {
             };
             match event {
                 None => return 1,
-                Some(Event::Connected { conn, taps, user }) => {
+                Some(Event::Connected { conn, taps, user, shown_rev }) => {
                     self.conn = Some(conn);
                     self.taps = Some(taps);
                     self.user = user;
+                    // never under what the app shows (a clock set back since a runner before
+                    // this one): a lower rev for the same surface would be refused as stale
+                    self.rev = self.rev.max(shown_rev);
                     // an app that came back is empty: the page is sent again
                     let page = self.page.clone();
                     self.open(page);
