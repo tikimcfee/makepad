@@ -323,10 +323,10 @@ fn on_terminate(events: Sender<Event>) -> std::io::Result<()> {
     static WAKE: AtomicI32 = AtomicI32::new(-1);
     extern "C" {
         fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
-        fn write(fd: i32, bytes: *const u8, count: usize) -> isize;
+        fn write(fd: i32, bytes: *const std::ffi::c_void, count: usize) -> isize;
     }
     extern "C" fn handler(_signal: i32) {
-        unsafe { write(WAKE.load(Ordering::Relaxed), [1u8].as_ptr(), 1) };
+        unsafe { write(WAKE.load(Ordering::Relaxed), [1u8].as_ptr().cast(), 1) };
     }
     let (wake, mut woken) = UnixStream::pair()?;
     WAKE.store(wake.into_raw_fd(), Ordering::Relaxed);
