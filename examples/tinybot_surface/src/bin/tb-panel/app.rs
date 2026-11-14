@@ -42,7 +42,7 @@ impl Conn {
         conn.send(&Json::obj([("type", "hello".into()), ("role", "runner".into())]))?;
         let hello = conn.read(Some(Duration::from_secs(5)))?;
         if !is_hello(&hello) {
-            return Err(other(format!("the surface does not take this process as the runner: {hello}")));
+            return Err(other(format!("it does not take this process as the runner: {hello}")));
         }
         Ok((conn, hello))
     }
