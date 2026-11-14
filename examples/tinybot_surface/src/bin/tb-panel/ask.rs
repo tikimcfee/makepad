@@ -1,6 +1,9 @@
 //! Questions from agents. `tb-panel ask FILE` hands a question to the running runner over
-//! its own socket (`runner.sock` in the state directory, root only); the runner hashes the
-//! question's text and the files it covers itself, so an answer is tied to exact bytes.
+//! its own socket (`ask.sock` in the state directory). Any user's process may ask, so the
+//! socket takes nothing but a question and a wait for its answer, and the runner records
+//! who asked from the socket itself (uid and process name), beside what the asker says of
+//! itself. The runner hashes the question's text and the files it covers itself, so an
+//! answer is tied to exact bytes.
 
 use crate::json::Json;
 use crate::sha256;
@@ -24,6 +27,8 @@ pub struct Question {
     pub covers: Vec<(String, String)>,
     pub choices: Vec<String>,
     pub t_asked: f64,
+    /// who asked, as the socket says: the uid, and the name the process gives itself
+    pub peer: Option<(u32, String)>,
 }
 
 impl Question {
@@ -41,7 +46,19 @@ impl Question {
             ("covers", self.covers_json()),
             ("choices", self.choices.clone().into()),
             ("t_asked", self.t_asked.into()),
+            (
+                "peer",
+                match &self.peer {
+                    Some((uid, comm)) => Json::obj([("uid", (*uid as u64).into()), ("comm", comm.as_str().into())]),
+                    None => Json::Null,
+                },
+            ),
         ])
+    }
+
+    /// "comm (uid N)" of the asking process.
+    pub fn asked_by(&self) -> Option<String> {
+        self.peer.as_ref().map(|(uid, comm)| format!("{comm} (uid {uid})"))
     }
 
     /// From the state file of a runner that ran before. The hashes are the ones taken then.
@@ -60,6 +77,7 @@ impl Question {
             covers,
             choices,
             t_asked: state.get("t_asked")?.as_f64()?,
+            peer: state.get("peer").and_then(|peer| Some((peer.get("uid")?.as_u64()? as u32, peer.get("comm")?.as_str()?.to_string()))),
         })
     }
 
@@ -110,7 +128,7 @@ pub fn question(file: &Json) -> Result<Question, String> {
             covers.push((path.to_string(), now));
         }
     }
-    Ok(Question { qid: String::new(), from, text_sha256: sha256::of_bytes(text.as_bytes()), text, covers, choices, t_asked: crate::records::now() })
+    Ok(Question { qid: String::new(), from, text_sha256: sha256::of_bytes(text.as_bytes()), text, covers, choices, t_asked: crate::records::now(), peer: None })
 }
 
 /// What arrives on the runner's socket, for the runner's main thread to answer.
@@ -130,7 +148,24 @@ pub fn refuse(to: &UnixStream, msg: &str) {
     reply(to, &Json::obj([("type", "err".into()), ("msg", msg.into())]));
 }
 
-/// Binds the runner's socket: root's alone.
+/// The uid and the process name of the other end of a connection.
+fn peer_of(stream: &UnixStream) -> Option<(u32, String)> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
+    }
+    // SOL_SOCKET 1, SO_PEERCRED 17: struct ucred { pid, uid, gid }
+    let mut cred = [0u32; 3];
+    let mut len = 12u32;
+    if unsafe { getsockopt(stream.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) } != 0 {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", cred[0])).unwrap_or_default();
+    Some((cred[1], if comm.trim().is_empty() { "?".to_string() } else { comm.trim().to_string() }))
+}
+
+/// Binds the runner's socket for questions: open to every user, since all it takes is a
+/// question and a wait.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -138,7 +173,7 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     // a file left by a runner that is gone; a second runner is kept out by the unit
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
     Ok(listener)
 }
 
@@ -164,7 +199,10 @@ pub fn serve(listener: UnixListener, hand_on: impl Fn(Asked)) {
         };
         match request.get("type").and_then(|t| t.as_str()) {
             Some("ask") => match question(&request) {
-                Ok(question) => hand_on(Asked::Question(question, stream)),
+                Ok(mut question) => {
+                    question.peer = peer_of(&stream);
+                    hand_on(Asked::Question(question, stream))
+                }
                 Err(why) => refuse(&stream, &why),
             },
             Some("wait") => match request.get("qid").and_then(|q| q.as_str()) {
