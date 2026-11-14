@@ -243,7 +243,7 @@ it passes on what was chosen and typed, and every limit that protects
 hardware is the tool's.
 
 ```sh
-tb-panel run [--dirs DIR:DIR…] [--home]   # default /usr/share/tinybot/panels:/etc/tinybot/panels
+tb-panel run [--dirs DIR:DIR…] [--home] [--key DEVICE:CODE]   # default /usr/share/tinybot/panels:/etc/tinybot/panels
 tb-panel check FILE                       # 0: the runner would take it; 64 and the reason: not
 tb-panel show [NAME]                      # a panel's state file, or the runner's own
 tb-panel ask FILE                         # queue a question, prints its qid
@@ -290,6 +290,9 @@ instead. The files are read again each time Home or a panel is opened.
     with neither is a record of the tap and nothing more.
 - `stop` is the panel's all-off: the runner adds the button "Stop / all off"
   and a line under it for its result. Without `stop` there is neither.
+- `key`: `{"code":523,"button":ID}` binds a key (its evdev code) to a
+  button's action, which must take no placeholders: a key press has no
+  values. Panels that bind the same code are all left out.
 - A field the runner does not know is refused, and so is a key given twice.
   Ids that start with `_` are the runner's own.
 
@@ -302,6 +305,7 @@ An action:
 | `timeout_s` | required: the unit's RuntimeMaxSec |
 | `stop_post` | an argv without placeholders, the unit's ExecStopPost: it runs however the try ends |
 | `result` | the id of the readout, text or heading that shows `rc N · last line` |
+| `live` | the id of the readout, text or heading that shows the tool's `LIVE ` lines while it runs |
 | `ask` | words asked for after the try, shown as a row; the word tapped is recorded |
 | `on_answer` | `{"WORD":"stop"}`: this answer runs Stop and locks the panel |
 | `checks` | `[{"name":…,"argv":[…]}]`: run directly as root after each try, 2 s each; a status other than 0 locks the panel |
@@ -324,6 +328,18 @@ they run never depends on what was typed.
 - **The result** is `rc N · <the last non-empty stdout line>`, at most 120
   characters on the page and whole in the record. One try runs at a time;
   a tap on another action meanwhile reads `busy`.
+- **Live output.** With `live`, each stdout line that starts with `LIVE `
+  replaces the text of that item (without the prefix) while the tool runs:
+  at most ten a second, a newer line taking the place of one that waits.
+  Such a line is never the result.
+- **A held key.** With `--key DEVICE:CODE` the runner reads that input
+  device (a plain read, no grab; it sleeps until a key moves). Key down
+  starts the action a panel binds to the code, whatever page is on screen
+  and without taking the screen; key up sends SIGTERM to the tool
+  (`systemctl kill --kill-whom=main`), which ends by itself, and the try
+  ends like any other. A key held past `timeout_s` ends as a time limit. A
+  key down while a try runs or the panel is locked runs nothing and is
+  recorded as dropped. The kernel's repeat is ignored.
 - **Stop** is live while a try runs: `systemctl stop` on the try's unit,
   then the panel's `stop` argv as a unit of its own. Its result shows under
   the Stop button, and on Home as "last Stop".
@@ -354,10 +370,12 @@ they run never depends on what was typed.
   `.1` at 1 MiB:
   - `{"t":"try","seq","panel","button","values","unit","rc","line","state","checks":[{"name","rc"}],"t_tap","t_start","t_end","stopped"}`,
     with `"result"` (systemd's word, e.g. `timeout`) when the unit did not
-    end with status 0. A Stop is a try of its own, button `_stop`.
+    end with status 0, and `"key"` when a key started it. A Stop is a try of
+    its own, button `_stop`.
   - `{"t":"answer","seq","word","t_answer"}`: the word for try `seq`;
     `unlock` for the unlock of the lock that try set.
-  - `{"t":"dropped","tap","t_seen"}`: a tap from before the runner's page.
+  - `{"t":"dropped","tap","t_seen"}`: a tap from before the runner's page;
+    `{"t":"dropped","key","button","why","t_seen"}`: a key down that ran nothing.
 - `/var/lib/tinybot/tries/_questions.jsonl`:
   `{"t":"question","qid","from","text_sha256","text","covers":[{"path","sha256"}],"choices","t_asked","answer","t_answered"}`.
 - Times are Unix seconds with milliseconds. Nothing decides on a log line.
@@ -382,6 +400,9 @@ first choice, 1 for any other answer or a void one, 2 for no answer in time,
 - The last non-empty stdout line is the result a person reads.
 - Optionally one stdout line `TBSTATE {json}`: the state the tool read back.
   It goes into the try's record and is not the result line.
+- Optionally stdout lines `LIVE <text>` for the page while it runs. A tool
+  bound to a key ends on SIGTERM: it finishes, prints its result line and
+  exits 0.
 - Its limits are its own, the runner has none. Its panel file ships as
   `/usr/share/tinybot/panels/<tool>.json` with a `stop` for hardware.
 
