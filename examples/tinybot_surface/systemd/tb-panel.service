@@ -1,0 +1,15 @@
+# An example of the panel runner's system unit; the paths are the image's to choose.
+# Root, because it starts tries as transient units. It needs no ordering after the surface:
+# it waits for the surface's socket by itself and says so in /run/tinybot/panel/runner.json.
+# On SIGTERM it stops a running try (with its all-off), clears the surface and exits 0.
+[Unit]
+Description=tinybot panel runner
+
+[Service]
+ExecStart=/opt/tinybot/surface/tb-panel run --dirs /usr/share/tinybot/panels:/etc/tinybot/panels --home
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
