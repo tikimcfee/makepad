@@ -28,6 +28,8 @@ pub struct Button {
     pub confirm: bool,
     /// `false`: a tap does not lock the row, and the button stays live in a locked row
     pub lock: bool,
+    /// drawn faded but live: there is a better button for this just now
+    pub dim: bool,
 }
 
 /// How long a `confirm` button stays armed.
@@ -131,6 +133,8 @@ pub enum Request {
     Done { seq: u64 },
     /// root only: which layer is on screen
     Show(Layer),
+    /// a root client that is the panel runner says so, and gets root's layer
+    Runner,
 }
 
 /// The app holds two surfaces, and one of them is on screen: root's (set by a uid-0 peer,
@@ -193,6 +197,10 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
             };
             Ok(Request::Taps { wait: flag("wait")?, layers: flag("layers")? })
         }
+        Some("hello") => match value.key("role").and_then(|r| r.as_str()) {
+            Some("runner") => Ok(Request::Runner),
+            _ => err("bad_request", "hello: the one role a client can ask for is \"runner\""),
+        },
         Some("show") => match value.key("layer").and_then(|l| l.as_str()) {
             Some("root") => Ok(Request::Show(Layer::Root)),
             Some("agent") => Ok(Request::Show(Layer::Agent)),
@@ -246,7 +254,14 @@ fn parse_button(v: &JsonValue, what: &str, seen: &mut HashSet<String>) -> Result
         Some("danger") => Style::Danger,
         _ => Style::Secondary,
     };
-    Ok(Button { id, text, style, confirm: flag_of(v, "confirm", false, what)?, lock: flag_of(v, "lock", true, what)? })
+    Ok(Button {
+        id,
+        text,
+        style,
+        confirm: flag_of(v, "confirm", false, what)?,
+        lock: flag_of(v, "lock", true, what)?,
+        dim: flag_of(v, "dim", false, what)?,
+    })
 }
 
 /// An optional true/false field.

@@ -97,19 +97,32 @@ pub fn socket_path() -> (PathBuf, bool) {
     (runtime.join("tinybot").join("surface.sock"), true)
 }
 
-/// Who is on the other end of a connection.
+/// What a connection is to the app.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Peer {
-    /// uid 0: what it sets is privileged, and it is given the taps on privileged surfaces
+    /// The panel runner: a uid-0 client that has said so (`hello` with role `runner`). Root's
+    /// layer is its own, and so are the taps made on it.
     Root,
-    /// the app's own user
+    /// Every other client, the app's own user's or root's: the agent's layer. Being root is
+    /// not enough to pose as the runner; an agent that runs as root is still an agent.
     User,
 }
 
+/// The process on the other end of a connection.
+#[derive(Clone)]
+struct Client {
+    pid: u32,
+    /// uid 0: may ask to be the runner
+    root: bool,
+    /// "comm (uid N)": the name the process gives itself and the uid the kernel says
+    who: String,
+}
+
 /// Only this user's processes and root's may talk to the surface: `None` for anyone else.
-/// Root is let in for the panel runner, which runs as root to start its actions; the socket
-/// and its directory stay private to the user (0600, 0700), which does not hold root back.
-fn peer_of(c: &UnixStream) -> Option<(Peer, String)> {
+/// Root is let in for the panel runner, which runs as root to start its actions, and for an
+/// agent that runs as root; the socket and its directory stay private to the user (0600,
+/// 0700), which does not hold root back.
+fn client_of(c: &UnixStream) -> Option<Client> {
     #[cfg(target_os = "linux")]
     let (pid, uid) = {
         extern "C" {
@@ -138,10 +151,8 @@ fn peer_of(c: &UnixStream) -> Option<(Peer, String)> {
     // the name a process gives itself (it can set it to anything) and its uid (it cannot)
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let who = format!("{} (uid {uid})", if comm.trim().is_empty() { "?" } else { comm.trim() });
-    if uid == 0 || (uid == own && test_root(pid, own)) {
-        Some((Peer::Root, who))
-    } else if uid == own {
-        Some((Peer::User, who))
+    if uid == 0 || uid == own {
+        Some(Client { pid, root: uid == 0 || test_root(pid, own), who })
     } else {
         None
     }
@@ -215,6 +226,7 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
         agent: Held::default(),
         front: None,
         layers_at: 0,
+        runner: None,
         taps: VecDeque::new(),
         next_seq: 1,
     };
@@ -227,8 +239,7 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
 struct Conn {
     stream: UnixStream,
     peer: Peer,
-    /// "comm (uid N)" of the process on the other end
-    who: String,
+    client: Client,
     buf: Vec<u8>,
     asks: Asks,
     closed: bool,
@@ -269,6 +280,8 @@ struct State {
     /// counts the changes of `front` and of the agent's layer, so that a client that was not
     /// waiting when one happened still hears of it
     layers_at: u64,
+    /// the pid of the runner while it has a connection: one runner at a time
+    runner: Option<u32>,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
@@ -400,11 +413,28 @@ impl State {
     }
 
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
-    fn request(&mut self, line: &str, peer: Peer, who: &str, asks: &mut Asks, waiters: usize) -> Option<String> {
+    fn request(&mut self, line: &str, peer: &mut Peer, client: &Client, asks: &mut Asks, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
             Ok(r) => r,
             Err(e) => return Some(e.line()),
         };
+        if let Request::Runner = request {
+            // the runner's layer is for one process: root, and the only one that says so
+            let refusal = if !client.root {
+                Some("only a root client can be the runner".to_string())
+            } else {
+                self.runner.filter(|pid| *pid != client.pid).map(|pid| format!("a runner is connected already (pid {pid})"))
+            };
+            if let Some(msg) = refusal {
+                return Some(WireErr { code: "privileged", msg }.line());
+            }
+            self.runner = Some(client.pid);
+            *peer = Peer::Root;
+            asks.layers_at = self.layers_at;
+            return Some(self.hello(Peer::Root));
+        }
+        let peer = *peer;
+        let who = client.who.as_str();
         let layer = Self::own(peer);
         Some(match request {
             Request::Set(spec) => {
@@ -492,6 +522,7 @@ impl State {
                 asks.layers_at = self.layers_at;
                 self.taps_reply(peer, news)
             }
+            Request::Runner => unreachable!("answered above"),
             Request::Done { seq } => {
                 let before = self.taps.len();
                 self.taps.retain(|t| !(t.seq <= seq && Self::sees(peer, t)));
@@ -583,9 +614,9 @@ impl Conn {
             let reply = match std::str::from_utf8(line) {
                 Ok(text) if text.trim().is_empty() => None,
                 Ok(text) => {
-                    let mut asks = self.asks;
-                    let reply = state.request(text, self.peer, &self.who, &mut asks, waiters);
-                    self.asks = asks;
+                    let (mut asks, mut peer) = (self.asks, self.peer);
+                    let reply = state.request(text, &mut peer, &self.client, &mut asks, waiters);
+                    (self.asks, self.peer) = (asks, peer);
                     reply
                 }
                 Err(_) => Some(WireErr { code: "bad_json", msg: "the line is not UTF-8".into() }.line()),
@@ -681,6 +712,10 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
             }
         }
         conns.retain(|c| !c.closed);
+        // a runner that has left makes room for the next one; its page stays until then
+        if state.runner.is_some() && !conns.iter().any(|c| c.peer == Peer::Root) {
+            state.runner = None;
+        }
 
         // the layers changed (a request above, or the user went Home): the waiting clients
         // that asked to hear of it are answered
@@ -695,7 +730,7 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let Some((peer, who)) = peer_of(&stream) else {
+                        let Some(client) = client_of(&stream) else {
                             eprintln!("[tinybot-surface] refused a client of another user");
                             continue;
                         };
@@ -704,8 +739,9 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
                         }
                         // the hello says how the layers are: this client has heard
                         let asks = Asks { layers_at: state.layers_at, ..Asks::default() };
-                        let mut conn = Conn { stream, peer, who, buf: Vec::new(), asks, closed: false };
-                        conn.send(&state.hello(peer));
+                        // every client starts on the agent's layer, root too
+                        let mut conn = Conn { stream, peer: Peer::User, client, buf: Vec::new(), asks, closed: false };
+                        conn.send(&state.hello(Peer::User));
                         if !conn.closed {
                             conns.push(conn);
                         }

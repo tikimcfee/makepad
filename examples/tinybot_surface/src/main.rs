@@ -515,10 +515,12 @@ impl ButtonRow {
             } else {
                 widget.set_text(cx, &button.text);
             }
-            // a locked button takes no press (enabled) and fades to its disabled look
+            // a locked button takes no press (enabled) and fades to its disabled look; a
+            // `dim` one fades and still takes presses
             widget.as_button().set_enabled(cx, armed);
-            if widget.disabled(cx) == armed {
-                widget.set_disabled(cx, !armed);
+            let faded = !armed || (button.dim && !confirming);
+            if widget.disabled(cx) != faded {
+                widget.set_disabled(cx, faded);
             }
             self.shown.push(key);
         }
@@ -1152,8 +1154,9 @@ impl App {
 
     /// One look at the microphone and speaker streams, and the next one a second later.
     /// Not while the phone's panel is off, and not without the kernel's status files: then
-    /// no timer runs, and the app is at rest as before.
-    fn look_at_dots(&mut self, cx: &mut Cx) {
+    /// no timer runs, and the app is at rest as before. `drawing`: called at the start of a
+    /// frame, which will show what is found here.
+    fn look_at_dots(&mut self, cx: &mut Cx, drawing: bool) {
         cx.stop_timer(self.dots_timer);
         let panel = std::env::var_os("TINYBOT_PANEL_STATE").unwrap_or_else(|| "/sys/kernel/tinybot_panel/state".into());
         if std::fs::read_to_string(panel).is_ok_and(|state| state.trim() == "off") {
@@ -1167,7 +1170,9 @@ impl App {
             self.lit = lit;
             self.ui.label(cx, ids!(mic)).set_text(cx, if lit.0 { "● mic" } else { "" });
             self.ui.label(cx, ids!(play)).set_text(cx, if lit.1 { "● out" } else { "" });
-            self.ui.redraw(cx);
+            if !drawing {
+                self.ui.redraw(cx);
+            }
         }
         if mic.is_none() && play.is_none() {
             self.dots = Dots::Absent;
@@ -1183,7 +1188,7 @@ impl MatchEvent for App {
         self.start_socket();
         self.settle = cx.start_timeout(SETTLE_SECONDS);
         self.settle_again = true;
-        self.look_at_dots(cx);
+        self.look_at_dots(cx, false);
     }
 
     #[cfg(unix)]
@@ -1205,7 +1210,7 @@ impl MatchEvent for App {
                 self.settle = cx.start_timeout(SETTLE_SECONDS);
                 // the status files may have come with a sound card that was not there before
                 if self.dots == Dots::Absent {
-                    self.look_at_dots(cx);
+                    self.look_at_dots(cx, false);
                 }
             }
             let list_of = |layer: wire::Layer| match layer {
@@ -1296,10 +1301,15 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.dots_timer.is_event(event).is_some() {
-            self.look_at_dots(cx);
-        } else if self.dots == Dots::Dark && matches!(event, Event::Draw(_) | Event::Signal | Event::MouseDown(_) | Event::TouchUpdate(_)) {
+            self.look_at_dots(cx, false);
+        } else if matches!(event, Event::Draw(_)) && self.dots != Dots::Absent {
+            // The mic dot is a privacy signal: every frame the app draws shows the streams
+            // as they are at that moment, the first frame after the screen comes on too.
+            // Two small reads, before the frame is drawn, only when one is drawn anyway.
+            self.look_at_dots(cx, true);
+        } else if self.dots == Dots::Dark && matches!(event, Event::Signal | Event::MouseDown(_) | Event::TouchUpdate(_)) {
             // something woke the app while the panel was off: it may be on again
-            self.look_at_dots(cx);
+            self.look_at_dots(cx, false);
         }
         if self.settle.is_event(event).is_some() {
             release_free_memory();
