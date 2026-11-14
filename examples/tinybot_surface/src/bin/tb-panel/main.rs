@@ -50,7 +50,7 @@ mod cli {
     use std::time::Duration;
 
     const USAGE: &str = "\
-usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH] [--key DEVICE:CODE]
+usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH] [--key DEVICE:CODE[,CODE…]]
        tb-panel check FILE
        tb-panel show [NAME]
        tb-panel ask FILE
@@ -59,7 +59,7 @@ usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH] [--key DEVICE:C
 run    serves the panels of the directories (default /usr/share/tinybot/panels:/etc/tinybot/panels;
        a later directory wins for the same name) with a Home page; --home says so and changes nothing
        --agent-direct=no: an agent's new page never comes up by itself, only from Home
-       --key /dev/input/event0:523 reads that key: held, it runs the action a panel binds to it
+       --key /dev/input/event0:523,115,114 reads those keys: each runs the action a panel binds to it
 check  reads FILE as the runner would: exit 0 when it is a valid panel, 64 with the reason when not
 show   prints the state file of the panel NAME, or the runner's own without a name
 ask    FILE is {\"from\":…,\"text\":…,\"covers\":[{\"path\":…,\"sha256\":…}],\"choices\":[…]}; prints the qid.
@@ -79,7 +79,7 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
         state_dir: PathBuf,
         tries_dir: PathBuf,
         panel_state: PathBuf,
-        key: Option<(PathBuf, u16)>,
+        key: Option<(PathBuf, Vec<u16>)>,
         wait: Option<String>,
         timeout: Option<f64>,
     }
@@ -118,8 +118,11 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
                 "--panel-state" => args.panel_state = take()?.into(),
                 "--key" => {
                     let value = take()?;
-                    let key = value.rsplit_once(':').and_then(|(device, code)| Some((PathBuf::from(device), code.parse().ok()?)));
-                    args.key = Some(key.ok_or(format!("--key {value:?} is not DEVICE:CODE, an input device and a key code"))?);
+                    let key = value.rsplit_once(':').and_then(|(device, codes)| {
+                        let codes: Option<Vec<u16>> = codes.split(',').map(|code| code.parse().ok()).collect();
+                        Some((PathBuf::from(device), codes?))
+                    });
+                    args.key = Some(key.ok_or(format!("--key {value:?} is not DEVICE:CODE[,CODE…], an input device and key codes"))?);
                 }
                 "--wait" => args.wait = Some(take()?),
                 "--timeout" => {
