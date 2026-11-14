@@ -7,7 +7,7 @@
 //! `try_recv` on `Event::Signal`, taps go the other way through a channel plus one byte on the
 //! wake socket.
 
-use crate::wire::{self, Request, Spec, Tap, Target, Update, WireErr};
+use crate::wire::{self, Layer, Request, Spec, Tap, Target, Update, WireErr};
 use makepad_widgets::makepad_platform::thread::SignalToUI;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -19,15 +19,21 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 /// Socket thread to UI.
 pub enum ToUi {
-    Set(Spec),
-    /// already checked against the surface on screen
-    Update(Update),
-    Clear,
+    /// a layer's new surface, and for the agent's who set it
+    Set(Layer, Spec, String),
+    /// already checked against the layer's surface
+    Update(Layer, Update),
+    Clear(Layer),
+    /// the layer on screen now, and whether root's layer exists (the way back from an
+    /// agent's page)
+    Front(Option<Layer>, bool),
 }
 
 /// UI to socket thread.
 pub enum ToIo {
-    Tap { surface: String, rev: u64, id: String, values: Vec<(String, wire::Value)> },
+    Tap { layer: Layer, surface: String, rev: u64, id: String, values: Vec<(String, wire::Value)> },
+    /// the user left an agent's page for root's with the band's button
+    Home,
 }
 
 /// The UI thread's end. Dropping it ends the socket thread.
@@ -103,7 +109,7 @@ enum Peer {
 /// Only this user's processes and root's may talk to the surface: `None` for anyone else.
 /// Root is let in for the panel runner, which runs as root to start its actions; the socket
 /// and its directory stay private to the user (0600, 0700), which does not hold root back.
-fn peer_of(c: &UnixStream) -> Option<Peer> {
+fn peer_of(c: &UnixStream) -> Option<(Peer, String)> {
     #[cfg(target_os = "linux")]
     let (pid, uid) = {
         extern "C" {
@@ -129,10 +135,13 @@ fn peer_of(c: &UnixStream) -> Option<Peer> {
         (0u32, uid)
     };
     let own = unsafe { getuid() };
+    // the name a process gives itself (it can set it to anything) and its uid (it cannot)
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let who = format!("{} (uid {uid})", if comm.trim().is_empty() { "?" } else { comm.trim() });
     if uid == 0 || (uid == own && test_root(pid, own)) {
-        Some(Peer::Root)
+        Some((Peer::Root, who))
     } else if uid == own {
-        Some(Peer::User)
+        Some((Peer::User, who))
     } else {
         None
     }
@@ -202,13 +211,10 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
     let (to_ui, from_io) = channel();
     let state = State {
         to_ui,
-        surface: None,
-        rev: 0,
-        title: String::new(),
-        items: 0,
-        targets: HashMap::new(),
-        privileged: false,
-        root_sets: VecDeque::new(),
+        root: Held::default(),
+        agent: Held::default(),
+        front: None,
+        layers_at: 0,
         taps: VecDeque::new(),
         next_seq: 1,
     };
@@ -221,44 +227,85 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
 struct Conn {
     stream: UnixStream,
     peer: Peer,
+    /// "comm (uid N)" of the process on the other end
+    who: String,
     buf: Vec<u8>,
-    /// asked for taps with `wait` while none were queued: answered when one arrives
-    waiting: bool,
+    asks: Asks,
     closed: bool,
 }
 
-struct State {
-    to_ui: Sender<ToUi>,
+/// What a connection waits for.
+#[derive(Clone, Copy, Default)]
+struct Asks {
+    /// asked for taps with `wait` while none were queued: answered when one arrives
+    waiting: bool,
+    /// with its waiting `taps`, also wants to hear of a change of the layers
+    layers: bool,
+    /// the count of layer changes this connection was last told at
+    layers_at: u64,
+}
+
+/// One of the app's two surfaces as the socket thread knows it.
+#[derive(Default)]
+struct Held {
     surface: Option<String>,
     rev: u64,
     title: String,
     items: usize,
-    /// the ids of the surface on screen: what an `update` may name
+    /// its ids: what an `update` may name
     targets: HashMap<String, Target>,
-    /// the surface on screen was set by root: only root changes or clears it
-    privileged: bool,
-    /// surface and rev of the last surfaces root set. A tap can still be on its way from the
-    /// UI thread when its surface is replaced here, so it is filed by these, not by what is
-    /// on screen when it arrives.
-    root_sets: VecDeque<(String, u64)>,
+    /// who set it
+    from: String,
+}
+
+struct State {
+    to_ui: Sender<ToUi>,
+    /// root's layer: set by a uid-0 peer, changed and cleared only by one
+    root: Held,
+    /// the agent's layer: set by a peer of the app's own user
+    agent: Held,
+    /// the layer on screen; `None` is the idle line
+    front: Option<Layer>,
+    /// counts the changes of `front` and of the agent's layer, so that a client that was not
+    /// waiting when one happened still hears of it
+    layers_at: u64,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
 }
 
-/// How many of root's surfaces are remembered for filing taps. A tap is at most one wake
-/// of this thread behind its surface, so a few is plenty.
-const ROOT_SETS: usize = 8;
-
 impl State {
-    fn shown(&self) -> String {
-        wire::surface_fields(self.surface.as_deref(), self.rev)
+    /// A peer's own layer: all it can set, change, clear or get the taps of.
+    fn own(peer: Peer) -> Layer {
+        match peer {
+            Peer::Root => Layer::Root,
+            Peer::User => Layer::Agent,
+        }
     }
 
-    /// The taps a peer is given. The taps on root's surfaces and the others are two queues
-    /// that never mix: root's peers see and confirm only the first, the user's only the
-    /// second. So no process of the user reads a tap meant for root's runner, and the runner
-    /// never confirms away a tap an agent of the user still waits for.
+    fn held(&self, layer: Layer) -> &Held {
+        match layer {
+            Layer::Root => &self.root,
+            Layer::Agent => &self.agent,
+        }
+    }
+
+    fn held_mut(&mut self, layer: Layer) -> &mut Held {
+        match layer {
+            Layer::Root => &mut self.root,
+            Layer::Agent => &mut self.agent,
+        }
+    }
+
+    /// `"surface":…,"rev":…` of the peer's own layer.
+    fn shown(&self, peer: Peer) -> String {
+        let held = self.held(Self::own(peer));
+        wire::surface_fields(held.surface.as_deref(), held.rev)
+    }
+
+    /// The taps a peer is given: those made on its own layer. The taps on root's layer and
+    /// on the agent's are two queues that never mix, so no process of the user reads a tap
+    /// meant for root's runner, and the runner never confirms away a tap an agent waits for.
     fn sees(peer: Peer, tap: &Tap) -> bool {
         tap.privileged == (peer == Peer::Root)
     }
@@ -267,30 +314,41 @@ impl State {
         self.taps.iter().filter(|t| Self::sees(peer, t)).count()
     }
 
-    /// Whether `peer` may not touch what is on screen.
-    fn refuses(&self, peer: Peer) -> Option<String> {
-        (self.privileged && peer != Peer::Root).then(|| {
-            WireErr { code: "privileged", msg: "the surface on screen is root's: only root changes or clears it".into() }.line()
-        })
+    /// `"privileged":…,"front":…,"agent":…`: whether root's layer exists, which layer is on
+    /// screen, and the agent's layer when there is one.
+    fn layers(&self) -> String {
+        let front = match self.front {
+            Some(layer) => wire::json_str(layer.name()),
+            None => "null".to_string(),
+        };
+        let agent = match &self.agent.surface {
+            Some(surface) => format!(
+                "{{\"surface\":{},\"title\":{},\"from\":{}}}",
+                wire::json_str(surface),
+                wire::json_str(&self.agent.title),
+                wire::json_str(&self.agent.from)
+            ),
+            None => "null".to_string(),
+        };
+        format!("\"privileged\":{},\"front\":{front},\"agent\":{agent}", self.root.surface.is_some())
     }
 
     fn hello(&self, peer: Peer) -> String {
-        format!(
-            "{{\"type\":\"hello\",\"v\":{},{},\"privileged\":{},\"pending\":{}}}\n",
-            wire::VERSION,
-            self.shown(),
-            self.privileged,
-            self.pending(peer)
-        )
+        format!("{{\"type\":\"hello\",\"v\":{},{},{},\"pending\":{}}}\n", wire::VERSION, self.shown(peer), self.layers(), self.pending(peer))
     }
 
+    /// `shown`: whether the peer's own layer is the one on screen.
     fn ack(&self, peer: Peer) -> String {
-        format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.pending(peer))
+        format!("{{\"type\":\"ack\",{},\"shown\":{},\"pending\":{}}}\n", self.shown(peer), self.front == Some(Self::own(peer)), self.pending(peer))
     }
 
     /// Every tap that waits for `peer`, one line each, then the line that ends the answer.
-    fn taps_reply(&self, peer: Peer) -> String {
+    /// `layers`: a line about the layers goes first.
+    fn taps_reply(&self, peer: Peer, layers: bool) -> String {
         let mut out = String::new();
+        if layers {
+            out.push_str(&format!("{{\"type\":\"layers\",{}}}\n", self.layers()));
+        }
         let (mut count, mut last) = (0, 0);
         for tap in self.taps.iter().filter(|t| Self::sees(peer, t)) {
             out.push_str(&tap.line());
@@ -301,19 +359,31 @@ impl State {
         out
     }
 
-    /// An `update` is for exactly the surface and rev on screen, changes only labels and
-    /// readouts, and arms only rows. One wrong id refuses all of it.
-    fn check_update(&self, update: &Update) -> Result<(), WireErr> {
-        if self.surface.as_deref() != Some(update.surface.as_str()) || update.rev != self.rev {
-            let shown = match &self.surface {
-                Some(surface) => format!("{surface} rev {}", self.rev),
+    /// Puts a layer on screen, or none, and tells the UI. `agent_changed`: the agent's layer
+    /// is another than before. Either is news for a client that asked about the layers.
+    fn set_front(&mut self, front: Option<Layer>, agent_changed: bool) {
+        if self.front != front || agent_changed {
+            self.layers_at += 1;
+        }
+        self.front = front;
+        let _ = self.to_ui.send(ToUi::Front(front, self.root.surface.is_some()));
+        SignalToUI::set_ui_signal();
+    }
+
+    /// An `update` is for exactly the surface and rev of the peer's layer, changes only
+    /// labels and readouts, and arms only rows. One wrong id refuses all of it.
+    fn check_update(&self, layer: Layer, update: &Update) -> Result<(), WireErr> {
+        let held = self.held(layer);
+        if held.surface.as_deref() != Some(update.surface.as_str()) || update.rev != held.rev {
+            let has = match &held.surface {
+                Some(surface) => format!("{surface} rev {}", held.rev),
                 None => "nothing".to_string(),
             };
-            return Err(WireErr { code: "stale_rev", msg: format!("update is for {} rev {}; on screen is {shown}", update.surface, update.rev) });
+            return Err(WireErr { code: "stale_rev", msg: format!("update is for {} rev {}; the layer has {has}", update.surface, update.rev) });
         }
         let bad = |msg: String| Err(WireErr { code: "bad_item", msg });
         for change in &update.changes {
-            match self.targets.get(&change.id) {
+            match held.targets.get(&change.id) {
                 Some(Target::Readout) => {}
                 Some(Target::Label) if change.value.is_none() => {}
                 Some(Target::Label) => return bad(format!("update {}: a heading or text has no value", change.id)),
@@ -322,7 +392,7 @@ impl State {
             }
         }
         for id in &update.arm {
-            if self.targets.get(id) != Some(&Target::Row) {
+            if held.targets.get(id) != Some(&Target::Row) {
                 return bad(format!("update arm {id}: no row or button with this id"));
             }
         }
@@ -330,87 +400,97 @@ impl State {
     }
 
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
-    fn request(&mut self, line: &str, peer: Peer, waiting: &mut bool, waiters: usize) -> Option<String> {
+    fn request(&mut self, line: &str, peer: Peer, who: &str, asks: &mut Asks, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
             Ok(r) => r,
             Err(e) => return Some(e.line()),
         };
+        let layer = Self::own(peer);
         Some(match request {
             Request::Set(spec) => {
-                if let Some(refusal) = self.refuses(peer) {
-                    return Some(refusal);
+                let held = self.held(layer);
+                if held.surface.as_deref() == Some(spec.surface.as_str()) && spec.rev < held.rev {
+                    return Some(WireErr { code: "stale_rev", msg: format!("rev {} is older than rev {} of the layer", spec.rev, held.rev) }.line());
                 }
-                if self.surface.as_deref() == Some(spec.surface.as_str()) && spec.rev < self.rev {
-                    return Some(
-                        WireErr {
-                            code: "stale_rev",
-                            msg: format!("rev {} is older than rev {} on screen", spec.rev, self.rev),
-                        }
-                        .line(),
-                    );
-                }
-                self.surface = Some(spec.surface.clone());
-                self.rev = spec.rev;
-                self.title = spec.title.clone();
-                self.items = spec.items.len();
-                self.targets = spec.targets().into_iter().collect();
-                // whose surface this is now, and whose its taps will be
-                self.privileged = peer == Peer::Root;
-                self.root_sets.retain(|(surface, rev)| *surface != spec.surface || *rev != spec.rev);
-                if self.privileged {
-                    self.root_sets.push_back((spec.surface.clone(), spec.rev));
-                    if self.root_sets.len() > ROOT_SETS {
-                        self.root_sets.pop_front();
-                    }
-                }
-                let _ = self.to_ui.send(ToUi::Set(spec));
-                SignalToUI::set_ui_signal();
+                let first = held.surface.is_none();
+                *self.held_mut(layer) = Held {
+                    surface: Some(spec.surface.clone()),
+                    rev: spec.rev,
+                    title: spec.title.clone(),
+                    items: spec.items.len(),
+                    targets: spec.targets().into_iter().collect(),
+                    from: who.to_string(),
+                };
+                let _ = self.to_ui.send(ToUi::Set(layer, spec, who.to_string()));
+                // Root's first page takes the screen. An agent's page comes up by itself
+                // only when root has none: it never covers one, root shows it (`show`).
+                let front = match layer {
+                    Layer::Root if first => Some(Layer::Root),
+                    Layer::Agent if self.root.surface.is_none() => Some(Layer::Agent),
+                    _ => self.front,
+                };
+                self.set_front(front, layer == Layer::Agent);
                 self.ack(peer)
             }
             Request::Update(update) => {
-                if let Some(refusal) = self.refuses(peer) {
-                    return Some(refusal);
-                }
-                if let Err(e) = self.check_update(&update) {
+                if let Err(e) = self.check_update(layer, &update) {
                     return Some(e.line());
                 }
                 if let Some(title) = &update.title {
-                    self.title.clone_from(title);
+                    self.held_mut(layer).title.clone_from(title);
+                    if layer == Layer::Agent {
+                        self.layers_at += 1;
+                    }
                 }
-                let _ = self.to_ui.send(ToUi::Update(update));
+                let _ = self.to_ui.send(ToUi::Update(layer, update));
                 SignalToUI::set_ui_signal();
                 self.ack(peer)
             }
             Request::Clear => {
-                if let Some(refusal) = self.refuses(peer) {
-                    return Some(refusal);
-                }
-                self.privileged = false;
-                self.surface = None;
-                self.rev = 0;
-                self.title.clear();
-                self.items = 0;
-                self.targets.clear();
-                let _ = self.to_ui.send(ToUi::Clear);
-                SignalToUI::set_ui_signal();
+                *self.held_mut(layer) = Held::default();
+                let _ = self.to_ui.send(ToUi::Clear(layer));
+                // the other layer, if there is one, has the screen now
+                let other = match layer {
+                    Layer::Root => Layer::Agent,
+                    Layer::Agent => Layer::Root,
+                };
+                let front = if self.held(other).surface.is_some() { Some(other) } else { None };
+                self.set_front(front, layer == Layer::Agent);
                 self.ack(peer)
             }
-            Request::Status => format!(
-                "{{\"type\":\"status\",\"v\":{},{},\"privileged\":{},\"title\":{},\"items\":{},\"pending\":{},\"waiting\":{}}}\n",
-                wire::VERSION,
-                self.shown(),
-                self.privileged,
-                wire::json_str(&self.title),
-                self.items,
-                self.pending(peer),
-                waiters
-            ),
-            Request::Taps { wait } => {
-                if self.pending(peer) == 0 && wait {
-                    *waiting = true;
+            Request::Show(target) => {
+                if peer != Peer::Root {
+                    return Some(WireErr { code: "privileged", msg: "only root chooses the layer on screen".into() }.line());
+                }
+                if self.held(target).surface.is_none() {
+                    return Some(WireErr { code: "bad_request", msg: format!("show: there is no {} layer", target.name()) }.line());
+                }
+                self.set_front(Some(target), false);
+                self.ack(peer)
+            }
+            Request::Status => {
+                let held = self.held(layer);
+                format!(
+                    "{{\"type\":\"status\",\"v\":{},{},{},\"title\":{},\"items\":{},\"pending\":{},\"waiting\":{}}}\n",
+                    wire::VERSION,
+                    self.shown(peer),
+                    self.layers(),
+                    wire::json_str(&held.title),
+                    held.items,
+                    self.pending(peer),
+                    waiters
+                )
+            }
+            Request::Taps { wait, layers } => {
+                asks.layers = layers;
+                // a change of the layers this client has not heard of is news as well
+                let news = layers && asks.layers_at != self.layers_at;
+                if self.pending(peer) == 0 && wait && !news {
+                    asks.waiting = true;
                     return None;
                 }
-                self.taps_reply(peer)
+                asks.layers_at = self.layers_at;
+                self.taps_reply(peer, news)
             }
             Request::Done { seq } => {
                 let before = self.taps.len();
@@ -503,9 +583,9 @@ impl Conn {
             let reply = match std::str::from_utf8(line) {
                 Ok(text) if text.trim().is_empty() => None,
                 Ok(text) => {
-                    let mut waiting = self.waiting;
-                    let reply = state.request(text, self.peer, &mut waiting, waiters);
-                    self.waiting = waiting;
+                    let mut asks = self.asks;
+                    let reply = state.request(text, self.peer, &self.who, &mut asks, waiters);
+                    self.asks = asks;
                     reply
                 }
                 Err(_) => Some(WireErr { code: "bad_json", msg: "the line is not UTF-8".into() }.line()),
@@ -563,29 +643,38 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
             let mut arrived = Vec::new();
             loop {
                 match from_ui.try_recv() {
-                    Ok(ToIo::Tap { surface, rev, id, values }) => {
+                    Ok(ToIo::Tap { layer, surface, rev, id, values }) => {
                         let seq = state.next_seq;
                         state.next_seq += 1;
-                        let privileged = state.root_sets.iter().any(|(s, r)| *s == surface && *r == rev);
+                        let privileged = layer == Layer::Root;
                         state.taps.push_back(Tap { seq, surface, rev, id, values, privileged });
                         arrived.push(privileged);
+                    }
+                    // the UI has switched already; the layer on screen is root's again
+                    Ok(ToIo::Home) => {
+                        if state.root.surface.is_some() {
+                            state.front = Some(Layer::Root);
+                            state.layers_at += 1;
+                        }
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
             // the waiting clients one of the new taps is for
-            for conn in conns.iter_mut().filter(|c| c.waiting) {
+            for conn in conns.iter_mut().filter(|c| c.asks.waiting) {
                 if arrived.contains(&(conn.peer == Peer::Root)) {
-                    conn.waiting = false;
-                    conn.send(&state.taps_reply(conn.peer));
+                    conn.asks.waiting = false;
+                    let news = conn.asks.layers && conn.asks.layers_at != state.layers_at;
+                    conn.asks.layers_at = state.layers_at;
+                    conn.send(&state.taps_reply(conn.peer, news));
                 }
             }
         }
 
         // clients that sent something or left (only those that were in this poll)
         let polled = fds.len() - 2;
-        let waiters = conns.iter().filter(|c| c.waiting).count();
+        let waiters = conns.iter().filter(|c| c.asks.waiting).count();
         for (conn, fd) in conns.iter_mut().zip(&fds[2..]).take(polled) {
             if fd.revents & (POLLIN | POLLHUP | POLLERR) != 0 {
                 conn.service(&mut state, waiters);
@@ -593,19 +682,29 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
         }
         conns.retain(|c| !c.closed);
 
+        // the layers changed (a request above, or the user went Home): the waiting clients
+        // that asked to hear of it are answered
+        for conn in conns.iter_mut().filter(|c| c.asks.waiting && c.asks.layers && c.asks.layers_at != state.layers_at) {
+            conn.asks.waiting = false;
+            conn.asks.layers_at = state.layers_at;
+            conn.send(&state.taps_reply(conn.peer, true));
+        }
+
         // new clients
         if fds[1].revents != 0 {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let Some(peer) = peer_of(&stream) else {
+                        let Some((peer, who)) = peer_of(&stream) else {
                             eprintln!("[tinybot-surface] refused a client of another user");
                             continue;
                         };
                         if stream.set_nonblocking(true).is_err() {
                             continue;
                         }
-                        let mut conn = Conn { stream, peer, buf: Vec::new(), waiting: false, closed: false };
+                        // the hello says how the layers are: this client has heard
+                        let asks = Asks { layers_at: state.layers_at, ..Asks::default() };
+                        let mut conn = Conn { stream, peer, who, buf: Vec::new(), asks, closed: false };
                         conn.send(&state.hello(peer));
                         if !conn.closed {
                             conns.push(conn);

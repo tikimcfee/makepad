@@ -307,37 +307,108 @@ script_mod! {
                 body +: {
                     // the system bars sit over the window's edges: stay inside the safe area
                     padding: Inset{top: mod.widgets.SAFE_INSET_PAD_TOP right: mod.widgets.SAFE_INSET_PAD_RIGHT bottom: mod.widgets.SAFE_INSET_PAD_BOTTOM left: mod.widgets.SAFE_INSET_PAD_LEFT}
-                    flow: Down
-                    // nothing to show: tinybot's home, one line
-                    idle := View{
-                        width: Fill
-                        height: Fill
-                        align: Align{x: 0.5 y: 0.5}
-                        idle_line := Label{
-                            text: "tinybot · idle"
-                            draw_text.color: #888
-                            draw_text.text_style.font_size: 12
-                        }
-                    }
-                    surface := View{
-                        visible: false
+                    flow: Overlay
+                    pages := View{
                         width: Fill
                         height: Fill
                         flow: Down
-                        header := SolidView{
+                        // nothing to show: tinybot's home, one line
+                        idle := View{
                             width: Fill
-                            height: 48
-                            padding: Inset{left: 16 right: 16}
-                            align: Align{y: 0.5}
-                            draw_bg.color: #202428
-                            title := Label{
-                                width: Fill
-                                text: "tinybot"
-                                draw_text.color: #fff
-                                draw_text.text_style.font_size: 14
+                            height: Fill
+                            align: Align{x: 0.5 y: 0.5}
+                            idle_line := Label{
+                                text: "tinybot · idle"
+                                draw_text.color: #888
+                                draw_text.text_style.font_size: 12
                             }
                         }
-                        items := mod.widgets.SurfaceList{}
+                        // root's layer: the panel runner's pages
+                        surface := View{
+                            visible: false
+                            width: Fill
+                            height: Fill
+                            flow: Down
+                            header := SolidView{
+                                width: Fill
+                                height: 48
+                                // the right end is the dots' place
+                                padding: Inset{left: 16 right: 126}
+                                align: Align{y: 0.5}
+                                draw_bg.color: #202428
+                                title := Label{
+                                    width: Fill
+                                    text: "tinybot"
+                                    draw_text.color: #fff
+                                    draw_text.text_style.font_size: 14
+                                }
+                            }
+                            items := mod.widgets.SurfaceList{}
+                        }
+                        // the agent's layer. The band is the app's own: a page cannot
+                        // change it or leave it out, so the user sees whose page this is.
+                        agent := View{
+                            visible: false
+                            width: Fill
+                            height: Fill
+                            flow: Down
+                            band := SolidView{
+                                width: Fill
+                                height: 44
+                                flow: Right
+                                spacing: 8
+                                // the right end is the dots' place
+                                padding: Inset{left: 16 right: 126}
+                                align: Align{y: 0.5}
+                                draw_bg.color: #6a3d00
+                                who := Label{
+                                    width: Fill
+                                    text: "agent"
+                                    draw_text.color: #fff
+                                    draw_text.text_style.font_size: 10
+                                }
+                                agent_home := Button{
+                                    visible: false
+                                    width: Fit
+                                    height: 34
+                                    text: "‹ Home"
+                                }
+                            }
+                            agent_header := SolidView{
+                                width: Fill
+                                height: 40
+                                padding: Inset{left: 16 right: 16}
+                                align: Align{y: 0.5}
+                                draw_bg.color: #202428
+                                agent_title := Label{
+                                    width: Fill
+                                    text: ""
+                                    draw_text.color: #fff
+                                    draw_text.text_style.font_size: 13
+                                }
+                            }
+                            agent_items := mod.widgets.SurfaceList{}
+                        }
+                    }
+                    // over every page of either layer: lit while the microphone or the
+                    // speaker stream runs. No page can cover or draw them.
+                    dots := View{
+                        width: Fill
+                        height: 44
+                        flow: Right
+                        spacing: 10
+                        align: Align{x: 1.0 y: 0.5}
+                        padding: Inset{right: 14}
+                        mic := Label{
+                            text: ""
+                            draw_text.color: #ff5a4a
+                            draw_text.text_style.font_size: 10
+                        }
+                        play := Label{
+                            text: ""
+                            draw_text.color: #5ad06a
+                            draw_text.text_style.font_size: 10
+                        }
                     }
                 }
             }
@@ -956,7 +1027,44 @@ pub struct App {
     /// the service manager has been told the app is up
     #[rust]
     ready_sent: bool,
+    /// the layer on screen; `None` is the idle line
+    #[rust]
+    front: Option<wire::Layer>,
+    /// root's layer exists: an agent's page has the way back to it
+    #[rust]
+    has_root: bool,
+    #[rust]
+    dots: Dots,
+    /// one shot, started again by each look while the dots are watched
+    #[rust]
+    dots_timer: Timer,
+    /// what the dots show: (microphone, speaker)
+    #[rust]
+    lit: (bool, bool),
 }
+
+/// How the microphone and speaker dots are watched.
+#[derive(Default, PartialEq)]
+enum Dots {
+    /// the kernel has no stream status files: nothing to watch until a surface comes
+    #[default]
+    Absent,
+    /// looked at once a second
+    Watched,
+    /// the phone's panel is off: not looked at until the app is woken by something else
+    Dark,
+}
+
+/// The kernel's state of a PCM stream: `state: RUNNING` while it is open and running. The
+/// files exist with CONFIG_SND_VERBOSE_PROCFS. `None`: no such file.
+fn stream_runs(env: &str, default: &str) -> Option<bool> {
+    let path = std::env::var_os(env).unwrap_or_else(|| default.into());
+    std::fs::read_to_string(path).ok().map(|status| status.contains("state: RUNNING"))
+}
+
+/// How often the dots are looked at while the panel is on.
+const DOTS_SECONDS: f64 = 1.0;
+
 
 /// Tells the service manager that the app is up, for a unit of `Type=notify`: one datagram
 /// `READY=1` to the socket `NOTIFY_SOCKET` names (systemd's sd_notify protocol). Sent once
@@ -1033,11 +1141,40 @@ impl App {
         eprintln!("[tinybot-surface] no Unix sockets on this platform: the surface stays idle");
     }
 
-    /// Shows either the surface or the idle line.
-    fn show(&mut self, cx: &mut Cx, surface: bool) {
-        self.ui.view(cx, ids!(surface)).set_visible(cx, surface);
-        self.ui.view(cx, ids!(idle)).set_visible(cx, !surface);
+    /// Shows the layer in front, or the idle line.
+    fn show(&mut self, cx: &mut Cx) {
+        self.ui.view(cx, ids!(surface)).set_visible(cx, self.front == Some(wire::Layer::Root));
+        self.ui.view(cx, ids!(agent)).set_visible(cx, self.front == Some(wire::Layer::Agent));
+        self.ui.view(cx, ids!(idle)).set_visible(cx, self.front.is_none());
+        self.ui.widget(cx, ids!(agent_home)).set_visible(cx, self.has_root);
         self.ui.redraw(cx);
+    }
+
+    /// One look at the microphone and speaker streams, and the next one a second later.
+    /// Not while the phone's panel is off, and not without the kernel's status files: then
+    /// no timer runs, and the app is at rest as before.
+    fn look_at_dots(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.dots_timer);
+        let panel = std::env::var_os("TINYBOT_PANEL_STATE").unwrap_or_else(|| "/sys/kernel/tinybot_panel/state".into());
+        if std::fs::read_to_string(panel).is_ok_and(|state| state.trim() == "off") {
+            self.dots = Dots::Dark;
+            return;
+        }
+        let mic = stream_runs("TINYBOT_MIC_STATUS", "/proc/asound/card1/pcm1c/sub0/status");
+        let play = stream_runs("TINYBOT_PLAY_STATUS", "/proc/asound/card1/pcm0p/sub0/status");
+        let lit = (mic == Some(true), play == Some(true));
+        if lit != self.lit {
+            self.lit = lit;
+            self.ui.label(cx, ids!(mic)).set_text(cx, if lit.0 { "● mic" } else { "" });
+            self.ui.label(cx, ids!(play)).set_text(cx, if lit.1 { "● out" } else { "" });
+            self.ui.redraw(cx);
+        }
+        if mic.is_none() && play.is_none() {
+            self.dots = Dots::Absent;
+        } else {
+            self.dots = Dots::Watched;
+            self.dots_timer = cx.start_timeout(DOTS_SECONDS);
+        }
     }
 }
 
@@ -1046,6 +1183,7 @@ impl MatchEvent for App {
         self.start_socket();
         self.settle = cx.start_timeout(SETTLE_SECONDS);
         self.settle_again = true;
+        self.look_at_dots(cx);
     }
 
     #[cfg(unix)]
@@ -1062,46 +1200,80 @@ impl MatchEvent for App {
             };
             // a new surface (or none) may free memory a moment later; an update in place
             // does not, and a readout that changes every few seconds must not run a timer
-            if !matches!(message, socket::ToUi::Update(_)) {
+            if matches!(message, socket::ToUi::Set(..) | socket::ToUi::Clear(_)) {
                 cx.stop_timer(self.settle);
                 self.settle = cx.start_timeout(SETTLE_SECONDS);
+                // the status files may have come with a sound card that was not there before
+                if self.dots == Dots::Absent {
+                    self.look_at_dots(cx);
+                }
             }
-            let items = self.ui.widget(cx, ids!(items));
+            let list_of = |layer: wire::Layer| match layer {
+                wire::Layer::Root => ids!(items),
+                wire::Layer::Agent => ids!(agent_items),
+            };
             match message {
-                socket::ToUi::Update(update) => {
+                socket::ToUi::Update(layer, update) => {
                     if let Some(title) = &update.title {
                         let title = if title.is_empty() { "tinybot" } else { title.as_str() };
-                        self.ui.label(cx, ids!(title)).set_text(cx, title);
+                        match layer {
+                            wire::Layer::Root => self.ui.label(cx, ids!(title)).set_text(cx, title),
+                            wire::Layer::Agent => self.ui.label(cx, ids!(agent_title)).set_text(cx, title),
+                        }
                     }
-                    if let Some(mut list) = items.borrow_mut::<SurfaceList>() {
+                    if let Some(mut list) = self.ui.widget(cx, list_of(layer)).borrow_mut::<SurfaceList>() {
                         list.update(cx, update);
                     }
                 }
-                socket::ToUi::Set(spec) => {
+                socket::ToUi::Set(layer, spec, who) => {
                     let title = if spec.title.is_empty() { "tinybot" } else { spec.title.as_str() };
-                    self.ui.label(cx, ids!(title)).set_text(cx, title);
-                    if let Some(mut list) = items.borrow_mut::<SurfaceList>() {
+                    match layer {
+                        wire::Layer::Root => self.ui.label(cx, ids!(title)).set_text(cx, title),
+                        wire::Layer::Agent => {
+                            self.ui.label(cx, ids!(agent_title)).set_text(cx, title);
+                            // the name is the process's own word for itself; the uid is the kernel's
+                            self.ui.label(cx, ids!(who)).set_text(cx, &format!("agent · {who}"));
+                        }
+                    }
+                    if let Some(mut list) = self.ui.widget(cx, list_of(layer)).borrow_mut::<SurfaceList>() {
                         list.set_spec(cx, spec);
                     }
-                    self.show(cx, true);
                 }
-                socket::ToUi::Clear => {
-                    if let Some(mut list) = items.borrow_mut::<SurfaceList>() {
+                socket::ToUi::Clear(layer) => {
+                    if let Some(mut list) = self.ui.widget(cx, list_of(layer)).borrow_mut::<SurfaceList>() {
                         list.clear(cx);
                     }
-                    self.show(cx, false);
+                }
+                socket::ToUi::Front(front, has_root) => {
+                    self.front = front;
+                    self.has_root = has_root;
+                    self.show(cx);
                 }
             }
         }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        let items = self.ui.widget(cx, ids!(items));
-        let pressed = items.borrow_mut::<SurfaceList>().map(|mut list| list.handle_actions(cx, actions)).unwrap_or_default();
+        // each layer's presses go to that layer's clients
+        let mut pressed = Vec::new();
+        for (layer, list) in [(wire::Layer::Root, ids!(items)), (wire::Layer::Agent, ids!(agent_items))] {
+            let list = self.ui.widget(cx, list);
+            let presses = list.borrow_mut::<SurfaceList>().map(|mut list| list.handle_actions(cx, actions)).unwrap_or_default();
+            pressed.extend(presses.into_iter().map(|press| (layer, press)));
+        }
+        // the band's way back from an agent's page: at once, no round trip
+        let home = self.has_root && self.front == Some(wire::Layer::Agent) && self.ui.button(cx, ids!(agent_home)).clicked(actions);
+        if home {
+            self.front = Some(wire::Layer::Root);
+            self.show(cx);
+        }
         #[cfg(unix)]
         if let Some(link) = &self.link {
-            for p in pressed {
-                link.send(socket::ToIo::Tap { surface: p.surface, rev: p.rev, id: p.id, values: p.values });
+            for (layer, p) in pressed {
+                link.send(socket::ToIo::Tap { layer, surface: p.surface, rev: p.rev, id: p.id, values: p.values });
+            }
+            if home {
+                link.send(socket::ToIo::Home);
             }
         }
         #[cfg(not(unix))]
@@ -1123,6 +1295,12 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if self.dots_timer.is_event(event).is_some() {
+            self.look_at_dots(cx);
+        } else if self.dots == Dots::Dark && matches!(event, Event::Draw(_) | Event::Signal | Event::MouseDown(_) | Event::TouchUpdate(_)) {
+            // something woke the app while the panel was off: it may be on again
+            self.look_at_dots(cx);
+        }
         if self.settle.is_event(event).is_some() {
             release_free_memory();
             if std::mem::take(&mut self.settle_again) {
