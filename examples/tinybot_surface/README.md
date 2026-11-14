@@ -335,7 +335,9 @@ instead. The files are read again each time Home or a panel is opened.
 - `key`: `{"code":523,"button":ID}`, or an array of such for several
   codes, binds a key (its evdev code) to a button's action, which must take
   no placeholders: a key press has no values. Panels that bind the same
-  code are all left out.
+  code are all left out. The button may be `_stop`: the key is then the
+  panel's Stop, as live as its button (on a locked panel, while a try
+  runs), and its record names the key.
 - A field the runner does not know is refused, and so is a key given twice.
   Ids that start with `_` are the runner's own.
 
@@ -392,9 +394,10 @@ they run never depends on what was typed.
   recorded as dropped. The kernel's repeat is ignored.
 - **A short action** (`"short": true`, `timeout_s` at most 5, no `ask`,
   `checks` or `retry`) is for keys like the volume keys: it runs while a
-  try runs, takes no part in one-at-a-time, never locks, runs on a locked
-  panel too, and its key coming up means nothing. It is a record with
-  `"short":true`.
+  try runs, takes no part in one-at-a-time, never locks, and its key
+  coming up means nothing. A locked panel holds it back like any action (a
+  record `dropped`, `why` `locked`): a lock means a person must look first.
+  It is a record with `"short":true`.
 - **A follow-up on offer.** When a try ends with a status its `retry`
   names (a tool's "only if you mean it"), the page shows, above the
   action's row: the tool's last line, then ONE primary button with the
