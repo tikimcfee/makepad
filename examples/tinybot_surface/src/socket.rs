@@ -7,9 +7,9 @@
 //! `try_recv` on `Event::Signal`, taps go the other way through a channel plus one byte on the
 //! wake socket.
 
-use crate::wire::{self, Request, Spec, Tap, WireErr};
+use crate::wire::{self, Request, Spec, Tap, Target, Update, WireErr};
 use makepad_widgets::makepad_platform::thread::SignalToUI;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -20,12 +20,14 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 /// Socket thread to UI.
 pub enum ToUi {
     Set(Spec),
+    /// already checked against the surface on screen
+    Update(Update),
     Clear,
 }
 
 /// UI to socket thread.
 pub enum ToIo {
-    Tap { surface: String, rev: u64, id: String, values: Vec<(String, bool)> },
+    Tap { surface: String, rev: u64, id: String, values: Vec<(String, wire::Value)> },
 }
 
 /// The UI thread's end. Dropping it ends the socket thread.
@@ -89,8 +91,11 @@ pub fn socket_path() -> (PathBuf, bool) {
     (runtime.join("tinybot").join("surface.sock"), true)
 }
 
-/// Only this user's processes may talk to the surface (the socket is 0600 too).
-fn same_user(c: &UnixStream) -> bool {
+/// Only this user's processes and root's may talk to the surface. Root is let in for the panel
+/// runner, which runs as root to start its actions; the socket and its directory stay private
+/// to the user (0600, 0700), which does not hold root back anyway.
+fn allowed_peer(c: &UnixStream) -> bool {
+    let allowed = |uid: u32| uid == 0 || uid == unsafe { getuid() };
     #[cfg(target_os = "linux")]
     {
         extern "C" {
@@ -99,7 +104,8 @@ fn same_user(c: &UnixStream) -> bool {
         // SOL_SOCKET 1, SO_PEERCRED 17: struct ucred { pid, uid, gid }
         let mut cred = [0u32; 3];
         let mut len = 12u32;
-        unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) == 0 && cred[1] == getuid() }
+        let known = unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) } == 0;
+        known && allowed(cred[1])
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -107,7 +113,8 @@ fn same_user(c: &UnixStream) -> bool {
             fn getpeereid(fd: i32, uid: *mut u32, gid: *mut u32) -> i32;
         }
         let (mut uid, mut gid) = (u32::MAX, 0u32);
-        unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == getuid() }
+        let known = unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } == 0;
+        known && allowed(uid)
     }
 }
 
@@ -152,7 +159,7 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
     wake_rx.set_nonblocking(true)?;
     let (to_io, from_ui) = channel();
     let (to_ui, from_io) = channel();
-    let state = State { to_ui, surface: None, rev: 0, title: String::new(), items: 0, taps: VecDeque::new(), next_seq: 1 };
+    let state = State { to_ui, surface: None, rev: 0, title: String::new(), items: 0, targets: HashMap::new(), taps: VecDeque::new(), next_seq: 1 };
     std::thread::Builder::new()
         .name("tinybot-surface-io".into())
         .spawn(move || run(listener, wake_rx, from_ui, state))?;
@@ -173,6 +180,8 @@ struct State {
     rev: u64,
     title: String,
     items: usize,
+    /// the ids of the surface on screen: what an `update` may name
+    targets: HashMap<String, Target>,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
@@ -198,6 +207,34 @@ impl State {
         out
     }
 
+    /// An `update` is for exactly the surface and rev on screen, changes only labels and
+    /// readouts, and arms only rows. One wrong id refuses all of it.
+    fn check_update(&self, update: &Update) -> Result<(), WireErr> {
+        if self.surface.as_deref() != Some(update.surface.as_str()) || update.rev != self.rev {
+            let shown = match &self.surface {
+                Some(surface) => format!("{surface} rev {}", self.rev),
+                None => "nothing".to_string(),
+            };
+            return Err(WireErr { code: "stale_rev", msg: format!("update is for {} rev {}; on screen is {shown}", update.surface, update.rev) });
+        }
+        let bad = |msg: String| Err(WireErr { code: "bad_item", msg });
+        for change in &update.changes {
+            match self.targets.get(&change.id) {
+                Some(Target::Readout) => {}
+                Some(Target::Label) if change.value.is_none() => {}
+                Some(Target::Label) => return bad(format!("update {}: a heading or text has no value", change.id)),
+                Some(_) => return bad(format!("update {}: only a heading, text or readout is changed in place", change.id)),
+                None => return bad(format!("update {}: no item with this id", change.id)),
+            }
+        }
+        for id in &update.arm {
+            if self.targets.get(id) != Some(&Target::Row) {
+                return bad(format!("update arm {id}: no row or button with this id"));
+            }
+        }
+        Ok(())
+    }
+
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
     fn request(&mut self, line: &str, waiting: &mut bool, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
@@ -219,7 +256,16 @@ impl State {
                 self.rev = spec.rev;
                 self.title = spec.title.clone();
                 self.items = spec.items.len();
+                self.targets = spec.targets().into_iter().collect();
                 let _ = self.to_ui.send(ToUi::Set(spec));
+                SignalToUI::set_ui_signal();
+                format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
+            }
+            Request::Update(update) => {
+                if let Err(e) = self.check_update(&update) {
+                    return Some(e.line());
+                }
+                let _ = self.to_ui.send(ToUi::Update(update));
                 SignalToUI::set_ui_signal();
                 format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
             }
@@ -228,6 +274,7 @@ impl State {
                 self.rev = 0;
                 self.title.clear();
                 self.items = 0;
+                self.targets.clear();
                 let _ = self.to_ui.send(ToUi::Clear);
                 SignalToUI::set_ui_signal();
                 format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
@@ -434,7 +481,7 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if !same_user(&stream) {
+                        if !allowed_peer(&stream) {
                             eprintln!("[tinybot-surface] refused a client of another user");
                             continue;
                         }
