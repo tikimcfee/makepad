@@ -22,7 +22,7 @@ import socket
 import sys
 import time
 
-VERSION = 1
+VERSION = 2
 
 
 def socket_path(arg):
