@@ -155,6 +155,8 @@ struct Stopping {
     t_tap: f64,
     /// the result item of the try it ended
     result: Option<String>,
+    /// the key that asked for it, when it was not the button
+    key: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -1072,7 +1074,7 @@ impl Runner {
             (Page::Home, "_agent") => self.send(&Json::obj([("type", "show".into()), ("layer", "agent".into())])),
             (Page::Home, "_stop") => {
                 if let Some(panel) = self.running.as_ref().map(|run| run.panel.clone()) {
-                    self.stop(&panel);
+                    self.stop(&panel, None);
                 }
             }
             (Page::Home, id) => {
@@ -1085,7 +1087,7 @@ impl Runner {
                     self.answer_question(choice);
                 }
             }
-            (Page::Panel(panel), "_stop") => self.stop(&panel),
+            (Page::Panel(panel), "_stop") => self.stop(&panel, None),
             (Page::Panel(panel), "_unlock") => self.unlock(&panel),
             (Page::Panel(panel), "_offer") => self.take_offer(&panel, &values),
             (Page::Panel(panel), id) => match id.strip_prefix("_ans_").and_then(|n| n.parse().ok()) {
@@ -1236,6 +1238,10 @@ impl Runner {
         let Some((panel, button)) = bound else {
             return;
         };
+        // a key on the panel's Stop is its Stop button: always live, whatever runs or is locked
+        if button == "_stop" {
+            return self.stop(&panel, Some(code));
+        }
         let t = records::now();
         let short = matches!(self.panels.get(&panel).and_then(|p| p.button(&button)).map(|b| &b.does), Some(Does::Action(action)) if action.short);
         let started = if short { self.start_short(&panel, &button, code, t) } else { self.start(&panel, &button, &Json::Obj(Vec::new()), t, Some(code), &[], None) };
@@ -1245,8 +1251,12 @@ impl Runner {
     }
 
     /// A short action: beside the tries, with no part in one-at-a-time, no lock of its own
-    /// and no end at key up. It runs on a locked panel too, since it is not a try.
+    /// and no end at key up. A locked panel holds it back like any action: a lock means a
+    /// person must look first, and what a short action does (a volume blip) is a sound too.
     fn start_short(&mut self, panel_name: &str, button_id: &str, key: u16, t_tap: f64) -> Result<(), &'static str> {
+        if self.locks.contains_key(panel_name) {
+            return Err("locked");
+        }
         let panel = self.panels.get(panel_name).ok_or("no such panel")?;
         let Some(Does::Action(action)) = panel.button(button_id).map(|b| &b.does) else {
             return Err("no such action");
@@ -1358,7 +1368,7 @@ impl Runner {
         self.write_state();
         // a tool that could not set things back gets the all-off at once
         if exit_3 && !run.stopped {
-            self.stop(&run.panel);
+            self.stop(&run.panel, None);
         }
         let on_page = self.page == Page::Panel(run.panel.clone());
         let changes_page = self.locks.contains_key(&run.panel) || self.asking.is_some() || self.offer.is_some();
@@ -1377,8 +1387,8 @@ impl Runner {
     }
 
     /// Stop: the all-off of `panel`, and first the end of its try when one runs. Never asks,
-    /// never waits for a try.
-    fn stop(&mut self, panel_name: &str) {
+    /// never waits for a try, and a lock does not hold it. `key`: a key asked for it.
+    fn stop(&mut self, panel_name: &str, key: Option<u16>) {
         let Some(stop) = self.panels.get(panel_name).and_then(|p| p.stop.as_ref()) else {
             return;
         };
@@ -1399,7 +1409,7 @@ impl Runner {
                 _ => None,
             };
         }
-        self.stopping = Some(Stopping { seq: self.seq, panel: panel_name.to_string(), unit: unit.clone(), t_tap, result });
+        self.stopping = Some(Stopping { seq: self.seq, panel: panel_name.to_string(), unit: unit.clone(), t_tap, result, key });
         if self.stops.send(StopJob::Stop { unit: ends, command }).is_err() {
             self.error = Some("the stop worker is gone".into());
         }
@@ -1428,7 +1438,7 @@ impl Runner {
         let tried = Tried { ran, result: String::new(), checks: Vec::new(), t_start: stop.t_tap, t_end: records::now() };
         // the last try of the panel stays its state; the stop is a record of its own
         let before = self.last.get(&stop.panel).cloned();
-        self.record_try(stop.seq, &stop.panel, "_stop", &Json::Obj(Vec::new()), Some(&stop.unit), Some(&tried), stop.t_tap, false, &[]);
+        self.record_try(stop.seq, &stop.panel, "_stop", &Json::Obj(Vec::new()), Some(&stop.unit), Some(&tried), stop.t_tap, false, &Self::try_extra(stop.key, None));
         if let Some(before) = before {
             self.last.insert(stop.panel.clone(), before);
             self.write_panel_state(&stop.panel);
@@ -1471,7 +1481,7 @@ impl Runner {
             self.locks.insert(panel_name.to_string(), Lock { reason, seq: asking.seq, t: records::now() });
             self.write_panel_state(panel_name);
             self.write_state();
-            self.stop(panel_name);
+            self.stop(panel_name, None);
         }
         self.show(true);
     }
