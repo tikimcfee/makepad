@@ -1039,6 +1039,10 @@ impl MatchEvent for App {
             let items = self.ui.widget(cx, ids!(items));
             match message {
                 socket::ToUi::Update(update) => {
+                    if let Some(title) = &update.title {
+                        let title = if title.is_empty() { "tinybot" } else { title.as_str() };
+                        self.ui.label(cx, ids!(title)).set_text(cx, title);
+                    }
                     if let Some(mut list) = items.borrow_mut::<SurfaceList>() {
                         list.update(cx, update);
                     }
