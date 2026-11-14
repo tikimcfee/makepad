@@ -138,6 +138,10 @@ fn peer_of(c: &UnixStream) -> Option<Peer> {
     }
 }
 
+// The phone is aarch64 Linux: a build for it with the test feature does not compile.
+#[cfg(all(feature = "test-userns-root", target_arch = "aarch64", target_os = "linux"))]
+compile_error!("the feature test-userns-root is for tests on a build host and must never be in a build for the phone");
+
 /// Test builds only (cargo feature `test-userns-root`): a peer of this user that is root
 /// inside a user namespace (`unshare -r`) counts as root, so the rules for privileged
 /// surfaces can be tried on a machine without root. Never in a build for the phone.
