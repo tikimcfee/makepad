@@ -18,8 +18,8 @@ pub struct Panel {
     pub order: f64,
     /// the all-off: behind the Stop button and behind every lock
     pub stop: Option<Stop>,
-    /// a key (its evdev code) that runs a button's action while it is held
-    pub key: Option<(u16, String)>,
+    /// keys (their evdev codes) that run a button's action: (code, button id)
+    pub keys: Vec<(u16, String)>,
     pub items: Vec<Item>,
 }
 
@@ -76,6 +76,13 @@ pub struct Action {
     pub result: Option<String>,
     /// the readout, text or heading that shows the tool's `LIVE ` lines while it runs
     pub live: Option<String>,
+    /// what is asked above the answer row
+    pub ask_text: Option<String>,
+    /// follow-ups the tool asks for by its exit status
+    pub retry: Vec<(i32, Retry)>,
+    /// For a key only: a short action beside the tries. It runs while a try runs, takes no
+    /// part in one-at-a-time, never locks, and its key coming up means nothing.
+    pub short: bool,
     /// the words asked for after the try
     pub ask: Vec<String>,
     /// the answers that run Stop and lock the panel
@@ -86,6 +93,14 @@ pub struct Action {
 pub struct Check {
     pub name: String,
     pub argv: Vec<String>,
+}
+
+/// "Do it, but only if you mean it": after a try that ended with this status, one button
+/// runs the same action again with the same values and these arguments added.
+pub struct Retry {
+    pub text: String,
+    pub add: Vec<String>,
+    pub confirm: bool,
 }
 
 pub enum Part {
@@ -154,24 +169,31 @@ impl Panel {
                 Some(Stop { argv: fixed_argv(stop.get("argv"), what)?, timeout_s: seconds(stop, "timeout_s", what)?.ok_or("stop: timeout_s is missing")? })
             }
         };
-        let key = match file.get("key") {
-            None => None,
-            Some(key) => {
-                known(key.as_obj().ok_or("key is not an object")?, &["code", "panel", "button"], "key")?;
-                let code = key.get("code").and_then(|c| c.as_u64()).filter(|c| *c <= u16::MAX as u64).ok_or("key: code is not a key code (a number up to 65535)")?;
-                if key.get("panel").is_some_and(|p| p.as_str() != Some(name.as_str())) {
-                    return Err("key: panel is not this panel".into());
-                }
-                Some((code as u16, string(key, "button", "key")?.ok_or("key: button is missing")?))
-            }
+        // one binding as an object, or several as an array of them, one per code
+        let bindings: &[Json] = match file.get("key") {
+            None => &[],
+            Some(Json::Arr(list)) => list,
+            Some(one) => std::slice::from_ref(one),
         };
+        let mut keys: Vec<(u16, String)> = Vec::new();
+        for key in bindings {
+            known(key.as_obj().ok_or("key is not an object or an array of objects")?, &["code", "panel", "button"], "key")?;
+            let code = key.get("code").and_then(|c| c.as_u64()).filter(|c| *c <= u16::MAX as u64).ok_or("key: code is not a key code (a number up to 65535)")? as u16;
+            if key.get("panel").is_some_and(|p| p.as_str() != Some(name.as_str())) {
+                return Err("key: panel is not this panel".into());
+            }
+            if keys.iter().any(|(c, _)| *c == code) {
+                return Err(format!("key: code {code} is bound twice"));
+            }
+            keys.push((code, string(key, "button", "key")?.ok_or("key: button is missing")?));
+        }
         let list = file.get("items").and_then(|i| i.as_arr()).ok_or("items is missing or not an array")?;
         let mut ids = HashSet::new();
         let mut items = Vec::new();
         for (n, item) in list.iter().enumerate() {
             items.push(parse_item(item, n, &mut ids)?);
         }
-        let panel = Panel { name, title, summary, order, stop, key, items };
+        let panel = Panel { name, title, summary, order, stop, keys, items };
         panel.check_references()?;
         let page = panel.items.iter().map(|item| item.json(false).to_string().len() + 1).sum::<usize>() + panel.title.len();
         if page > PAGE_BYTES {
@@ -212,12 +234,19 @@ impl Panel {
                 return Err(format!("{what}: on_answer asks for stop, but the panel has no stop"));
             }
         }
-        if let Some((_, button)) = &self.key {
+        for (_, button) in &self.keys {
             // a key press is no tap and has no values
             match self.button(button).map(|b| &b.does) {
                 Some(Does::Action(action)) if action.argv.iter().flatten().all(|part| matches!(part, Part::Text(_))) => {}
                 Some(Does::Action(_)) => return Err(format!("key: the action of button {button} takes values, which a key press does not have")),
                 _ => return Err(format!("key: {button:?} is not a button with an action")),
+            }
+        }
+        for button in self.buttons() {
+            if let Does::Action(action) = &button.does {
+                if action.short && !self.keys.iter().any(|(_, bound)| *bound == button.id) {
+                    return Err(format!("button {}: a short action is one a key runs, and no key is bound to it", button.id));
+                }
             }
         }
         Ok(())
@@ -537,7 +566,7 @@ fn parse_action(action: &Json, what: &str) -> Result<Action, String> {
     let what = format!("{what}: action");
     let what = what.as_str();
     let members = action.as_obj().ok_or(format!("{what} is not an object"))?;
-    known(members, &["argv", "as", "timeout_s", "stop_post", "result", "live", "ask", "on_answer", "checks"], what)?;
+    known(members, &["argv", "as", "timeout_s", "stop_post", "result", "live", "ask", "ask_text", "on_answer", "checks", "retry", "short"], what)?;
     let as_root = match string(action, "as", what)?.as_deref() {
         None | Some("user") => false,
         Some("root") => true,
@@ -575,13 +604,45 @@ fn parse_action(action: &Json, what: &str) -> Result<Action, String> {
             checks.push(Check { argv: fixed_argv(check.get("argv"), &format!("{what} {name}"))?, name });
         }
     }
+    let ask_text = string(action, "ask_text", what)?;
+    if ask_text.is_some() && ask.is_empty() {
+        return Err(format!("{what}: ask_text without ask"));
+    }
+    let mut retry = Vec::new();
+    if let Some(offers) = action.get("retry") {
+        for (code, offer) in offers.as_obj().ok_or(format!("{what}: retry is not an object of exit status: offer"))? {
+            let what = format!("{what}: retry {code}");
+            // 0 is done and 3 is the one that locks: neither is a "do it if you mean it"
+            let status = code.parse::<i32>().ok().filter(|c| (1..=255).contains(c) && *c != 3).ok_or(format!("{what}: not an exit status an offer can answer (1 to 255, not 3)"))?;
+            known(offer.as_obj().ok_or(format!("{what} is not an object"))?, &["text", "add", "confirm"], &what)?;
+            let text = string(offer, "text", &what)?.filter(|t| !t.is_empty()).ok_or(format!("{what}: text is missing"))?;
+            let add = strings(offer.get("add"), &format!("{what}: add"))?;
+            if add.iter().any(|arg| arg.contains('\0')) {
+                return Err(format!("{what}: add holds a NUL"));
+            }
+            retry.push((status, Retry { text, add, confirm: flag(offer, "confirm", &what)?.unwrap_or(false) }));
+        }
+    }
+    let timeout_s = seconds(action, "timeout_s", what)?.ok_or(format!("{what}: timeout_s is missing"))?;
+    let short = flag(action, "short", what)?.unwrap_or(false);
+    if short {
+        if timeout_s > 5.0 {
+            return Err(format!("{what}: a short action has a timeout_s of at most 5"));
+        }
+        if !ask.is_empty() || !checks.is_empty() || !retry.is_empty() {
+            return Err(format!("{what}: a short action has no ask, checks or retry"));
+        }
+    }
     Ok(Action {
         argv: argv_template(action.get("argv"), what)?,
         as_root,
-        timeout_s: seconds(action, "timeout_s", what)?.ok_or(format!("{what}: timeout_s is missing"))?,
+        timeout_s,
         stop_post,
         result: string(action, "result", what)?,
         live: string(action, "live", what)?,
+        ask_text,
+        retry,
+        short,
         ask,
         stop_on,
         checks,
@@ -601,6 +662,19 @@ pub fn tap_value(kind: &Input, value: Option<&Json>) -> Option<String> {
 }
 
 impl Action {
+    /// The ids of the values the argv takes, in the order they first appear.
+    pub fn value_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = Vec::new();
+        for part in self.argv.iter().flatten() {
+            if let Part::Value(id) = part {
+                if !ids.contains(&id.as_str()) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     /// The argv of a try, each element whole whatever its values hold. `None`: a value is
     /// missing or does not pass `tap_value`.
     pub fn fill(&self, panel: &Panel, values: &Json) -> Option<Vec<String>> {

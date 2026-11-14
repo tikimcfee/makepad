@@ -40,6 +40,7 @@ thing, prints the app's answer as JSON lines and exits.
 |---|---|---|
 | `set FILE [--surface ID] [--rev N]` | Shows the surface in FILE (`-`: stdin) | `ack` or `err` |
 | `wait [--timeout S]` | Collects the taps that wait; with none, blocks for the next one. `--timeout 0` never blocks | one `tap` line per press |
+| `--runner` (before the command) | As root, with no runner connected: act on root's layer as the runner does. Without it every client's page is an agent's page | `err` and exit 1 when the role is refused |
 | `clear` | Back to the idle line | `ack` |
 | `status` | What is shown and how many taps wait | `status` |
 
@@ -82,8 +83,8 @@ and repeated keys included), which the app reads to the same surface.
 | `stepper` | `id`, `text`, `values` (a non-empty array of strings), `value` (optional, one of them) | `‹ value ›`: one of the strings, one step per press, repeating while held |
 | `number` | `id`, `text`, `value` (optional, a string) | a text field |
 | `readout` | `id`, `text`, `value` (optional, a string) | a label and a monospace value on one line |
-| `row` | `id` (optional), `buttons`: a non-empty array of `{id, text, style, confirm, lock}` | buttons side by side, three to a line |
-| `button` | `id`, `text`, `style`, `confirm`, `lock` | a row of one button |
+| `row` | `id` (optional), `buttons`: a non-empty array of `{id, text, style, confirm, lock, dim}` | buttons side by side, three to a line |
+| `button` | `id`, `text`, `style`, `confirm`, `lock`, `dim` | a row of one button |
 | `divider` | | a thin line |
 
 - `style` is `primary`, `secondary` (the default) or `danger`; anything else
@@ -94,6 +95,8 @@ and repeated keys included), which the app reads to the same surface.
   ends the wait. This happens in the app; the agent sees one tap or none.
 - `lock: false`: a tap on this button does not lock its row, and the button
   stays live when another button has locked the row.
+- `dim: true`: the button is drawn faded and still takes taps (the runner
+  uses it while another button is the better answer).
 - A stepper's strings are the values: the app does not read them as
   numbers, and a stepper stops at its first and last value. A number is sent
   exactly as typed; the app does not parse it or hold it to a range.
@@ -152,7 +155,8 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 | `{"type":"taps","wait":false}` | every waiting `tap` line, then `{"type":"taps","count":N,"seq":LAST}` |
 | `{"type":"taps","wait":true}` | the same; with no tap waiting, the answer comes when one arrives |
 | `{"type":"taps","wait":true,"layers":true}` | the same, and also answered when the layers change, with a line `{"type":"layers","privileged":…,"front":…,"agent":…}` first |
-| `{"type":"show","layer":"agent"}` (or `"root"`) | root only: puts that layer on screen; `ack` |
+| `{"type":"show","layer":"agent"}` (or `"root"`) | the runner only: puts that layer on screen; `ack` |
+| `{"type":"hello","role":"runner"}` | a root client takes the runner's role: the `hello` of root's layer |
 | `{"type":"done","seq":LAST}` | `{"type":"ok","dropped":N,"pending":N}` |
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
@@ -188,7 +192,7 @@ A refused request is answered with `{"type":"err","code":…,"msg":…}`:
 | `bad_set` | `surface`, `rev`, `title` or `items` of a `set` is missing or of the wrong type; `surface` or `rev` of an `update` is |
 | `bad_item` | an item or button is malformed, of an unknown `kind`, lacks a required `id`, or repeats an id; an `update` names an id it cannot change or arm |
 | `stale_rev` | a `set` for the surface on screen with a lower `rev`; an `update` for another surface or rev than the one on screen |
-| `privileged` | `show` from a client that is not root's |
+| `privileged` | `show` from a client that is not the runner; the runner's role asked for by a client that is not root, or while another runner is connected |
 | `too_long` | a line over 64 KiB; the app then closes the connection |
 
 A `set` with the same `surface` and `rev` as on screen is accepted again
@@ -198,9 +202,14 @@ A `set` with the same `surface` and `rev` as on screen is accepted again
 
 The app holds two surfaces and shows one of them:
 
-- **root's layer**, set by a uid-0 client (the panel runner);
-- **the agent's layer**, set by a client of the app's own user (an agent
-  such as Claude Code on the phone, or `tb-surface`).
+- **root's layer**, the panel runner's: set by the one root client that
+  says it is the runner, with the request `{"type":"hello","role":"runner"}`
+  (answered with the `hello` of that layer; `privileged` for a client that
+  is not root, and for a second root process while a runner is connected);
+- **the agent's layer**, set by every other client: an agent of the app's
+  own user, such as Claude Code on the phone, or one that runs as root.
+  Being root is not being the runner: a root agent's page is an agent's
+  page, with `(uid 0)` in its band.
 
 Each client sets, updates and clears only its own layer, and gets only the
 taps made on it (`taps`, `done` and `pending` each count one layer's taps).
@@ -276,7 +285,7 @@ it passes on what was chosen and typed, and every limit that protects
 hardware is the tool's.
 
 ```sh
-tb-panel run [--dirs DIR:DIR…] [--home] [--key DEVICE:CODE]   # default /usr/share/tinybot/panels:/etc/tinybot/panels
+tb-panel run [--dirs DIR:DIR…] [--home] [--key DEVICE:CODE[,CODE…]]   # default /usr/share/tinybot/panels:/etc/tinybot/panels
 tb-panel check FILE                       # 0: the runner would take it; 64 and the reason: not
 tb-panel show [NAME]                      # a panel's state file, or the runner's own
 tb-panel ask FILE                         # queue a question, prints its qid
@@ -323,9 +332,10 @@ instead. The files are read again each time Home or a panel is opened.
     with neither is a record of the tap and nothing more.
 - `stop` is the panel's all-off: the runner adds the button "Stop / all off"
   and a line under it for its result. Without `stop` there is neither.
-- `key`: `{"code":523,"button":ID}` binds a key (its evdev code) to a
-  button's action, which must take no placeholders: a key press has no
-  values. Panels that bind the same code are all left out.
+- `key`: `{"code":523,"button":ID}`, or an array of such for several
+  codes, binds a key (its evdev code) to a button's action, which must take
+  no placeholders: a key press has no values. Panels that bind the same
+  code are all left out.
 - A field the runner does not know is refused, and so is a key given twice.
   Ids that start with `_` are the runner's own.
 
@@ -340,6 +350,9 @@ An action:
 | `result` | the id of the readout, text or heading that shows `rc N · last line` |
 | `live` | the id of the readout, text or heading that shows the tool's `LIVE ` lines while it runs |
 | `ask` | words asked for after the try, shown as a row; the word tapped is recorded |
+| `ask_text` | what is asked, shown above that row |
+| `retry` | `{"4":{"text":"Play it","add":["--confirm"],"confirm":false}}`: follow-ups by exit status (1 to 255, not 3), see below |
+| `short` | `true`, for an action a key runs: beside the tries, see below |
 | `on_answer` | `{"WORD":"stop"}`: this answer runs Stop and locks the panel |
 | `checks` | `[{"name":…,"argv":[…]}]`: run directly as root after each try, 2 s each; a status other than 0 locks the panel |
 
@@ -369,14 +382,31 @@ they run never depends on what was typed.
   above the tool's own limit (for a recorder with `--max-seconds N`, N plus
   some seconds for it to finish), so that a long hold ends as the tool's
   exit 0 and not as a time limit, which locks the panel.
-- **A held key.** With `--key DEVICE:CODE` the runner reads that input
-  device (a plain read, no grab; it sleeps until a key moves). Key down
+- **A held key.** With `--key DEVICE:CODE[,CODE…]` the runner reads that
+  input device (a plain read, no grab; it sleeps until a key moves). Key down
   starts the action a panel binds to the code, whatever page is on screen
   and without taking the screen; key up sends SIGTERM to the tool
   (`systemctl kill --kill-whom=main`), which ends by itself, and the try
   ends like any other. A key held past `timeout_s` ends as a time limit. A
   key down while a try runs or the panel is locked runs nothing and is
   recorded as dropped. The kernel's repeat is ignored.
+- **A short action** (`"short": true`, `timeout_s` at most 5, no `ask`,
+  `checks` or `retry`) is for keys like the volume keys: it runs while a
+  try runs, takes no part in one-at-a-time, never locks, runs on a locked
+  panel too, and its key coming up means nothing. It is a record with
+  `"short":true`.
+- **A follow-up on offer.** When a try ends with a status its `retry`
+  names (a tool's "only if you mean it"), the page shows, above the
+  action's row: the tool's last line, then ONE primary button with the
+  offer's `text` and the try's values; the row's own action buttons are
+  dimmed (still live) with the line "or use '<text>' above". The offer's
+  button runs the same action with the values of the try it answers, from
+  its record, plus the `add` arguments (fixed strings); `confirm: true`
+  makes that button need the double tap. The follow-up is a try of its own
+  with `"parent"` in its record. The offer ends after 30 s, when another
+  action starts, or when its button is tapped after a value it would run
+  with was changed on the page (then nothing runs); each end is recorded.
+  A try that ended with such a status is not asked about (`ask`).
 - **Stop** is live while a try runs: `systemctl stop` on the try's unit,
   then the panel's `stop` argv as a unit of its own. Its result shows under
   the Stop button, and on Home as "last Stop".
@@ -412,12 +442,15 @@ they run never depends on what was typed.
   `.1` at 1 MiB:
   - `{"t":"try","seq","panel","button","values","unit","rc","line","state","checks":[{"name","rc"}],"t_tap","t_start","t_end","stopped"}`,
     with `"result"` (systemd's word, e.g. `timeout`) when the unit did not
-    end with status 0, and `"key"` when a key started it. A Stop is a try of
-    its own, button `_stop`.
+    end with status 0, `"key"` when a key started it, `"short"` for a short
+    action and `"parent"` for a follow-up. A Stop is a try of its own, button
+    `_stop`.
   - `{"t":"answer","seq","word","t_answer"}`: the word for try `seq`;
     `unlock` for the unlock of the lock that try set.
   - `{"t":"dropped","tap","t_seen"}`: a tap from before the runner's page;
     `{"t":"dropped","key","button","why","t_seen"}`: a key down that ran nothing.
+  - `{"t":"expired","seq","why","t_expired"}`: the offer after try `seq` ended
+    unused (`30 s`, `another action`, `a value changed`).
 - `/var/lib/tinybot/tries/_questions.jsonl`:
   `{"t":"question","qid","from","text_sha256","text","covers":[{"path","sha256"}],"choices","t_asked","peer":{"uid","comm"},"answer","t_answered"}`.
 - Times are Unix seconds with milliseconds. Nothing decides on a log line.

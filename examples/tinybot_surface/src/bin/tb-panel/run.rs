@@ -32,8 +32,8 @@ pub struct Options {
     pub tries_dir: PathBuf,
     /// the file that reads `off` while the phone's panel is dark
     pub panel_state: PathBuf,
-    /// the input device and the key code on it that runs a panel's bound action while held
-    pub key: Option<(PathBuf, u16)>,
+    /// the input device and the key codes on it that run the actions panels bind to them
+    pub key: Option<(PathBuf, Vec<u16>)>,
 }
 
 /// The surface ids of the runner's own pages. A panel's surface id is its name.
@@ -58,8 +58,10 @@ enum Event {
     Live(String),
     Tried(Tried),
     Stopped(Ran),
-    /// the bound key went down (`true`) or came up
-    Key(bool),
+    /// a key the runner reads went down (`true`) or came up
+    Key(u16, bool),
+    /// a short action has ended
+    Short(Short, Tried),
     /// something of the runner's own does not work; it goes on without it
     Problem(String),
     Polled { panel: String, id: String, value: String },
@@ -75,6 +77,34 @@ struct Job {
     /// hand the tool's `LIVE ` lines on
     live: bool,
 }
+
+/// A short action of a key: it runs beside the tries and is only recorded.
+struct Short {
+    seq: u64,
+    panel: String,
+    button: String,
+    unit: String,
+    key: u16,
+    t_tap: f64,
+}
+
+/// A follow-up the tool asked for with its exit status: one button, for a while, that runs
+/// the same action with the same values and some arguments added.
+struct Offer {
+    panel: String,
+    button: String,
+    /// the try that is answered, and its exit status
+    seq: u64,
+    code: i32,
+    /// the values of that try: what the follow-up runs with, whatever the page says by then
+    values: Json,
+    /// the tool's last line: why it wants to be asked again
+    why: String,
+    until: Instant,
+}
+
+/// How long a follow-up is offered.
+const OFFER_TIME: Duration = Duration::from_secs(30);
 
 /// How a try ended.
 struct Tried {
@@ -113,6 +143,8 @@ struct Running {
     stopped: bool,
     /// the key that started it and holds it, by its code
     key: Option<u16>,
+    /// the try whose offer this one took up
+    parent: Option<u64>,
 }
 
 /// The all-off in flight.
@@ -159,6 +191,7 @@ struct Runner {
     tries: Sender<Job>,
     stops: Sender<StopJob>,
     polls: Sender<PollJob>,
+    shorts: Sender<(Short, Command)>,
 
     panels: BTreeMap<String, Panel>,
     /// the files that were left out, and why
@@ -181,6 +214,8 @@ struct Runner {
     stopping: Option<Stopping>,
     locks: HashMap<String, Lock>,
     asking: Option<Asking>,
+    /// the follow-up on offer
+    offer: Option<Offer>,
     /// what results, readouts and the Stop line show now: (panel, item id) to text
     live: HashMap<(String, String), String>,
     /// the last try of each panel, for its state file
@@ -351,7 +386,7 @@ fn stops_thread(jobs: Receiver<StopJob>, events: Sender<Event>) {
 
 /// Reads the key's input device: a plain read of the kernel's events, no grab, so the
 /// compositor sees the key as before. It sleeps in the read until a key of the device moves.
-fn key_thread(device: PathBuf, code: u16, events: Sender<Event>) {
+fn key_thread(device: PathBuf, codes: Vec<u16>, events: Sender<Event>) {
     loop {
         let problem = match std::fs::File::open(&device) {
             Ok(mut file) => loop {
@@ -364,14 +399,24 @@ fn key_thread(device: PathBuf, code: u16, events: Sender<Event>) {
                 let key = u16::from_ne_bytes([event[18], event[19]]);
                 let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
                 // EV_KEY; 1 is down, 0 is up, 2 is the kernel's repeat and says nothing new
-                if kind == 1 && key == code && (value == 0 || value == 1) {
-                    let _ = events.send(Event::Key(value == 1));
+                if kind == 1 && codes.contains(&key) && (value == 0 || value == 1) {
+                    let _ = events.send(Event::Key(key, value == 1));
                 }
             },
             Err(e) => e,
         };
         let _ = events.send(Event::Problem(format!("the key device {}: {problem}", device.display())));
         std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// Runs the short actions of keys, one after the other, beside whatever try runs.
+fn shorts_thread(jobs: Receiver<(Short, Command)>, events: Sender<Event>) {
+    for (short, command) in jobs {
+        let t_start = records::now();
+        let ran = exec::run_to_end(command);
+        let result = if ran.rc == 0 { String::new() } else { exec::unit_result(&short.unit) };
+        let _ = events.send(Event::Short(short, Tried { ran, result, checks: Vec::new(), t_start, t_end: records::now() }));
     }
 }
 
@@ -416,6 +461,7 @@ pub fn run(options: Options) -> i32 {
     let (tries, tries_jobs) = channel();
     let (stops, stops_jobs) = channel();
     let (polls, polls_jobs) = channel();
+    let (shorts, shorts_jobs) = channel();
     let spawn = |name: &str, body: Box<dyn FnOnce() + Send>| std::thread::Builder::new().name(name.into()).spawn(body).map(|_| ());
     let started = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(&options.state_dir)?;
@@ -429,10 +475,12 @@ pub fn run(options: Options) -> i32 {
         spawn("tb-panel-stop", Box::new(move || stops_thread(stops_jobs, to)))?;
         let to = events.clone();
         spawn("tb-panel-poll", Box::new(move || polls_thread(polls_jobs, to)))?;
-        if let Some((device, code)) = options.key.clone() {
+        if let Some((device, codes)) = options.key.clone() {
             let to = events.clone();
-            spawn("tb-panel-key", Box::new(move || key_thread(device, code, to)))?;
+            spawn("tb-panel-key", Box::new(move || key_thread(device, codes, to)))?;
         }
+        let to = events.clone();
+        spawn("tb-panel-short", Box::new(move || shorts_thread(shorts_jobs, to)))?;
         let to = events.clone();
         spawn("tb-panel-ask", Box::new(move || ask::serve(listener, |asked| drop(to.send(Event::Asked(asked))))))?;
         Ok(())
@@ -449,6 +497,7 @@ pub fn run(options: Options) -> i32 {
         tries,
         stops,
         polls,
+        shorts,
         panels: BTreeMap::new(),
         refused: Vec::new(),
         conn: None,
@@ -462,6 +511,7 @@ pub fn run(options: Options) -> i32 {
         stopping: None,
         locks: HashMap::new(),
         asking: None,
+        offer: None,
         live: HashMap::new(),
         last: HashMap::new(),
         readouts: Vec::new(),
@@ -539,15 +589,21 @@ impl Runner {
         // one key runs one action: panels that bind the same code are all left out
         let mut bound: HashMap<u16, Vec<String>> = HashMap::new();
         for panel in self.panels.values() {
-            if let Some((code, _)) = &panel.key {
+            for (code, _) in &panel.keys {
                 bound.entry(*code).or_default().push(panel.name.clone());
             }
         }
+        let mut clash: BTreeMap<String, Vec<u16>> = BTreeMap::new();
         for (code, names) in bound.into_iter().filter(|(_, names)| names.len() > 1) {
-            for name in &names {
-                self.panels.remove(name);
-                self.refused.push((format!("{name}.json"), format!("key {code} is bound by more than one panel: {}", names.join(", "))));
+            for name in names {
+                clash.entry(name).or_default().push(code);
             }
+        }
+        for (name, mut codes) in clash {
+            codes.sort();
+            let codes: Vec<String> = codes.iter().map(u16::to_string).collect();
+            self.panels.remove(&name);
+            self.refused.push((format!("{name}.json"), format!("key {} bound by another panel too", codes.join(", "))));
         }
         // a lock outlives the runner that set it (within a boot: the state directory is in /run)
         for name in self.panels.keys() {
@@ -588,12 +644,12 @@ impl Runner {
             .map(|p| Json::obj([("name", p.name.as_str().into()), ("title", p.title.as_str().into()), ("locked", self.locks.get(&p.name).map(|l| l.reason.clone()).into())]))
             .collect();
         // the bound keys, and whether the runner reads the one that is bound
-        let read = self.options.key.as_ref().map(|(_, code)| *code);
+        let read: &[u16] = self.options.key.as_ref().map_or(&[], |(_, codes)| codes);
         let keys: Vec<Json> = self
             .panels
             .values()
-            .filter_map(|p| p.key.as_ref().map(|(code, button)| (p, *code, button)))
-            .map(|(p, code, button)| Json::obj([("code", (code as u64).into()), ("panel", p.name.as_str().into()), ("button", button.as_str().into()), ("read", (read == Some(code)).into())]))
+            .flat_map(|p| p.keys.iter().map(move |(code, button)| (p, *code, button)))
+            .map(|(p, code, button)| Json::obj([("code", (code as u64).into()), ("panel", p.name.as_str().into()), ("button", button.as_str().into()), ("read", read.contains(&code).into())]))
             .collect();
         let refused: Vec<Json> = self.refused.iter().map(|(file, why)| Json::obj([("file", file.as_str().into()), ("error", why.as_str().into())])).collect();
         let running = match &self.running {
@@ -648,7 +704,7 @@ impl Runner {
     /// A `try` record, which is also the panel's state: at the start of a try (`rc` null)
     /// and at its end.
     #[allow(clippy::too_many_arguments)]
-    fn record_try(&mut self, seq: u64, panel: &str, button: &str, values: &Json, unit: Option<&str>, tried: Option<&Tried>, t_tap: f64, stopped: bool, key: Option<u16>) {
+    fn record_try(&mut self, seq: u64, panel: &str, button: &str, values: &Json, unit: Option<&str>, tried: Option<&Tried>, t_tap: f64, stopped: bool, extra: &[(&str, Json)]) {
         let mut line = Json::obj([
             ("t", "try".into()),
             ("seq", seq.into()),
@@ -665,8 +721,8 @@ impl Runner {
             ("t_end", Json::Null),
             ("stopped", stopped.into()),
         ]);
-        if let Some(code) = key {
-            line.set("key", (code as u64).into());
+        for (name, value) in extra {
+            line.set(name, value.clone());
         }
         if let Some(tried) = tried {
             line.set("rc", tried.ran.rc.into());
@@ -762,7 +818,13 @@ impl Runner {
         let asking = self.asking.as_ref().filter(|a| a.panel == panel.name);
         // the answer row goes under the try's result, or under its button when it has none
         let ask_after = asking.and_then(|a| match &panel.button(&a.button)?.does {
-            Does::Action(action) => Some((action.result.clone().unwrap_or_else(|| a.button.clone()), &action.ask)),
+            Does::Action(action) => Some((action.result.clone().unwrap_or_else(|| a.button.clone()), &action.ask, &action.ask_text)),
+            _ => None,
+        });
+        // a follow-up on offer: its button, with its action's row dimmed under it
+        let offer = self.offer.as_ref().filter(|o| o.panel == panel.name && locked.is_none());
+        let offered = offer.and_then(|o| match &panel.button(&o.button)?.does {
+            Does::Action(action) => action.retry.iter().find(|(code, _)| *code == o.code).map(|(_, retry)| (o, action, retry)),
             _ => None,
         });
         let mut items = Vec::new();
@@ -772,9 +834,34 @@ impl Runner {
                 Item::Row { id, buttons } => {
                     // a locked panel has no action buttons
                     let kept: Vec<&panel::Button> = buttons.iter().filter(|b| locked.is_none() || !matches!(b.does, Does::Action(_))).collect();
-                    is_ask_place = ask_after.as_ref().is_some_and(|(after, _)| buttons.iter().any(|b| b.id == *after));
-                    if !kept.is_empty() {
-                        items.push(panel::row_json(id, kept.into_iter()));
+                    is_ask_place = ask_after.as_ref().is_some_and(|(after, ..)| buttons.iter().any(|b| b.id == *after));
+                    match &offered {
+                        Some((offer, action, retry)) if buttons.iter().any(|b| b.id == offer.button) => {
+                            // what the tool said, then the one button that answers it, first
+                            // and primary, saying the values it will run with
+                            let with: Vec<String> = action.value_ids().iter().map(|id| format!("{id} {}", offer.values.get(id).map_or(String::new(), |v| v.as_str().map_or_else(|| v.to_string(), str::to_string)))).collect();
+                            let label = if with.is_empty() { retry.text.clone() } else { format!("{} · {}", retry.text, with.join(", ")) };
+                            items.push(text_item("_offer_why", &offer.why));
+                            items.push(Json::obj([("kind", "button".into()), ("id", "_offer".into()), ("text", shown(&label).into()), ("style", "primary".into()), ("confirm", retry.confirm.into())]));
+                            // the row's own buttons stay live, but they are not the answer
+                            let dimmed = kept.iter().map(|b| {
+                                let mut button = b.json.clone();
+                                if matches!(b.does, Does::Action(_)) {
+                                    button.set("dim", true.into());
+                                    button.set("style", "secondary".into());
+                                }
+                                button
+                            });
+                            let mut row = Json::obj([("kind", "row".into())]);
+                            if !id.is_empty() {
+                                row.set("id", id.as_str().into());
+                            }
+                            row.set("buttons", Json::Arr(dimmed.collect()));
+                            items.push(row);
+                            items.push(text_item("_offer_or", &format!("or use '{}' above", retry.text)));
+                        }
+                        _ if !kept.is_empty() => items.push(panel::row_json(id, kept.into_iter())),
+                        _ => {}
                     }
                 }
                 Item::Readout { id, .. } | Item::Plain { id, .. } => {
@@ -782,12 +869,15 @@ impl Runner {
                     if let Some(text) = self.live(&panel.name, id) {
                         json.set(if matches!(item, Item::Readout { .. }) { "value" } else { "text" }, text.as_str().into());
                     }
-                    is_ask_place = ask_after.as_ref().is_some_and(|(after, _)| after == id);
+                    is_ask_place = ask_after.as_ref().is_some_and(|(after, ..)| after == id);
                     items.push(json);
                 }
                 Item::Input { .. } => items.push(item.json(keep_user)),
             }
-            if let (true, Some((_, words))) = (is_ask_place, &ask_after) {
+            if let (true, Some((_, words, question))) = (is_ask_place, &ask_after) {
+                if let Some(question) = question {
+                    items.push(text_item("_ask_text", question));
+                }
                 let buttons = words.iter().enumerate().map(|(i, word)| Json::obj([("id", format!("_ans_{i}").into()), ("text", word.as_str().into())]));
                 items.push(Json::obj([("kind", "row".into()), ("id", "_ask".into()), ("buttons", Json::Arr(buttons.collect()))]));
             }
@@ -983,6 +1073,7 @@ impl Runner {
             }
             (Page::Panel(panel), "_stop") => self.stop(&panel),
             (Page::Panel(panel), "_unlock") => self.unlock(&panel),
+            (Page::Panel(panel), "_offer") => self.take_offer(&panel, &values),
             (Page::Panel(panel), id) => match id.strip_prefix("_ans_").and_then(|n| n.parse().ok()) {
                 Some(word) => self.answer_try(&panel, word),
                 None => self.press(&panel, id, values),
@@ -1007,7 +1098,7 @@ impl Runner {
             Does::Nothing => {
                 // nothing to run: the tap is a record, and the row takes presses again
                 self.seq += 1;
-                self.record_try(self.seq, panel_name, button_id, &values, None, None, t_tap, false, None);
+                self.record_try(self.seq, panel_name, button_id, &values, None, None, t_tap, false, &[]);
                 let line = self.last.get(panel_name).cloned().unwrap_or(Json::Null);
                 self.record(panel_name, &line);
                 return self.update(&[], &[button_id], None);
@@ -1016,7 +1107,7 @@ impl Runner {
         };
         let result = action.result.clone();
         // a tap that starts no try says why where the result goes, and its row is armed
-        if let Err(why) = self.start(panel_name, button_id, &values, t_tap, None) {
+        if let Err(why) = self.start(panel_name, button_id, &values, t_tap, None, &[], None) {
             match &result {
                 Some(result) => self.show_result(panel_name, result, why, Some(button_id)),
                 None => self.update(&[], &[button_id], None),
@@ -1025,7 +1116,13 @@ impl Runner {
     }
 
     /// Starts the try of an action button, for a tap or for a key. `Err`: why nothing runs.
-    fn start(&mut self, panel_name: &str, button_id: &str, values: &Json, t_tap: f64, key: Option<u16>) -> Result<(), &'static str> {
+    /// `add`: arguments after the action's own, and `parent`: the try whose offer this is.
+    #[allow(clippy::too_many_arguments)]
+    fn start(&mut self, panel_name: &str, button_id: &str, values: &Json, t_tap: f64, key: Option<u16>, add: &[String], parent: Option<u64>) -> Result<(), &'static str> {
+        // another action than the one on offer ends the offer
+        if self.offer.as_ref().is_some_and(|offer| parent != Some(offer.seq)) {
+            self.expire_offer("another action");
+        }
         let panel = self.panels.get(panel_name).ok_or("no such panel")?;
         let Some(Does::Action(action)) = panel.button(button_id).map(|b| &b.does) else {
             return Err("no such action");
@@ -1036,7 +1133,8 @@ impl Runner {
         if self.running.is_some() || self.stopping.is_some() {
             return Err("busy");
         }
-        let argv = action.fill(panel, values).ok_or("refused: stale value")?;
+        let mut argv = action.fill(panel, values).ok_or("refused: stale value")?;
+        argv.extend_from_slice(add);
         let result = action.result.clone();
         self.seq += 1;
         let unit = format!("tb-panel-{panel_name}-{}", self.seq);
@@ -1047,8 +1145,8 @@ impl Runner {
         let live = action.live.is_some();
         // a try that starts ends the wait for an answer to the one before it
         let had_answer_row = self.asking.take().is_some_and(|a| a.panel == panel_name);
-        self.running = Some(Running { seq: self.seq, panel: panel_name.to_string(), button: button_id.to_string(), unit: unit.clone(), values: values.clone(), t_tap, stopped: false, key });
-        self.record_try(self.seq, panel_name, button_id, values, Some(&unit), None, t_tap, false, key);
+        self.running = Some(Running { seq: self.seq, panel: panel_name.to_string(), button: button_id.to_string(), unit: unit.clone(), values: values.clone(), t_tap, stopped: false, key, parent });
+        self.record_try(self.seq, panel_name, button_id, values, Some(&unit), None, t_tap, false, &Self::try_extra(key, parent));
         self.write_state();
         if self.tries.send(Job { unit, command, checks, live }).is_err() {
             self.error = Some("the try worker is gone".into());
@@ -1063,26 +1161,115 @@ impl Runner {
         Ok(())
     }
 
-    /// The bound key went down: its action runs, whatever page is on screen. It does not
-    /// take the screen.
-    fn key_down(&mut self) {
-        let Some((_, code)) = self.options.key else {
+    /// What a try's record says beyond the usual: the key that started it, the try it follows.
+    fn try_extra(key: Option<u16>, parent: Option<u64>) -> Vec<(&'static str, Json)> {
+        let mut extra = Vec::new();
+        if let Some(code) = key {
+            extra.push(("key", (code as u64).into()));
+        }
+        if let Some(seq) = parent {
+            extra.push(("parent", seq.into()));
+        }
+        extra
+    }
+
+    /// The offer is over: recorded, and off the page.
+    fn expire_offer(&mut self, why: &str) {
+        let Some(offer) = self.offer.take() else {
             return;
         };
-        let bound = self.panels.values().find_map(|p| p.key.as_ref().filter(|(c, _)| *c == code).map(|(_, button)| (p.name.clone(), button.clone())));
+        self.record(&offer.panel, &Json::obj([("t", "expired".into()), ("seq", offer.seq.into()), ("why", why.into()), ("t_expired", records::now().into())]));
+        if self.page == Page::Panel(offer.panel) {
+            self.show(true);
+        }
+    }
+
+    /// The offer's button: the same action again with the values of the try it answers and
+    /// the offer's arguments added. If the page's values are no longer those, nothing runs:
+    /// what would run is not what is on the page.
+    fn take_offer(&mut self, panel_name: &str, now: &Json) {
+        let Some(offer) = self.offer.as_ref().filter(|o| o.panel == panel_name) else {
+            return;
+        };
+        let (button, seq, code, values) = (offer.button.clone(), offer.seq, offer.code, offer.values.clone());
+        let Some(Does::Action(action)) = self.panels.get(panel_name).and_then(|p| p.button(&button)).map(|b| &b.does) else {
+            return self.expire_offer("the panel changed");
+        };
+        let Some((_, retry)) = action.retry.iter().find(|(c, _)| *c == code) else {
+            return self.expire_offer("the panel changed");
+        };
+        let (add, result) = (retry.add.clone(), action.result.clone());
+        if action.value_ids().iter().any(|id| now.get(id) != values.get(id)) {
+            self.expire_offer("a value changed");
+            if let Some(result) = &result {
+                self.show_result(panel_name, result, "offer expired: a value changed", None);
+            }
+            return;
+        }
+        let started = self.start(panel_name, &button, &values, records::now(), None, &add, Some(seq));
+        // taken or not, the offer is spent; the page loses its button
+        self.offer = None;
+        if let (Err(why), Some(result)) = (started, &result) {
+            self.live.insert((panel_name.to_string(), result.clone()), why.to_string());
+        }
+        self.show(true);
+    }
+
+    /// A key the runner reads went down: its action runs, whatever page is on screen. It
+    /// does not take the screen.
+    fn key_down(&mut self, code: u16) {
+        let bound = self.panels.values().find_map(|p| p.keys.iter().find(|(c, _)| *c == code).map(|(_, button)| (p.name.clone(), button.clone())));
         let Some((panel, button)) = bound else {
             return;
         };
         let t = records::now();
-        if let Err(why) = self.start(&panel, &button, &Json::Obj(Vec::new()), t, Some(code)) {
+        let short = matches!(self.panels.get(&panel).and_then(|p| p.button(&button)).map(|b| &b.does), Some(Does::Action(action)) if action.short);
+        let started = if short { self.start_short(&panel, &button, code, t) } else { self.start(&panel, &button, &Json::Obj(Vec::new()), t, Some(code), &[], None) };
+        if let Err(why) = started {
             self.record(&panel, &Json::obj([("t", "dropped".into()), ("key", (code as u64).into()), ("button", button.as_str().into()), ("why", why.into()), ("t_seen", t.into())]));
+        }
+    }
+
+    /// A short action: beside the tries, with no part in one-at-a-time, no lock of its own
+    /// and no end at key up. It runs on a locked panel too, since it is not a try.
+    fn start_short(&mut self, panel_name: &str, button_id: &str, key: u16, t_tap: f64) -> Result<(), &'static str> {
+        let panel = self.panels.get(panel_name).ok_or("no such panel")?;
+        let Some(Does::Action(action)) = panel.button(button_id).map(|b| &b.does) else {
+            return Err("no such action");
+        };
+        let argv = action.fill(panel, &Json::Obj(Vec::new())).ok_or("refused: stale value")?;
+        self.seq += 1;
+        let unit = format!("tb-panel-{panel_name}-{}", self.seq);
+        let uid = if action.as_root { None } else { self.user.map(|(uid, _)| uid) };
+        let command = exec::systemd_run(&Unit { name: &unit, argv: &argv, timeout_s: action.timeout_s, stop_post: &action.stop_post, uid });
+        let short = Short { seq: self.seq, panel: panel_name.to_string(), button: button_id.to_string(), unit, key, t_tap };
+        self.write_state();
+        self.shorts.send((short, command)).map_err(|_| "the worker for short actions is gone")
+    }
+
+    /// A short action has ended: a record, and its result where the action names one.
+    fn short_done(&mut self, short: Short, tried: Tried) {
+        let result = match self.panels.get(&short.panel).and_then(|p| p.button(&short.button)).map(|b| &b.does) {
+            Some(Does::Action(action)) => action.result.clone(),
+            _ => None,
+        };
+        // the panel's last try stays its state: a short action is a record only
+        let before = self.last.get(&short.panel).cloned();
+        let extra = [("key", Json::from(short.key as u64)), ("short", Json::Bool(true))];
+        self.record_try(short.seq, &short.panel, &short.button, &Json::Obj(Vec::new()), Some(&short.unit), Some(&tried), short.t_tap, false, &extra);
+        if let Some(before) = before {
+            self.last.insert(short.panel.clone(), before);
+            self.write_panel_state(&short.panel);
+        }
+        if let Some(result) = &result {
+            self.show_result(&short.panel, result, &result_text(&tried.ran), None);
         }
     }
 
     /// The key came up: the tool it holds is asked to end (SIGTERM). The try then ends as
     /// any other, with the tool's result.
-    fn key_up(&mut self) {
-        if let Some(run) = self.running.as_ref().filter(|run| run.key.is_some() && !run.stopped) {
+    fn key_up(&mut self, code: u16) {
+        if let Some(run) = self.running.as_ref().filter(|run| run.key == Some(code) && !run.stopped) {
             let _ = self.stops.send(StopJob::Term(run.unit.clone()));
         }
     }
@@ -1107,9 +1294,9 @@ impl Runner {
         let Some(run) = self.running.take() else {
             return;
         };
-        let (result, asks, exit_3) = match self.panels.get(&run.panel).and_then(|p| p.button(&run.button)).map(|b| &b.does) {
-            Some(Does::Action(action)) => (action.result.clone(), !action.ask.is_empty(), tried.ran.rc == 3),
-            _ => (None, false, false),
+        let (result, asks, exit_3, offers) = match self.panels.get(&run.panel).and_then(|p| p.button(&run.button)).map(|b| &b.does) {
+            Some(Does::Action(action)) => (action.result.clone(), !action.ask.is_empty(), tried.ran.rc == 3, action.retry.iter().any(|(code, _)| *code == tried.ran.rc)),
+            _ => (None, false, false, false),
         };
         let failed: Vec<&str> = tried.checks.iter().filter(|(_, rc)| *rc != 0).map(|(name, _)| name.as_str()).collect();
         let timed_out = tried.result == "timeout";
@@ -1133,13 +1320,26 @@ impl Runner {
         if !failed.is_empty() {
             text.push_str(&format!(" · failed checks: {}", failed.join(", ")));
         }
-        self.record_try(run.seq, &run.panel, &run.button, &run.values, Some(&run.unit), Some(&tried), run.t_tap, run.stopped, run.key);
+        self.record_try(run.seq, &run.panel, &run.button, &run.values, Some(&run.unit), Some(&tried), run.t_tap, run.stopped, &Self::try_extra(run.key, run.parent));
         if let Some(reason) = lock {
             self.locks.insert(run.panel.clone(), Lock { reason, seq: run.seq, t: records::now() });
             self.write_panel_state(&run.panel);
         }
-        if asks && !run.stopped {
+        // a try the tool did not carry out ("ask me again") is not one to ask about
+        if asks && !offers && !run.stopped {
             self.asking = Some(Asking { panel: run.panel.clone(), button: run.button.clone(), seq: run.seq });
+        }
+        // the tool answered "only if you mean it": the follow-up is on offer for a while
+        if offers && !run.stopped && !self.locks.contains_key(&run.panel) {
+            self.offer = Some(Offer {
+                panel: run.panel.clone(),
+                button: run.button.clone(),
+                seq: run.seq,
+                code: tried.ran.rc,
+                values: run.values.clone(),
+                why: shown(&tried.ran.line),
+                until: Instant::now() + OFFER_TIME,
+            });
         }
         self.write_state();
         // a tool that could not set things back gets the all-off at once
@@ -1147,7 +1347,7 @@ impl Runner {
             self.stop(&run.panel);
         }
         let on_page = self.page == Page::Panel(run.panel.clone());
-        let changes_page = self.locks.contains_key(&run.panel) || self.asking.is_some();
+        let changes_page = self.locks.contains_key(&run.panel) || self.asking.is_some() || self.offer.is_some();
         match &result {
             Some(result) if on_page && !changes_page => self.show_result(&run.panel, result, &text, Some(&run.button)),
             Some(result) => {
@@ -1214,7 +1414,7 @@ impl Runner {
         let tried = Tried { ran, result: String::new(), checks: Vec::new(), t_start: stop.t_tap, t_end: records::now() };
         // the last try of the panel stays its state; the stop is a record of its own
         let before = self.last.get(&stop.panel).cloned();
-        self.record_try(stop.seq, &stop.panel, "_stop", &Json::Obj(Vec::new()), Some(&stop.unit), Some(&tried), stop.t_tap, false, None);
+        self.record_try(stop.seq, &stop.panel, "_stop", &Json::Obj(Vec::new()), Some(&stop.unit), Some(&tried), stop.t_tap, false, &[]);
         if let Some(before) = before {
             self.last.insert(stop.panel.clone(), before);
             self.write_panel_state(&stop.panel);
@@ -1398,12 +1598,22 @@ impl Runner {
         loop {
             // with the surface there and readouts on the page, wake for the next one
             let due = if self.conn.is_some() { self.readouts.iter().map(|r| r.due).min() } else { None };
+            // and for the end of an offer
+            let due = match (due, self.offer.as_ref().map(|offer| offer.until)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let event = match due {
                 None => inbox.recv().ok(),
                 Some(due) => match inbox.recv_timeout(due.saturating_duration_since(Instant::now())) {
                     Ok(event) => Some(event),
                     Err(RecvTimeoutError::Timeout) => {
-                        self.poll();
+                        if self.offer.as_ref().is_some_and(|offer| offer.until <= Instant::now()) {
+                            self.expire_offer("30 s");
+                        }
+                        if self.conn.is_some() {
+                            self.poll();
+                        }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => None,
@@ -1443,8 +1653,9 @@ impl Runner {
                 }
                 Some(Event::Tap(tap)) => self.tap(&tap),
                 Some(Event::Live(text)) => self.live_line(&text),
-                Some(Event::Key(true)) => self.key_down(),
-                Some(Event::Key(false)) => self.key_up(),
+                Some(Event::Key(code, true)) => self.key_down(code),
+                Some(Event::Key(code, false)) => self.key_up(code),
+                Some(Event::Short(short, tried)) => self.short_done(short, tried),
                 Some(Event::Problem(what)) => {
                     eprintln!("tb-panel: {what}");
                     self.error = Some(what);
