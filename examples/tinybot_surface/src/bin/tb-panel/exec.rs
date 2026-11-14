@@ -191,8 +191,25 @@ fn unit_quoted(arg: &str) -> String {
 
 /// A unit command line for an argv. The `:` in front tells systemd to leave `$` alone, so
 /// the program gets exactly these arguments.
-pub fn unit_command(argv: &[String]) -> String {
+fn unit_command(argv: &[String]) -> String {
     format!(":{}", argv.iter().map(|arg| unit_quoted(arg)).collect::<Vec<_>>().join(" "))
+}
+
+/// systemd's own tool that runs a program with its output sent to the journal.
+const SYSTEMD_CAT: &str = "/usr/bin/systemd-cat";
+
+/// The ExecStopPost line for an all-off. With `--pipe` everything the unit runs writes to
+/// the try's stdout, the all-off after the tool: its last line would be taken for the
+/// tool's result. So the all-off runs under systemd-cat, which sends its output to the
+/// journal instead. Where systemd-cat is not installed the all-off runs bare: that it runs
+/// matters more than what the result line reads.
+fn stop_post_line(unit: &str, argv: &[String]) -> String {
+    if !std::path::Path::new(SYSTEMD_CAT).exists() {
+        return unit_command(argv);
+    }
+    let mut wrapped = vec![SYSTEMD_CAT.to_string(), "-t".to_string(), unit.to_string()];
+    wrapped.extend_from_slice(argv);
+    unit_command(&wrapped)
 }
 
 /// What a transient unit is asked to run.
@@ -214,7 +231,7 @@ pub fn systemd_run(unit: &Unit) -> Command {
     command.arg(format!("--unit={}", unit.name)).args(["--wait", "--pipe", "--quiet", "--expand-environment=no"]);
     command.args(["-p", &format!("RuntimeMaxSec={}", unit.timeout_s), "-p", "TimeoutStopSec=2"]);
     if !unit.stop_post.is_empty() {
-        command.args(["-p", &format!("ExecStopPost={}", unit_command(unit.stop_post))]);
+        command.args(["-p", &format!("ExecStopPost={}", stop_post_line(unit.name, unit.stop_post))]);
     }
     if let Some(uid) = unit.uid {
         command.arg(format!("--uid={uid}"));

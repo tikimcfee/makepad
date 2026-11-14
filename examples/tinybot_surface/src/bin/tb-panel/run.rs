@@ -630,6 +630,10 @@ impl Runner {
                 None if !panel.summary.is_empty() => items.push(text_item(&format!("_about_{}", panel.name), &panel.summary)),
                 None => {}
             }
+            // the all-off of a panel is seen to have run from here too
+            if let Some(stop) = self.live(&panel.name, "_stop_res").filter(|text| !text.is_empty()) {
+                items.push(text_item(&format!("_stopped_{}", panel.name), &format!("last Stop: {stop}")));
+            }
         }
         if self.panels.is_empty() {
             items.push(text_item("_none", "no panels"));
@@ -1054,6 +1058,9 @@ impl Runner {
         self.show_stop(&stop.panel, &text);
         if let Some(result) = &stop.result {
             self.show_result(&stop.panel, result, &format!("stopped · {text}"), None);
+        }
+        if self.page == Page::Home {
+            self.show(true);
         }
     }
 
