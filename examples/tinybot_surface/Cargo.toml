@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "tinybot's live surface (not for upstream): an app that shows text, toggles and button rows an agent describes over a local Unix socket, and keeps the taps for the agent's next call"
 
+[features]
+# Test builds only, never for the phone: a peer that is root of a user namespace
+# (`unshare -r`) counts as root, so privileged surfaces can be tried without root.
+test-userns-root = []
+
 [dependencies]
 makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }
 

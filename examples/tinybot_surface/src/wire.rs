@@ -106,6 +106,8 @@ pub struct Change {
 pub struct Update {
     pub surface: String,
     pub rev: u64,
+    /// a new header line
+    pub title: Option<String>,
     pub changes: Vec<Change>,
     pub arm: Vec<String>,
 }
@@ -147,6 +149,8 @@ pub struct Tap {
     pub rev: u64,
     pub id: String,
     pub values: Vec<(String, Value)>,
+    /// the tap's surface was set by root: only root's peers are given it
+    pub privileged: bool,
 }
 
 pub fn parse_request(line: &str) -> Result<Request, WireErr> {
@@ -256,6 +260,13 @@ fn surface_and_rev(value: &JsonValue) -> Result<(String, u64), WireErr> {
 
 fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
     let (surface, rev) = surface_and_rev(value)?;
+    let title = match value.key("title") {
+        None => None,
+        Some(title) => match title.as_str() {
+            Some(title) => Some(title.to_string()),
+            None => return err("bad_request", "update: title is not a string"),
+        },
+    };
     let mut changes = Vec::new();
     if let Some(items) = value.key("items") {
         let Some(items) = items.as_object() else {
@@ -281,7 +292,7 @@ fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
             }
         }
     }
-    Ok(Update { surface, rev, changes, arm })
+    Ok(Update { surface, rev, title, changes, arm })
 }
 
 fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
