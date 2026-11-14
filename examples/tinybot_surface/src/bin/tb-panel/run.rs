@@ -281,9 +281,23 @@ fn read_small(path: &str) -> String {
 /// gone, backing off to 5 s; while it is gone nothing else of the runner runs on a timer.
 fn taps_thread(socket: Option<String>, events: Sender<Event>) {
     let mut pause = Duration::from_millis(200);
+    let mut said = String::new();
     loop {
-        if attach(&socket, &events).is_ok() {
-            pause = Duration::from_millis(200);
+        match attach(&socket, &events) {
+            Ok(()) => {
+                pause = Duration::from_millis(200);
+                said.clear();
+            }
+            // Why the surface cannot be used is said once, in the state file: a socket that
+            // is not there yet is only waiting, but a surface that refuses this process as
+            // the runner (it is not root) would otherwise wait for ever without a word.
+            Err(e) => {
+                let why = e.to_string();
+                if why != said && why != "no surface socket" && e.kind() != std::io::ErrorKind::NotFound && e.kind() != std::io::ErrorKind::ConnectionRefused {
+                    let _ = events.send(Event::Problem(format!("the surface: {why}")));
+                }
+                said = why;
+            }
         }
         std::thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_secs(5));
@@ -1626,6 +1640,10 @@ impl Runner {
                     self.agent = None;
                     self.agent_front = false;
                     self.layers(&layers);
+                    // whatever kept the surface away before is over
+                    if self.error.as_ref().is_some_and(|e| e.starts_with("the surface: ")) {
+                        self.error = None;
+                    }
                     self.conn = Some(conn);
                     self.taps = Some(taps);
                     self.user = user;
