@@ -235,6 +235,13 @@ impl Panel {
             }
         }
         for (_, button) in &self.keys {
+            // the panel's Stop can have a key too: the same all-off as its button
+            if button == "_stop" {
+                if self.stop.is_none() {
+                    return Err("key: _stop is bound, but the panel has no stop".into());
+                }
+                continue;
+            }
             // a key press is no tap and has no values
             match self.button(button).map(|b| &b.does) {
                 Some(Does::Action(action)) if action.argv.iter().flatten().all(|part| matches!(part, Part::Text(_))) => {}
