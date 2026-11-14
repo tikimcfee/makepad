@@ -29,12 +29,20 @@ fn other(msg: String) -> io::Error {
 }
 
 impl Conn {
-    /// Connects and reads the app's hello.
+    /// Connects, reads the app's hello and says that this is the runner: being root is not
+    /// enough for root's layer, the app gives it to the one root client that asks as the
+    /// runner. The hello that comes back is that of the runner's layer.
     pub fn connect(path: &PathBuf) -> io::Result<(Conn, Json)> {
         let mut conn = Conn { stream: UnixStream::connect(path)?, buf: Vec::new() };
+        let is_hello = |line: &Json| line.get("type").and_then(|t| t.as_str()) == Some("hello") && line.get("v").and_then(|v| v.as_u64()) == Some(VERSION);
         let hello = conn.read(Some(Duration::from_secs(5)))?;
-        if hello.get("type").and_then(|t| t.as_str()) != Some("hello") || hello.get("v").and_then(|v| v.as_u64()) != Some(VERSION) {
+        if !is_hello(&hello) {
             return Err(other(format!("unexpected greeting: {hello}")));
+        }
+        conn.send(&Json::obj([("type", "hello".into()), ("role", "runner".into())]))?;
+        let hello = conn.read(Some(Duration::from_secs(5)))?;
+        if !is_hello(&hello) {
+            return Err(other(format!("the surface does not take this process as the runner: {hello}")));
         }
         Ok((conn, hello))
     }
