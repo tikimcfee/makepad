@@ -3,7 +3,7 @@
 //! this one runner (root) shows Home, the panels and agents' questions on the surface, runs
 //! each try as a transient systemd unit and writes what happened to state files and records.
 //!
-//!   tb-panel run [--dirs DIR:DIR…] [--home]   serve the panels of the directories
+//!   tb-panel run [--dirs DIR:DIR…] [--home] [--key DEVICE:CODE]   serve the panels
 //!   tb-panel check FILE                       is FILE a panel the runner would take? 0 or 64
 //!   tb-panel show [NAME]                      a panel's state file, or the runner's own
 //!   tb-panel ask FILE                         queue a question; prints its qid
@@ -50,7 +50,7 @@ mod cli {
     use std::time::Duration;
 
     const USAGE: &str = "\
-usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH]
+usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH] [--key DEVICE:CODE]
        tb-panel check FILE
        tb-panel show [NAME]
        tb-panel ask FILE
@@ -58,6 +58,7 @@ usage: tb-panel run [--dirs DIR:DIR…] [--home] [--socket PATH]
 
 run    serves the panels of the directories (default /usr/share/tinybot/panels:/etc/tinybot/panels;
        a later directory wins for the same name) with a Home page; --home says so and changes nothing
+       --key /dev/input/event0:523 reads that key: held, it runs the action a panel binds to it
 check  reads FILE as the runner would: exit 0 when it is a valid panel, 64 with the reason when not
 show   prints the state file of the panel NAME, or the runner's own without a name
 ask    FILE is {\"from\":…,\"text\":…,\"covers\":[{\"path\":…,\"sha256\":…}],\"choices\":[…]}; prints the qid.
@@ -76,6 +77,7 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
         state_dir: PathBuf,
         tries_dir: PathBuf,
         panel_state: PathBuf,
+        key: Option<(PathBuf, u16)>,
         wait: Option<String>,
         timeout: Option<f64>,
     }
@@ -88,6 +90,7 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
             state_dir: "/run/tinybot/panel".into(),
             tries_dir: "/var/lib/tinybot/tries".into(),
             panel_state: "/sys/kernel/tinybot_panel/state".into(),
+            key: None,
             wait: None,
             timeout: None,
         };
@@ -103,6 +106,11 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
                 "--state-dir" => args.state_dir = take()?.into(),
                 "--tries-dir" => args.tries_dir = take()?.into(),
                 "--panel-state" => args.panel_state = take()?.into(),
+                "--key" => {
+                    let value = take()?;
+                    let key = value.rsplit_once(':').and_then(|(device, code)| Some((PathBuf::from(device), code.parse().ok()?)));
+                    args.key = Some(key.ok_or(format!("--key {value:?} is not DEVICE:CODE, an input device and a key code"))?);
+                }
                 "--wait" => args.wait = Some(take()?),
                 "--timeout" => {
                     let value = take()?;
@@ -253,6 +261,7 @@ for other places: --state-dir DIR (default /run/tinybot/panel), --tries-dir DIR 
                 state_dir: args.state_dir,
                 tries_dir: args.tries_dir,
                 panel_state: args.panel_state,
+                key: args.key,
             }),
             (["check", file], None) => check(file),
             (["show"], None) => show(&args, None),

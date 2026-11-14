@@ -34,6 +34,8 @@ struct Lines {
     current: Vec<u8>,
     last: String,
     state: Option<Json>,
+    /// the newest `LIVE ` line not yet handed on, without its prefix
+    live: Option<String>,
 }
 
 impl Lines {
@@ -56,6 +58,11 @@ impl Lines {
                 self.state = Some(state);
                 return;
             }
+        }
+        // progress for the page while the tool runs: never the result line
+        if let Some(live) = line.strip_prefix("LIVE ") {
+            self.live = Some(live.to_string());
+            return;
         }
         if !line.trim().is_empty() {
             self.last = line;
@@ -80,7 +87,17 @@ fn failed(what: &str, e: std::io::Error) -> Ran {
 
 /// Runs a command to its end and reads its stdout meanwhile. For `systemd-run --wait` and
 /// `systemctl`, whose time limits are systemd's.
-pub fn run_to_end(mut command: Command) -> Ran {
+pub fn run_to_end(command: Command) -> Ran {
+    run_live(command, |_| {})
+}
+
+/// The least time between two `LIVE` lines handed on: at most ten a second.
+const LIVE_APART: Duration = Duration::from_millis(100);
+
+/// `run_to_end`, with each `LIVE ` line of the stdout handed to `live` as it comes. A line
+/// that comes sooner than `LIVE_APART` after the one before waits, and a newer one takes
+/// its place: the page gets the newest text, never a backlog.
+pub fn run_live(mut command: Command, mut live: impl FnMut(String)) -> Ran {
     let what = command.get_program().to_string_lossy().into_owned();
     let mut child = match command.stdin(Stdio::null()).stdout(Stdio::piped()).spawn() {
         Ok(child) => child,
@@ -89,13 +106,29 @@ pub fn run_to_end(mut command: Command) -> Ran {
     let mut lines = Lines::default();
     if let Some(mut out) = child.stdout.take() {
         let mut piece = [0u8; 4096];
+        let mut handed_on: Option<Instant> = None;
         loop {
+            // a line that waits is handed on when its time has come, output or not
+            if lines.live.is_some() {
+                let wait = handed_on.map_or(Duration::ZERO, |at| LIVE_APART.saturating_sub(at.elapsed()));
+                let mut fd = PollFd { fd: out.as_raw_fd(), events: 1, revents: 0 };
+                if wait.is_zero() || unsafe { poll(&mut fd, 1, wait.as_millis() as i32 + 1) } == 0 {
+                    if let Some(text) = lines.live.take() {
+                        live(text);
+                        handed_on = Some(Instant::now());
+                    }
+                    continue;
+                }
+            }
             match out.read(&mut piece) {
                 Ok(0) => break,
                 Ok(n) => lines.take(&piece[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
+        }
+        if let Some(text) = lines.live.take() {
+            live(text);
         }
     }
     match child.wait() {
@@ -256,6 +289,14 @@ pub fn unit_result(name: &str) -> String {
     reset.args(["reset-failed", &unit]).stderr(Stdio::null());
     run_to_end(reset);
     result
+}
+
+/// SIGTERM to the unit's main process: the tool is asked to end by itself (the key of a
+/// held action was let go). `false` when there is no such unit (yet).
+pub fn systemctl_term(name: &str) -> bool {
+    let mut kill = Command::new("systemctl");
+    kill.args(["kill", "--kill-whom=main", "--signal=TERM", &format!("{name}.service")]).stderr(Stdio::null());
+    run_to_end(kill).rc == 0
 }
 
 pub fn systemctl_stop(name: &str) -> Ran {
