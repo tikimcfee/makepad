@@ -12,6 +12,10 @@ opens no network socket. It is tinybot's own app, not for upstream.
   `tb-surface` (Rust standard library only; nothing of Makepad is linked in).
 - `tb-surface.py`: the same command in Python (standard library only), for a
   host that has python3 and no build.
+- `src/bin/tb-panel/`: the panel runner, the package's third binary `tb-panel`
+  (Rust standard library only): [tb-panel](#tb-panel-panels-of-tries) below.
+- `systemd/`: example units for the app and the runner.
+- `check-release.sh`: fails on a binary built with the test feature.
 
 ## Run
 
@@ -129,24 +133,25 @@ One UTF-8 JSON object per line, in both directions. A request line is at most
 On connect the app sends
 
 ```json
-{"type":"hello","v":2,"surface":"deploy-42","rev":1,"pending":0}
+{"type":"hello","v":2,"surface":"deploy-42","rev":1,"privileged":false,"pending":0}
 ```
 
 `surface` is `null` and `rev` 0 when the idle line is shown; `pending` is the
-number of taps that wait.
+number of taps that wait for this client; `privileged` says whether the
+surface on screen is root's (see [The socket](#the-socket)).
 
 | Request | Answer |
 |---|---|
 | `{"type":"set","surface":…,"rev":…,"title":…,"items":[…]}` | `{"type":"ack","surface":…,"rev":…,"pending":N}` |
-| `{"type":"update","surface":S,"rev":R,"items":{ID:{"text":…,"value":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
+| `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
 | `{"type":"clear"}` | `{"type":"ack","surface":null,"rev":0,"pending":N}` |
-| `{"type":"status"}` | `{"type":"status","v":2,"surface":…,"rev":…,"title":…,"items":N,"pending":N,"waiting":N}` |
+| `{"type":"status"}` | `{"type":"status","v":2,"surface":…,"rev":…,"privileged":…,"title":…,"items":N,"pending":N,"waiting":N}` |
 | `{"type":"taps","wait":false}` | every waiting `tap` line, then `{"type":"taps","count":N,"seq":LAST}` |
 | `{"type":"taps","wait":true}` | the same; with no tap waiting, the answer comes when one arrives |
 | `{"type":"done","seq":LAST}` | `{"type":"ok","dropped":N,"pending":N}` |
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
-otherwise) and does not change the rev. `items` names items by id: `text`
+otherwise) and does not change the rev. `title` is a new header line. `items` names items by id: `text`
 for a heading, text or readout, `value` for a readout. `arm` names rows to
 unlock, each by the row's own id or the id of one of its buttons. Both are
 optional. One id that does not fit (`bad_item`) refuses the whole request
@@ -178,6 +183,7 @@ A refused request is answered with `{"type":"err","code":…,"msg":…}`:
 | `bad_set` | `surface`, `rev`, `title` or `items` of a `set` is missing or of the wrong type; `surface` or `rev` of an `update` is |
 | `bad_item` | an item or button is malformed, of an unknown `kind`, lacks a required `id`, or repeats an id; an `update` names an id it cannot change or arm |
 | `stale_rev` | a `set` for the surface on screen with a lower `rev`; an `update` for another surface or rev than the one on screen |
+| `privileged` | a `set`, `update` or `clear` from the user's client while root's surface is on screen |
 | `too_long` | a line over 64 KiB; the app then closes the connection |
 
 A `set` with the same `surface` and `rev` as on screen is accepted again
@@ -195,6 +201,12 @@ A `set` with the same `surface` and `rev` as on screen is accepted again
 - A socket file found at start is probed: when something answers, the app
   logs and exits 1 without touching it; a dead one is replaced. The file is
   removed on shutdown.
+- A surface set by root is privileged. While it is on screen, a `set`,
+  `update` or `clear` from a client of the app's user is refused
+  (`privileged`): no process of the user can put a look-alike page over the
+  runner's, or take the screen from it. The taps are two queues that never
+  mix: taps on root's surfaces are given only to root's clients, the other
+  taps only to the user's, for `taps`, `done` and every `pending` count.
 - After an app restart the screen is idle and the tap queue is empty; the
   agent sees `"surface":null` in `hello` or `status` and sends its `set` again.
 - The surface socket is the app's only socket. Makepad's own remote-control
@@ -220,6 +232,169 @@ which is where most of the app's memory at rest went on the phone.
 `TB_SURFACE_ARENA_MAX=N` chooses another limit (`0`: glibc's own choice); a
 `GLIBC_TUNABLES` that sets `glibc.malloc.arena_max`, or `MALLOC_ARENA_MAX`,
 is left to decide.
+
+## tb-panel: panels of tries
+
+Hardware tries as pages the user taps. A panel file describes a page and
+what its buttons run; one runner, root, shows Home, the panels and agents'
+questions on the surface, runs each try as a transient systemd unit and
+writes what happened to state files and records. The runner knows no device:
+it passes on what was chosen and typed, and every limit that protects
+hardware is the tool's.
+
+```sh
+tb-panel run [--dirs DIR:DIR…] [--home]   # default /usr/share/tinybot/panels:/etc/tinybot/panels
+tb-panel check FILE                       # 0: the runner would take it; 64 and the reason: not
+tb-panel show [NAME]                      # a panel's state file, or the runner's own
+tb-panel ask FILE                         # queue a question, prints its qid
+tb-panel ask --wait QID [--timeout S]     # prints the answer
+```
+
+### A panel file
+
+`NAME.json`, in a panel directory. The file and its directory are root's and
+not writable by group or others, or the file is left out. A later directory
+wins for the same NAME (`/etc/tinybot/panels` over `/usr/share/tinybot/panels`);
+a file that fails is left off Home and named there and in the runner's
+state, and the panel of that name in an earlier directory is not used
+instead. The files are read again each time Home or a panel is opened.
+
+```json
+{"panel":"sound","title":"Sound tries","summary":"A tone per tap","order":2,
+ "stop":{"argv":["/usr/local/sbin/tb-audio-off"],"timeout_s":5},
+ "items":[
+  {"kind":"stepper","id":"path","text":"Path","values":["receiver","speaker"]},
+  {"kind":"number","id":"level","text":"Level (dBFS)","value":"-40"},
+  {"kind":"readout","id":"bat","text":"Battery mA","poll":{"file":"/sys/class/power_supply/battery/current_now"},"every_s":2},
+  {"kind":"readout","id":"res","text":"Last try","value":"-"},
+  {"kind":"row","buttons":[
+    {"id":"play","text":"Play 1 s","style":"primary",
+     "action":{"argv":["/usr/local/sbin/tb-sound","--path","{path}","--level","{level}"],
+               "as":"root","timeout_s":10,"stop_post":["/usr/local/sbin/tb-audio-off"],"result":"res",
+               "ask":["Heard","Faint","Nothing","Pop-bad"],"on_answer":{"Pop-bad":"stop"},
+               "checks":[{"name":"pin159","argv":["/usr/local/sbin/tb-pin","159","low"]}]}},
+    {"id":"more","text":"Microphone","open":"mic"}
+  ]}
+ ]}
+```
+
+- `panel` is the NAME (the file's base name; A-Z a-z 0-9 _ -, at most 32,
+  not starting with `_`). `title`, `summary` (one line) and `order` (lower
+  first, then by title) are for Home.
+- `items` are the surface's items, with these fields for the runner:
+  - a readout's `poll`: `{"file":PATH}` (read in the runner: open, up to 256
+    bytes, close) or `{"argv":[…]}` (run directly as the app's user, killed
+    at 2 s, its last stdout line), every `every_s` seconds (at least 1,
+    default 2);
+  - a button's `action` (below) or `open` (another panel's NAME). A button
+    with neither is a record of the tap and nothing more.
+- `stop` is the panel's all-off: the runner adds the button "Stop / all off"
+  and a line under it for its result. Without `stop` there is neither.
+- A field the runner does not know is refused, and so is a key given twice.
+  Ids that start with `_` are the runner's own.
+
+An action:
+
+| Field | Meaning |
+|---|---|
+| `argv` | the program (an absolute path) and its arguments. `{id}` in an argument is the tap's value of the toggle, stepper or number `id`; `{{` is a literal brace. No shell, no PATH: each value stays inside its one argument whatever it holds. |
+| `as` | `user` (the default: the app's user) or `root` |
+| `timeout_s` | required: the unit's RuntimeMaxSec |
+| `stop_post` | an argv without placeholders, the unit's ExecStopPost: it runs however the try ends |
+| `result` | the id of the readout, text or heading that shows `rc N · last line` |
+| `ask` | words asked for after the try, shown as a row; the word tapped is recorded |
+| `on_answer` | `{"WORD":"stop"}`: this answer runs Stop and locks the panel |
+| `checks` | `[{"name":…,"argv":[…]}]`: run directly as root after each try, 2 s each; a status other than 0 locks the panel |
+
+`stop.argv`, `stop_post`, `checks` and `poll.argv` take no placeholders: what
+they run never depends on what was typed.
+
+### What the runner does
+
+- **A tap.** The tap is confirmed to the app before anything runs, and taps
+  that waited in the app before the runner's page was shown are dropped (and
+  recorded as dropped): nothing runs twice or late. The values are checked
+  again (a stepper's value is one of its `values`; a number is 1 to 64 bytes
+  without NUL or newline), else the result reads `refused: stale value`.
+- **A try** runs as
+  `systemd-run --unit=tb-panel-NAME-SEQ --wait --pipe --quiet --expand-environment=no -p RuntimeMaxSec=T -p TimeoutStopSec=2 [-p ExecStopPost=…] [--uid=UID] -- argv…`.
+  Without `--expand-environment=no` systemd-run replaces `$NAME` in the
+  arguments. The all-off in ExecStopPost runs under `systemd-cat`, so that
+  its output goes to the journal and not into the try's stdout.
+- **The result** is `rc N · <the last non-empty stdout line>`, at most 120
+  characters on the page and whole in the record. One try runs at a time;
+  a tap on another action meanwhile reads `busy`.
+- **Stop** is live while a try runs: `systemctl stop` on the try's unit,
+  then the panel's `stop` argv as a unit of its own. Its result shows under
+  the Stop button, and on Home as "last Stop".
+- **A lock.** A panel locks when a try ends with status 3 (Stop then runs at
+  once), runs into its time limit (the unit's `Result` is `timeout`), fails
+  a check, or gets an answer with `on_answer` stop. Status 1, 2 and 64 do
+  not lock. A locked panel shows `locked: <reason>` and a `confirm` button
+  Unlock in place of its action buttons; the lock outlives the runner
+  within a boot.
+- **Home** has a button per panel, the count of waiting questions, and
+  while a try runs `running: NAME/BUTTON` with that panel's Stop. Every
+  panel has "‹ Home"; leaving a panel does not end its try.
+- **Readouts** are polled for the page on screen only, not while the surface
+  is away, and not while `/sys/kernel/tinybot_panel/state` reads `off`. A
+  value that did not change is not sent.
+- **The surface away** is a state (`"surface":"waiting for the surface"` in
+  the runner's state file): the runner connects again, backing off to 5 s,
+  and shows its page again. On SIGTERM it stops a running try, clears the
+  surface and exits 0.
+
+### State and records
+
+- `/run/tinybot/panel/runner.json`: the panels and their locks, the files
+  left out and why, what runs, the questions that wait, the runner's own
+  error if it has one. `/run/tinybot/panel/NAME.json`: the panel's last try
+  and its lock. Both are replaced whole.
+- `/var/lib/tinybot/tries/NAME.jsonl`, one object per line, rotated once to
+  `.1` at 1 MiB:
+  - `{"t":"try","seq","panel","button","values","unit","rc","line","state","checks":[{"name","rc"}],"t_tap","t_start","t_end","stopped"}`,
+    with `"result"` (systemd's word, e.g. `timeout`) when the unit did not
+    end with status 0. A Stop is a try of its own, button `_stop`.
+  - `{"t":"answer","seq","word","t_answer"}`: the word for try `seq`;
+    `unlock` for the unlock of the lock that try set.
+  - `{"t":"dropped","tap","t_seen"}`: a tap from before the runner's page.
+- `/var/lib/tinybot/tries/_questions.jsonl`:
+  `{"t":"question","qid","from","text_sha256","text","covers":[{"path","sha256"}],"choices","t_asked","answer","t_answered"}`.
+- Times are Unix seconds with milliseconds. Nothing decides on a log line.
+
+### Questions
+
+`tb-panel ask FILE`, as root, with FILE
+`{"from":…,"text":…,"covers":[{"path":…,"sha256":…}],"choices":["Yes","No"]}`.
+The runner hashes the text and each covered file itself; a file that is not
+what the question says is refused (`file changed`, exit 1). A question never
+takes the screen: it is a count on Home and in the header until the user
+opens it. If a covered file changed between the question and the answer, the
+answer is void (`"answer":null,"void":"file changed: …"`).
+`tb-panel ask --wait QID [--timeout S]` prints the answer: exit 0 for the
+first choice, 1 for any other answer or a void one, 2 for no answer in time,
+3 for no runner or no such question.
+
+### What a tool does to have a panel
+
+- Exit status: 0 done; 1 refused, nothing changed; 2 failed, set back; 3 NOT
+  set back (the runner runs Stop and locks); 64 wrong use.
+- The last non-empty stdout line is the result a person reads.
+- Optionally one stdout line `TBSTATE {json}`: the state the tool read back.
+  It goes into the try's record and is not the result line.
+- Its limits are its own, the runner has none. Its panel file ships as
+  `/usr/share/tinybot/panels/<tool>.json` with a `stop` for hardware.
+
+### Units, and a test build
+
+`systemd/tinybot-surface.service` (user, `Type=notify`: the app sends
+`READY=1` once its socket is bound and its first frame is drawn) and
+`systemd/tb-panel.service` (system, root) are examples.
+
+The cargo feature `test-userns-root` is for tests on a build host only: with
+it the app takes a client that is root of a user namespace (`unshare -r`)
+for root, and says `TEST BUILD` on stderr. It does not compile for aarch64
+Linux, and `check-release.sh BINARY…` fails on a binary that has it.
 
 ## Driving it in a test
 
