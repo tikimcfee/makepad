@@ -31,9 +31,9 @@ mod unix {
     /// The protocol version this tool speaks (`v` in the app's `hello`).
     const VERSION: u64 = 2;
 
-    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] {set,wait,clear,status} ...\n";
+    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status} ...\n";
     const HELP: &str = "\
-usage: tb-surface [-h] [--socket PATH] {set,wait,clear,status} ...
+usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status} ...
 
 tinybot's live surface, one call per turn
 
@@ -46,6 +46,8 @@ options:
   -h, --help     this text
   --socket PATH  the surface's socket (default: $TINYBOT_SURFACE_SOCK, then
                  $XDG_RUNTIME_DIR/tinybot/surface.sock)
+  --runner       as root: act on root's layer as the panel runner does (refused while a
+                 runner is connected); without it every client's page is an agent's page
   --surface ID   set: the surface id, over the one in FILE
   --rev N        set: the rev, over the one in FILE
   --timeout S    wait: give up after S seconds (0: only what waits now; default: no limit)
@@ -331,6 +333,9 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         Unreachable(String),
         /// No line from the app within the time given.
         TimedOut,
+        /// The app's `err` line to the request for the runner's role: exit 1, as for any
+        /// refusal.
+        Refused(String),
         /// stdout is gone. The Python tool dies of the same with status 1; what matters is
         /// that no `done` follows a tap that could not be printed.
         Output(io::Error),
@@ -367,10 +372,19 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
     }
 
     impl Surface {
-        fn connect(path: &PathBuf) -> Result<Surface, Fail> {
+        /// `runner`: ask for root's layer as the panel runner would (for root, when no
+        /// runner is connected).
+        fn connect(path: &PathBuf, runner: bool) -> Result<Surface, Fail> {
             let sock = UnixStream::connect(path).map_err(|e| Fail::Unreachable(format!("no surface at {} ({e})", path.display())))?;
             let mut conn = Surface { sock, buf: Vec::new() };
-            let hello = conn.read(Some(5.0))?;
+            let mut hello = conn.read(Some(5.0))?;
+            if runner && hello.kind == "hello" {
+                conn.send("{\"type\":\"hello\",\"role\":\"runner\"}")?;
+                hello = conn.read(Some(5.0))?;
+                if hello.kind == "err" {
+                    return Err(Fail::Refused(hello.text));
+                }
+            }
             if hello.kind != "hello" || hello.get("v").and_then(|v| v.parse().ok()) != Some(VERSION) {
                 return Err(Fail::Unreachable(format!("unexpected greeting: {}", hello.text)));
             }
@@ -543,14 +557,19 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         Err(Some(format!("unrecognized arguments: {arg}")))
     }
 
-    fn parse(mut rest: impl Iterator<Item = String>) -> Result<(Option<String>, Command), Stop> {
+    fn parse(mut rest: impl Iterator<Item = String>) -> Result<(Option<String>, bool, Command), Stop> {
         let mut socket = None;
+        let mut runner = false;
         let command = loop {
             let Some(arg) = rest.next() else {
                 return Err(Some("the following arguments are required: command".into()));
             };
             if is_help(&arg) {
                 return Err(None);
+            }
+            if arg == "--runner" {
+                runner = true;
+                continue;
             }
             match option(&arg, "--socket", &mut rest) {
                 Some(value) => socket = Some(value?),
@@ -618,7 +637,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
                 return Err(Some(format!("argument command: invalid choice: '{other}' (choose from set, wait, clear, status)")));
             }
         };
-        Ok((socket, command))
+        Ok((socket, runner, command))
     }
 
     /// `--socket PATH`, else `$TINYBOT_SURFACE_SOCK`, else `$XDG_RUNTIME_DIR/tinybot/surface.sock`
@@ -642,7 +661,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
 
     pub fn main() -> i32 {
         let args = std::env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned());
-        let (socket, command) = match parse(args) {
+        let (socket, runner, command) = match parse(args) {
             Ok(parsed) => parsed,
             Err(None) => {
                 let _ = io::stdout().write_all(HELP.as_bytes());
@@ -655,7 +674,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
             }
         };
         // the app is reached before FILE is read, so a missing app is status 3 whatever FILE is
-        let done = Surface::connect(&socket_path(socket)).and_then(|mut conn| match &command {
+        let done = Surface::connect(&socket_path(socket), runner).and_then(|mut conn| match &command {
             Command::Set { file, surface, rev } => set(&mut conn, file, surface, *rev),
             Command::Wait { timeout } => wait(&mut conn, *timeout),
             Command::Clear => ask(&mut conn, "clear"),
@@ -670,6 +689,10 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
             Err(Fail::TimedOut) => {
                 eprintln!("tb-surface: the surface did not answer");
                 3
+            }
+            Err(Fail::Refused(line)) => {
+                let _ = emit(&line);
+                1
             }
             Err(Fail::Output(e)) => {
                 eprintln!("tb-surface: cannot write to stdout ({e})");

@@ -43,10 +43,14 @@ class TimedOut(Exception):
     pass
 
 
+class Refused(Exception):
+    """The app's err line to the request for the runner's role."""
+
+
 class Surface:
     """A connection: the hello is read on connect, then requests and answers are lines."""
 
-    def __init__(self, path):
+    def __init__(self, path, runner=False):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.buf = b""
         try:
@@ -54,6 +58,12 @@ class Surface:
         except OSError as e:
             raise Unreachable("no surface at %s (%s)" % (path, e.strerror or e))
         self.hello = self.read(5.0)
+        if runner and self.hello.get("type") == "hello":
+            # root's layer, as the panel runner: the app gives it to one root client that asks
+            self.send({"type": "hello", "role": "runner"})
+            self.hello = self.read(5.0)
+            if self.hello.get("type") == "err":
+                raise Refused(self.hello["_text"])
         if self.hello.get("type") != "hello" or self.hello.get("v") != VERSION:
             raise Unreachable("unexpected greeting: %r" % (self.hello,))
 
@@ -158,6 +168,7 @@ def cmd_status(conn, args):
 def main():
     parser = argparse.ArgumentParser(prog="tb-surface", description="tinybot's live surface, one call per turn")
     parser.add_argument("--socket", help="the surface's socket (default: $TINYBOT_SURFACE_SOCK, then $XDG_RUNTIME_DIR/tinybot/surface.sock)")
+    parser.add_argument("--runner", action="store_true", help="as root: act on root's layer as the panel runner does (refused while a runner is connected)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("set", help="show a surface")
     p.add_argument("file", metavar="FILE", help="a JSON object: surface, rev, title, items (- for stdin)")
@@ -173,7 +184,7 @@ def main():
     p.set_defaults(run=cmd_status)
     args = parser.parse_args()
     try:
-        conn = Surface(socket_path(args.socket))
+        conn = Surface(socket_path(args.socket), args.runner)
         return args.run(conn, args)
     except Unreachable as e:
         sys.stderr.write("tb-surface: %s\n" % e)
@@ -181,6 +192,9 @@ def main():
     except TimedOut:
         sys.stderr.write("tb-surface: the surface did not answer\n")
         return 3
+    except Refused as e:
+        print(e)
+        return 1
 
 
 if __name__ == "__main__":
