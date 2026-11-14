@@ -91,31 +91,66 @@ pub fn socket_path() -> (PathBuf, bool) {
     (runtime.join("tinybot").join("surface.sock"), true)
 }
 
-/// Only this user's processes and root's may talk to the surface. Root is let in for the panel
-/// runner, which runs as root to start its actions; the socket and its directory stay private
-/// to the user (0600, 0700), which does not hold root back anyway.
-fn allowed_peer(c: &UnixStream) -> bool {
-    let allowed = |uid: u32| uid == 0 || uid == unsafe { getuid() };
+/// Who is on the other end of a connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Peer {
+    /// uid 0: what it sets is privileged, and it is given the taps on privileged surfaces
+    Root,
+    /// the app's own user
+    User,
+}
+
+/// Only this user's processes and root's may talk to the surface: `None` for anyone else.
+/// Root is let in for the panel runner, which runs as root to start its actions; the socket
+/// and its directory stay private to the user (0600, 0700), which does not hold root back.
+fn peer_of(c: &UnixStream) -> Option<Peer> {
     #[cfg(target_os = "linux")]
-    {
+    let (pid, uid) = {
         extern "C" {
             fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
         }
         // SOL_SOCKET 1, SO_PEERCRED 17: struct ucred { pid, uid, gid }
         let mut cred = [0u32; 3];
         let mut len = 12u32;
-        let known = unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) } == 0;
-        known && allowed(cred[1])
-    }
+        if unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) } != 0 {
+            return None;
+        }
+        (cred[0], cred[1])
+    };
     #[cfg(not(target_os = "linux"))]
-    {
+    let (pid, uid) = {
         extern "C" {
             fn getpeereid(fd: i32, uid: *mut u32, gid: *mut u32) -> i32;
         }
         let (mut uid, mut gid) = (u32::MAX, 0u32);
-        let known = unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } == 0;
-        known && allowed(uid)
+        if unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return None;
+        }
+        (0u32, uid)
+    };
+    let own = unsafe { getuid() };
+    if uid == 0 || (uid == own && test_root(pid, own)) {
+        Some(Peer::Root)
+    } else if uid == own {
+        Some(Peer::User)
+    } else {
+        None
     }
+}
+
+/// Test builds only (cargo feature `test-userns-root`): a peer of this user that is root
+/// inside a user namespace (`unshare -r`) counts as root, so the rules for privileged
+/// surfaces can be tried on a machine without root. Never in a build for the phone.
+#[cfg(all(feature = "test-userns-root", target_os = "linux"))]
+fn test_root(pid: u32, own: u32) -> bool {
+    let map = std::fs::read_to_string(format!("/proc/{pid}/uid_map")).unwrap_or_default();
+    let mut fields = map.split_whitespace();
+    fields.next() == Some("0") && fields.next().and_then(|outside| outside.parse().ok()) == Some(own)
+}
+
+#[cfg(not(all(feature = "test-userns-root", target_os = "linux")))]
+fn test_root(_pid: u32, _own: u32) -> bool {
+    false
 }
 
 fn other(msg: String) -> io::Error {
@@ -125,6 +160,8 @@ fn other(msg: String) -> io::Error {
 /// Binds the socket and starts the socket thread. Fails when another surface already serves
 /// the path (its socket is left alone) or the path cannot be made private.
 pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
+    #[cfg(feature = "test-userns-root")]
+    eprintln!("[tinybot-surface] TEST BUILD: a peer that is root of a user namespace counts as root");
     if default_place {
         let dir = path.parent().ok_or_else(|| other("the socket path has no directory".into()))?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -159,7 +196,18 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
     wake_rx.set_nonblocking(true)?;
     let (to_io, from_ui) = channel();
     let (to_ui, from_io) = channel();
-    let state = State { to_ui, surface: None, rev: 0, title: String::new(), items: 0, targets: HashMap::new(), taps: VecDeque::new(), next_seq: 1 };
+    let state = State {
+        to_ui,
+        surface: None,
+        rev: 0,
+        title: String::new(),
+        items: 0,
+        targets: HashMap::new(),
+        privileged: false,
+        root_sets: VecDeque::new(),
+        taps: VecDeque::new(),
+        next_seq: 1,
+    };
     std::thread::Builder::new()
         .name("tinybot-surface-io".into())
         .spawn(move || run(listener, wake_rx, from_ui, state))?;
@@ -168,6 +216,7 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
 
 struct Conn {
     stream: UnixStream,
+    peer: Peer,
     buf: Vec<u8>,
     /// asked for taps with `wait` while none were queued: answered when one arrives
     waiting: bool,
@@ -182,28 +231,69 @@ struct State {
     items: usize,
     /// the ids of the surface on screen: what an `update` may name
     targets: HashMap<String, Target>,
+    /// the surface on screen was set by root: only root changes or clears it
+    privileged: bool,
+    /// surface and rev of the last surfaces root set. A tap can still be on its way from the
+    /// UI thread when its surface is replaced here, so it is filed by these, not by what is
+    /// on screen when it arrives.
+    root_sets: VecDeque<(String, u64)>,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
 }
+
+/// How many of root's surfaces are remembered for filing taps. A tap is at most one wake
+/// of this thread behind its surface, so a few is plenty.
+const ROOT_SETS: usize = 8;
 
 impl State {
     fn shown(&self) -> String {
         wire::surface_fields(self.surface.as_deref(), self.rev)
     }
 
-    fn hello(&self) -> String {
-        format!("{{\"type\":\"hello\",\"v\":{},{},\"pending\":{}}}\n", wire::VERSION, self.shown(), self.taps.len())
+    /// The taps a peer is given. The taps on root's surfaces and the others are two queues
+    /// that never mix: root's peers see and confirm only the first, the user's only the
+    /// second. So no process of the user reads a tap meant for root's runner, and the runner
+    /// never confirms away a tap an agent of the user still waits for.
+    fn sees(peer: Peer, tap: &Tap) -> bool {
+        tap.privileged == (peer == Peer::Root)
     }
 
-    /// Every waiting tap, one line each, then the line that ends the answer.
-    fn taps_reply(&self) -> String {
+    fn pending(&self, peer: Peer) -> usize {
+        self.taps.iter().filter(|t| Self::sees(peer, t)).count()
+    }
+
+    /// Whether `peer` may not touch what is on screen.
+    fn refuses(&self, peer: Peer) -> Option<String> {
+        (self.privileged && peer != Peer::Root).then(|| {
+            WireErr { code: "privileged", msg: "the surface on screen is root's: only root changes or clears it".into() }.line()
+        })
+    }
+
+    fn hello(&self, peer: Peer) -> String {
+        format!(
+            "{{\"type\":\"hello\",\"v\":{},{},\"privileged\":{},\"pending\":{}}}\n",
+            wire::VERSION,
+            self.shown(),
+            self.privileged,
+            self.pending(peer)
+        )
+    }
+
+    fn ack(&self, peer: Peer) -> String {
+        format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.pending(peer))
+    }
+
+    /// Every tap that waits for `peer`, one line each, then the line that ends the answer.
+    fn taps_reply(&self, peer: Peer) -> String {
         let mut out = String::new();
-        for tap in &self.taps {
+        let (mut count, mut last) = (0, 0);
+        for tap in self.taps.iter().filter(|t| Self::sees(peer, t)) {
             out.push_str(&tap.line());
+            count += 1;
+            last = tap.seq;
         }
-        let last = self.taps.back().map_or(0, |t| t.seq);
-        out.push_str(&format!("{{\"type\":\"taps\",\"count\":{},\"seq\":{last}}}\n", self.taps.len()));
+        out.push_str(&format!("{{\"type\":\"taps\",\"count\":{count},\"seq\":{last}}}\n"));
         out
     }
 
@@ -236,13 +326,16 @@ impl State {
     }
 
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
-    fn request(&mut self, line: &str, waiting: &mut bool, waiters: usize) -> Option<String> {
+    fn request(&mut self, line: &str, peer: Peer, waiting: &mut bool, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
             Ok(r) => r,
             Err(e) => return Some(e.line()),
         };
         Some(match request {
             Request::Set(spec) => {
+                if let Some(refusal) = self.refuses(peer) {
+                    return Some(refusal);
+                }
                 if self.surface.as_deref() == Some(spec.surface.as_str()) && spec.rev < self.rev {
                     return Some(
                         WireErr {
@@ -257,19 +350,38 @@ impl State {
                 self.title = spec.title.clone();
                 self.items = spec.items.len();
                 self.targets = spec.targets().into_iter().collect();
+                // whose surface this is now, and whose its taps will be
+                self.privileged = peer == Peer::Root;
+                self.root_sets.retain(|(surface, rev)| *surface != spec.surface || *rev != spec.rev);
+                if self.privileged {
+                    self.root_sets.push_back((spec.surface.clone(), spec.rev));
+                    if self.root_sets.len() > ROOT_SETS {
+                        self.root_sets.pop_front();
+                    }
+                }
                 let _ = self.to_ui.send(ToUi::Set(spec));
                 SignalToUI::set_ui_signal();
-                format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
+                self.ack(peer)
             }
             Request::Update(update) => {
+                if let Some(refusal) = self.refuses(peer) {
+                    return Some(refusal);
+                }
                 if let Err(e) = self.check_update(&update) {
                     return Some(e.line());
                 }
+                if let Some(title) = &update.title {
+                    self.title.clone_from(title);
+                }
                 let _ = self.to_ui.send(ToUi::Update(update));
                 SignalToUI::set_ui_signal();
-                format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
+                self.ack(peer)
             }
             Request::Clear => {
+                if let Some(refusal) = self.refuses(peer) {
+                    return Some(refusal);
+                }
+                self.privileged = false;
                 self.surface = None;
                 self.rev = 0;
                 self.title.clear();
@@ -277,30 +389,29 @@ impl State {
                 self.targets.clear();
                 let _ = self.to_ui.send(ToUi::Clear);
                 SignalToUI::set_ui_signal();
-                format!("{{\"type\":\"ack\",{},\"pending\":{}}}\n", self.shown(), self.taps.len())
+                self.ack(peer)
             }
             Request::Status => format!(
-                "{{\"type\":\"status\",\"v\":{},{},\"title\":{},\"items\":{},\"pending\":{},\"waiting\":{}}}\n",
+                "{{\"type\":\"status\",\"v\":{},{},\"privileged\":{},\"title\":{},\"items\":{},\"pending\":{},\"waiting\":{}}}\n",
                 wire::VERSION,
                 self.shown(),
+                self.privileged,
                 wire::json_str(&self.title),
                 self.items,
-                self.taps.len(),
+                self.pending(peer),
                 waiters
             ),
             Request::Taps { wait } => {
-                if self.taps.is_empty() && wait {
+                if self.pending(peer) == 0 && wait {
                     *waiting = true;
                     return None;
                 }
-                self.taps_reply()
+                self.taps_reply(peer)
             }
             Request::Done { seq } => {
                 let before = self.taps.len();
-                while self.taps.front().is_some_and(|t| t.seq <= seq) {
-                    self.taps.pop_front();
-                }
-                format!("{{\"type\":\"ok\",\"dropped\":{},\"pending\":{}}}\n", before - self.taps.len(), self.taps.len())
+                self.taps.retain(|t| !(t.seq <= seq && Self::sees(peer, t)));
+                format!("{{\"type\":\"ok\",\"dropped\":{},\"pending\":{}}}\n", before - self.taps.len(), self.pending(peer))
             }
         })
     }
@@ -389,7 +500,7 @@ impl Conn {
                 Ok(text) if text.trim().is_empty() => None,
                 Ok(text) => {
                     let mut waiting = self.waiting;
-                    let reply = state.request(text, &mut waiting, waiters);
+                    let reply = state.request(text, self.peer, &mut waiting, waiters);
                     self.waiting = waiting;
                     reply
                 }
@@ -444,24 +555,26 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
                     Err(_) => break,
                 }
             }
-            let mut arrived = false;
+            // whether each new tap is root's
+            let mut arrived = Vec::new();
             loop {
                 match from_ui.try_recv() {
                     Ok(ToIo::Tap { surface, rev, id, values }) => {
                         let seq = state.next_seq;
                         state.next_seq += 1;
-                        state.taps.push_back(Tap { seq, surface, rev, id, values });
-                        arrived = true;
+                        let privileged = state.root_sets.iter().any(|(s, r)| *s == surface && *r == rev);
+                        state.taps.push_back(Tap { seq, surface, rev, id, values, privileged });
+                        arrived.push(privileged);
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            if arrived {
-                let reply = state.taps_reply();
-                for conn in conns.iter_mut().filter(|c| c.waiting) {
+            // the waiting clients one of the new taps is for
+            for conn in conns.iter_mut().filter(|c| c.waiting) {
+                if arrived.contains(&(conn.peer == Peer::Root)) {
                     conn.waiting = false;
-                    conn.send(&reply);
+                    conn.send(&state.taps_reply(conn.peer));
                 }
             }
         }
@@ -481,15 +594,15 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if !allowed_peer(&stream) {
+                        let Some(peer) = peer_of(&stream) else {
                             eprintln!("[tinybot-surface] refused a client of another user");
                             continue;
-                        }
+                        };
                         if stream.set_nonblocking(true).is_err() {
                             continue;
                         }
-                        let mut conn = Conn { stream, buf: Vec::new(), waiting: false, closed: false };
-                        conn.send(&state.hello());
+                        let mut conn = Conn { stream, peer, buf: Vec::new(), waiting: false, closed: false };
+                        conn.send(&state.hello(peer));
                         if !conn.closed {
                             conns.push(conn);
                         }
