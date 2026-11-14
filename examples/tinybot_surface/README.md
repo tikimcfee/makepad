@@ -133,21 +133,26 @@ One UTF-8 JSON object per line, in both directions. A request line is at most
 On connect the app sends
 
 ```json
-{"type":"hello","v":2,"surface":"deploy-42","rev":1,"privileged":false,"pending":0}
+{"type":"hello","v":2,"surface":"deploy-42","rev":1,"privileged":false,"front":"agent","agent":{"surface":"deploy-42","title":"Deploy trixie-18?","from":"tb-surface (uid 1000)"},"pending":0}
 ```
 
-`surface` is `null` and `rev` 0 when the idle line is shown; `pending` is the
-number of taps that wait for this client; `privileged` says whether the
-surface on screen is root's (see [The socket](#the-socket)).
+The app holds two surfaces, root's and the agent's (see
+[Two layers](#two-layers)). `surface` and `rev` are those of the client's own
+layer (`null` and 0 when it has none); `pending` is the number of taps that
+wait for this client; `privileged` says whether root has a page; `front` is
+the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
+`agent` is the agent's page, with who set it, or `null`.
 
 | Request | Answer |
 |---|---|
-| `{"type":"set","surface":…,"rev":…,"title":…,"items":[…]}` | `{"type":"ack","surface":…,"rev":…,"pending":N}` |
+| `{"type":"set","surface":…,"rev":…,"title":…,"items":[…]}` | `{"type":"ack","surface":…,"rev":…,"shown":B,"pending":N}` (`shown`: the client's layer is the one on screen) |
 | `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
 | `{"type":"clear"}` | `{"type":"ack","surface":null,"rev":0,"pending":N}` |
 | `{"type":"status"}` | `{"type":"status","v":2,"surface":…,"rev":…,"privileged":…,"title":…,"items":N,"pending":N,"waiting":N}` |
 | `{"type":"taps","wait":false}` | every waiting `tap` line, then `{"type":"taps","count":N,"seq":LAST}` |
 | `{"type":"taps","wait":true}` | the same; with no tap waiting, the answer comes when one arrives |
+| `{"type":"taps","wait":true,"layers":true}` | the same, and also answered when the layers change, with a line `{"type":"layers","privileged":…,"front":…,"agent":…}` first |
+| `{"type":"show","layer":"agent"}` (or `"root"`) | root only: puts that layer on screen; `ack` |
 | `{"type":"done","seq":LAST}` | `{"type":"ok","dropped":N,"pending":N}` |
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
@@ -183,11 +188,43 @@ A refused request is answered with `{"type":"err","code":…,"msg":…}`:
 | `bad_set` | `surface`, `rev`, `title` or `items` of a `set` is missing or of the wrong type; `surface` or `rev` of an `update` is |
 | `bad_item` | an item or button is malformed, of an unknown `kind`, lacks a required `id`, or repeats an id; an `update` names an id it cannot change or arm |
 | `stale_rev` | a `set` for the surface on screen with a lower `rev`; an `update` for another surface or rev than the one on screen |
-| `privileged` | a `set`, `update` or `clear` from the user's client while root's surface is on screen |
+| `privileged` | `show` from a client that is not root's |
 | `too_long` | a line over 64 KiB; the app then closes the connection |
 
 A `set` with the same `surface` and `rev` as on screen is accepted again
 (the surface is replaced and its rows are armed).
+
+## Two layers
+
+The app holds two surfaces and shows one of them:
+
+- **root's layer**, set by a uid-0 client (the panel runner);
+- **the agent's layer**, set by a client of the app's own user (an agent
+  such as Claude Code on the phone, or `tb-surface`).
+
+Each client sets, updates and clears only its own layer, and gets only the
+taps made on it (`taps`, `done` and `pending` each count one layer's taps).
+So no process of the user can change or imitate the runner's page, read its
+taps, or confirm them away, and the runner does the same to no agent.
+
+- While root has a page, an agent's `set` is kept and not shown
+  (`"shown":false`): it never covers root's page. Root puts it on screen
+  with `show` (the runner does when the user opens it from Home). With no
+  root page an agent's page comes up by itself.
+- An agent's page is always under a band the app draws, which the page can
+  neither style nor leave out: `agent · <comm> (uid N)`, in its own colour.
+  `comm` is the name the setting process gives itself, so it can be
+  anything; `agent ·` and the uid are the app's and the kernel's. With a
+  root page there the band has "‹ Home", which goes back to it in the app,
+  with no round trip.
+- Root's first page takes the screen. When a layer is cleared the other has
+  the screen, or the idle line.
+- Two dots sit at the right end of the header of every page of either layer:
+  `● mic` while `/proc/asound/card1/pcm1c/sub0/status` reads
+  `state: RUNNING`, `● out` for `pcm0p`. They are looked at once a second
+  while `/sys/kernel/tinybot_panel/state` does not read `off`; without the
+  status files (CONFIG_SND_VERBOSE_PROCFS) no dot is drawn and no timer
+  runs. No page can cover or draw them.
 
 ## The socket
 
@@ -201,12 +238,8 @@ A `set` with the same `surface` and `rev` as on screen is accepted again
 - A socket file found at start is probed: when something answers, the app
   logs and exits 1 without touching it; a dead one is replaced. The file is
   removed on shutdown.
-- A surface set by root is privileged. While it is on screen, a `set`,
-  `update` or `clear` from a client of the app's user is refused
-  (`privileged`): no process of the user can put a look-alike page over the
-  runner's, or take the screen from it. The taps are two queues that never
-  mix: taps on root's surfaces are given only to root's clients, the other
-  taps only to the user's, for `taps`, `done` and every `pending` count.
+- What a client can touch is its own layer and nothing else: see
+  [Two layers](#two-layers).
 - After an app restart the screen is idle and the tap queue is empty; the
   agent sees `"surface":null` in `hello` or `status` and sends its `set` again.
 - The surface socket is the app's only socket. Makepad's own remote-control
@@ -332,6 +365,10 @@ they run never depends on what was typed.
   replaces the text of that item (without the prefix) while the tool runs:
   at most ten a second, a newer line taking the place of one that waits.
   Such a line is never the result.
+- **A key-bound action and its time limit.** Give it a `timeout_s` well
+  above the tool's own limit (for a recorder with `--max-seconds N`, N plus
+  some seconds for it to finish), so that a long hold ends as the tool's
+  exit 0 and not as a time limit, which locks the panel.
 - **A held key.** With `--key DEVICE:CODE` the runner reads that input
   device (a plain read, no grab; it sleeps until a key moves). Key down
   starts the action a panel binds to the code, whatever page is on screen
@@ -349,8 +386,12 @@ they run never depends on what was typed.
   not lock. A locked panel shows `locked: <reason>` and a `confirm` button
   Unlock in place of its action buttons; the lock outlives the runner
   within a boot.
-- **Home** has a button per panel, the count of waiting questions, and
-  while a try runs `running: NAME/BUTTON` with that panel's Stop. Every
+- **Home** has a button per panel, the count of waiting questions, an
+  agent's page when there is one ("Agent: <title>", from whom), and while a
+  try runs `running: NAME/BUTTON` with that panel's Stop. An agent's new
+  page comes straight up only while Home is on screen and nothing runs
+  (`--agent-direct=no`: never by itself); over a panel or a try it waits on
+  Home. Behind an agent's page the runner reads no readouts. Every
   panel has "‹ Home"; leaving a panel does not end its try.
 - **Readouts** are polled for the page on screen only, not while the surface
   is away, and not while `/sys/kernel/tinybot_panel/state` reads `off`. A
@@ -363,8 +404,9 @@ they run never depends on what was typed.
 ### State and records
 
 - `/run/tinybot/panel/runner.json`: the panels and their locks, the files
-  left out and why, what runs, the questions that wait, the runner's own
-  error if it has one. `/run/tinybot/panel/NAME.json`: the panel's last try
+  left out and why, the bound keys, the agent's page and which layer is in
+  front, what runs, the questions that wait, the runner's own error if it
+  has one. `/run/tinybot/panel/NAME.json`: the panel's last try
   and its lock. Both are replaced whole.
 - `/var/lib/tinybot/tries/NAME.jsonl`, one object per line, rotated once to
   `.1` at 1 MiB:
@@ -377,13 +419,17 @@ they run never depends on what was typed.
   - `{"t":"dropped","tap","t_seen"}`: a tap from before the runner's page;
     `{"t":"dropped","key","button","why","t_seen"}`: a key down that ran nothing.
 - `/var/lib/tinybot/tries/_questions.jsonl`:
-  `{"t":"question","qid","from","text_sha256","text","covers":[{"path","sha256"}],"choices","t_asked","answer","t_answered"}`.
+  `{"t":"question","qid","from","text_sha256","text","covers":[{"path","sha256"}],"choices","t_asked","peer":{"uid","comm"},"answer","t_answered"}`.
 - Times are Unix seconds with milliseconds. Nothing decides on a log line.
 
 ### Questions
 
-`tb-panel ask FILE`, as root, with FILE
+`tb-panel ask FILE`, from any user, with FILE
 `{"from":…,"text":…,"covers":[{"path":…,"sha256":…}],"choices":["Yes","No"]}`.
+The socket (`/run/tinybot/panel/ask.sock`, mode 0666) takes a question and
+a wait for its answer and nothing else. `from` is the asker's word; the
+runner adds `peer`, the uid and process name the socket gives, and the
+question's page shows both.
 The runner hashes the text and each covered file itself; a file that is not
 what the question says is refused (`file changed`, exit 1). A question never
 takes the screen: it is a count on Home and in the header until the user
