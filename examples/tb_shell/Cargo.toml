@@ -1,0 +1,12 @@
+[package]
+name = "tb-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A thin shell around Splash surfaces: one JSON store, a socket, a protected strip"
+
+[dependencies]
+# No default families: in particular no `dock`, whose ghost tab draws in the
+# top overlay tier the strip owns.
+makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }
+makepad-micro-serde = { path = "../../libs/micro_serde", version = "1.0.0" }

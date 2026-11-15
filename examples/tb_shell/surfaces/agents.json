@@ -1,0 +1,1 @@
+{"agents":[{"id":"ph","name":"phone agent","status":"busy"},{"id":"bb","name":"build box","status":"idle"},{"id":"lt","name":"laptop","status":"error"}],"target":"bb"}
