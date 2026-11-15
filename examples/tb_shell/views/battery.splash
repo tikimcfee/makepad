@@ -1,0 +1,26 @@
+// BATTERY: readouts a service puts in the key `battery`; it reads them on `shown` or `refresh`.
+let Cell = Squircle{
+    width: Fill height: 96 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
+    k := Small{}
+    v := Title{draw_text.text_style.font_size: 26}
+}
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 10
+    on_render: || {
+        let b = state.battery ?? nil
+        if b == nil { Small{text: "no reading yet"} }
+        else {
+            View{width: Fill height: Fit flow: Right spacing: 10
+                Cell{k.text: "level" v.text: show(b.pct ?? nil, " %")}
+                Cell{k.text: "current" v.text: show(b.ma ?? nil, " mA")}}
+            View{width: Fill height: Fit flow: Right spacing: 10
+                Cell{k.text: "charge" v.text: show(b.state ?? nil, "")}
+                Cell{k.text: "hours left" v.text: show(b.hours ?? nil, " h")}}
+            View{width: Fill height: Fit flow: Right spacing: 10
+                Cell{k.text: "volts" v.text: show(b.volts ?? nil, " V")}
+                Cell{k.text: "temp" v.text: show(b.temp ?? nil, " C")}}
+        }
+        Big{text: "refresh" on_click: || emit("refresh", {})}
+    }
+}

@@ -1,0 +1,21 @@
+// HOME: the views, one tap away. The strip at the top always comes back here.
+let Tile = Squircle{height: 96 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
+    t := Title{}
+    s := Small{}
+}
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 12
+    on_item_tap: |i| {
+        if i == 0 { front("agents") }
+        if i == 1 { front("voice") }
+        if i == 2 { front("battery") }
+    }
+    on_render: || {
+        let b = state.battery ?? nil
+        let v = state.voice ?? nil
+        Tile{t.text: "Agents" s.text: "default: " + agent_name(state.agents ?? nil, state.target ?? nil)}
+        Tile{t.text: "Voice" s.text: if v == nil { "quiet" } else { v.text ?? "quiet" }}
+        Tile{t.text: "Battery" s.text: if b == nil { "no reading yet" } else { show(b.pct ?? nil, " %") + "  " + (b.state ?? "") }}
+    }
+}

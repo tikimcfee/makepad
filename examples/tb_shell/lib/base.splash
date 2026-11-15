@@ -15,3 +15,8 @@ fn status_color(s) {
     #x666666
 }
 fn show(v, unit) { if v == nil { return "-" } "" + v + unit }
+fn agent_name(list, id) {
+    for a in list ?? [] { if a.id == id { return a.name } }
+    if id == nil { return "none" }
+    id
+}
