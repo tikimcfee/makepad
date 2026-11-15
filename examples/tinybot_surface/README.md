@@ -43,6 +43,7 @@ thing, prints the app's answer as JSON lines and exits.
 | `--runner` (before the command) | As root, with no runner connected: act on root's layer as the runner does. Without it every client's page is an agent's page | `err` and exit 1 when the role is refused |
 | `clear` | Back to the idle line | `ack` |
 | `status` | What is shown and how many taps wait | `status` |
+| `voice` | As root: every line of stdin is the voice strip's text from then on; an empty line takes the strip away, and so does the end of the input | nothing, or `err` and exit 1 when refused |
 
 Exit status: 0 done; 1 the app refused (the `err` line is on stdout); 2 `wait`
 ended without a tap; 3 the app cannot be reached; 64 FILE cannot be read.
@@ -158,6 +159,9 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 | `{"type":"show","layer":"agent"}` (or `"root"`) | the runner only: puts that layer on screen; `ack` |
 | `{"type":"hello","role":"runner"}` | a root client takes the runner's role: the `hello` of root's layer |
 | `{"type":"done","seq":LAST}` | `{"type":"ok","dropped":N,"pending":N}` |
+| `{"type":"hello","role":"voice"}` | a root client takes the voice strip: a `hello` line |
+| `{"type":"voice","text":TEXT}` | the voice client only: TEXT is the strip's text; `{"type":"ok"}` |
+| `{"type":"voice"}` | the voice client only: no strip; `{"type":"ok"}` |
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
 otherwise) and does not change the rev. `title` is a new header line. `items` names items by id: `text`
@@ -192,7 +196,7 @@ A refused request is answered with `{"type":"err","code":…,"msg":…}`:
 | `bad_set` | `surface`, `rev`, `title` or `items` of a `set` is missing or of the wrong type; `surface` or `rev` of an `update` is |
 | `bad_item` | an item or button is malformed, of an unknown `kind`, lacks a required `id`, or repeats an id; an `update` names an id it cannot change or arm |
 | `stale_rev` | a `set` for the surface on screen with a lower `rev`; an `update` for another surface or rev than the one on screen |
-| `privileged` | `show` from a client that is not the runner; the runner's role asked for by a client that is not root, or while another runner is connected |
+| `privileged` | `show` from a client that is not the runner; the runner's role asked for by a client that is not root, or while another runner is connected; the same for the voice's role; `voice` from a client that has not got it |
 | `too_long` | a line over 64 KiB; the app then closes the connection |
 
 A `set` with the same `surface` and `rev` as on screen is accepted again
@@ -234,6 +238,44 @@ taps, or confirm them away, and the runner does the same to no agent.
   while `/sys/kernel/tinybot_panel/state` does not read `off`; without the
   status files (CONFIG_SND_VERBOSE_PROCFS) no dot is drawn and no timer
   runs. No page can cover or draw them.
+
+## The voice strip
+
+One more thing can be on screen, under the page of either layer or the idle
+line: a band with what a voice service hears, as it comes.
+
+- It belongs to one connection of a root client that asks for it with
+  `{"type":"hello","role":"voice"}`. A second one is refused (`privileged`)
+  until the first has closed. The runner's role and the voice's are apart:
+  the voice client has no page and gets no taps for the strip.
+- `{"type":"voice","text":TEXT}` shows TEXT or replaces what is shown;
+  `{"type":"voice"}` takes the strip away; so does closing the connection.
+  Every request is answered with one line, which the client has to read.
+- The band is the app's: a tag `voice` and two lines of text, the newest
+  words (the end of TEXT as the band's width breaks it). Line ends and tabs
+  in TEXT count as spaces, other control characters are left out, and of a
+  long TEXT the last 600 bytes are kept.
+- The band takes its 58 points from the foot of the page: the list above
+  gets shorter and its rows stay where they are. Nothing is drawn over a
+  page. The band takes no touch; a row under it is reached by scrolling.
+- While a `confirm` button is armed the band neither comes nor goes: the
+  button stays where it is and in sight until it is tapped or gives up
+  (3 s), and the strip follows then.
+- Texts may come as fast as the client likes. The band changes at most
+  about eight times a second and shows the newest; nothing queues up. Each
+  change is one frame.
+- A text that is not replaced or sent again for 15 s is taken away by the
+  app, so a client that hangs leaves no words standing. Sending the same
+  text again keeps it.
+- While `/sys/kernel/tinybot_panel/state` reads `off` nothing is drawn; the
+  newest text shows when the panel is on again, unless its 15 s have passed.
+
+By hand, as root (the socket is the app's user's): five seconds of text,
+gone when the input ends.
+
+```sh
+(echo "hello from the voice strip"; sleep 5) | tb-surface --socket /run/user/UID/tinybot/surface.sock voice
+```
 
 ## The socket
 
