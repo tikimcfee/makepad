@@ -304,6 +304,13 @@ script_mod! {
                     height: 54
                     text: ""
                 }
+                // the chosen row: the same button in the primary style
+                hit_selected := ButtonPrimary{
+                    visible: false
+                    width: Fill
+                    height: 54
+                    text: ""
+                }
                 View{
                     width: Fill
                     height: 54
@@ -721,7 +728,7 @@ enum Entry {
     /// `tapped`: the button that was pressed. The row is locked from then until the agent
     /// sends the next surface, arms the row with an `update`, or clears.
     Row { id: String, buttons: Vec<wire::Button>, tapped: Option<usize> },
-    Pick { id: String, text: String, note: String, dot: Option<wire::Dot> },
+    Pick { id: String, text: String, note: String, dot: Option<wire::Dot>, selected: bool },
     Divider,
 }
 
@@ -797,7 +804,7 @@ impl SurfaceList {
                 wire::Item::Heading { id, text } => Entry::Heading { id, text },
                 wire::Item::Text { id, text } => Entry::Text { id, text },
                 wire::Item::Divider => Entry::Divider,
-                wire::Item::Pick { id, text, note, dot } => Entry::Pick { id, text, note, dot },
+                wire::Item::Pick { id, text, note, dot, selected } => Entry::Pick { id, text, note, dot, selected },
                 wire::Item::Row { id, buttons } => Entry::Row { id, buttons, tapped: None },
                 wire::Item::Readout { id, text, value } => Entry::Readout { id, text, value },
                 wire::Item::Toggle { id, text, value } => {
@@ -854,7 +861,7 @@ impl SurfaceList {
                             value.clone_from(new);
                         }
                     }
-                    Entry::Pick { id, text, note, dot } if *id == change.id => {
+                    Entry::Pick { id, text, note, dot, selected } if *id == change.id => {
                         if let Some(new) = &change.text {
                             text.clone_from(new);
                         }
@@ -863,6 +870,9 @@ impl SurfaceList {
                         }
                         if change.dot.is_some() {
                             *dot = change.dot;
+                        }
+                        if let Some(new) = change.selected {
+                            *selected = new;
                         }
                     }
                     _ => {}
@@ -957,7 +967,7 @@ impl SurfaceList {
         for (index, item) in list.items_with_actions(actions) {
             match self.entries.get(index) {
                 Some(Entry::Pick { id, .. }) => {
-                    if item.button(cx, ids!(hit)).clicked(actions) {
+                    if item.button(cx, ids!(hit)).clicked(actions) || item.button(cx, ids!(hit_selected)).clicked(actions) {
                         picked.push(id.clone());
                     }
                 }
@@ -1099,8 +1109,10 @@ impl Widget for SurfaceList {
                             row
                         }
                         Entry::Divider => list.item(cx, index, id!(Divider)),
-                        Entry::Pick { text, note, dot, .. } => {
+                        Entry::Pick { text, note, dot, selected, .. } => {
                             let row = list.item(cx, index, id!(Pick));
+                            row.widget(cx, ids!(hit)).set_visible(cx, !*selected);
+                            row.widget(cx, ids!(hit_selected)).set_visible(cx, *selected);
                             row.label(cx, ids!(label)).set_text(cx, text);
                             row.label(cx, ids!(note)).set_text(cx, note);
                             row.label(cx, ids!(note)).set_visible(cx, !note.is_empty());
