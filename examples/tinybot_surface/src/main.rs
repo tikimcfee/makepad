@@ -120,7 +120,12 @@ mod before_main {
     static BEFORE_MAIN: extern "C" fn(c_int, *const *const c_char, *const *const c_char) = before_main;
 }
 
-app_main!(App);
+// The Latin font set: the text faces, a symbol face, and the CJK and emoji faces only from
+// the first glyph the others miss. The default set opens the CJK and emoji faces with the
+// first text; where their files cannot be mapped at the build's own paths (a packaged
+// build on the phone) that is 29 MB read into memory, and twice that from Makepad's work
+// branch on, where the font gets a copy of its own.
+app_main!(App, font_set: Latin);
 
 script_mod! {
     use mod.prelude.widgets.*
