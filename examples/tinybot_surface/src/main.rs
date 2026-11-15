@@ -7,7 +7,8 @@
 //! The widgets are a fixed set compiled into the app; a description is data, checked as a
 //! whole before the screen changes (`wire.rs`). The socket has its own thread (`socket.rs`).
 //! At rest nothing runs: no timer, no frame callback. The two timers there are run only
-//! while the user holds a stepper's button or a `confirm` button is armed.
+//! while the user holds a stepper's button or a `confirm` button is armed, and two more only
+//! while the voice strip shows a text.
 
 pub use makepad_widgets;
 
@@ -308,86 +309,134 @@ script_mod! {
                     // the system bars sit over the window's edges: stay inside the safe area
                     padding: Inset{top: mod.widgets.SAFE_INSET_PAD_TOP right: mod.widgets.SAFE_INSET_PAD_RIGHT bottom: mod.widgets.SAFE_INSET_PAD_BOTTOM left: mod.widgets.SAFE_INSET_PAD_LEFT}
                     flow: Overlay
-                    pages := View{
+                    // the pages, and under them the voice strip while there is one: it takes
+                    // its room from the page above, so it never lies over anything
+                    column := View{
                         width: Fill
                         height: Fill
                         flow: Down
-                        // nothing to show: tinybot's home, one line
-                        idle := View{
-                            width: Fill
-                            height: Fill
-                            align: Align{x: 0.5 y: 0.5}
-                            idle_line := Label{
-                                text: "tinybot · idle"
-                                draw_text.color: #888
-                                draw_text.text_style.font_size: 12
-                            }
-                        }
-                        // root's layer: the panel runner's pages
-                        surface := View{
-                            visible: false
+                        pages := View{
                             width: Fill
                             height: Fill
                             flow: Down
-                            header := SolidView{
+                            // nothing to show: tinybot's home, one line
+                            idle := View{
                                 width: Fill
-                                height: 48
-                                // the right end is the dots' place
-                                padding: Inset{left: 16 right: 126}
-                                align: Align{y: 0.5}
-                                draw_bg.color: #202428
-                                title := Label{
-                                    width: Fill
-                                    text: "tinybot"
-                                    draw_text.color: #fff
-                                    draw_text.text_style.font_size: 14
+                                height: Fill
+                                align: Align{x: 0.5 y: 0.5}
+                                idle_line := Label{
+                                    text: "tinybot · idle"
+                                    draw_text.color: #888
+                                    draw_text.text_style.font_size: 12
                                 }
                             }
-                            items := mod.widgets.SurfaceList{}
+                            // root's layer: the panel runner's pages
+                            surface := View{
+                                visible: false
+                                width: Fill
+                                height: Fill
+                                flow: Down
+                                header := SolidView{
+                                    width: Fill
+                                    height: 48
+                                    // the right end is the dots' place
+                                    padding: Inset{left: 16 right: 126}
+                                    align: Align{y: 0.5}
+                                    draw_bg.color: #202428
+                                    title := Label{
+                                        width: Fill
+                                        text: "tinybot"
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 14
+                                    }
+                                }
+                                items := mod.widgets.SurfaceList{}
+                            }
+                            // the agent's layer. The band is the app's own: a page cannot
+                            // change it or leave it out, so the user sees whose page this is.
+                            agent := View{
+                                visible: false
+                                width: Fill
+                                height: Fill
+                                flow: Down
+                                band := SolidView{
+                                    width: Fill
+                                    height: 44
+                                    flow: Right
+                                    spacing: 8
+                                    // the right end is the dots' place
+                                    padding: Inset{left: 16 right: 126}
+                                    align: Align{y: 0.5}
+                                    draw_bg.color: #6a3d00
+                                    who := Label{
+                                        width: Fill
+                                        text: "agent"
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 10
+                                    }
+                                    agent_home := Button{
+                                        visible: false
+                                        width: Fit
+                                        height: 34
+                                        text: "‹ Home"
+                                    }
+                                }
+                                agent_header := SolidView{
+                                    width: Fill
+                                    height: 40
+                                    padding: Inset{left: 16 right: 16}
+                                    align: Align{y: 0.5}
+                                    draw_bg.color: #202428
+                                    agent_title := Label{
+                                        width: Fill
+                                        text: ""
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 13
+                                    }
+                                }
+                                agent_items := mod.widgets.SurfaceList{}
+                            }
                         }
-                        // the agent's layer. The band is the app's own: a page cannot
-                        // change it or leave it out, so the user sees whose page this is.
-                        agent := View{
+                        // The voice strip: what the voice service hears, as it comes. The band
+                        // and its tag are the app's own; the text is two lines, the newest
+                        // words. It takes no touch. (The sizes here are VOICE_* in the code.)
+                        voice := SolidView{
                             visible: false
                             width: Fill
-                            height: Fill
-                            flow: Down
-                            band := SolidView{
-                                width: Fill
-                                height: 44
-                                flow: Right
-                                spacing: 8
-                                // the right end is the dots' place
-                                padding: Inset{left: 16 right: 126}
-                                align: Align{y: 0.5}
-                                draw_bg.color: #6a3d00
-                                who := Label{
-                                    width: Fill
-                                    text: "agent"
-                                    draw_text.color: #fff
-                                    draw_text.text_style.font_size: 10
-                                }
-                                agent_home := Button{
-                                    visible: false
-                                    width: Fit
-                                    height: 34
-                                    text: "‹ Home"
-                                }
+                            height: 58
+                            flow: Right
+                            spacing: 8
+                            padding: Inset{left: 12 right: 12 top: 9 bottom: 9}
+                            draw_bg.color: #16324a
+                            voice_tag := Label{
+                                width: 40
+                                padding: Inset{top: 0 right: 0 bottom: 0 left: 0}
+                                text: "voice"
+                                draw_text.color: #8fc1e8
+                                draw_text.text_style.font_size: 9
                             }
-                            agent_header := SolidView{
+                            View{
                                 width: Fill
-                                height: 40
-                                padding: Inset{left: 16 right: 16}
-                                align: Align{y: 0.5}
-                                draw_bg.color: #202428
-                                agent_title := Label{
+                                height: Fit
+                                flow: Down
+                                spacing: 2
+                                voice_1 := Label{
                                     width: Fill
+                                    padding: Inset{top: 0 right: 0 bottom: 0 left: 0}
+                                    max_lines: 1
                                     text: ""
                                     draw_text.color: #fff
-                                    draw_text.text_style.font_size: 13
+                                    draw_text.text_style.font_size: 12
+                                }
+                                voice_2 := Label{
+                                    width: Fill
+                                    padding: Inset{top: 0 right: 0 bottom: 0 left: 0}
+                                    max_lines: 1
+                                    text: ""
+                                    draw_text.color: #fff
+                                    draw_text.text_style.font_size: 12
                                 }
                             }
-                            agent_items := mod.widgets.SurfaceList{}
                         }
                     }
                     // over every page of either layer: lit while the microphone or the
@@ -1043,7 +1092,36 @@ pub struct App {
     /// what the dots show: (microphone, speaker)
     #[rust]
     lit: (bool, bool),
+    #[rust]
+    voice: Voice,
 }
+
+/// The voice strip: one text of the voice client's, in a band under the page.
+#[derive(Default)]
+struct Voice {
+    /// the newest word from the client that the band does not show yet: a text, or `None`
+    /// for no band
+    next: Option<Option<String>>,
+    /// the text the band shows; `None`: no band
+    shown: Option<String>,
+    /// when the band was last changed
+    at: Option<std::time::Instant>,
+    /// one shot: the newest text waits for `VOICE_APART` to pass since the last change
+    turn: Timer,
+    waits: bool,
+    /// one shot, started again by every text: the client has gone quiet
+    quiet: Timer,
+}
+
+/// The least time between two changes of the voice strip: about eight a second. Texts that
+/// come faster are not queued; the newest one is shown when its turn comes.
+const VOICE_APART: f64 = 0.125;
+/// A text the client has not replaced or sent again for this long is taken away by the app:
+/// a client that hangs cannot leave words standing.
+const VOICE_SECONDS: f64 = 15.0;
+/// The room the band's text does not have: the band's padding left and right, the tag and
+/// the space after it (the numbers of `voice` in the layout).
+const VOICE_BESIDE: f64 = 12.0 + 12.0 + 40.0 + 8.0;
 
 /// How the microphone and speaker dots are watched.
 #[derive(Default, PartialEq)]
@@ -1152,6 +1230,91 @@ impl App {
         self.ui.redraw(cx);
     }
 
+    /// A `confirm` button waits for its second tap.
+    fn confirm_armed(&self, cx: &mut Cx) -> bool {
+        [ids!(items), ids!(agent_items)]
+            .into_iter()
+            .any(|list| self.ui.widget(cx, list).borrow::<SurfaceList>().is_some_and(|list| list.confirming.is_some()))
+    }
+
+    /// The last two lines of `text` as the band's labels will break it: the newest words.
+    fn voice_lines(&self, cx: &mut Cx, text: &str) -> (String, String) {
+        let width = self.ui.view(cx, ids!(column)).area().rect(cx).size.x;
+        // before the first frame there is no width yet: the window's own
+        let width = (if width > VOICE_BESIDE { width } else { 360.0 } - VOICE_BESIDE) as f32;
+        let label = self.ui.label(cx, ids!(voice_1));
+        let Some(mut label) = label.borrow_mut() else {
+            return (text.to_string(), String::new());
+        };
+        // laid out with the label's own text style, so the lines are the ones it would
+        // break; all of them (the label sets its one-line limit again when it draws)
+        label.draw_text.max_lines = 0;
+        let laid = label.draw_text.layout(cx, 0.0, 0.0, Some(width), true, Align::default(), text);
+        let mut rows = laid.rows.iter().rev().map(|row| row.text.as_str().trim().to_string()).filter(|row| !row.is_empty());
+        let last = rows.next().unwrap_or_default();
+        match rows.next() {
+            Some(before) => (before, last),
+            None => (last, String::new()),
+        }
+    }
+
+    /// Brings the band to the voice client's newest word, when that may be done now.
+    /// Called after every event while a word waits, so each of the three reasons to wait
+    /// ends by itself: the panel comes on, the armed button is tapped or gives up, the
+    /// text's turn comes.
+    fn voice_flush(&mut self, cx: &mut Cx) {
+        let Some(next) = &self.voice.next else {
+            return;
+        };
+        // nothing is drawn for a panel that is off: the newest word waits for the screen
+        if self.dots == Dots::Dark {
+            return;
+        }
+        // The band takes its room from the foot of the page, and gives it back: neither
+        // while a `confirm` button waits for its second tap, which must stay where it is
+        // and in sight for the three seconds it is armed.
+        if next.is_some() != self.voice.shown.is_some() && self.confirm_armed(cx) {
+            return;
+        }
+        if let Some(since) = self.voice.at.map(|at| at.elapsed().as_secs_f64()) {
+            if since < VOICE_APART {
+                if !self.voice.waits {
+                    self.voice.turn = cx.start_timeout(VOICE_APART - since);
+                    self.voice.waits = true;
+                }
+                return;
+            }
+        }
+        let Some(next) = self.voice.next.take() else {
+            return;
+        };
+        // the same text again keeps it on screen (the client is alive) and draws nothing
+        if next == self.voice.shown {
+            return;
+        }
+        let comes_or_goes = next.is_some() != self.voice.shown.is_some();
+        let (first, second) = match &next {
+            Some(text) => self.voice_lines(cx, text),
+            None => Default::default(),
+        };
+        self.ui.label(cx, ids!(voice_1)).set_text(cx, &first);
+        self.ui.label(cx, ids!(voice_2)).set_text(cx, &second);
+        if comes_or_goes {
+            // the page above gets shorter or longer: all of it is laid out again
+            self.ui.view(cx, ids!(voice)).set_visible(cx, next.is_some());
+            self.ui.redraw(cx);
+        } else {
+            self.ui.view(cx, ids!(voice)).redraw(cx);
+        }
+        // for a count of the band's changes and the size of what it was given; never the words
+        if std::env::var_os("TINYBOT_SURFACE_LOG").is_some() {
+            let what = if next.is_none() { "gone" } else if comes_or_goes { "shown" } else { "changed" };
+            eprintln!("[tinybot-surface] voice strip {what} ({} bytes)", next.as_ref().map_or(0, |text| text.len()));
+        }
+        self.voice.shown = next;
+        self.voice.at = Some(std::time::Instant::now());
+    }
+
     /// One look at the microphone and speaker streams, and the next one a second later.
     /// Not while the phone's panel is off, and not without the kernel's status files: then
     /// no timer runs, and the app is at rest as before. `drawing`: called at the start of a
@@ -1254,6 +1417,14 @@ impl MatchEvent for App {
                     self.has_root = has_root;
                     self.show(cx);
                 }
+                // shown by `voice_flush`, after this event; of several the newest counts
+                socket::ToUi::Voice(text) => {
+                    cx.stop_timer(self.voice.quiet);
+                    if text.is_some() {
+                        self.voice.quiet = cx.start_timeout(VOICE_SECONDS);
+                    }
+                    self.voice.next = Some(text);
+                }
             }
         }
     }
@@ -1317,8 +1488,17 @@ impl AppMain for App {
                 self.settle = cx.start_timeout(SETTLE_AGAIN_SECONDS);
             }
         }
+        if self.voice.quiet.is_event(event).is_some() {
+            self.voice.next = Some(None);
+        }
+        if self.voice.turn.is_event(event).is_some() {
+            self.voice.waits = false;
+        }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        if self.voice.next.is_some() {
+            self.voice_flush(cx);
+        }
         // the first frame is drawn, and the socket was bound at startup (or the app left)
         if matches!(event, Event::Draw(_)) && !std::mem::replace(&mut self.ready_sent, true) {
             notify_ready();
