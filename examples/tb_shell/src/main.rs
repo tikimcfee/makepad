@@ -193,7 +193,12 @@ struct State {
     /// Surfaces whose `on_render` runs at the next frame: at most once a frame each,
     /// with the newest state, however many updates arrive before it.
     render_pending: Vec<WidgetRef>,
+    /// Hidden surfaces fed since they last rendered: they render when they come to the front.
+    stale: Vec<WidgetRef>,
     render_frame: NextFrame,
+    /// Surfaces loaded from the views folder (the rest are the agents').
+    views: HashSet<String>,
+    notified: bool,
 }
 
 #[derive(Script, ScriptHook)]
@@ -239,6 +244,13 @@ impl AppMain for App {
             self.st.split.timed(4, || ui.handle_event(cx, event, &mut Scope::empty()));
         }
         self.drain_host_requests(cx);
+        if let Event::Draw(_) = event {
+            self.notify_ready();
+        }
+        let home = self.shell(cx).borrow_mut::<Shell>().map_or(false, |mut sh| sh.take_go_home());
+        if home && self.st.guards.is_empty() && self.st.bodies.contains_key("home") {
+            self.apply(cx, &obj(vec![("front", "home".into())]), "shell");
+        }
         let answer = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.take_answer());
         if let Some(yes) = answer {
             self.answer_guard(cx, yes);
@@ -337,6 +349,81 @@ impl App {
         self.st.split = split::Split::from_env();
         self.st.trace = paneltrace::PanelTrace::from_env();
         self.read_mic(cx);
+        self.left_out(cx);
+        self.load_views(cx);
+    }
+
+    /// The views folder (TB_SHELL_VIEWS, else `views/` beside the binary): every
+    /// `NAME.splash` becomes surface NAME; `home` comes to the front.
+    fn load_views(&mut self, cx: &mut Cx) {
+        let dir = env("TB_SHELL_VIEWS").map(std::path::PathBuf::from).or_else(|| {
+            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("views")))
+        });
+        let Some(dir) = dir else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "splash")).collect();
+        files.sort();
+        for path in files {
+            let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(body) = std::fs::read_to_string(&path) else { continue };
+            match self.show(cx, &name, &body, false) {
+                Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
+                    log!("tb-shell: view {name} shown in {} ms", reply.get("ms").map_or(String::new(), |m| m.serialize_json()));
+                    self.st.views.insert(name);
+                }
+                Ok(reply) => error!("tb-shell: view {name}: {}", reply.serialize_json()),
+                Err(e) => error!("tb-shell: view {name}: {e}"),
+            }
+        }
+        log!("tb-shell: {} views from {}", self.st.views.len(), dir.display());
+        if self.st.views.contains("home") {
+            self.apply(cx, &obj(vec![("front", "home".into())]), "shell");
+        }
+    }
+
+    /// The agents' surfaces are not brought back after a restart (a body that
+    /// crashed the shell would crash it again). Their names live in a file in
+    /// XDG_RUNTIME_DIR (memory, not disk); after a restart the strip names them.
+    fn surfaces_file() -> Option<String> {
+        env("XDG_RUNTIME_DIR").map(|d| format!("{d}/tb-shell.agent-surfaces"))
+    }
+
+    fn left_out(&mut self, cx: &mut Cx) {
+        let Some(file) = Self::surfaces_file() else { return };
+        let names = std::fs::read_to_string(&file).unwrap_or_default();
+        let names: Vec<&str> = names.split_whitespace().collect();
+        if !names.is_empty() {
+            let note = format!("left out: {}", names.join(", "));
+            log!("tb-shell: after a restart, {note}");
+            if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+                sh.note = note;
+            }
+        }
+        let _ = std::fs::write(&file, "");
+    }
+
+    /// systemd's Type=notify: READY=1 once the first frame is drawn.
+    fn notify_ready(&mut self) {
+        if std::mem::replace(&mut self.st.notified, true) {
+            return;
+        }
+        let Some(path) = env("NOTIFY_SOCKET") else { return };
+        use std::os::linux::net::SocketAddrExt;
+        let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else { return };
+        let sent = match path.strip_prefix('@') {
+            Some(name) => std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).and_then(|a| sock.send_to_addr(b"READY=1", &a)),
+            None => sock.send_to(b"READY=1", &path),
+        };
+        if let Err(e) = sent {
+            error!("tb-shell: READY=1 to {path}: {e}");
+        }
+    }
+
+    fn write_surfaces_file(&self) {
+        let Some(file) = Self::surfaces_file() else { return };
+        let mut names: Vec<&String> = self.st.bodies.keys().filter(|n| !self.st.views.contains(*n)).collect();
+        names.sort();
+        let _ = std::fs::write(&file, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(" "));
     }
 
     /// The recording mark, from the kernel's capture status (on start and on
@@ -477,6 +564,10 @@ impl App {
                     return Err(format!("the key {key} is the shell's"));
                 }
                 self.apply(cx, patch, &format!("client:{}", peer.label()));
+                // "reply": false: a service's stream of updates takes no answers (errors still come).
+                if req.get("reply") == Some(&JsonValue::Bool(false)) {
+                    return Ok(None);
+                }
                 Ok(Some(obj(vec![])))
             }
             "push" => {
@@ -593,6 +684,7 @@ impl App {
             }
         }
         self.st.bodies.insert(name.to_string(), body.to_string());
+        self.write_surfaces_file();
         self.st.reads.insert(name.to_string(), Reads::scan(body));
         self.st.order.retain(|n| n != name);
         self.st.order.push(name.to_string());
@@ -620,6 +712,7 @@ impl App {
         }
         self.st.reads.remove(name);
         self.st.bodies.remove(name);
+        self.write_surfaces_file();
         self.st.order.retain(|n| n != name);
         if self.st.store.get("front").and_then(|v| v.as_str()) == Some(name) {
             let back = self.st.order.last().map_or(JsonValue::Null, |n| JsonValue::String(n.clone()));
@@ -673,7 +766,16 @@ impl App {
 
     /// The frame has come: each surface fed since the last one renders once.
     fn render_pending(&mut self, cx: &mut Cx) {
+        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let front = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(&front));
         for splash in std::mem::take(&mut self.st.render_pending) {
+            // Only the front surface renders; a hidden one waits until it is shown.
+            if front.as_ref().map_or(true, |f| f.widget_uid() != splash.widget_uid()) {
+                if !self.st.stale.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
+                    self.st.stale.push(splash);
+                }
+                continue;
+            }
             let _ = splash.widget(cx, ids!(main)); // the tree warm-up, as in feed
             if let Some(mut inner) = splash.borrow_mut::<Splash>() {
                 self.st.split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
@@ -707,8 +809,17 @@ impl App {
         self.st.split.add_named("shell-lookup", t.elapsed());
         if touched.iter().any(|k| k == "front") {
             let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let shown = shell.borrow::<Shell>().and_then(|sh| sh.surface(&front));
             if let Some(mut sh) = shell.borrow_mut::<Shell>() {
                 sh.front = front;
+            }
+            // A surface that was fed while hidden renders now, with the newest state.
+            if let Some(shown) = shown {
+                if let Some(at) = self.st.stale.iter().position(|w| w.widget_uid() == shown.widget_uid()) {
+                    self.st.stale.remove(at);
+                    self.st.render_pending.push(shown);
+                    self.st.render_frame = cx.new_next_frame();
+                }
             }
             cx.redraw_all();
         }
