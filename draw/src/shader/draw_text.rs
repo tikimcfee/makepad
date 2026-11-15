@@ -2895,10 +2895,11 @@ mod tests {
 }
 
 /// Reads a font member's resource unless `get_resource_font_bytes_by_path` can map it.
-/// Local files and stored Android assets bypass the resource table's duplicate heap copy.
+/// Local files, a packaged desktop build's files and stored Android assets bypass the
+/// resource table's duplicate heap copy.
 fn load_font_resource(cx: &mut Cx, path: &str) {
     #[cfg(not(target_arch = "wasm32"))]
-    if std::path::Path::new(path).is_file() {
+    if std::path::Path::new(path).is_file() || cx.packaged_font_file(path).is_some() {
         return;
     }
     #[cfg(target_os = "android")]
