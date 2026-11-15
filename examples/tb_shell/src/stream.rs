@@ -25,12 +25,20 @@ thread_local! {
 }
 
 /// Stores the newest values of a stream; the views pick them up on the next event.
-pub fn push(name: &str, values: Vec<f32>) {
+/// `append`: the values are added to the stream's own ring of the last MAX_VALUES (a
+/// client sends one new value a time); otherwise they replace it.
+pub fn push(name: &str, values: Vec<f32>, append: bool) {
     STREAMS.with(|s| {
         let mut s = s.borrow_mut();
         let e = s.entry(name.to_string()).or_insert((0, Vec::new()));
         e.0 += 1;
-        e.1 = values;
+        if append {
+            e.1.extend(values);
+            let over = e.1.len().saturating_sub(MAX_VALUES);
+            e.1.drain(..over);
+        } else {
+            e.1 = values;
+        }
     });
 }
 
