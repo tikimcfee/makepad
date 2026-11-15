@@ -11,6 +11,7 @@ pub use makepad_widgets;
 
 mod io;
 mod shell;
+mod split;
 
 use io::{Msg, Peer};
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
@@ -185,6 +186,7 @@ struct State {
     sources: Sources,
     panel_off: bool,
     log_cursor: u64,
+    split: split::Split,
 }
 
 #[derive(Script, ScriptHook)]
@@ -204,18 +206,32 @@ impl AppMain for App {
         if let Event::Startup = event {
             self.start(cx);
         }
+        self.st.split.event_start();
         self.check_panel(cx);
         if let Event::Signal = event {
-            self.drain_socket(cx);
+            if self.st.split.on() {
+                let t = std::time::Instant::now();
+                self.drain_socket(cx);
+                let dt = t.elapsed();
+                self.st.split.add_drain(dt);
+            } else {
+                self.drain_socket(cx);
+            }
         }
         self.drain_host_requests(cx);
-        self.ui.handle_event(cx, event, &mut Scope::empty());
+        if let Event::Draw(_) = event {
+            self.ui.handle_event(cx, event, &mut Scope::empty());
+        } else {
+            let ui = &self.ui;
+            self.st.split.timed(4, || ui.handle_event(cx, event, &mut Scope::empty()));
+        }
         self.drain_host_requests(cx);
         let answer = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.take_answer());
         if let Some(yes) = answer {
             self.answer_guard(cx, yes);
         }
         self.errors_to_watchers();
+        self.st.split.event_end(event);
     }
 }
 
@@ -305,6 +321,7 @@ impl App {
             s.mic_status = Some(status);
         }
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
+        self.st.split = split::Split::from_env();
         self.read_mic(cx);
     }
 
@@ -376,7 +393,11 @@ impl App {
                 }
                 Msg::Changed => sources_changed = true,
                 Msg::Line { conn, line } => {
-                    let reply = match JsonValue::deserialize_json(&line) {
+                    if self.st.split.on() && line.contains("\"op\":\"set\"") {
+                        self.st.split.begin();
+                    }
+                    let parsed = self.st.split.timed(0, || JsonValue::deserialize_json(&line));
+                    let reply = match parsed {
                         Ok(req) => self.request(cx, conn, &req),
                         Err(e) => Err(format!("bad json: {e:?}")),
                     };
@@ -390,7 +411,9 @@ impl App {
                         }
                         Err(e) => obj(vec![("ok", JsonValue::Bool(false)), ("error", JsonValue::String(e))]),
                     };
+                    let t = std::time::Instant::now();
                     self.send(conn, reply.serialize_json());
+                    self.st.split.add_named("reply", t.elapsed());
                 }
             }
         }
@@ -407,6 +430,16 @@ impl App {
     }
 
     fn request(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<Option<JsonValue>, String> {
+        let t = std::time::Instant::now();
+        if req.get("op").and_then(|v| v.as_str()) != Some("set") {
+            self.st.split.taint();
+        }
+        let r = self.request_inner(cx, conn, req);
+        self.st.split.add_named("request", t.elapsed());
+        r
+    }
+
+    fn request_inner(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<Option<JsonValue>, String> {
         let op = req.get("op").and_then(|v| v.as_str()).ok_or("missing op")?;
         let surface = req.get("surface").and_then(|v| v.as_str());
         let peer = self.st.conns.get(&conn).map(|c| c.peer.clone()).ok_or("no connection")?;
@@ -570,30 +603,54 @@ impl App {
 
     /// Hands a surface the current values of `keys` and re-renders it.
     fn feed(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
+        let t = std::time::Instant::now();
+        let r = self.feed_inner(cx, splash, keys);
+        self.st.split.add_named("feed", t.elapsed());
+        r
+    }
+
+    fn feed_inner(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
         let vals = keys.iter()
             .map(|k| (k.clone(), self.st.store.get(k).cloned().unwrap_or(JsonValue::Null)))
             .collect();
         let text = JsonValue::Object(vals).serialize_json();
         // Warm the widget tree from here: while the Splash is borrowed below,
         // the tree cannot read its children, and `ui.main` would not resolve.
-        let _ = splash.widget(cx, ids!(main));
+        let split = &mut self.st.split;
+        split.timed(5, || { let _ = splash.widget(cx, ids!(main)); });
+        // Two calls, so their costs can be told apart (TB_SHELL_SPLIT): the
+        // assignment, then `on_render` and the reload of its result.
         if let Some(mut inner) = splash.borrow_mut::<Splash>() {
-            inner.call_script_fn_with_strings(cx, live_id!(__apply), &[&text]);
+            let split = &mut self.st.split;
+            split.timed(2, || inner.call_script_fn_with_strings(cx, live_id!(__assign), &[&text]));
+            split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
         }
     }
 
     /// The one write path: merge, re-render the readers, tell the watchers.
     fn apply(&mut self, cx: &mut Cx, patch: &JsonValue, by: &str) {
+        let t = std::time::Instant::now();
+        let r = self.apply_inner(cx, patch, by);
+        self.st.split.add_named("apply", t.elapsed());
+        r
+    }
+
+    fn apply_inner(&mut self, cx: &mut Cx, patch: &JsonValue, by: &str) {
         let JsonValue::Object(top) = patch else { return };
         let touched: Vec<String> = top.keys().cloned().collect();
-        for (k, v) in top {
-            if *v == JsonValue::Null {
-                self.st.store.remove(k);
-            } else {
-                merge(self.st.store.entry(k.clone()).or_insert(JsonValue::Null), v);
+        let store = &mut self.st.store;
+        self.st.split.timed(1, || {
+            for (k, v) in top {
+                if *v == JsonValue::Null {
+                    store.remove(k);
+                } else {
+                    merge(store.entry(k.clone()).or_insert(JsonValue::Null), v);
+                }
             }
-        }
+        });
+        let t = std::time::Instant::now();
         let shell = self.shell(cx);
+        self.st.split.add_named("shell-lookup", t.elapsed());
         if touched.iter().any(|k| k == "front") {
             let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(mut sh) = shell.borrow_mut::<Shell>() {
