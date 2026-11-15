@@ -205,6 +205,9 @@ struct State {
     placement: sched::Placement,
     /// The note's end (a one-shot timer, only while a note is up).
     note_timer: Timer,
+    /// The recording mark's re-read (only while it may be on).
+    mic_timer: Timer,
+    mic_unreadable: bool,
 }
 
 #[derive(Script, ScriptHook)]
@@ -252,6 +255,9 @@ impl AppMain for App {
         self.drain_host_requests(cx);
         if let Event::Draw(_) = event {
             self.notify_ready();
+        }
+        if self.st.mic_timer.is_event(event).is_some() {
+            self.mic_timer(cx);
         }
         if self.st.note_timer.is_event(event).is_some() {
             self.clear_note(cx);
@@ -366,7 +372,7 @@ impl App {
         self.guard_input(cx);
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
-        self.read_mic(cx);
+        self.mic_timer(cx); // read once at start; if it is on, keep reading
         let before = Self::surfaces_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         self.load_views(cx);
         self.left_out(cx, &before);
@@ -490,13 +496,43 @@ impl App {
 
     /// The recording mark, from the kernel's capture status (on start and on
     /// each open or close in the sound device directory).
+    ///
+    /// The mark is the status file's content, read again; the events only say when.
+    /// The kernel sends a close event before the PCM is released (fsnotify_close comes
+    /// before ->release in __fput), so the read a close triggers can still find the
+    /// stream open. So every event is followed by a second read 300 ms later, and while
+    /// the mark is on the status is read every 2 s until it says closed. With the mark
+    /// off there is no timer at all.
     fn read_mic(&mut self, cx: &mut Cx) {
-        let mic = self.st.sources.mic_status.as_deref().and_then(read_trim).map_or(false, |t| t != "closed");
+        let Some(status) = self.st.sources.mic_status.clone() else { return };
+        let text = read_trim(&status);
+        if text.is_none() && !self.st.mic_unreadable {
+            error!("tb-shell: cannot read {status}: the recording mark shows off");
+        }
+        self.st.mic_unreadable = text.is_none();
+        let mic = text.as_deref().map_or(false, |t| t != "closed");
         if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
             if sh.marks.mic != mic {
                 sh.marks.mic = mic;
+                log!("tb-shell: recording mark {} (status: {:?}) at {}", if mic { "ON" } else { "off" }, text, paneltrace::stamp());
                 cx.redraw_all();
             }
+        }
+    }
+
+    /// An open or close in the sound device directory: read now, and again shortly.
+    fn mic_event(&mut self, cx: &mut Cx) {
+        self.read_mic(cx);
+        cx.stop_timer(self.st.mic_timer);
+        self.st.mic_timer = cx.start_timeout(0.3);
+    }
+
+    /// The re-read timer: read; while the mark is on, read again in 2 s.
+    fn mic_timer(&mut self, cx: &mut Cx) {
+        self.read_mic(cx);
+        let on = self.shell(cx).borrow::<Shell>().map_or(false, |sh| sh.marks.mic);
+        if on {
+            self.st.mic_timer = cx.start_timeout(2.0);
         }
     }
 
@@ -590,7 +626,7 @@ impl App {
         }
         self.st.rx = Some(rx);
         if sources_changed {
-            self.read_mic(cx);
+            self.mic_event(cx);
         }
     }
 
