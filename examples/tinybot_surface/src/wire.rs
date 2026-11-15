@@ -135,6 +135,34 @@ pub enum Request {
     Show(Layer),
     /// a root client that is the panel runner says so, and gets root's layer
     Runner,
+    /// a root client that is the voice service says so, and gets the voice strip
+    Voice,
+    /// the voice client's text for the strip; `None` takes the strip away
+    Say(Option<String>),
+}
+
+/// The most of a voice text that is kept, in bytes: its end, which is what the strip shows.
+pub const VOICE_BYTES: usize = 600;
+
+/// A voice text as the strip takes it: line ends and tabs are spaces, other control
+/// characters are left out, and of a long text the last `VOICE_BYTES` bytes are kept (from a
+/// character's start). `None` when nothing is left to show.
+pub fn voice_text(raw: &str) -> Option<String> {
+    let clean: String = raw
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let clean = clean.trim();
+    let mut from = clean.len().saturating_sub(VOICE_BYTES);
+    while !clean.is_char_boundary(from) {
+        from += 1;
+    }
+    let kept = clean[from..].trim_start();
+    (!kept.is_empty()).then(|| kept.to_string())
 }
 
 /// The app holds two surfaces, and one of them is on screen: root's (set by a uid-0 peer,
@@ -199,7 +227,15 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
         }
         Some("hello") => match value.key("role").and_then(|r| r.as_str()) {
             Some("runner") => Ok(Request::Runner),
-            _ => err("bad_request", "hello: the one role a client can ask for is \"runner\""),
+            Some("voice") => Ok(Request::Voice),
+            _ => err("bad_request", "hello: the roles a client can ask for are \"runner\" and \"voice\""),
+        },
+        Some("voice") => match value.key("text") {
+            None => Ok(Request::Say(None)),
+            Some(text) => match text.as_str() {
+                Some(text) => Ok(Request::Say(voice_text(text))),
+                None => err("bad_request", "voice: text is a string; without it the strip goes away"),
+            },
         },
         Some("show") => match value.key("layer").and_then(|l| l.as_str()) {
             Some("root") => Ok(Request::Show(Layer::Root)),

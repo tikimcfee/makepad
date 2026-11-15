@@ -27,6 +27,8 @@ pub enum ToUi {
     /// the layer on screen now, and whether root's layer exists (the way back from an
     /// agent's page)
     Front(Option<Layer>, bool),
+    /// the voice strip's text, or no strip
+    Voice(Option<String>),
 }
 
 /// UI to socket thread.
@@ -227,6 +229,7 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
         front: None,
         layers_at: 0,
         runner: None,
+        voice: None,
         taps: VecDeque::new(),
         next_seq: 1,
     };
@@ -239,6 +242,8 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
 struct Conn {
     stream: UnixStream,
     peer: Peer,
+    /// this is the voice client's connection: the strip is its own and goes with it
+    voice: bool,
     client: Client,
     buf: Vec<u8>,
     asks: Asks,
@@ -282,6 +287,8 @@ struct State {
     layers_at: u64,
     /// the pid of the runner while it has a connection: one runner at a time
     runner: Option<u32>,
+    /// the pid of the voice client while its connection is open: one at a time
+    voice: Option<u32>,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
@@ -413,7 +420,7 @@ impl State {
     }
 
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
-    fn request(&mut self, line: &str, peer: &mut Peer, client: &Client, asks: &mut Asks, waiters: usize) -> Option<String> {
+    fn request(&mut self, line: &str, peer: &mut Peer, voice: &mut bool, client: &Client, asks: &mut Asks, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
             Ok(r) => r,
             Err(e) => return Some(e.line()),
@@ -434,6 +441,34 @@ impl State {
             return Some(self.hello(Peer::Root));
         }
         let peer = *peer;
+        match request {
+            Request::Voice => {
+                // the strip is for one connection of a root client: the voice service's
+                let refusal = if !client.root {
+                    Some("only a root client can be the voice".to_string())
+                } else if *voice {
+                    None
+                } else {
+                    self.voice.map(|pid| format!("a voice client is connected already (pid {pid})"))
+                };
+                if let Some(msg) = refusal {
+                    return Some(WireErr { code: "privileged", msg }.line());
+                }
+                self.voice = Some(client.pid);
+                *voice = true;
+                return Some(self.hello(peer));
+            }
+            Request::Say(text) => {
+                if !*voice {
+                    let msg = "voice: only the voice client has the strip (hello with role \"voice\")".to_string();
+                    return Some(WireErr { code: "privileged", msg }.line());
+                }
+                let _ = self.to_ui.send(ToUi::Voice(text));
+                SignalToUI::set_ui_signal();
+                return Some("{\"type\":\"ok\"}\n".to_string());
+            }
+            _ => {}
+        }
         let who = client.who.as_str();
         let layer = Self::own(peer);
         Some(match request {
@@ -522,7 +557,7 @@ impl State {
                 asks.layers_at = self.layers_at;
                 self.taps_reply(peer, news)
             }
-            Request::Runner => unreachable!("answered above"),
+            Request::Runner | Request::Voice | Request::Say(_) => unreachable!("answered above"),
             Request::Done { seq } => {
                 let before = self.taps.len();
                 self.taps.retain(|t| !(t.seq <= seq && Self::sees(peer, t)));
@@ -614,9 +649,9 @@ impl Conn {
             let reply = match std::str::from_utf8(line) {
                 Ok(text) if text.trim().is_empty() => None,
                 Ok(text) => {
-                    let (mut asks, mut peer) = (self.asks, self.peer);
-                    let reply = state.request(text, &mut peer, &self.client, &mut asks, waiters);
-                    (self.asks, self.peer) = (asks, peer);
+                    let (mut asks, mut peer, mut voice) = (self.asks, self.peer, self.voice);
+                    let reply = state.request(text, &mut peer, &mut voice, &self.client, &mut asks, waiters);
+                    (self.asks, self.peer, self.voice) = (asks, peer, voice);
                     reply
                 }
                 Err(_) => Some(WireErr { code: "bad_json", msg: "the line is not UTF-8".into() }.line()),
@@ -716,6 +751,12 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
         if state.runner.is_some() && !conns.iter().any(|c| c.peer == Peer::Root) {
             state.runner = None;
         }
+        // the voice client has left: its strip goes with it, whatever it last said
+        if state.voice.is_some() && !conns.iter().any(|c| c.voice) {
+            state.voice = None;
+            let _ = state.to_ui.send(ToUi::Voice(None));
+            SignalToUI::set_ui_signal();
+        }
 
         // the layers changed (a request above, or the user went Home): the waiting clients
         // that asked to hear of it are answered
@@ -740,7 +781,7 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
                         // the hello says how the layers are: this client has heard
                         let asks = Asks { layers_at: state.layers_at, ..Asks::default() };
                         // every client starts on the agent's layer, root too
-                        let mut conn = Conn { stream, peer: Peer::User, client, buf: Vec::new(), asks, closed: false };
+                        let mut conn = Conn { stream, peer: Peer::User, voice: false, client, buf: Vec::new(), asks, closed: false };
                         conn.send(&state.hello(Peer::User));
                         if !conn.closed {
                             conns.push(conn);
