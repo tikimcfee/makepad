@@ -4,6 +4,7 @@
 //!   tb-surface wait [--timeout S]                  print the waiting taps, or block for the next one
 //!   tb-surface clear                               back to the idle line
 //!   tb-surface status                              what is shown, how many taps wait
+//!   tb-surface voice                               as root: each line of stdin is the voice strip's text
 //!
 //! This is `tb-surface.py` as a binary, for an image without python3: the same commands,
 //! options, output lines and exit codes. Standard library only: nothing of the package's
@@ -31,9 +32,9 @@ mod unix {
     /// The protocol version this tool speaks (`v` in the app's `hello`).
     const VERSION: u64 = 2;
 
-    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status} ...\n";
+    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice} ...\n";
     const HELP: &str = "\
-usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status} ...
+usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice} ...
 
 tinybot's live surface, one call per turn
 
@@ -41,6 +42,7 @@ tinybot's live surface, one call per turn
   tb-surface wait [--timeout S]                  print the waiting taps, or block for the next one
   tb-surface clear                               back to the idle line
   tb-surface status                              what is shown, how many taps wait
+  tb-surface voice                               as root: each line of stdin is the voice strip's text
 
 options:
   -h, --help     this text
@@ -53,7 +55,9 @@ options:
   --timeout S    wait: give up after S seconds (0: only what waits now; default: no limit)
 
 Each command prints the app's answer as JSON lines on stdout. `wait` prints one `tap` line per
-press and nothing else; the app keeps a tap until this command has printed it.
+press and nothing else; the app keeps a tap until this command has printed it. `voice` prints
+only a refusal: every line it reads replaces the strip's text, an empty line takes the strip
+away, and so does the end of the input.
 
 Exit status: 0 done; 1 the app refused (its `err` line is on stdout); 2 `wait` ended without a
 tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot be read.
@@ -333,8 +337,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         Unreachable(String),
         /// No line from the app within the time given.
         TimedOut,
-        /// The app's `err` line to the request for the runner's role: exit 1, as for any
-        /// refusal.
+        /// The app's `err` line to the request for a role: exit 1, as for any refusal.
         Refused(String),
         /// stdout is gone. The Python tool dies of the same with status 1; what matters is
         /// that no `done` follows a tap that could not be printed.
@@ -372,14 +375,14 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
     }
 
     impl Surface {
-        /// `runner`: ask for root's layer as the panel runner would (for root, when no
-        /// runner is connected).
-        fn connect(path: &PathBuf, runner: bool) -> Result<Surface, Fail> {
+        /// `role`: ask for it after the greeting. `runner` is root's layer as the panel
+        /// runner has it (for root, when no runner is connected), `voice` the voice strip.
+        fn connect(path: &PathBuf, role: Option<&str>) -> Result<Surface, Fail> {
             let sock = UnixStream::connect(path).map_err(|e| Fail::Unreachable(format!("no surface at {} ({e})", path.display())))?;
             let mut conn = Surface { sock, buf: Vec::new() };
             let mut hello = conn.read(Some(5.0))?;
-            if runner && hello.kind == "hello" {
-                conn.send("{\"type\":\"hello\",\"role\":\"runner\"}")?;
+            if let (Some(role), "hello") = (role, hello.kind.as_str()) {
+                conn.send(&format!("{{\"type\":\"hello\",\"role\":\"{role}\"}}"))?;
                 hello = conn.read(Some(5.0))?;
                 if hello.kind == "err" {
                     return Err(Fail::Refused(hello.text));
@@ -524,6 +527,31 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         answer(conn.read(Some(10.0))?)
     }
 
+    /// Every line of stdin is the strip's text from then on; an empty line takes the strip
+    /// away, and so does the end of the input (the app does it too when this process goes).
+    fn voice(conn: &mut Surface) -> Result<i32, Fail> {
+        let mut input = io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let more = io::BufRead::read_until(&mut input, b'\n', &mut line).unwrap_or(0) > 0;
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\n', '\r']);
+            if more && !text.is_empty() {
+                conn.send(&format!("{{\"type\":\"voice\",\"text\":{}}}", quote(text)))?;
+            } else {
+                conn.send("{\"type\":\"voice\"}")?;
+            }
+            let reply = conn.read(Some(10.0))?;
+            if reply.kind == "err" {
+                return answer(reply);
+            }
+            if !more {
+                return Ok(0);
+            }
+        }
+    }
+
     // ---- the command line ----
 
     enum Command {
@@ -531,6 +559,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         Wait { timeout: Option<f64> },
         Clear,
         Status,
+        Voice,
     }
 
     /// Why no command runs: `None` when help was asked for, else what is wrong.
@@ -623,18 +652,18 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
                 }
                 Command::Wait { timeout }
             }
-            "clear" | "status" => {
+            "clear" | "status" | "voice" => {
                 if let Some(arg) = rest.next() {
                     return if is_help(&arg) { Err(None) } else { unrecognized(&arg) };
                 }
-                if command == "clear" {
-                    Command::Clear
-                } else {
-                    Command::Status
+                match command.as_str() {
+                    "clear" => Command::Clear,
+                    "status" => Command::Status,
+                    _ => Command::Voice,
                 }
             }
             other => {
-                return Err(Some(format!("argument command: invalid choice: '{other}' (choose from set, wait, clear, status)")));
+                return Err(Some(format!("argument command: invalid choice: '{other}' (choose from set, wait, clear, status, voice)")));
             }
         };
         Ok((socket, runner, command))
@@ -674,11 +703,18 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
             }
         };
         // the app is reached before FILE is read, so a missing app is status 3 whatever FILE is
-        let done = Surface::connect(&socket_path(socket), runner).and_then(|mut conn| match &command {
+        // the voice strip is a role of its own; the other commands act on a layer
+        let role = match command {
+            Command::Voice => Some("voice"),
+            _ if runner => Some("runner"),
+            _ => None,
+        };
+        let done = Surface::connect(&socket_path(socket), role).and_then(|mut conn| match &command {
             Command::Set { file, surface, rev } => set(&mut conn, file, surface, *rev),
             Command::Wait { timeout } => wait(&mut conn, *timeout),
             Command::Clear => ask(&mut conn, "clear"),
             Command::Status => ask(&mut conn, "status"),
+            Command::Voice => voice(&mut conn),
         });
         match done {
             Ok(status) => status,

@@ -5,9 +5,12 @@
   tb-surface wait [--timeout S]                  print the waiting taps, or block for the next one
   tb-surface clear                               back to the idle line
   tb-surface status                              what is shown, how many taps wait
+  tb-surface voice                               as root: each line of stdin is the voice strip's text
 
 Each command prints the app's answer as JSON lines on stdout. `wait` prints one `tap` line per
-press and nothing else; the app keeps a tap until this command has printed it.
+press and nothing else; the app keeps a tap until this command has printed it. `voice` prints
+only a refusal: every line it reads replaces the strip's text, an empty line takes the strip
+away, and so does the end of the input.
 
 Exit status: 0 done; 1 the app refused (its `err` line is on stdout); 2 `wait` ran out of time
 without a tap; 3 the app cannot be reached or did not speak the protocol.
@@ -44,13 +47,13 @@ class TimedOut(Exception):
 
 
 class Refused(Exception):
-    """The app's err line to the request for the runner's role."""
+    """The app's err line to the request for a role."""
 
 
 class Surface:
     """A connection: the hello is read on connect, then requests and answers are lines."""
 
-    def __init__(self, path, runner=False):
+    def __init__(self, path, role=None):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.buf = b""
         try:
@@ -58,9 +61,10 @@ class Surface:
         except OSError as e:
             raise Unreachable("no surface at %s (%s)" % (path, e.strerror or e))
         self.hello = self.read(5.0)
-        if runner and self.hello.get("type") == "hello":
-            # root's layer, as the panel runner: the app gives it to one root client that asks
-            self.send({"type": "hello", "role": "runner"})
+        if role and self.hello.get("type") == "hello":
+            # "runner": root's layer, as the panel runner; "voice": the voice strip. The app
+            # gives each to one root client that asks
+            self.send({"type": "hello", "role": role})
             self.hello = self.read(5.0)
             if self.hello.get("type") == "err":
                 raise Refused(self.hello["_text"])
@@ -165,6 +169,22 @@ def cmd_status(conn, args):
     return answer(conn.read(10.0))
 
 
+def cmd_voice(conn, args):
+    stdin = open(sys.stdin.fileno(), "rb", closefd=False)
+    while True:
+        line = stdin.readline()
+        text = line.decode("utf-8", "replace").rstrip("\r\n")
+        if line and text:
+            conn.send({"type": "voice", "text": text})
+        else:
+            conn.send({"type": "voice"})
+        reply = conn.read(10.0)
+        if reply.get("type") == "err":
+            return answer(reply)
+        if not line:
+            return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tb-surface", description="tinybot's live surface, one call per turn")
     parser.add_argument("--socket", help="the surface's socket (default: $TINYBOT_SURFACE_SOCK, then $XDG_RUNTIME_DIR/tinybot/surface.sock)")
@@ -182,9 +202,12 @@ def main():
     p.set_defaults(run=cmd_clear)
     p = sub.add_parser("status", help="what is shown, how many taps wait")
     p.set_defaults(run=cmd_status)
+    p = sub.add_parser("voice", help="as root: each line of stdin is the voice strip's text")
+    p.set_defaults(run=cmd_voice)
     args = parser.parse_args()
     try:
-        conn = Surface(socket_path(args.socket), args.runner)
+        role = "voice" if args.command == "voice" else "runner" if args.runner else None
+        conn = Surface(socket_path(args.socket), role)
         return args.run(conn, args)
     except Unreachable as e:
         sys.stderr.write("tb-surface: %s\n" % e)
