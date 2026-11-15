@@ -6,6 +6,8 @@
 //!   tbui set -j JSON | tbui set KEY=JSON...
 //!   tbui set -        one connection; each line of stdin is a patch (for a service: no
 //!                     process per update); exit 1 if any was refused
+//!   tbui push NAME    one connection; each line of stdin is the values of stream NAME
+//!                     (numbers, comma or space separated), for StreamView; no replies
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
@@ -224,6 +226,19 @@ fn main() {
                 if errors > 0 {
                     exit(1);
                 }
+            }
+        }
+        "push" => {
+            let name = rest.first().unwrap_or_else(|| die("push NAME (values on stdin)"));
+            let mut c = Client::connect();
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let values: Vec<&str> = line.split(|ch: char| ch == ',' || ch.is_whitespace()).filter(|v| !v.is_empty()).collect();
+                if values.iter().any(|v| v.parse::<f64>().is_err()) {
+                    die(&format!("not numbers: {line}"));
+                }
+                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
+                c.out.write_all(req.as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
             }
         }
         "set" if rest.first().map(String::as_str) == Some("-") => {
