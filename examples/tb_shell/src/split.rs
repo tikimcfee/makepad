@@ -200,6 +200,16 @@ impl Split {
         }
     }
 
+    /// A count (bytes, calls) under a name, in the same list as the clock spans.
+    pub fn add_count(&mut self, name: &'static str, v: f64) {
+        if let Some((rec, _)) = self.cur.as_mut() {
+            match rec.named.iter_mut().find(|(n, _)| *n == name) {
+                Some(e) => e.1 += v,
+                None => rec.named.push((name, v)),
+            }
+        }
+    }
+
     pub fn add_named(&mut self, name: &'static str, dt: std::time::Duration) {
         if let Some((rec, _)) = self.cur.as_mut() {
             let dt = dt.as_secs_f64() * 1e6;
