@@ -12,7 +12,10 @@
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
 //!   tbui ask "QUESTION" CHOICE... [--from TEXT] [--timeout SECS]
-//!        prints the choice; exit 0 for the first choice, 1 for another, 2 on timeout
+//!        prints the choice; exit 0 for the first choice, 1 for another, 2 on timeout.
+//!        Run as root it is the shell's GUARD (two choices: the first is yes, the second no):
+//!        drawn above everything, input to the views gated, the asker named by the kernel;
+//!        exit 3 when it went away unanswered. From any other user it is an ordinary view.
 //!   tbui guard "TEXT" [--yes LABEL] [--no LABEL]
 //!        the shell's own guard (a uid it allows, root by default); waits for a person's tap;
 //!        exit 0 yes, 1 no, 3 when the guard went away unanswered (the shell ended)
@@ -143,6 +146,38 @@ fn ask(args: &[String]) -> ! {
         die("ask QUESTION CHOICE...");
     }
     let (question, choices) = (words[0].clone(), words[1..].to_vec());
+    // Root asks through the guard; TBUI_ASK_GUARD=1 does it for a test (the shell still
+    // refuses a guard from a uid it does not allow).
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    if unsafe { geteuid() } == 0 || std::env::var("TBUI_ASK_GUARD").map_or(false, |v| v == "1") {
+        if choices.len() != 2 {
+            die("a root ask is the guard: exactly two choices, yes then no");
+        }
+        let mut c = Client::connect();
+        c.send(&obj(vec![("op", "guard".into()), ("text", question.as_str().into()), ("yes", choices[0].as_str().into()), ("no", choices[1].as_str().into())]));
+        if timeout > 0 {
+            c.out.set_read_timeout(Some(Duration::from_secs(timeout))).ok();
+        }
+        // On a timeout the connection closes with this process, and the guard goes with it.
+        match c.next() {
+            Some(reply) if reply.get("ok") == Some(&JsonValue::Bool(true)) => {
+                let choice = reply.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                println!("{choice}");
+                exit(if reply.get("answer").and_then(|v| v.as_str()) == Some("yes") { 0 } else { 1 })
+            }
+            Some(reply) => {
+                eprintln!("{}", reply.serialize_json());
+                exit(4)
+            }
+            None if timeout > 0 => exit(2),
+            None => {
+                eprintln!("tbui: the guard went away unanswered");
+                exit(3)
+            }
+        }
+    }
     let id = format!("ask-{}", std::process::id());
     if from.is_empty() {
         from = format!("asked by pid {}", std::os::unix::process::parent_id());

@@ -15,11 +15,17 @@ pub struct Peer {
     pub pid: i32,
     pub uid: u32,
     pub comm: String,
+    /// The process that started it (a tool runs `tbui`; the tool is the asker).
+    pub parent: String,
 }
 
 impl Peer {
     pub fn label(&self) -> String {
-        format!("{} pid {} uid {}", self.comm, self.pid, self.uid)
+        if self.parent.is_empty() {
+            format!("{} pid {} uid {}", self.comm, self.pid, self.uid)
+        } else {
+            format!("{} (from {}) pid {} uid {}", self.comm, self.parent, self.pid, self.uid)
+        }
     }
 }
 
@@ -52,10 +58,15 @@ fn peer_of(stream: &UnixStream) -> Peer {
     let mut len = std::mem::size_of::<Ucred>() as u32;
     let ok = unsafe { getsockopt(stream.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, &mut cred as *mut Ucred as *mut c_void, &mut len) } == 0;
     if !ok {
-        return Peer { pid: -1, uid: u32::MAX, comm: "?".into() };
+        return Peer { pid: -1, uid: u32::MAX, comm: "?".into(), parent: String::new() };
     }
-    let comm = std::fs::read_to_string(format!("/proc/{}/comm", cred.pid)).map(|s| s.trim().to_string()).unwrap_or_else(|_| "?".into());
-    Peer { pid: cred.pid, uid: cred.uid, comm }
+    let comm_of = |pid: i32| std::fs::read_to_string(format!("/proc/{pid}/comm")).map(|s| s.trim().to_string()).ok();
+    let comm = comm_of(cred.pid).unwrap_or_else(|| "?".into());
+    // The parent from /proc/PID/stat (field 4, after the parenthesised name).
+    let parent = std::fs::read_to_string(format!("/proc/{}/stat", cred.pid)).ok()
+        .and_then(|s| s.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(1).and_then(|p| p.parse::<i32>().ok())))
+        .filter(|p| *p > 1).and_then(comm_of).unwrap_or_default();
+    Peer { pid: cred.pid, uid: cred.uid, comm, parent }
 }
 
 /// A named thread: an unnamed one takes its parent's name, `makepad-app`.
