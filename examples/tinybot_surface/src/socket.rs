@@ -403,11 +403,17 @@ impl State {
         }
         let bad = |msg: String| Err(WireErr { code: "bad_item", msg });
         for change in &update.changes {
+            let pick = held.targets.get(&change.id) == Some(&Target::Pick);
+            if !pick && (change.note.is_some() || change.dot.is_some()) {
+                return bad(format!("update {}: only a pick has a note and a dot", change.id));
+            }
             match held.targets.get(&change.id) {
                 Some(Target::Readout) => {}
+                Some(Target::Pick) if change.value.is_none() => {}
+                Some(Target::Pick) => return bad(format!("update {}: a pick has no value", change.id)),
                 Some(Target::Label) if change.value.is_none() => {}
                 Some(Target::Label) => return bad(format!("update {}: a heading or text has no value", change.id)),
-                Some(_) => return bad(format!("update {}: only a heading, text or readout is changed in place", change.id)),
+                Some(_) => return bad(format!("update {}: only a heading, text, readout or pick is changed in place", change.id)),
                 None => return bad(format!("update {}: no item with this id", change.id)),
             }
         }
