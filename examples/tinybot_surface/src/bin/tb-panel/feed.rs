@@ -66,13 +66,94 @@ pub struct Feed {
     pub error: Option<String>,
 }
 
-/// What tells one state of a file from another without reading it: its inode, size and time
-/// of change. A file replaced by a rename is another inode.
+/// What tells one state of a file from another without reading it: its inode, size and the
+/// time its inode last changed (its content, its owner or its mode). A file replaced by a
+/// rename is another inode.
 pub type Stamp = (u64, u64, i64, i64);
 
 pub fn stamp(path: &str) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.ino(), meta.size(), meta.mtime(), meta.mtime_nsec()))
+    Some((meta.ino(), meta.size(), meta.ctime(), meta.ctime_nsec()))
+}
+
+/// The kernel's word that a directory changed (inotify), so a feed file that is replaced
+/// shows at once and a page with a feed costs no wakeup while nothing happens. One inotify
+/// instance for the runner; a thread sleeps in its read and hands each event on.
+pub struct Watcher {
+    fd: i32,
+}
+
+/// What a watch told: the watch, and the name in its directory that changed. `None`: the
+/// watch itself is gone or events were lost, so every file under it may have changed.
+pub struct Watched {
+    pub watch: i32,
+    pub name: Option<String>,
+}
+
+extern "C" {
+    fn inotify_init1(flags: i32) -> i32;
+    fn inotify_add_watch(fd: i32, path: *const std::ffi::c_char, mask: u32) -> i32;
+    fn inotify_rm_watch(fd: i32, watch: i32) -> i32;
+    #[link_name = "read"]
+    fn read_fd(fd: i32, bytes: *mut std::ffi::c_void, count: usize) -> isize;
+}
+
+/// A file written and closed, renamed into or out of the directory, made, removed, or
+/// given another owner or mode.
+const IN_FILE: u32 = 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x4;
+/// The directory itself removed or moved, the watch dropped, events lost.
+const IN_LOST: u32 = 0x400 | 0x800 | 0x4000 | 0x8000;
+
+impl Watcher {
+    /// `None` where the kernel gives no inotify instance: the runner then looks at its
+    /// feeds on a timer, as slowly as it has to.
+    pub fn new(mut hand_on: impl FnMut(Watched) + Send + 'static) -> Option<Watcher> {
+        // IN_CLOEXEC: the tools the runner starts do not get it
+        let fd = unsafe { inotify_init1(0o2000000) };
+        if fd < 0 {
+            return None;
+        }
+        let spawned = std::thread::Builder::new().name("tb-panel-watch".into()).spawn(move || {
+            // struct inotify_event: watch, mask, cookie, the name's length, the name
+            let mut bytes = [0u8; 4096];
+            loop {
+                let n = unsafe { read_fd(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+                if n <= 0 {
+                    if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                let mut at = 0;
+                while at + 16 <= n as usize {
+                    let word = |i: usize| u32::from_ne_bytes([bytes[at + i], bytes[at + i + 1], bytes[at + i + 2], bytes[at + i + 3]]);
+                    let (watch, mask, len) = (word(0) as i32, word(4), word(12) as usize);
+                    let name = &bytes[(at + 16).min(n as usize)..(at + 16 + len).min(n as usize)];
+                    let name = String::from_utf8_lossy(name.split(|b| *b == 0).next().unwrap_or_default()).into_owned();
+                    at += 16 + len;
+                    if mask & IN_LOST != 0 {
+                        hand_on(Watched { watch, name: None });
+                    } else if mask & IN_FILE != 0 {
+                        hand_on(Watched { watch, name: Some(name) });
+                    }
+                }
+            }
+        });
+        spawned.ok().map(|_| Watcher { fd })
+    }
+
+    /// Watches the directory of `file`. `None`: it cannot be watched (it is not there).
+    pub fn watch_dir_of(&self, file: &str) -> Option<i32> {
+        let dir = std::path::Path::new(file).parent()?;
+        let dir = std::ffi::CString::new(dir.to_str()?).ok()?;
+        // IN_ONLYDIR 0x01000000: a directory, nothing else
+        let watch = unsafe { inotify_add_watch(self.fd, dir.as_ptr(), IN_FILE | 0x400 | 0x800 | 0x0100_0000) };
+        (watch >= 0).then_some(watch)
+    }
+
+    pub fn unwatch(&self, watch: i32) {
+        unsafe { inotify_rm_watch(self.fd, watch) };
+    }
 }
 
 /// An id goes to the action as one argument. It is kept to characters that mean nothing to
@@ -316,6 +397,24 @@ impl Feed {
             }
         }
         Some(changes)
+    }
+
+    /// Makes the pick `id` the selected one, as its tap most likely will: the changes for the
+    /// page, so the tap is seen at once. The next read of the file says what is true.
+    pub fn select(&mut self, id: &str) -> Vec<(String, Json)> {
+        if !self.items.iter().any(|item| matches!(item, Item::Pick { id: this, tappable: true, .. } if this == id)) {
+            return Vec::new();
+        }
+        let mut changes = Vec::new();
+        for item in &mut self.items {
+            if let Item::Pick { id: this, selected, tappable: true, .. } = item {
+                if *selected != (this == id) {
+                    *selected = this == id;
+                    changes.push((page_id(this), Json::obj([("selected", (*selected).into())])));
+                }
+            }
+        }
+        changes
     }
 
     /// Whether `id` is an item of this feed that can be tapped.

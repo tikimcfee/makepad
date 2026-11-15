@@ -44,8 +44,15 @@ const QUESTION: &str = "_question";
 const SHOWN_CHARS: usize = 120;
 /// The time a check or a readout command gets.
 const DIRECT_LIMIT: Duration = Duration::from_secs(2);
-/// How often a feed's file is looked at while its page is on screen.
+/// How often a feed's file is looked at while its page is on screen and the kernel cannot
+/// be asked to say when it changes (no inotify, or its directory is not there yet).
 const FEED_EVERY: Duration = Duration::from_secs(1);
+/// With a watch on its directory a feed's file is looked at when the watch says so; this
+/// is the look in between, for a watch that was lost without a word.
+const FEED_FALLBACK: Duration = Duration::from_secs(10);
+/// A feed that changed while the phone's panel was off waits for the panel: this often the
+/// runner looks whether it is on again.
+const FEED_WAITS: Duration = Duration::from_secs(2);
 /// The most a page's items may take in the `set` line: under the app's 64 KiB a line.
 const PAGE_LIMIT: usize = 60 * 1024;
 
@@ -70,6 +77,8 @@ enum Event {
     /// something of the runner's own does not work; it goes on without it
     Problem(String),
     Polled { panel: String, id: String, value: String },
+    /// the directory of a feed changed
+    Watched(feed::Watched),
     Asked(Asked),
     Terminate,
 }
@@ -202,6 +211,8 @@ struct Fed {
     stamp: Option<feed::Stamp>,
     feed: Feed,
     due: Instant,
+    /// the watch on the file's directory, when there is one
+    watch: Option<i32>,
 }
 
 struct Runner {
@@ -241,6 +252,8 @@ struct Runner {
     readouts: Vec<Polled>,
     /// the feeds of the page on screen (none for any other page: nothing is read for them)
     feeds: Vec<Fed>,
+    /// the kernel's watches on the feeds' directories; `None` where there is no inotify
+    watcher: Option<feed::Watcher>,
     /// readout commands that have not come back yet
     polling: HashSet<String>,
 
@@ -550,6 +563,7 @@ pub fn run(options: Options) -> i32 {
         last: HashMap::new(),
         readouts: Vec::new(),
         feeds: Vec::new(),
+        watcher: None,
         polling: HashSet::new(),
         questions: Vec::new(),
         answered: HashMap::new(),
@@ -558,6 +572,8 @@ pub fn run(options: Options) -> i32 {
         agent: None,
         agent_front: false,
     };
+    let to = events.clone();
+    runner.watcher = feed::Watcher::new(move |watched| drop(to.send(Event::Watched(watched))));
     runner.restore();
     // units a runner that died left running are stopped, with their all-off
     let mut leftover = Command::new("systemctl");
@@ -979,7 +995,8 @@ impl Runner {
     /// or taken away.
     fn show(&mut self, keep_user: bool) {
         self.readouts.clear();
-        self.feeds.clear();
+        // the watches of the page before: let go further down, when the new page's are known
+        let watched: Vec<i32> = self.feeds.drain(..).filter_map(|fed| fed.watch).collect();
         let (title, items) = match &self.page {
             Page::Home => self.home_items(),
             Page::Question => match self.questions.first() {
@@ -994,9 +1011,12 @@ impl Runner {
                             Item::Readout { id, poll: Some(poll), every_s, .. } => {
                                 self.readouts.push(Polled { id: id.clone(), poll: poll.clone(), every: Duration::from_secs_f64(*every_s), due: now });
                             }
-                            // a feed's file is read as its page goes to the screen
+                            // a feed's file is read as its page goes to the screen; watched
+                            // first, so no change between the two is missed
                             Item::Feed { id, file, .. } => {
-                                self.feeds.push(Fed { id: id.clone(), file: file.clone(), stamp: feed::stamp(file), feed: feed::read(file), due: now + FEED_EVERY });
+                                let watch = self.watcher.as_ref().and_then(|watcher| watcher.watch_dir_of(file));
+                                let due = now + if watch.is_some() { FEED_FALLBACK } else { FEED_EVERY };
+                                self.feeds.push(Fed { id: id.clone(), file: file.clone(), stamp: feed::stamp(file), feed: feed::read(file), due, watch });
                             }
                             _ => {}
                         }
@@ -1015,6 +1035,12 @@ impl Runner {
                 None => self.home_items(),
             },
         };
+        // a directory no feed of this page is in is watched no longer
+        if let Some(watcher) = &self.watcher {
+            for watch in watched.into_iter().filter(|watch| !self.feeds.iter().any(|fed| fed.watch == Some(*watch))) {
+                watcher.unwatch(watch);
+            }
+        }
         self.rev += 1;
         let set = Json::obj([
             ("type", "set".into()),
@@ -1197,6 +1223,14 @@ impl Runner {
             if let Some(result) = &result {
                 self.show_result(panel_name, result, why, None);
             }
+            return;
+        }
+        // The tap is seen at once: a pick is drawn as the selected one before its action
+        // has said so. The feed's file says what is true: it is read when it changes and
+        // in any case when the action has ended (`tried`).
+        let changes = self.feeds.iter_mut().find(|fed| fed.id == feed_id).map(|fed| fed.feed.select(item)).unwrap_or_default();
+        if !changes.is_empty() {
+            self.update_items(changes);
         }
     }
 
@@ -1391,10 +1425,14 @@ impl Runner {
         };
         // only a button has a row to arm again; a feed's action has none
         let button = self.panels.get(&run.panel).is_some_and(|p| p.button(&run.button).is_some()).then(|| run.button.clone());
-        // a feed's action has most likely changed its feed: looked at now, not in a second
+        // A feed's action has ended: its file is read now, changed or not, so the page is
+        // what the file says (the pick that was drawn as selected at the tap may not be).
         if button.is_none() {
             let now = Instant::now();
-            self.feeds.iter_mut().for_each(|fed| fed.due = now);
+            for fed in self.feeds.iter_mut().filter(|fed| fed.id == run.button) {
+                fed.due = now;
+                fed.stamp = None;
+            }
         }
         let failed: Vec<&str> = tried.checks.iter().filter(|(_, rc)| *rc != 0).map(|(name, _)| name.as_str()).collect();
         let timed_out = tried.result == "timeout";
@@ -1684,12 +1722,18 @@ impl Runner {
         let mut changes = Vec::new();
         let mut other_items = false;
         for fed in self.feeds.iter_mut().filter(|fed| fed.due <= now) {
-            fed.due = now + FEED_EVERY;
-            if off {
+            // a directory that was not there when the page came up may be there now
+            if fed.watch.is_none() {
+                fed.watch = self.watcher.as_ref().and_then(|watcher| watcher.watch_dir_of(&fed.file));
+            }
+            fed.due = now + if fed.watch.is_some() { FEED_FALLBACK } else { FEED_EVERY };
+            let stamp = feed::stamp(&fed.file);
+            if stamp == fed.stamp && stamp.is_some() {
                 continue;
             }
-            let stamp = feed::stamp(&fed.file);
-            if stamp == fed.stamp {
+            if off {
+                // it has changed and nobody sees the page: read once the panel is on again
+                fed.due = now + FEED_WAITS;
                 continue;
             }
             let new = feed::read(&fed.file);
@@ -1805,6 +1849,20 @@ impl Runner {
                 Some(Event::Polled { panel, id, value }) => {
                     self.polling.remove(&id);
                     self.show_readouts(&panel, vec![(id, value)]);
+                }
+                // a feed's directory changed: its file is looked at now (a watch that was
+                // lost says nothing of which file: every feed under it is looked at)
+                Some(Event::Watched(watched)) => {
+                    let now = Instant::now();
+                    for fed in self.feeds.iter_mut().filter(|fed| fed.watch == Some(watched.watch)) {
+                        let name = Path::new(&fed.file).file_name().and_then(|name| name.to_str());
+                        if watched.name.is_none() || watched.name.as_deref() == name {
+                            fed.due = now;
+                        }
+                        if watched.name.is_none() {
+                            fed.watch = None;
+                        }
+                    }
                 }
                 Some(Event::Asked(asked)) => self.asked(asked),
                 Some(Event::Terminate) => {
