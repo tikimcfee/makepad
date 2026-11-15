@@ -169,6 +169,7 @@ workspace.members = [
     "examples/splash_live",
     "examples/slides",
     "examples/isolate",
+    "examples/tb_shell",
     "examples/uizoo",
     "examples/video_player",
     "examples/video_codec_test",

@@ -1,0 +1,19 @@
+let AgentRow = Squircle{
+    dot := Dot{}
+    name := Title{width: Fill}
+    mark := Small{}
+}
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fill flow: Down spacing: 10
+    on_item_tap: |i| { set("target", state.agents[i].id) }
+    on_render: || {
+        for a in state.agents ?? [] {
+            AgentRow{
+                name.text: a.name
+                dot.draw_bg.color: status_color(a.status)
+                mark.text: if a.id == state.target { "default" } else { "" }
+            }
+        }
+    }
+}
