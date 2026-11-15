@@ -816,8 +816,19 @@ impl App {
         if touched.iter().any(|k| k == "front") {
             let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let shown = shell.borrow::<Shell>().and_then(|sh| sh.surface(&front));
+            let before = shell.borrow::<Shell>().map(|sh| sh.front.clone()).unwrap_or_default();
             if let Some(mut sh) = shell.borrow_mut::<Shell>() {
-                sh.front = front;
+                sh.front = front.clone();
+            }
+            // A service does its work only while its view is looked at: `shown` and `hidden`
+            // go to the watchers of those surfaces.
+            if before != front {
+                if !before.is_empty() {
+                    self.to_surface_watchers(&before, obj(vec![("ev", "hidden".into()), ("surface", before.as_str().into())]));
+                }
+                if !front.is_empty() {
+                    self.to_surface_watchers(&front, obj(vec![("ev", "shown".into()), ("surface", front.as_str().into())]));
+                }
             }
             // A surface that was fed while hidden renders now, with the newest state.
             if let Some(shown) = shown {
