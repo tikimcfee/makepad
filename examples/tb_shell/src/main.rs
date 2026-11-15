@@ -1,5 +1,6 @@
-//! tb-shell: one JSON store, one Splash isolate per surface, a strip the
-//! shell draws itself, and a Unix socket that speaks newline-delimited JSON.
+//! tb-shell: one JSON store, one Splash isolate per surface, a strip and a
+//! guard the shell draws itself, and a Unix socket that speaks
+//! newline-delimited JSON.
 //!
 //! A write from anywhere (a client's `set`, a tap's `set(k, v)`) is a JSON
 //! merge patch on the one store. The shell applies it, hands the new values
@@ -8,35 +9,31 @@
 
 pub use makepad_widgets;
 
+mod io;
+mod shell;
+
+use io::{Msg, Peer};
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
-use makepad_widgets::*;
+use makepad_widgets::makepad_platform::log_ring;
 use makepad_widgets::splash_host::take_splash_host_requests;
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use makepad_widgets::*;
+use shell::{GuardView, Shell};
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
 
 app_main!(App);
 
 const PRELUDE: &str = include_str!("prelude.splash");
 const BASE: &str = include_str!("../lib/base.splash");
-/// Keys only the shell writes (the marks and the guard live here later).
+/// A key only the shell writes.
 const SHELL_KEY: &str = "shell";
+/// Lines ahead of a body: Splash's own prefix, the prelude, the library.
+fn lines_ahead() -> usize {
+    3 + PRELUDE.lines().count() + BASE.lines().count()
+}
 
 script_mod! {
     use mod.prelude.widgets.*
-
-    mod.widgets.ShellBase = #(Shell::register_widget(vm))
-    mod.widgets.Shell = set_type_default() do mod.widgets.ShellBase {
-        width: Fill
-        height: Fill
-        strip_height: 28.0
-        draw_strip +: { color: #x05070b }
-        draw_label +: {
-            color: #x9aa4b2
-            text_style: theme.font_regular{ font_size: 10 }
-        }
-    }
 
     startup() do #(App::script_component(vm)){
         ui: Root{
@@ -49,101 +46,6 @@ script_mod! {
                 }
             }
         }
-    }
-}
-
-/// The strip on top (drawn in the last overlay tier, above every popup a
-/// body can open) and the `main` slot under it, which shows the front surface.
-#[derive(Script, ScriptHook, WidgetRef, WidgetRegister)]
-pub struct Shell {
-    #[source] source: ScriptObjectRef,
-    #[uid] uid: WidgetUid,
-    #[walk] walk: Walk,
-    #[live] draw_strip: DrawColor,
-    #[live] draw_label: DrawText,
-    #[live] strip_list: DrawList2d,
-    #[live] strip_height: f64,
-    #[rust] area: Area,
-    #[rust] surfaces: Vec<(String, WidgetRef)>,
-    #[rust] front: String,
-}
-
-impl Widget for Shell {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        for (name, splash) in &self.surfaces {
-            // Input goes to the front surface only; hidden ones still get time.
-            if *name == self.front || matches!(event, Event::Signal | Event::Timer(_) | Event::NextFrame(_)) {
-                splash.handle_event(cx, event, scope);
-            }
-        }
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let layout = Layout { padding: Inset { top: self.strip_height, ..Inset::default() }, ..Layout::flow_down() };
-        cx.begin_turtle(walk, layout);
-        let rect = cx.turtle().rect();
-        if let Some((_, splash)) = self.surfaces.iter().find(|(n, _)| *n == self.front) {
-            splash.draw_walk_all(cx, scope, Walk::fill());
-        }
-        self.strip_list.begin_overlay_last(cx);
-        self.draw_strip.draw_abs(cx, Rect { pos: rect.pos, size: dvec2(rect.size.x, self.strip_height) });
-        let front = if self.front.is_empty() { "-" } else { self.front.as_str() };
-        let label = format!("tb-shell   {front}   {} surfaces", self.surfaces.len());
-        self.draw_label.draw_abs(cx, rect.pos + dvec2(12.0, 8.0), &label);
-        self.strip_list.end(cx);
-        cx.end_turtle_with_area(&mut self.area);
-        DrawStep::done()
-    }
-
-}
-
-impl WidgetNode for Shell {
-    fn widget_uid(&self) -> WidgetUid {
-        self.uid
-    }
-    fn walk(&mut self, _cx: &mut Cx) -> Walk {
-        self.walk
-    }
-    fn area(&self) -> Area {
-        self.area
-    }
-    fn redraw(&mut self, cx: &mut Cx) {
-        self.area.redraw(cx);
-    }
-    fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
-        for (name, splash) in &self.surfaces {
-            visit(LiveId::from_str(name), splash.clone());
-        }
-    }
-}
-
-impl Shell {
-    fn surface(&self, name: &str) -> Option<WidgetRef> {
-        self.surfaces.iter().find(|(n, _)| n == name).map(|(_, w)| w.clone())
-    }
-
-    fn add(&mut self, cx: &mut Cx, name: &str) -> WidgetRef {
-        let splash = cx.with_vm(|vm| {
-            let value = script_eval!(vm, { use mod.prelude.widgets.* Splash{width: Fill height: Fill} });
-            WidgetRef::script_from_value(vm, value)
-        });
-        if let Some(mut inner) = splash.borrow_mut::<Splash>() {
-            inner.set_host_io_only(true);
-            inner.set_debug_name(name);
-            inner.set_host_tag(cx, Some(name.to_string()));
-        }
-        self.surfaces.push((name.to_string(), splash.clone()));
-        cx.widget_tree_mark_dirty(self.uid);
-        splash
-    }
-
-    fn remove(&mut self, cx: &mut Cx, name: &str) -> bool {
-        let Some(at) = self.surfaces.iter().position(|(n, _)| n == name) else { return false };
-        let (_, splash) = self.surfaces.remove(at);
-        splash.set_text(cx, ""); // an empty body reclaims the isolate and its timers
-        cx.widget_tree_mark_dirty(self.uid);
-        cx.redraw_all();
-        true
     }
 }
 
@@ -189,20 +91,82 @@ impl Reads {
     }
 }
 
-enum Msg {
-    Open { conn: u64, tx: Sender<String> },
-    Line { conn: u64, line: String },
-    Closed { conn: u64 },
+/// Shader code in a body: an anonymous `fn(` (how a draw shader's methods
+/// are written) or a `pixel:` / `vertex:` key. Agents may not send it until a
+/// per-surface frame-time watch exists; bodies we wrote and tried are trusted.
+fn shader_text(body: &str) -> Option<String> {
+    let b = body.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    for (i, _) in body.match_indices("fn") {
+        let before_ok = i == 0 || !ident(b[i - 1]);
+        let rest = body[i + 2..].trim_start();
+        if before_ok && rest.starts_with('(') {
+            return Some(snippet(body, i));
+        }
+    }
+    for key in ["pixel", "vertex"] {
+        for (i, _) in body.match_indices(key) {
+            let before_ok = i == 0 || !ident(b[i - 1]);
+            let after = &body[i + key.len()..];
+            let after_ok = after.chars().next().map_or(false, |c| !c.is_ascii_alphanumeric() && c != '_');
+            if before_ok && after_ok && after.trim_start().starts_with(':') {
+                return Some(snippet(body, i));
+            }
+        }
+    }
+    None
 }
 
-struct Watch {
+fn snippet(body: &str, at: usize) -> String {
+    let line = body[..at].lines().count().max(1);
+    let text = body[at..].lines().next().unwrap_or("");
+    format!("line {line}: {}", text.chars().take(40).collect::<String>())
+}
+
+struct WatchSpec {
     surfaces: Option<Vec<String>>,
     keys: Option<Vec<String>>,
 }
 
+impl WatchSpec {
+    fn wants_surface(&self, surface: &str) -> bool {
+        match (&self.surfaces, &self.keys) {
+            (Some(s), _) => s.iter().any(|s| s == surface),
+            (None, Some(_)) => false,
+            (None, None) => true,
+        }
+    }
+    fn wants_keys(&self, touched: &[String]) -> bool {
+        match (&self.keys, &self.surfaces) {
+            (Some(keys), _) => keys.iter().any(|k| touched.contains(k)),
+            (None, Some(_)) => false,
+            (None, None) => true,
+        }
+    }
+}
+
 struct Conn {
     tx: Sender<String>,
-    watch: Option<Watch>,
+    peer: Peer,
+    watch: Option<WatchSpec>,
+}
+
+struct Guard {
+    conn: u64,
+    view: GuardView,
+}
+
+/// Where the panel state and the recording mark come from: kernel state, never the store.
+#[derive(Default)]
+struct Sources {
+    /// The panel state file and the content that means asleep. It gives no
+    /// change event and is never polled: it is read when the shell is awake
+    /// anyway (an event), at most every quarter second.
+    panel: Option<(String, String)>,
+    panel_read: Option<std::time::Instant>,
+    /// The capture stream's status file ("closed" when no capture is open),
+    /// read again on each open or close in the sound device directory.
+    mic_status: Option<String>,
 }
 
 #[derive(Default)]
@@ -211,9 +175,16 @@ struct State {
     rx: Option<Receiver<Msg>>,
     conns: HashMap<u64, Conn>,
     reads: HashMap<String, Reads>,
+    bodies: HashMap<String, String>,
     /// Surfaces in the order they were last shown; closing the front one
     /// brings back the one before it.
     order: Vec<String>,
+    guards: Vec<Guard>,
+    guard_uids: HashSet<u32>,
+    trusted: HashSet<String>,
+    sources: Sources,
+    panel_off: bool,
+    log_cursor: u64,
 }
 
 #[derive(Script, ScriptHook)]
@@ -225,71 +196,31 @@ pub struct App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
+        crate::shell::script_mod(vm);
         self::script_mod(vm)
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if let Event::Startup = event {
-            self.st.rx = Some(listen(&socket_path()));
+            self.start(cx);
         }
+        self.check_panel(cx);
         if let Event::Signal = event {
             self.drain_socket(cx);
         }
         self.drain_host_requests(cx);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         self.drain_host_requests(cx);
+        let answer = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.take_answer());
+        if let Some(yes) = answer {
+            self.answer_guard(cx, yes);
+        }
+        self.errors_to_watchers();
     }
 }
 
-fn socket_path() -> String {
-    if let Ok(p) = std::env::var("TB_SHELL_SOCK") {
-        return p;
-    }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    format!("{dir}/tb-shell.sock")
-}
-
-/// One accept thread; per connection a reader (lines in) and a writer (lines
-/// out). The UI thread only ever does non-blocking sends to the writers.
-fn listen(path: &str) -> Receiver<Msg> {
-    let (tx, rx) = channel();
-    let _ = std::fs::remove_file(path);
-    let listener = match UnixListener::bind(path) {
-        Ok(l) => l,
-        Err(e) => {
-            error!("tb-shell: bind {path}: {e}; no clients can reach this shell");
-            return rx;
-        }
-    };
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    log!("tb-shell: listening on {path}");
-    std::thread::spawn(move || {
-        for (conn, stream) in (1u64..).zip(listener.incoming()) {
-            let Ok(stream) = stream else { continue };
-            let Ok(mut out) = stream.try_clone() else { continue };
-            let (wtx, wrx) = channel::<String>();
-            std::thread::spawn(move || {
-                for line in wrx {
-                    if out.write_all(line.as_bytes()).and_then(|_| out.write_all(b"\n")).is_err() {
-                        break;
-                    }
-                }
-            });
-            let _ = tx.send(Msg::Open { conn, tx: wtx });
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stream).lines() {
-                    let Ok(line) = line else { break };
-                    let _ = tx.send(Msg::Line { conn, line });
-                    SignalToUI::set_ui_signal();
-                }
-                let _ = tx.send(Msg::Closed { conn });
-                SignalToUI::set_ui_signal();
-            });
-        }
-    });
-    rx
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
@@ -298,6 +229,10 @@ fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
 
 fn strings(v: Option<&JsonValue>) -> Option<Vec<String>> {
     Some(v?.as_array()?.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+}
+
+fn read_trim(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
 /// RFC 7386: objects merge, everything else replaces, null deletes.
@@ -319,23 +254,22 @@ fn merge(target: &mut JsonValue, patch: &JsonValue) {
     }
 }
 
-/// Error locations count from the top of the surface's own body.
-fn body_errors(errors: Vec<String>, name: &str) -> Vec<JsonValue> {
-    let ahead = 3 + PRELUDE.lines().count() + BASE.lines().count();
+/// Parses a log location `splash:<surface>:<line>:<col>` into body-relative
+/// numbers (line 0: in the prelude or the library).
+fn locate(text: &str, name: &str) -> Option<(usize, usize, String)> {
     let tag = format!("splash:{name}:");
-    errors
-        .into_iter()
-        .map(|e| {
-            let Some(at) = e.find(&tag) else { return JsonValue::String(e) };
-            let rest = &e[at + tag.len()..];
-            let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
-            match rest[..digits].parse::<usize>() {
-                Ok(line) if line > ahead => JsonValue::String(format!("{}{}{}", &e[..at + tag.len()], line - ahead, &rest[digits..])),
-                Ok(_) => JsonValue::String(format!("{e} (in the prelude or library)")),
-                Err(_) => JsonValue::String(e),
-            }
-        })
-        .collect()
+    let at = text.find(&tag)?;
+    let rest = &text[at + tag.len()..];
+    let mut parts = rest.splitn(3, |c: char| c == ':' || c == ' ');
+    let line: usize = parts.next()?.parse().ok()?;
+    let col: usize = parts.next()?.trim_end_matches(':').parse().ok().unwrap_or(0);
+    let message = rest.split_once(" - ").map(|(_, m)| m).or_else(|| rest.split_once(": ").map(|(_, m)| m)).unwrap_or(rest).to_string();
+    let line = line.checked_sub(lines_ahead()).unwrap_or(0);
+    Some((line, col, message))
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
 impl App {
@@ -343,23 +277,112 @@ impl App {
         self.ui.widget(cx, ids!(shell))
     }
 
+    fn start(&mut self, cx: &mut Cx) {
+        let (tx, rx) = io::new_channel();
+        let path = env("TB_SHELL_SOCK").unwrap_or_else(|| format!("{}/tb-shell.sock", env("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())));
+        io::listen(&path, tx.clone());
+        self.st.rx = Some(rx);
+        self.st.guard_uids = env("TB_SHELL_GUARD_UIDS").unwrap_or("0".into()).split(',').filter_map(|u| u.trim().parse().ok()).collect();
+        // Bodies we wrote and tried: their shader text is allowed.
+        let trusted = env("TB_SHELL_TRUSTED").or_else(|| {
+            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("trusted").to_string_lossy().to_string()))
+        });
+        if let Some(dir) = trusted {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if let Ok(body) = std::fs::read_to_string(entry.path()) {
+                    self.st.trusted.insert(body);
+                }
+            }
+            log!("tb-shell: {} trusted bodies from {dir}", self.st.trusted.len());
+        }
+        // The panel and the marks: files and device nodes, watched by inotify.
+        let s = &mut self.st.sources;
+        if let Some(file) = env("TB_SHELL_PANEL_FILE") {
+            s.panel = Some((file, env("TB_SHELL_PANEL_OFF").unwrap_or("off".into())));
+        }
+        if let (Some(dir), Some(status)) = (env("TB_SHELL_MIC_DIR"), env("TB_SHELL_MIC_STATUS")) {
+            io::watch_capture(&dir, tx);
+            s.mic_status = Some(status);
+        }
+        self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
+        self.read_mic(cx);
+    }
+
+    /// The recording mark, from the kernel's capture status (on start and on
+    /// each open or close in the sound device directory).
+    fn read_mic(&mut self, cx: &mut Cx) {
+        let mic = self.st.sources.mic_status.as_deref().and_then(read_trim).map_or(false, |t| t != "closed");
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            if sh.marks.mic != mic {
+                sh.marks.mic = mic;
+                cx.redraw_all();
+            }
+        }
+    }
+
+    fn check_panel(&mut self, cx: &mut Cx) {
+        let s = &mut self.st.sources;
+        let Some((file, off_value)) = &s.panel else { return };
+        if s.panel_read.map_or(false, |t| t.elapsed().as_millis() < 250) {
+            return;
+        }
+        s.panel_read = Some(std::time::Instant::now());
+        let off = read_trim(file).as_deref() == Some(off_value.as_str());
+        if off != self.st.panel_off {
+            self.panel(cx, !off);
+        }
+    }
+
+    /// Panel asleep: every isolate is torn down, so no timer runs and nothing
+    /// asks for a frame. Awake: every surface is shown again from its body
+    /// and the store, which holds all the state a view has.
+    fn panel(&mut self, cx: &mut Cx, on: bool) {
+        self.st.panel_off = !on;
+        log!("tb-shell: panel {}", if on { "on: surfaces back" } else { "off: surfaces stopped" });
+        let shell = self.shell(cx);
+        let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
+        for (name, splash) in surfaces {
+            if on {
+                let body = self.st.bodies.get(&name).cloned().unwrap_or_default();
+                splash.set_text(cx, &format!("{PRELUDE}{BASE}{body}"));
+                self.feed_all(cx, &name, &splash);
+            } else {
+                splash.set_text(cx, "");
+            }
+        }
+        cx.redraw_all();
+        let ev = obj(vec![("ev", "panel".into()), ("on", JsonValue::Bool(on))]).serialize_json();
+        for c in self.st.conns.values().filter(|c| c.watch.is_some()) {
+            let _ = c.tx.send(ev.clone());
+        }
+    }
+
     fn drain_socket(&mut self, cx: &mut Cx) {
         let Some(rx) = self.st.rx.take() else { return };
+        let mut sources_changed = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Msg::Open { conn, tx } => {
-                    self.st.conns.insert(conn, Conn { tx, watch: None });
+                Msg::Open { conn, tx, peer } => {
+                    self.st.conns.insert(conn, Conn { tx, peer, watch: None });
                 }
                 Msg::Closed { conn } => {
                     self.st.conns.remove(&conn);
+                    // A guard whose asker is gone is withdrawn, never answered.
+                    let raised = self.st.guards.first().map(|g| g.conn);
+                    self.st.guards.retain(|g| g.conn != conn);
+                    if raised == Some(conn) {
+                        self.raise_next_guard(cx);
+                    }
                 }
+                Msg::Changed => sources_changed = true,
                 Msg::Line { conn, line } => {
                     let reply = match JsonValue::deserialize_json(&line) {
                         Ok(req) => self.request(cx, conn, &req),
                         Err(e) => Err(format!("bad json: {e:?}")),
                     };
                     let reply = match reply {
-                        Ok(mut v) => {
+                        Ok(None) => continue, // answered later (a guard)
+                        Ok(Some(mut v)) => {
                             if let JsonValue::Object(m) = &mut v {
                                 m.entry("ok".into()).or_insert(JsonValue::Bool(true));
                             }
@@ -367,35 +390,43 @@ impl App {
                         }
                         Err(e) => obj(vec![("ok", JsonValue::Bool(false)), ("error", JsonValue::String(e))]),
                     };
-                    if let Some(c) = self.st.conns.get(&conn) {
-                        let _ = c.tx.send(reply.serialize_json());
-                    }
+                    self.send(conn, reply.serialize_json());
                 }
             }
         }
         self.st.rx = Some(rx);
+        if sources_changed {
+            self.read_mic(cx);
+        }
     }
 
-    fn request(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<JsonValue, String> {
+    fn send(&self, conn: u64, line: String) {
+        if let Some(c) = self.st.conns.get(&conn) {
+            let _ = c.tx.send(line);
+        }
+    }
+
+    fn request(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<Option<JsonValue>, String> {
         let op = req.get("op").and_then(|v| v.as_str()).ok_or("missing op")?;
         let surface = req.get("surface").and_then(|v| v.as_str());
+        let peer = self.st.conns.get(&conn).map(|c| c.peer.clone()).ok_or("no connection")?;
         match op {
             "show" => {
                 let name = surface.ok_or("show needs surface")?;
                 let body = req.get("body").and_then(|v| v.as_str()).ok_or("show needs body")?;
                 let front = req.get("front") != Some(&JsonValue::Bool(false));
-                self.show(cx, name, body, front)
+                self.show(cx, name, body, front).map(Some)
             }
             "set" => {
                 let patch = req.get("patch").ok_or("set needs patch")?;
                 if !matches!(patch, JsonValue::Object(_)) {
                     return Err("patch must be an object".into());
                 }
-                if patch.get(SHELL_KEY).is_some() {
-                    return Err(format!("the key {SHELL_KEY} is the shell's"));
+                if let Some(key) = self.refused_key(patch) {
+                    return Err(format!("the key {key} is the shell's"));
                 }
-                self.apply(cx, patch, &format!("client:{conn}"));
-                Ok(obj(vec![]))
+                self.apply(cx, patch, &format!("client:{}", peer.label()));
+                Ok(Some(obj(vec![])))
             }
             "get" => {
                 let keys = strings(req.get("keys"));
@@ -403,24 +434,74 @@ impl App {
                     .filter(|(k, _)| keys.as_ref().map_or(true, |ks| ks.contains(k)))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                Ok(obj(vec![("state", JsonValue::Object(state))]))
+                Ok(Some(obj(vec![("state", JsonValue::Object(state))])))
             }
             "watch" => {
-                let watch = Watch { surfaces: strings(req.get("surfaces")), keys: strings(req.get("keys")) };
-                self.st.conns.get_mut(&conn).ok_or("no connection")?.watch = Some(watch);
-                Ok(obj(vec![]))
+                let spec = WatchSpec { surfaces: strings(req.get("surfaces")), keys: strings(req.get("keys")) };
+                self.st.conns.get_mut(&conn).ok_or("no connection")?.watch = Some(spec);
+                Ok(Some(obj(vec![])))
             }
             "close" => {
                 let name = surface.ok_or("close needs surface")?;
-                self.close(cx, name)
+                self.close(cx, name).map(Some)
+            }
+            "guard" => {
+                if !self.st.guard_uids.contains(&peer.uid) {
+                    return Err(format!("guard: uid {} may not raise a guard", peer.uid));
+                }
+                let text = req.get("text").and_then(|v| v.as_str()).ok_or("guard needs text")?.to_string();
+                let yes = req.get("yes").and_then(|v| v.as_str()).unwrap_or("Proceed").to_string();
+                let no = req.get("no").and_then(|v| v.as_str()).unwrap_or("Cancel").to_string();
+                let view = GuardView { text, who: format!("asked by {}", peer.label()), yes, no };
+                self.st.guards.push(Guard { conn, view });
+                if self.st.guards.len() == 1 {
+                    self.raise_next_guard(cx);
+                }
+                Ok(None)
             }
             _ => Err(format!("unknown op {op}")),
         }
     }
 
+    /// The shell's own key, and `front` while a guard is up.
+    fn refused_key(&self, patch: &JsonValue) -> Option<&'static str> {
+        if patch.get(SHELL_KEY).is_some() {
+            return Some(SHELL_KEY);
+        }
+        if !self.st.guards.is_empty() && patch.get("front").is_some() {
+            return Some("front");
+        }
+        None
+    }
+
+    fn raise_next_guard(&mut self, cx: &mut Cx) {
+        let view = self.st.guards.first().map(|g| g.view.clone());
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            sh.set_guard(cx, view);
+        }
+    }
+
+    /// Only a tap on the raised guard gets here; it answers the asker's own connection.
+    fn answer_guard(&mut self, cx: &mut Cx, yes: bool) {
+        if self.st.guards.is_empty() {
+            return;
+        }
+        let g = self.st.guards.remove(0);
+        let choice = if yes { &g.view.yes } else { &g.view.no };
+        let drawn = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.guard_drawn_ms).map_or(JsonValue::Null, |ms| JsonValue::F64((ms * 10.0).round() / 10.0));
+        let reply = obj(vec![("ok", JsonValue::Bool(true)), ("answer", if yes { "yes" } else { "no" }.into()), ("choice", choice.as_str().into()), ("drawn_ms", drawn)]);
+        self.send(g.conn, reply.serialize_json());
+        self.raise_next_guard(cx);
+    }
+
     fn show(&mut self, cx: &mut Cx, name: &str, body: &str, front: bool) -> Result<JsonValue, String> {
-        if name.is_empty() {
-            return Err("empty surface name".into());
+        if !valid_name(name) {
+            return Err("a surface name is 1 to 64 of A-Z a-z 0-9 - _ .".into());
+        }
+        if !self.st.trusted.contains(body) {
+            if let Some(at) = shader_text(body) {
+                return Err(format!("shader text is not taken from agents yet (no frame-time watch): {at}"));
+            }
         }
         let started = std::time::Instant::now();
         let shell = self.shell(cx);
@@ -430,30 +511,35 @@ impl App {
             None => (sh.add(cx, name), true),
         };
         drop(sh);
-        splash.set_text(cx, &format!("{PRELUDE}{BASE}{body}"));
-        let errors = body_errors(splash.as_splash().last_errors(), name);
-        if !errors.is_empty() {
-            if created {
-                shell.borrow_mut::<Shell>().map(|mut sh| sh.remove(cx, name));
+        if !self.st.panel_off {
+            splash.set_text(cx, &format!("{PRELUDE}{BASE}{body}"));
+            let errors: Vec<JsonValue> = splash.as_splash().last_errors().into_iter().map(|e| match locate(&e, name) {
+                Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
+                None => obj(vec![("message", e.into())]),
+            }).collect();
+            if !errors.is_empty() {
+                if created {
+                    shell.borrow_mut::<Shell>().map(|mut sh| sh.remove(cx, name));
+                }
+                // The previous body (if any) keeps drawing.
+                return Ok(obj(vec![("ok", JsonValue::Bool(false)), ("error", "body did not evaluate".into()), ("errors", JsonValue::Array(errors))]));
             }
-            // The previous body (if any) keeps drawing.
-            let error = JsonValue::String("body did not evaluate".into());
-            return Ok(obj(vec![("ok", JsonValue::Bool(false)), ("error", error), ("errors", JsonValue::Array(errors))]));
         }
-        let reads = Reads::scan(body);
-        self.st.reads.insert(name.to_string(), reads.clone());
+        self.st.bodies.insert(name.to_string(), body.to_string());
+        self.st.reads.insert(name.to_string(), Reads::scan(body));
         self.st.order.retain(|n| n != name);
         self.st.order.push(name.to_string());
-        // `on_render` does not run on first show: feed it the keys it reads.
-        let keys: Vec<String> = self.st.store.keys().filter(|k| reads.any(std::slice::from_ref(k))).cloned().collect();
-        self.feed(cx, &splash, &keys);
-        if front {
+        if !self.st.panel_off {
+            self.feed_all(cx, name, &splash);
+        }
+        // Behind a raised guard the front does not change.
+        if front && self.st.guards.is_empty() {
             self.apply(cx, &obj(vec![("front", JsonValue::String(name.into()))]), "shell");
         }
         cx.redraw_all();
-        let reads = match reads {
+        let reads = match &self.st.reads[name] {
             Reads::All => JsonValue::String("*".into()),
-            Reads::Keys(k) => JsonValue::Array(k.into_iter().map(JsonValue::String).collect()),
+            Reads::Keys(k) => JsonValue::Array(k.iter().map(|k| k.as_str().into()).collect()),
         };
         // Evaluation and the first feed; the frame that draws it comes after.
         let ms = JsonValue::F64((started.elapsed().as_secs_f64() * 1e4).round() / 10.0);
@@ -466,12 +552,20 @@ impl App {
             return Err(format!("no surface {name}"));
         }
         self.st.reads.remove(name);
+        self.st.bodies.remove(name);
         self.st.order.retain(|n| n != name);
         if self.st.store.get("front").and_then(|v| v.as_str()) == Some(name) {
             let back = self.st.order.last().map_or(JsonValue::Null, |n| JsonValue::String(n.clone()));
             self.apply(cx, &obj(vec![("front", back)]), "shell");
         }
         Ok(obj(vec![]))
+    }
+
+    /// `on_render` does not run on first show: hand a surface every key it reads.
+    fn feed_all(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) {
+        let Some(reads) = self.st.reads.get(name).cloned() else { return };
+        let keys: Vec<String> = self.st.store.keys().filter(|k| reads.any(std::slice::from_ref(k))).cloned().collect();
+        self.feed(cx, splash, &keys);
     }
 
     /// Hands a surface the current values of `keys` and re-renders it.
@@ -507,42 +601,57 @@ impl App {
             }
             cx.redraw_all();
         }
-        let readers: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
-        for (name, splash) in readers {
-            if self.st.reads.get(&name).map_or(false, |r| r.any(&touched)) {
-                let keys: Vec<String> = match &self.st.reads[&name] {
-                    Reads::All => touched.clone(),
-                    Reads::Keys(ks) => touched.iter().filter(|k| ks.contains(k)).cloned().collect(),
+        // Asleep, nothing renders: a surface gets the whole store when the panel wakes.
+        if !self.st.panel_off {
+            let readers: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
+            for (name, splash) in readers {
+                let keys: Vec<String> = match self.st.reads.get(&name) {
+                    Some(Reads::All) => touched.clone(),
+                    Some(Reads::Keys(ks)) => touched.iter().filter(|k| ks.contains(k)).cloned().collect(),
+                    None => continue,
                 };
-                self.feed(cx, &splash, &keys);
+                if !keys.is_empty() {
+                    self.feed(cx, &splash, &keys);
+                }
             }
         }
         let ev = obj(vec![("ev", "set".into()), ("patch", patch.clone()), ("by", by.into())]).serialize_json();
         for c in self.st.conns.values() {
-            let Some(w) = &c.watch else { continue };
-            let wants = match (&w.keys, &w.surfaces) {
-                (Some(keys), _) => keys.iter().any(|k| touched.contains(k)),
-                (None, Some(_)) => false,
-                (None, None) => true,
-            };
-            if wants {
+            if c.watch.as_ref().map_or(false, |w| w.wants_keys(&touched)) {
                 let _ = c.tx.send(ev.clone());
             }
         }
     }
 
-    fn emit(&mut self, surface: &str, ev: JsonValue) {
+    fn to_surface_watchers(&self, surface: &str, ev: JsonValue) {
         let line = ev.serialize_json();
         for c in self.st.conns.values() {
-            let Some(w) = &c.watch else { continue };
-            let wants = match (&w.surfaces, &w.keys) {
-                (Some(s), _) => s.iter().any(|s| s == surface),
-                (None, Some(_)) => false,
-                (None, None) => true,
-            };
-            if wants {
+            if c.watch.as_ref().map_or(false, |w| w.wants_surface(surface)) {
                 let _ = c.tx.send(line.clone());
             }
+        }
+    }
+
+    /// Script errors land in the process log, wherever they happen (a render,
+    /// a tap, a timer). Those of a surface go to its watchers as `error` events.
+    fn errors_to_watchers(&mut self) {
+        let (cursor, lines) = log_ring::read_since(self.st.log_cursor, usize::MAX);
+        if lines.is_empty() {
+            return;
+        }
+        self.st.log_cursor = cursor;
+        for l in lines {
+            if !matches!(l.level, LogLevel::Error | LogLevel::Panic) {
+                continue;
+            }
+            let Some(at) = l.text.find("splash:") else { continue };
+            let name: String = l.text[at + 7..].chars().take_while(|c| *c != ':').collect();
+            if !self.st.bodies.contains_key(&name) {
+                continue;
+            }
+            let Some((line, col, message)) = locate(&l.text, &name) else { continue };
+            let ev = obj(vec![("ev", "error".into()), ("surface", name.as_str().into()), ("line", (line as u64).into()), ("col", (col as u64).into()), ("message", message.into())]);
+            self.to_surface_watchers(&name, ev);
         }
     }
 
@@ -563,18 +672,18 @@ impl App {
                 match req.service.as_str() {
                     "set" => {
                         let Some(key) = args.get("key").and_then(|k| k.as_str()) else { continue };
-                        if key == SHELL_KEY {
-                            log!("tb-shell: surface {surface} may not write {SHELL_KEY}");
+                        let patch = obj(vec![(key, args.get("value").cloned().unwrap_or(JsonValue::Null))]);
+                        if let Some(key) = self.refused_key(&patch) {
+                            log!("tb-shell: surface {surface} may not write {key} now");
                             continue;
                         }
-                        let value = args.get("value").cloned().unwrap_or(JsonValue::Null);
-                        self.apply(cx, &obj(vec![(key, value)]), &format!("surface:{surface}"));
+                        self.apply(cx, &patch, &format!("surface:{surface}"));
                     }
                     "emit" => {
                         let name = args.get("name").cloned().unwrap_or(JsonValue::Null);
                         let data = args.get("data").cloned().unwrap_or(JsonValue::Null);
                         let ev = obj(vec![("ev", "emit".into()), ("surface", surface.as_str().into()), ("name", name), ("data", data)]);
-                        self.emit(&surface, ev);
+                        self.to_surface_watchers(&surface, ev);
                     }
                     other => log!("tb-shell: surface {surface} asked for {other}: refused"),
                 }

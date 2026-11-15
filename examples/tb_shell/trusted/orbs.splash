@@ -1,0 +1,54 @@
+// A body we wrote (design example). Untried on the phone.
+let Orbs = View{
+    width: Fill height: 380 show_bg: true
+    draw_bg +: {
+        level: instance(0.0)
+        a0: instance(vec4(0.0)) a1: instance(vec4(0.0)) a2: instance(vec4(0.0)) a3: instance(vec4(0.0))
+        tint: fn(s) {
+            if s > 2.5 { return vec3(1.0, 0.35, 0.35) }
+            if s > 1.5 { return vec3(0.96, 0.72, 0.26) }
+            if s > 0.5 { return vec3(0.24, 0.86, 0.52) }
+            return vec3(0.4, 0.42, 0.5)
+        }
+        field: fn(p, o, k) {
+            let c = o.xy * vec2(1.0, k)
+            let d = length(p - c)
+            return o.z * o.z / (d * d + 0.0004)
+        }
+        pixel: fn() {
+            let k = self.rect_size.y / self.rect_size.x
+            let p = self.pos * vec2(1.0, k)
+            let f0 = self.field(p, self.a0, k)
+            let f1 = self.field(p, self.a1, k)
+            let f2 = self.field(p, self.a2, k)
+            let f3 = self.field(p, self.a3, k)
+            let f = f0 + f1 + f2 + f3
+            let col = (self.tint(self.a0.w) * f0 + self.tint(self.a1.w) * f1 + self.tint(self.a2.w) * f2 + self.tint(self.a3.w) * f3) / max(f, 0.0001)
+            let body = smoothstep(0.9, 1.05, f)
+            let glow = clamp(f * (0.18 + 0.5 * self.level), 0.0, 1.0)
+            let rgb = mix(vec3(0.03, 0.035, 0.05) + col * glow * 0.7, col, body)
+            return vec4(rgb, 1.0)
+        }
+    }
+}
+let slots = [vec2(0.22, 0.2), vec2(0.78, 0.2), vec2(0.22, 0.8), vec2(0.78, 0.8)]
+fn code(s) { if s == "error" { return 3.0 } if s == "busy" { return 2.0 } if s == "idle" { return 1.0 } 0.0 }
+fn orb(i) {
+    let list = state.agents ?? []
+    if i >= list.len() { return vec4(0.0) }
+    let a = list[i]
+    if a.id == state.target { return vec4(0.5, 0.5, 0.15, code(a.status)) }
+    let s = slots[i]
+    vec4(s.x, s.y, 0.08, code(a.status))
+}
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down
+    on_render: || {
+        let v = state.voice ?? nil
+        Orbs{
+            draw_bg.a0: orb(0) draw_bg.a1: orb(1) draw_bg.a2: orb(2) draw_bg.a3: orb(3)
+            draw_bg.level: if v == nil { 0.0 } else { v.level ?? 0.0 }
+        }
+    }
+}
