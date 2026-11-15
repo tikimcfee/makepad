@@ -10,6 +10,7 @@
 pub use makepad_widgets;
 
 mod io;
+mod paneltrace;
 mod shell;
 mod split;
 
@@ -187,6 +188,7 @@ struct State {
     panel_off: bool,
     log_cursor: u64,
     split: split::Split,
+    trace: paneltrace::PanelTrace,
 }
 
 #[derive(Script, ScriptHook)]
@@ -207,6 +209,7 @@ impl AppMain for App {
             self.start(cx);
         }
         self.st.split.event_start();
+        self.st.trace.event(event);
         self.check_panel(cx);
         if let Event::Signal = event {
             if self.st.split.on() {
@@ -322,6 +325,7 @@ impl App {
         }
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
+        self.st.trace = paneltrace::PanelTrace::from_env();
         self.read_mic(cx);
     }
 
@@ -344,7 +348,9 @@ impl App {
             return;
         }
         s.panel_read = Some(std::time::Instant::now());
-        let off = read_trim(file).as_deref() == Some(off_value.as_str());
+        let value = read_trim(file);
+        let off = value.as_deref() == Some(off_value.as_str());
+        self.st.trace.read(value.as_deref());
         if off != self.st.panel_off {
             self.panel(cx, !off);
         }
@@ -355,7 +361,8 @@ impl App {
     /// and the store, which holds all the state a view has.
     fn panel(&mut self, cx: &mut Cx, on: bool) {
         self.st.panel_off = !on;
-        log!("tb-shell: panel {}", if on { "on: surfaces back" } else { "off: surfaces stopped" });
+        self.st.trace.changed();
+        log!("tb-shell: panel {} at {}", if on { "on: surfaces back" } else { "off: surfaces stopped" }, paneltrace::stamp());
         let shell = self.shell(cx);
         let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
         for (name, splash) in surfaces {
@@ -395,6 +402,7 @@ impl App {
                 Msg::Line { conn, line } => {
                     if self.st.split.on() && line.contains("\"op\":\"set\"") {
                         self.st.split.begin();
+                        self.st.split.add_count("req-bytes", line.len() as f64);
                     }
                     let parsed = self.st.split.timed(0, || JsonValue::deserialize_json(&line));
                     let reply = match parsed {
@@ -622,6 +630,13 @@ impl App {
         // assignment, then `on_render` and the reload of its result.
         if let Some(mut inner) = splash.borrow_mut::<Splash>() {
             let split = &mut self.st.split;
+            if split.on() {
+                // The bare cost of a host-to-script call carrying this text, for the split.
+                split.add_count("assign-bytes", text.len() as f64);
+                let t = std::time::Instant::now();
+                inner.call_script_fn_with_strings(cx, live_id!(__noop), &[&text]);
+                split.add_named("noop-call", t.elapsed());
+            }
             split.timed(2, || inner.call_script_fn_with_strings(cx, live_id!(__assign), &[&text]));
             split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
         }
@@ -734,6 +749,7 @@ impl App {
                             log!("tb-shell: surface {surface} may not write {key} now");
                             continue;
                         }
+                        self.st.trace.body_write();
                         self.apply(cx, &patch, &format!("surface:{surface}"));
                     }
                     "emit" => {
