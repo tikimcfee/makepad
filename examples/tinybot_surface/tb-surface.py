@@ -6,11 +6,14 @@
   tb-surface clear                               back to the idle line
   tb-surface status                              what is shown, how many taps wait
   tb-surface voice                               as root: each line of stdin is the voice strip's text
+  tb-surface talk                                as root, as the voice client: stdin lines are requests, every line back is printed
 
 Each command prints the app's answer as JSON lines on stdout. `wait` prints one `tap` line per
 press and nothing else; the app keeps a tap until this command has printed it. `voice` prints
 only a refusal: every line it reads replaces the strip's text, an empty line takes the strip
-away, and so does the end of the input.
+away, and so does the end of the input. `talk` takes the voice client's role and then sends
+each line of stdin as it is (a `put`, a `view`, a `voice` request) and prints every line the
+app sends, answers and events alike, until the input ends.
 
 Exit status: 0 done; 1 the app refused (its `err` line is on stdout); 2 `wait` ran out of time
 without a tap; 3 the app cannot be reached or did not speak the protocol.
@@ -185,6 +188,49 @@ def cmd_voice(conn, args):
             return 0
 
 
+def cmd_talk(conn, args):
+    import threading
+
+    def printer():
+        pending = conn.buf
+        while True:
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                try:
+                    print(raw.decode("utf-8", "replace"), flush=True)
+                except OSError:
+                    return
+            try:
+                chunk = conn.sock.recv(4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            pending += chunk
+
+    conn.sock.settimeout(None)
+    thread = threading.Thread(target=printer, daemon=True)
+    thread.start()
+    stdin = open(sys.stdin.fileno(), "rb", closefd=False)
+    while True:
+        line = stdin.readline()
+        if not line:
+            break
+        text = line.decode("utf-8", "replace").rstrip("\r\n")
+        if text.strip():
+            try:
+                conn.sock.sendall(text.encode("utf-8") + b"\n")
+            except OSError as e:
+                raise Unreachable("the surface went away (%s)" % (e.strerror or e))
+    time.sleep(0.3)
+    try:
+        conn.sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    thread.join(1.0)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tb-surface", description="tinybot's live surface, one call per turn")
     parser.add_argument("--socket", help="the surface's socket (default: $TINYBOT_SURFACE_SOCK, then $XDG_RUNTIME_DIR/tinybot/surface.sock)")
@@ -204,9 +250,11 @@ def main():
     p.set_defaults(run=cmd_status)
     p = sub.add_parser("voice", help="as root: each line of stdin is the voice strip's text")
     p.set_defaults(run=cmd_voice)
+    p = sub.add_parser("talk", help="as root, as the voice client: stdin lines are requests, every line back is printed")
+    p.set_defaults(run=cmd_talk)
     args = parser.parse_args()
     try:
-        role = "voice" if args.command == "voice" else "runner" if args.runner else None
+        role = "voice" if args.command in ("voice", "talk") else "runner" if args.runner else None
         conn = Surface(socket_path(args.socket), role)
         return args.run(conn, args)
     except Unreachable as e:

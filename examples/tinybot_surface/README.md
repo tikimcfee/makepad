@@ -44,6 +44,7 @@ thing, prints the app's answer as JSON lines and exits.
 | `clear` | Back to the idle line | `ack` |
 | `status` | What is shown and how many taps wait | `status` |
 | `voice` | As root: every line of stdin is the voice strip's text from then on; an empty line takes the strip away, and so does the end of the input | nothing, or `err` and exit 1 when refused |
+| `talk` | As root, as the voice client: every line of stdin is sent as it is (`put`, `view`, `voice`), until the end of the input. For trying [state and views](#state-and-views) by hand | every line the app sends: answers and `event` lines; `err` and exit 1 when the role is refused |
 
 Exit status: 0 done; 1 the app refused (the `err` line is on stdout); 2 `wait`
 ended without a tap; 3 the app cannot be reached; 64 FILE cannot be read.
@@ -152,8 +153,11 @@ The app holds two surfaces, root's and the agent's (see
 [Two layers](#two-layers)). `surface` and `rev` are those of the client's own
 layer (`null` and 0 when it has none); `pending` is the number of taps that
 wait for this client; `privileged` says whether root has a page; `front` is
-the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
-`agent` is the agent's page, with who set it, or `null`.
+the layer on screen (`"root"`, `"agent"`, `"view"` or `null` for the idle
+line); `agent` is the agent's page, with who set it, or `null`. While an
+owner holds views ([State and views](#state-and-views)) a member
+`"views":[{"name":…,"title":…,"from":"voice"}]` follows `agent`, here and in
+`status` and `layers`; with none it is left out.
 
 | Request | Answer |
 |---|---|
@@ -170,6 +174,9 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 | `{"type":"hello","role":"voice"}` | a root client takes the voice strip: a `hello` line |
 | `{"type":"voice","text":TEXT}` | the voice client only: TEXT is the strip's text; `{"type":"ok"}` |
 | `{"type":"voice"}` | the voice client only: no strip; `{"type":"ok"}` |
+| `{"type":"put","state":{KEY:VALUE,…}}` | the voice client only: its values; `{"type":"ok"}` |
+| `{"type":"view","name":NAME,"title":…,"tree":[…]}` | the voice client only: a view of its values; without `tree` the view is taken away; `{"type":"ok"}` |
+| `{"type":"show","layer":"view","name":NAME}` | the runner only: puts that view on screen; `ack` |
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
 otherwise) and does not change the rev. `title` is a new header line. `items` names items by id: `text`
@@ -205,7 +212,11 @@ A refused request is answered with `{"type":"err","code":…,"msg":…}`:
 | `bad_set` | `surface`, `rev`, `title` or `items` of a `set` is missing or of the wrong type; `surface` or `rev` of an `update` is |
 | `bad_item` | an item or button is malformed, of an unknown `kind`, lacks a required `id`, or repeats an id; an `update` names an id it cannot change or arm |
 | `stale_rev` | a `set` for the surface on screen with a lower `rev`; an `update` for another surface or rev than the one on screen |
-| `privileged` | `show` from a client that is not the runner; the runner's role asked for by a client that is not root, or while another runner is connected; the same for the voice's role; `voice` from a client that has not got it |
+| `privileged` | `show` from a client that is not the runner; the runner's role asked for by a client that is not root, or while another runner is connected; the same for the voice's role; `voice`, `put` or `view` from a client that has not got it |
+| `bad_put` | `state` of a `put` is not an object; a key is malformed or not under the owner's name; a value is of no kind a value can be |
+| `bad_view` | a `view` with a wrong name, a node of an unknown kind or with an unknown field, or a binding to a key that is not the owner's |
+| `too_big` | a `put` or a `view` over one of the sizes in [State and views](#state-and-views) |
+| `too_fast` | more than 60 `put` lines in a second on one connection: this one was not taken |
 | `too_long` | a line over 64 KiB; the app then closes the connection |
 
 A `set` with the same `surface` and `rev` as on screen is accepted again
@@ -285,6 +296,150 @@ gone when the input ends.
 ```sh
 (echo "hello from the voice strip"; sleep 5) | tb-surface --socket /run/user/UID/tinybot/surface.sock voice
 ```
+
+## State and views
+
+The voice client can also hold **state**, named values it pushes, and
+**views**, pages that say which values they show. The app draws a view from
+the state; when a value changes, the rows that show it change in place. A
+tap goes back to the owner on the connection it holds. Nothing is a file
+and nothing is polled. In this version the voice client is the only owner,
+its keys start with `voice/`, and the pieces a view can use are fixed in
+the app.
+
+### put: the owner's values
+
+```json
+{"type":"put","state":{"voice/level":0.42,"voice/default":"opt@linux-node","voice/agents":[{"id":"opt@linux-node","name":"tiny-monolith-optimizer","host":"linux-node","note":"idle","dot":"green"}]}}
+```
+
+Answer: `{"type":"ok"}`, or `err` with `privileged`, `bad_put`, `too_big`
+or `too_fast`. A refused `put` changes nothing, and it is always answered.
+
+- A key is 1 to 64 of `a-z 0-9 _ . -` in parts joined by `/`, and starts
+  with the owner's name: `voice/`. One key that does not refuses the whole
+  `put`.
+- A value is a text, a number, `true` or `false`, or a list of records (a
+  record is an object of texts, numbers and true/false). `null` takes the
+  key away. Only the keys named change. A value equal to the one held
+  changes nothing and draws nothing.
+- Sizes: 16 keys in one `put`, 64 keys held, a text 2048 bytes, a list 200
+  records, a record 12 fields of 512 bytes each, and the line 64 KiB as
+  every line. Over one of them: `too_big`.
+- Rate: 60 `put` lines a second on the connection; the ones over it are
+  answered `too_fast` and not taken. The strip's `voice` text is not
+  counted.
+- The values and the views go when the connection closes.
+
+### view: a page of bound pieces
+
+```json
+{"type":"view","name":"agents","title":"Agents","tree":[
+ {"kind":"text","text":"Tap an agent to make it the default for voice."},
+ {"kind":"each","of":"voice/agents","group":"host","item":
+  {"kind":"pick","id":{"field":"id"},"text":{"field":"name"},"note":{"field":"note"},"dot":{"field":"dot"},
+   "selected":{"is":"voice/default"},"set":"voice/default"}}]}
+```
+
+(One line on the wire.) Answer: `{"type":"ok"}`, or `err` with
+`privileged`, `bad_view` or `too_big`. Sending a name again replaces that
+view; without `tree` it is taken away.
+
+- `name` is 1 to 32 of `a-z 0-9 _ -`; `title` is the header line (the app
+  adds `· voice`, which a view can neither style nor leave out).
+- `tree` is a list of up to 64 nodes. A node is a piece: `heading` (`text`),
+  `text` (`text`, `id`), `readout` (`id`, `text`, `value`), `pick` (`id`,
+  `text`, `note`, `dot`, `selected`, `set`), `button` (`id`, `text`,
+  `style`). Or it is `{"kind":"each","of":KEY,"group":FIELD,"item":PIECE}`:
+  one piece per record of the list at KEY, with a heading wherever the
+  record's FIELD is another than the one before (`group` is optional).
+- A field of a piece is a text as written, `{"bind":KEY}` (the value at
+  KEY, as text), or inside `each` `{"field":NAME}` (the record's field).
+  `selected` is `true`, `false` or `{"is":KEY}`: selected while the value at
+  KEY is this pick's id. `"set":KEY` on a pick: a tap writes the pick's id
+  to KEY in the app at once, so the selection moves in the same frame; the
+  owner's next `put` of KEY says what is true.
+- Every key a view names is the owner's own. A view has no `toggle`,
+  `stepper`, `number` or `row`, and no `confirm`: a button that asks twice
+  is the app's own and only root's layer has it.
+- A record whose id is empty, or the same as an earlier one's, is left
+  out. A page shows 400 items at most; an owner holds 8 views.
+- Where a `put` leaves the same rows, their texts, notes, dots, values and
+  selection change in place. Where rows come or go the page is set again
+  and stays scrolled where it was.
+
+### event: what the owner hears
+
+Lines the app sends to the owner by itself, between its answers:
+
+```json
+{"type":"event","view":"agents","id":"bld@linux-node","kind":"tap"}
+{"type":"event","view":"agents","kind":"shown"}
+{"type":"event","view":"agents","kind":"hidden"}
+```
+
+`tap`: a pick or a button of the view was tapped; `id` is its id. `shown`
+and `hidden`: the view came to the screen or left it. A view's taps are
+not in any client's `taps` queue.
+
+### Where a view is shown
+
+- With no page of root's or an agent's, the owner's first view comes up by
+  itself. Otherwise it waits: the runner lists it on Home ("View: TITLE",
+  from voice) and puts it on screen with
+  `{"type":"show","layer":"view","name":NAME}` when its button is tapped.
+- Over a root page the view's band has "‹ Home", as an agent's page has.
+- A `put` for a view that is not on screen is kept and builds nothing.
+  (Not built yet: holding the view on screen back while the panel is off.
+  Today a `put` for it is built and drawn then too, as a runner's `update`
+  is.)
+- The voice strip and the two dots stay over a view as over any page.
+
+### The level: a wave in the strip
+
+`voice/level` is the one key the app itself reads: the peak of a block of
+sound as a number from 0 to 1, put about 20 times a second while the key
+is held.
+
+```json
+{"type":"put","state":{"voice/level":0.42}}
+```
+
+- The app clamps it to 0..1 (a value that is no number is no level), keeps
+  the last 64, and draws them as bars behind the strip's text, the newest at
+  the right: one shader, one draw call, a bar's height and lightness its
+  level.
+- One level is one frame, and the frame repaints the strip's rectangle
+  only. Nothing is drawn from a level while the strip is not on screen or
+  the panel is off.
+- With no level for 300 ms the bars sink (every 50 ms to half their
+  height, about six steps) and then no more frames are asked for. While
+  levels come the only timer is that one timeout of 300 ms, started again
+  by each level.
+- The wave goes with the strip, and a strip that comes starts with none.
+
+### By hand
+
+As root, without a voice service (stop it first: there is one voice client
+at a time). The first two lines give the Agents view, the third the strip,
+the loop five seconds of levels; a tap on an agent prints its `event`
+line. The view and the strip go when the input ends.
+
+```sh
+S=/run/user/UID/tinybot/surface.sock
+(
+echo '{"type":"view","name":"agents","title":"Agents","tree":[{"kind":"text","text":"Tap an agent to make it the default for voice."},{"kind":"each","of":"voice/agents","group":"host","item":{"kind":"pick","id":{"field":"id"},"text":{"field":"name"},"note":{"field":"note"},"dot":{"field":"dot"},"selected":{"is":"voice/default"},"set":"voice/default"}}]}'
+echo '{"type":"put","state":{"voice/agents":[{"id":"opt","name":"tiny-monolith-optimizer","host":"linux-node","note":"idle","dot":"green"},{"id":"bld","name":"tinybot-building","host":"linux-node","note":"processing","dot":"amber"},{"id":"m2","name":"tinybot-m2","host":"mac-host","note":"ended","dot":"off"}],"voice/default":"opt"}}'
+echo '{"type":"voice","text":"listening"}'
+i=0; while [ $i -lt 100 ]; do i=$((i+1)); echo "{\"type\":\"put\",\"state\":{\"voice/level\":0.$(( (i * 37 + i * i) % 90 + 10 ))}}"; sleep 0.05; done
+sleep 20
+) | tb-surface --socket $S talk
+```
+
+With the runner connected the view is on Home as "View: Agents"; without
+it the view is on screen at once. The strip's text goes after its 15 s, as
+any text that is not sent again. `examples/view-by-hand.sh SOCKET [SECONDS]`
+is the same as a script.
 
 ## The socket
 
@@ -556,7 +711,9 @@ and feed file.
   Unlock in place of its action buttons; the lock outlives the runner
   within a boot.
 - **Home** has a button per panel, the count of waiting questions, an
-  agent's page when there is one ("Agent: <title>", from whom), and while a
+  agent's page when there is one ("Agent: <title>", from whom), each view
+  an owner holds ("View: <title>", from whom; a tap shows it, and none
+  comes up by itself over the runner's pages), and while a
   try runs `running: NAME/BUTTON` with that panel's Stop. An agent's new
   page comes straight up only while Home is on screen and nothing runs
   (`--agent-direct=no`: never by itself); over a panel or a try it waits on
@@ -573,8 +730,8 @@ and feed file.
 ### State and records
 
 - `/run/tinybot/panel/runner.json`: the panels and their locks, the files
-  left out and why, the bound keys, the agent's page and which layer is in
-  front, what runs, the questions that wait, the runner's own error if it
+  left out and why, the bound keys, the agent's page, the views and which
+  layer is in front (`root`, `agent` or `view`), what runs, the questions that wait, the runner's own error if it
   has one. `/run/tinybot/panel/NAME.json`: the panel's last try
   and its lock. Both are replaced whole.
 - `/var/lib/tinybot/tries/NAME.jsonl`, one object per line, rotated once to

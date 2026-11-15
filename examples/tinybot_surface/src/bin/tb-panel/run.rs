@@ -40,6 +40,8 @@ pub struct Options {
 /// The surface ids of the runner's own pages. A panel's surface id is its name.
 const HOME: &str = "_home";
 const QUESTION: &str = "_question";
+/// the start of the id of a view's button on Home; the view's name follows
+const VIEW_ID: &str = "_view:";
 /// The most of a result that is shown; the record has the whole line.
 const SHOWN_CHARS: usize = 120;
 /// The time a check or a readout command gets.
@@ -266,8 +268,12 @@ struct Runner {
 
     /// the agent's layer in the app: its surface, its title and who set it
     agent: Option<(String, String, String)>,
-    /// the agent's page is the one on screen, not the runner's
+    /// another layer than the runner's is the one on screen: an agent's page or a view
     agent_front: bool,
+    /// the views the app holds for their owners: name, title and whose it is
+    views: Vec<(String, String, String)>,
+    /// that other layer is a view
+    view_front: bool,
 }
 
 fn shown(text: &str) -> String {
@@ -571,6 +577,8 @@ pub fn run(options: Options) -> i32 {
         asked: 0,
         agent: None,
         agent_front: false,
+        views: Vec::new(),
+        view_front: false,
     };
     let to = events.clone();
     runner.watcher = feed::Watcher::new(move |watched| drop(to.send(Event::Watched(watched))));
@@ -723,7 +731,8 @@ impl Runner {
                 Some((surface, title, from)) => Json::obj([("surface", surface.as_str().into()), ("title", title.as_str().into()), ("from", from.as_str().into())]),
                 None => Json::Null,
             }),
-            ("front", if self.agent_front { "agent" } else { "root" }.into()),
+            ("views", Json::Arr(self.views.iter().map(|(name, title, from)| Json::obj([("name", name.as_str().into()), ("title", title.as_str().into()), ("from", from.as_str().into())])).collect())),
+            ("front", if self.view_front { "view" } else if self.agent_front { "agent" } else { "root" }.into()),
             ("keys", Json::Arr(keys)),
             ("running", running),
             ("questions", Json::Arr(self.questions.iter().map(Question::json).collect())),
@@ -831,6 +840,11 @@ impl Runner {
         if let Some((_, title, from)) = &self.agent {
             items.push(button_item("_agent", &format!("Agent: {}", if title.is_empty() { "a page" } else { title.as_str() }), "secondary", false));
             items.push(text_item("_agent_from", &format!("from {from}")));
+        }
+        // so does a view of an owner that holds its own connection (the voice service)
+        for (name, title, from) in &self.views {
+            items.push(button_item(&format!("{VIEW_ID}{name}"), &format!("View: {}", if title.is_empty() { name.as_str() } else { title.as_str() }), "secondary", false));
+            items.push(text_item(&format!("_view_from:{name}"), &format!("from {from}")));
         }
         if let Some(run) = &self.running {
             items.push(text_item("_running", &format!("running: {}/{}", run.panel, run.button)));
@@ -1148,6 +1162,10 @@ impl Runner {
             (_, "_home") => self.open(Page::Home),
             (Page::Home, "_questions") => self.open(Page::Question),
             (Page::Home, "_agent") => self.send(&Json::obj([("type", "show".into()), ("layer", "agent".into())])),
+            (Page::Home, id) if id.strip_prefix(VIEW_ID).is_some_and(|name| self.views.iter().any(|(this, ..)| this == name)) => {
+                let name = id[VIEW_ID.len()..].to_string();
+                self.send(&Json::obj([("type", "show".into()), ("layer", "view".into()), ("name", name.into())]));
+            }
             (Page::Home, "_stop") => {
                 if let Some(panel) = self.running.as_ref().map(|run| run.panel.clone()) {
                     self.stop(&panel, None);
@@ -1661,16 +1679,28 @@ impl Runner {
             let field = |name: &str| agent.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
             (field("surface"), field("title"), field("from"))
         });
+        // an owner's views are listed on Home too; none comes up by itself over the runner
+        let views: Vec<(String, String, String)> = layers
+            .get("views")
+            .and_then(|v| v.as_arr())
+            .map(|views| {
+                let field = |view: &Json, name: &str| view.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                views.iter().map(|view| (field(view, "name"), field(view, "title"), field(view, "from"))).filter(|(name, ..)| !name.is_empty()).collect()
+            })
+            .unwrap_or_default();
         let was_front = self.agent_front;
-        self.agent_front = layers.get("front").and_then(|f| f.as_str()) == Some("agent");
+        let front = layers.get("front").and_then(|f| f.as_str());
+        self.view_front = front == Some("view");
+        self.agent_front = self.view_front || front == Some("agent");
         // the runner's page is on screen again: its feeds are looked at now
         if was_front && !self.agent_front {
             let now = Instant::now();
             self.feeds.iter_mut().for_each(|fed| fed.due = now);
         }
         let new_page = agent.is_some() && agent != self.agent;
-        let changed = agent != self.agent;
+        let changed = agent != self.agent || views != self.views;
         self.agent = agent;
+        self.views = views;
         self.write_state();
         if self.agent_front {
             return;
@@ -1804,6 +1834,7 @@ impl Runner {
                 Some(Event::Connected { conn, taps, user, shown_rev, layers }) => {
                     self.agent = None;
                     self.agent_front = false;
+                    self.view_front = false;
                     self.layers(&layers);
                     // whatever kept the surface away before is over
                     if self.error.as_ref().is_some_and(|e| e.starts_with("the surface: ")) {

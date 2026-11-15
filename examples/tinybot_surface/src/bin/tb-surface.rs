@@ -5,6 +5,7 @@
 //!   tb-surface clear                               back to the idle line
 //!   tb-surface status                              what is shown, how many taps wait
 //!   tb-surface voice                               as root: each line of stdin is the voice strip's text
+//!   tb-surface talk                                as root, as the voice client: stdin lines are requests, every line back is printed
 //!
 //! This is `tb-surface.py` as a binary, for an image without python3: the same commands,
 //! options, output lines and exit codes. Standard library only: nothing of the package's
@@ -32,9 +33,9 @@ mod unix {
     /// The protocol version this tool speaks (`v` in the app's `hello`).
     const VERSION: u64 = 2;
 
-    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice} ...\n";
+    const USAGE: &str = "usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice,talk} ...\n";
     const HELP: &str = "\
-usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice} ...
+usage: tb-surface [-h] [--socket PATH] [--runner] {set,wait,clear,status,voice,talk} ...
 
 tinybot's live surface, one call per turn
 
@@ -43,6 +44,7 @@ tinybot's live surface, one call per turn
   tb-surface clear                               back to the idle line
   tb-surface status                              what is shown, how many taps wait
   tb-surface voice                               as root: each line of stdin is the voice strip's text
+  tb-surface talk                                as root, as the voice client: stdin lines are requests, every line back is printed
 
 options:
   -h, --help     this text
@@ -57,7 +59,9 @@ options:
 Each command prints the app's answer as JSON lines on stdout. `wait` prints one `tap` line per
 press and nothing else; the app keeps a tap until this command has printed it. `voice` prints
 only a refusal: every line it reads replaces the strip's text, an empty line takes the strip
-away, and so does the end of the input.
+away, and so does the end of the input. `talk` takes the voice client's role and then sends
+each line of stdin as it is (a `put`, a `view`, a `voice` request) and prints every line the
+app sends, answers and events alike, until the input ends.
 
 Exit status: 0 done; 1 the app refused (its `err` line is on stdout); 2 `wait` ended without a
 tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot be read.
@@ -552,6 +556,47 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         }
     }
 
+    /// The voice client's connection by hand: each line of stdin goes to the app as it is,
+    /// and every line the app sends (an answer, an `event`) is printed as it comes. The
+    /// two do not wait for each other. It ends with the input, after a moment for the last
+    /// answers; the app then takes the strip, the values and the views of this client away.
+    fn talk(conn: &mut Surface) -> Result<i32, Fail> {
+        let mut from_app = conn.sock.try_clone().map_err(gone)?;
+        let printer = std::thread::spawn(move || {
+            let mut pending: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = from_app.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                pending.extend_from_slice(&chunk[..n]);
+                while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    if emit(String::from_utf8_lossy(&line[..end]).as_ref()).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut input = io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if io::BufRead::read_until(&mut input, b'\n', &mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\n', '\r']);
+            if !text.trim().is_empty() {
+                conn.send(text)?;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = conn.sock.shutdown(std::net::Shutdown::Both);
+        let _ = printer.join();
+        Ok(0)
+    }
+
     // ---- the command line ----
 
     enum Command {
@@ -560,6 +605,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         Clear,
         Status,
         Voice,
+        Talk,
     }
 
     /// Why no command runs: `None` when help was asked for, else what is wrong.
@@ -652,18 +698,19 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
                 }
                 Command::Wait { timeout }
             }
-            "clear" | "status" | "voice" => {
+            "clear" | "status" | "voice" | "talk" => {
                 if let Some(arg) = rest.next() {
                     return if is_help(&arg) { Err(None) } else { unrecognized(&arg) };
                 }
                 match command.as_str() {
                     "clear" => Command::Clear,
                     "status" => Command::Status,
+                    "talk" => Command::Talk,
                     _ => Command::Voice,
                 }
             }
             other => {
-                return Err(Some(format!("argument command: invalid choice: '{other}' (choose from set, wait, clear, status, voice)")));
+                return Err(Some(format!("argument command: invalid choice: '{other}' (choose from set, wait, clear, status, voice, talk)")));
             }
         };
         Ok((socket, runner, command))
@@ -705,7 +752,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
         // the app is reached before FILE is read, so a missing app is status 3 whatever FILE is
         // the voice strip is a role of its own; the other commands act on a layer
         let role = match command {
-            Command::Voice => Some("voice"),
+            Command::Voice | Command::Talk => Some("voice"),
             _ if runner => Some("runner"),
             _ => None,
         };
@@ -715,6 +762,7 @@ tap; 3 the app cannot be reached or did not speak the protocol; 64 FILE cannot b
             Command::Clear => ask(&mut conn, "clear"),
             Command::Status => ask(&mut conn, "status"),
             Command::Voice => voice(&mut conn),
+            Command::Talk => talk(&mut conn),
         });
         match done {
             Ok(status) => status,

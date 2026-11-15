@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 #[cfg(unix)]
 mod socket;
+mod state;
 mod wire;
 
 /// What the surface settles before `main`. Makepad starts three things in every app that a
@@ -154,6 +155,38 @@ script_mod! {
             width: Fill
             height: 46
             text: ""
+        }
+    }
+
+    // The voice level, drawn: one shader, one bar of it per level, the newest at the right.
+    mod.widgets.DrawWaveBarBase = #(DrawWaveBar::script_component(vm))
+    set_type_default() do #(DrawWaveBar::script_shader(vm)){
+        ..mod.draw.DrawQuad
+    }
+    mod.widgets.WaveBase = #(Wave::register_widget(vm))
+    mod.widgets.Wave = set_type_default() do mod.widgets.WaveBase{
+        width: Fill
+        height: Fill
+        draw_bar +: {
+            // the bar's level, 0 to 1: louder is lighter
+            level: 0.0
+            color_quiet: uniform(#x2f6f9f)
+            color_loud: uniform(#x9fe0ff)
+            pixel: fn() {
+                // a bar with a round top, standing on the band's lower edge
+                let p = self.pos * self.rect_size
+                let px = 1.0 / max(self.draw_pass.dpi_factor, 0.5)
+                let r = min(self.rect_size.x * 0.5, self.rect_size.y)
+                let c = vec2(self.rect_size.x * 0.5, r)
+                let above = step(p.y, r)
+                let d = mix(abs(p.x - c.x) - r, length(p - c) - r, above)
+                let a = clamp(0.5 - d / px, 0.0, 1.0)
+                let ink = mix(self.color_quiet, self.color_loud, clamp(self.level, 0.0, 1.0))
+                // lighter at its top, so a moving bar reads as light and not as a block
+                let shade = mix(1.0, 0.55, self.pos.y)
+                let alpha = a * 0.55
+                return vec4(ink.rgb * shade * alpha, alpha)
+            }
         }
     }
 
@@ -480,6 +513,37 @@ script_mod! {
                                 }
                                 agent_items := mod.widgets.SurfaceList{}
                             }
+                            // an owner's view: a page built from the state the owner pushes.
+                            // The band is the app's own and names the owner.
+                            viewpage := View{
+                                visible: false
+                                width: Fill
+                                height: Fill
+                                flow: Down
+                                view_band := SolidView{
+                                    width: Fill
+                                    height: 44
+                                    flow: Right
+                                    spacing: 8
+                                    // the right end is the dots' place
+                                    padding: Inset{left: 16 right: 126}
+                                    align: Align{y: 0.5}
+                                    draw_bg.color: #16324a
+                                    view_title := Label{
+                                        width: Fill
+                                        text: ""
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 13
+                                    }
+                                    view_home := Button{
+                                        visible: false
+                                        width: Fit
+                                        height: 34
+                                        text: "‹ Home"
+                                    }
+                                }
+                                view_items := mod.widgets.SurfaceList{}
+                            }
                         }
                         // The voice strip: what the voice service hears, as it comes. The band
                         // and its tag are the app's own; the text is two lines, the newest
@@ -488,10 +552,16 @@ script_mod! {
                             visible: false
                             width: Fill
                             height: 58
+                            flow: Overlay
+                            draw_bg.color: #16324a
+                            // behind the words: the voice level of the last seconds
+                            wave := mod.widgets.Wave{}
+                            View{
+                            width: Fill
+                            height: Fill
                             flow: Right
                             spacing: 8
                             padding: Inset{left: 12 right: 12 top: 9 bottom: 9}
-                            draw_bg.color: #16324a
                             voice_tag := Label{
                                 width: 40
                                 padding: Inset{top: 0 right: 0 bottom: 0 left: 0}
@@ -520,6 +590,7 @@ script_mod! {
                                     draw_text.color: #fff
                                     draw_text.text_style.font_size: 12
                                 }
+                            }
                             }
                         }
                     }
@@ -715,6 +786,89 @@ impl Widget for ButtonRow {
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }
+}
+
+/// How many levels the wave shows: a little over three seconds at 20 a second.
+const WAVE_BARS: usize = 64;
+
+/// One bar of the wave. The instance carries its level, so the whole wave is one draw call.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawWaveBar {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    level: f32,
+}
+
+/// The voice level of the last seconds as bars, the newest at the right. It holds no
+/// timer and asks for no frame by itself: it is drawn when the app says a level came.
+#[derive(Script, ScriptHook, Widget)]
+pub struct Wave {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[walk]
+    walk: Walk,
+    #[live]
+    draw_bar: DrawWaveBar,
+    #[redraw]
+    #[rust]
+    area: Area,
+    #[rust]
+    levels: std::collections::VecDeque<f32>,
+}
+
+impl Wave {
+    pub fn push(&mut self, level: f32) {
+        if self.levels.len() == WAVE_BARS {
+            self.levels.pop_front();
+        }
+        self.levels.push_back(level);
+    }
+
+    /// One step towards rest: every bar half as high. `true` while one is still to be seen.
+    pub fn decay(&mut self) -> bool {
+        for level in &mut self.levels {
+            *level = if *level < 0.04 { 0.0 } else { *level * 0.5 };
+        }
+        self.levels.iter().any(|level| *level > 0.0)
+    }
+
+    pub fn clear(&mut self) {
+        self.levels.clear();
+    }
+}
+
+impl Widget for Wave {
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        cx.begin_turtle(walk, Layout::default());
+        let rect = cx.turtle().rect();
+        let step = rect.size.x / WAVE_BARS as f64;
+        let width = (step * 0.6).max(1.0);
+        // One bar of no size, always: the wave's draw call is in the frame from the strip's
+        // first one. A first or a last bar then changes that call's instances and nothing
+        // else, so the frame's damage stays in the strip (a call that comes or goes moves
+        // the calls after it, and the whole window is repainted once).
+        self.draw_bar.level = 0.0;
+        self.draw_bar.draw_abs(cx, Rect { pos: rect.pos, size: dvec2(0.0, 0.0) });
+        // the newest level at the right end; a level of 0 is no bar
+        let first = WAVE_BARS - self.levels.len();
+        for (i, level) in self.levels.iter().enumerate() {
+            if *level <= 0.0 {
+                continue;
+            }
+            let height = (*level as f64 * rect.size.y).max(width);
+            self.draw_bar.level = *level;
+            let x = rect.pos.x + (first + i) as f64 * step + (step - width) * 0.5;
+            self.draw_bar.draw_abs(cx, Rect { pos: dvec2(x, rect.pos.y + rect.size.y - height), size: dvec2(width, height) });
+        }
+        cx.end_turtle_with_area(&mut self.area);
+        DrawStep::done()
+    }
+
+    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
 }
 
 /// One line of the list.
@@ -1217,7 +1371,34 @@ pub struct App {
     lit: (bool, bool),
     #[rust]
     voice: Voice,
+    /// the values an owner has pushed (`state.rs`)
+    #[rust]
+    store: state::Store,
+    /// the owner's views
+    #[rust]
+    views: Vec<state::View>,
+    /// the view that is the page on screen, by its name
+    #[rust]
+    view_shown: Option<String>,
+    /// that view as it was last built from the store
+    #[rust]
+    built: Option<state::Built>,
+    #[rust]
+    view_rev: u64,
+    /// one shot: no level has come for a while, the wave goes to rest
+    #[rust]
+    wave_timer: Timer,
+    /// TINYBOT_SURFACE_LOG is set: the strip's and the wave's draws are counted on stderr
+    #[rust]
+    log: bool,
 }
+
+/// The key of the voice level, which the wave shows.
+const VOICE_LEVEL: &str = "voice/level";
+/// A level older than this lets the wave go to rest,
+const WAVE_QUIET: f64 = 0.3;
+/// one step every so long, each bar half as high, until all are flat.
+const WAVE_STEP: f64 = 0.05;
 
 /// The voice strip: one text of the voice client's, in a band under the page.
 #[derive(Default)]
@@ -1348,9 +1529,87 @@ impl App {
     fn show(&mut self, cx: &mut Cx) {
         self.ui.view(cx, ids!(surface)).set_visible(cx, self.front == Some(wire::Layer::Root));
         self.ui.view(cx, ids!(agent)).set_visible(cx, self.front == Some(wire::Layer::Agent));
+        self.ui.view(cx, ids!(viewpage)).set_visible(cx, self.front == Some(wire::Layer::View));
         self.ui.view(cx, ids!(idle)).set_visible(cx, self.front.is_none());
         self.ui.widget(cx, ids!(agent_home)).set_visible(cx, self.has_root);
+        self.ui.widget(cx, ids!(view_home)).set_visible(cx, self.has_root);
         self.ui.redraw(cx);
+    }
+
+    /// Builds the view on screen from the store and brings the page to it: in place where
+    /// the items are the same ones, as a new page where they are not (`fresh`: always).
+    fn view_build(&mut self, cx: &mut Cx, fresh: bool) {
+        let Some(view) = self.view_shown.as_ref().and_then(|name| self.views.iter().find(|view| view.name == *name)) else {
+            return;
+        };
+        let mut new = self.store.build(view, self.view_rev);
+        let title = format!("{} · voice", new.spec.title);
+        let list = self.ui.widget(cx, ids!(view_items));
+        let Some(mut list) = list.borrow_mut::<SurfaceList>() else {
+            return;
+        };
+        match self.built.as_ref().filter(|_| !fresh).and_then(|old| state::diff(&old.spec, &new.spec)) {
+            Some(update) => {
+                if update.title.is_some() {
+                    self.ui.label(cx, ids!(view_title)).set_text(cx, &title);
+                }
+                if self.log && !update.changes.is_empty() {
+                    eprintln!("[tinybot-surface] view {} changed in place ({} items)", new.spec.surface, update.changes.len());
+                }
+                if !update.changes.is_empty() {
+                    list.update(cx, update);
+                }
+            }
+            None => {
+                if self.log {
+                    eprintln!("[tinybot-surface] view {} set ({} items)", new.spec.surface, new.spec.items.len());
+                }
+                // the same surface id: where the page is scrolled to stays
+                self.view_rev += 1;
+                new.spec.rev = self.view_rev;
+                self.ui.label(cx, ids!(view_title)).set_text(cx, &title);
+                list.set_spec(cx, new.spec.clone());
+            }
+        }
+        self.built = Some(new);
+    }
+
+    /// A voice level has come: into the wave, which is drawn if the strip is on screen.
+    fn voice_level(&mut self, cx: &mut Cx, level: f64) {
+        let level = if level.is_finite() { level.clamp(0.0, 1.0) as f32 } else { 0.0 };
+        if let Some(mut wave) = self.ui.widget(cx, ids!(wave)).borrow_mut::<Wave>() {
+            wave.push(level);
+        }
+        cx.stop_timer(self.wave_timer);
+        self.wave_timer = cx.start_timeout(WAVE_QUIET);
+        self.wave_redraw(cx);
+    }
+
+    /// Draws the wave again, if anyone can see it: not with the strip away, not with the
+    /// panel off. Only the wave's own rectangle is marked.
+    fn wave_redraw(&mut self, cx: &mut Cx) -> bool {
+        if self.voice.shown.is_none() || self.dots == Dots::Dark {
+            return false;
+        }
+        self.ui.widget(cx, ids!(wave)).redraw(cx);
+        if self.log {
+            eprintln!("[tinybot-surface] wave drawn");
+        }
+        true
+    }
+
+    /// No level for a while: the bars sink, a step at a time, and then nothing more is
+    /// asked for. With nobody to see it the wave is simply emptied.
+    fn wave_rest(&mut self, cx: &mut Cx) {
+        let moving = self.ui.widget(cx, ids!(wave)).borrow_mut::<Wave>().is_some_and(|mut wave| wave.decay());
+        if moving && self.wave_redraw(cx) {
+            self.wave_timer = cx.start_timeout(WAVE_STEP);
+            return;
+        }
+        if let Some(mut wave) = self.ui.widget(cx, ids!(wave)).borrow_mut::<Wave>() {
+            wave.clear();
+        }
+        self.wave_redraw(cx);
     }
 
     /// A `confirm` button waits for its second tap.
@@ -1434,6 +1693,13 @@ impl App {
             let what = if next.is_none() { "gone" } else if comes_or_goes { "shown" } else { "changed" };
             eprintln!("[tinybot-surface] voice strip {what} ({} bytes)", next.as_ref().map_or(0, |text| text.len()));
         }
+        if next.is_none() {
+            // the strip has gone: the next take starts with an empty wave
+            cx.stop_timer(self.wave_timer);
+            if let Some(mut wave) = self.ui.widget(cx, ids!(wave)).borrow_mut::<Wave>() {
+                wave.clear();
+            }
+        }
         self.voice.shown = next;
         self.voice.at = Some(std::time::Instant::now());
     }
@@ -1478,6 +1744,7 @@ impl MatchEvent for App {
             cx.set_partial_repainting(false);
             eprintln!("[tinybot-surface] whole frames (TINYBOT_PARTIAL_REPAINT=0)");
         }
+        self.log = std::env::var_os("TINYBOT_SURFACE_LOG").is_some();
         self.start_socket();
         self.settle = cx.start_timeout(SETTLE_SECONDS);
         self.settle_again = true;
@@ -1509,6 +1776,7 @@ impl MatchEvent for App {
             let list_of = |layer: wire::Layer| match layer {
                 wire::Layer::Root => ids!(items),
                 wire::Layer::Agent => ids!(agent_items),
+                wire::Layer::View => ids!(view_items),
             };
             match message {
                 socket::ToUi::Update(layer, update) => {
@@ -1517,6 +1785,7 @@ impl MatchEvent for App {
                         match layer {
                             wire::Layer::Root => self.ui.label(cx, ids!(title)).set_text(cx, title),
                             wire::Layer::Agent => self.ui.label(cx, ids!(agent_title)).set_text(cx, title),
+                            wire::Layer::View => {}
                         }
                     }
                     if let Some(mut list) = self.ui.widget(cx, list_of(layer)).borrow_mut::<SurfaceList>() {
@@ -1532,6 +1801,7 @@ impl MatchEvent for App {
                             // the name is the process's own word for itself; the uid is the kernel's
                             self.ui.label(cx, ids!(who)).set_text(cx, &format!("agent · {who}"));
                         }
+                        wire::Layer::View => {}
                     }
                     if let Some(mut list) = self.ui.widget(cx, list_of(layer)).borrow_mut::<SurfaceList>() {
                         list.set_spec(cx, spec);
@@ -1542,10 +1812,49 @@ impl MatchEvent for App {
                         list.clear(cx);
                     }
                 }
-                socket::ToUi::Front(front, has_root) => {
+                socket::ToUi::Front(front, has_root, view) => {
                     self.front = front;
                     self.has_root = has_root;
+                    // a view is built as it comes to the screen; off it, nothing is built
+                    self.built = None;
+                    self.view_shown = view;
+                    self.view_build(cx, true);
                     self.show(cx);
+                }
+                socket::ToUi::Put(values) => {
+                    let level = values.iter().rev().find(|(key, _)| key == VOICE_LEVEL).and_then(|(_, value)| match value {
+                        Some(state::Value::Num(level)) => Some(*level),
+                        _ => None,
+                    });
+                    let others = values.iter().any(|(key, _)| key != VOICE_LEVEL);
+                    // an equal value changes nothing and draws nothing
+                    let changed = self.store.put(values);
+                    if let Some(level) = level {
+                        self.voice_level(cx, level);
+                    }
+                    if changed && others {
+                        self.view_build(cx, false);
+                    }
+                }
+                socket::ToUi::View(name, view) => {
+                    self.views.retain(|view| view.name != name);
+                    let shown = self.view_shown.as_deref() == Some(name.as_str());
+                    match view {
+                        Some(view) => {
+                            self.views.push(view);
+                            if shown {
+                                self.view_build(cx, true);
+                            }
+                        }
+                        None if shown => self.built = None,
+                        None => {}
+                    }
+                }
+                socket::ToUi::Gone => {
+                    self.store.clear();
+                    self.views.clear();
+                    self.built = None;
+                    self.view_shown = None;
                 }
                 // shown by `voice_flush`, after this event; of several the newest counts
                 socket::ToUi::Voice(text) => {
@@ -1567,8 +1876,26 @@ impl MatchEvent for App {
             let presses = list.borrow_mut::<SurfaceList>().map(|mut list| list.handle_actions(cx, actions)).unwrap_or_default();
             pressed.extend(presses.into_iter().map(|press| (layer, press)));
         }
-        // the band's way back from an agent's page: at once, no round trip
-        let home = self.has_root && self.front == Some(wire::Layer::Agent) && self.ui.button(cx, ids!(agent_home)).clicked(actions);
+        // A tap on an owner's view is told to the owner. Where the item says so, the tap
+        // also sets a value at once (the pick that is selected), so it is seen in this
+        // frame; the owner's next put says what is true.
+        let mut events = Vec::new();
+        let taps = self.ui.widget(cx, ids!(view_items)).borrow_mut::<SurfaceList>().map(|mut list| list.handle_actions(cx, actions)).unwrap_or_default();
+        let mut set = false;
+        for tap in taps {
+            if let Some(key) = self.built.as_ref().and_then(|built| built.sets.get(&tap.id)).cloned() {
+                self.store.set_text(&key, &tap.id);
+                set = true;
+            }
+            events.push((tap.surface, tap.id));
+        }
+        if set {
+            self.view_build(cx, false);
+        }
+        // the band's way back from an agent's page or a view: at once, no round trip
+        let home = self.has_root
+            && ((self.front == Some(wire::Layer::Agent) && self.ui.button(cx, ids!(agent_home)).clicked(actions))
+                || (self.front == Some(wire::Layer::View) && self.ui.button(cx, ids!(view_home)).clicked(actions)));
         if home {
             self.front = Some(wire::Layer::Root);
             self.show(cx);
@@ -1581,9 +1908,12 @@ impl MatchEvent for App {
             if home {
                 link.send(socket::ToIo::Home);
             }
+            for (view, id) in events {
+                link.send(socket::ToIo::Event { view, id });
+            }
         }
         #[cfg(not(unix))]
-        let _ = pressed;
+        let _ = (pressed, events);
     }
 
     fn handle_shutdown(&mut self, _cx: &mut Cx) {
@@ -1623,6 +1953,9 @@ impl AppMain for App {
         }
         if self.voice.turn.is_event(event).is_some() {
             self.voice.waits = false;
+        }
+        if self.wave_timer.is_event(event).is_some() {
+            self.wave_rest(cx);
         }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());

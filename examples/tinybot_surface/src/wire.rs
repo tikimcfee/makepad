@@ -19,7 +19,7 @@ pub enum Style {
     Danger,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Button {
     pub id: String,
     pub text: String,
@@ -38,7 +38,7 @@ pub const CONFIRM_SECONDS: f64 = 3.0;
 /// The items. An `id` that is optional and was left out is empty. For the three kinds the
 /// user sets (toggle, stepper, number), `value: None` keeps what the user set when the
 /// surface id is unchanged.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Heading { id: String, text: String },
     Text { id: String, text: String },
@@ -160,6 +160,12 @@ pub enum Request {
     Runner,
     /// a root client that is the voice service says so, and gets the voice strip
     Voice,
+    /// an owner's new values for its state keys (`None`: the key goes)
+    Put(Vec<(String, Option<crate::state::Value>)>),
+    /// an owner's view, by its name (`None`: the view goes)
+    View(String, Option<crate::state::View>),
+    /// the runner only: an owner's view on screen
+    ShowView(String),
     /// the voice client's text for the strip; `None` takes the strip away
     Say(Option<String>),
 }
@@ -194,6 +200,8 @@ pub fn voice_text(raw: &str) -> Option<String> {
 pub enum Layer {
     Root,
     Agent,
+    /// an owner's view, built from its state (`state.rs`)
+    View,
 }
 
 impl Layer {
@@ -201,6 +209,7 @@ impl Layer {
         match self {
             Layer::Root => "root",
             Layer::Agent => "agent",
+            Layer::View => "view",
         }
     }
 }
@@ -260,11 +269,14 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
                 None => err("bad_request", "voice: text is a string; without it the strip goes away"),
             },
         },
-        Some("show") => match value.key("layer").and_then(|l| l.as_str()) {
-            Some("root") => Ok(Request::Show(Layer::Root)),
-            Some("agent") => Ok(Request::Show(Layer::Agent)),
-            _ => err("bad_request", "show: layer is \"root\" or \"agent\""),
+        Some("show") => match (value.key("layer").and_then(|l| l.as_str()), value.key("name").and_then(|n| n.as_str())) {
+            (Some("root"), _) => Ok(Request::Show(Layer::Root)),
+            (Some("agent"), _) => Ok(Request::Show(Layer::Agent)),
+            (Some("view"), Some(name)) => Ok(Request::ShowView(name.to_string())),
+            _ => err("bad_request", "show: layer is \"root\", \"agent\", or \"view\" with the view's name"),
         },
+        Some("put") => crate::state::parse_put(&value).map(Request::Put),
+        Some("view") => crate::state::parse_view(&value).map(|(name, view)| Request::View(name, view)),
         Some("done") => match value.key("seq").and_then(|s| s.as_u64()) {
             Some(seq) => Ok(Request::Done { seq }),
             None => err("bad_request", "done: seq is the seq of the last tap received"),

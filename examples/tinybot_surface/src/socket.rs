@@ -7,9 +7,10 @@
 //! `try_recv` on `Event::Signal`, taps go the other way through a channel plus one byte on the
 //! wake socket.
 
+use crate::state;
 use crate::wire::{self, Layer, Request, Spec, Tap, Target, Update, WireErr};
 use makepad_widgets::makepad_platform::thread::SignalToUI;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -24,9 +25,15 @@ pub enum ToUi {
     /// already checked against the layer's surface
     Update(Layer, Update),
     Clear(Layer),
-    /// the layer on screen now, and whether root's layer exists (the way back from an
-    /// agent's page)
-    Front(Option<Layer>, bool),
+    /// the layer on screen now, whether root's layer exists (the way back from an agent's
+    /// page), and for a view its name
+    Front(Option<Layer>, bool, Option<String>),
+    /// an owner's new values
+    Put(Vec<(String, Option<state::Value>)>),
+    /// an owner's view, new or gone
+    View(String, Option<state::View>),
+    /// the owner has left: its values and views go
+    Gone,
     /// the voice strip's text, or no strip
     Voice(Option<String>),
 }
@@ -36,7 +43,17 @@ pub enum ToIo {
     Tap { layer: Layer, surface: String, rev: u64, id: String, values: Vec<(String, wire::Value)> },
     /// the user left an agent's page for root's with the band's button
     Home,
+    /// a tap on an item of an owner's view: told to the owner
+    Event { view: String, id: String },
 }
+
+/// The most `put` requests a connection may send in a second. A level 20 times a second and
+/// the rest of a voice service's state fit several times over.
+const PUTS_PER_SECOND: u32 = 60;
+/// The most views an owner holds.
+const OWNER_VIEWS: usize = 8;
+/// The one owner of state in this version: the voice role. Its keys start with this.
+const VOICE_KEYS: &str = "voice/";
 
 /// The UI thread's end. Dropping it ends the socket thread.
 pub struct Link {
@@ -230,6 +247,9 @@ pub fn start(path: PathBuf, default_place: bool) -> io::Result<Link> {
         layers_at: 0,
         runner: None,
         voice: None,
+        views: Vec::new(),
+        view_front: None,
+        keys: HashSet::new(),
         taps: VecDeque::new(),
         next_seq: 1,
     };
@@ -244,6 +264,8 @@ struct Conn {
     peer: Peer,
     /// this is the voice client's connection: the strip is its own and goes with it
     voice: bool,
+    /// the second that is counted now and the `put` requests in it
+    puts: (std::time::Instant, u32),
     client: Client,
     buf: Vec<u8>,
     asks: Asks,
@@ -289,6 +311,12 @@ struct State {
     runner: Option<u32>,
     /// the pid of the voice client while its connection is open: one at a time
     voice: Option<u32>,
+    /// the owner's views, in the order they came: (name, title)
+    views: Vec<(String, String)>,
+    /// the view that is (or was last) on screen
+    view_front: Option<String>,
+    /// the owner's state keys, to keep their number bounded
+    keys: HashSet<String>,
     /// every tap not yet confirmed by a `done`, oldest first
     taps: VecDeque<Tap>,
     next_seq: u64,
@@ -306,14 +334,14 @@ impl State {
     fn held(&self, layer: Layer) -> &Held {
         match layer {
             Layer::Root => &self.root,
-            Layer::Agent => &self.agent,
+            Layer::Agent | Layer::View => &self.agent,
         }
     }
 
     fn held_mut(&mut self, layer: Layer) -> &mut Held {
         match layer {
             Layer::Root => &mut self.root,
-            Layer::Agent => &mut self.agent,
+            Layer::Agent | Layer::View => &mut self.agent,
         }
     }
 
@@ -350,7 +378,29 @@ impl State {
             ),
             None => "null".to_string(),
         };
-        format!("\"privileged\":{},\"front\":{front},\"agent\":{agent}", self.root.surface.is_some())
+        // an owner's views, for the runner to list on Home (left out while there are none)
+        let views = if self.views.is_empty() {
+            String::new()
+        } else {
+            let views: Vec<String> = self.views.iter().map(|(name, title)| format!("{{\"name\":{},\"title\":{},\"from\":\"voice\"}}", wire::json_str(name), wire::json_str(title))).collect();
+            format!(",\"views\":[{}]", views.join(","))
+        };
+        format!("\"privileged\":{},\"front\":{front},\"agent\":{agent}{views}", self.root.surface.is_some())
+    }
+
+    /// The layer the screen falls to when the one on it has gone: root's page, an agent's,
+    /// an owner's view, or the idle line.
+    fn fall_back(&mut self) -> Option<Layer> {
+        if self.root.surface.is_some() {
+            Some(Layer::Root)
+        } else if self.agent.surface.is_some() {
+            Some(Layer::Agent)
+        } else if let Some((name, _)) = self.views.first() {
+            self.view_front = Some(name.clone());
+            Some(Layer::View)
+        } else {
+            None
+        }
     }
 
     fn hello(&self, peer: Peer) -> String {
@@ -386,7 +436,8 @@ impl State {
             self.layers_at += 1;
         }
         self.front = front;
-        let _ = self.to_ui.send(ToUi::Front(front, self.root.surface.is_some()));
+        let view = self.view_front.clone().filter(|_| front == Some(Layer::View));
+        let _ = self.to_ui.send(ToUi::Front(front, self.root.surface.is_some(), view));
         SignalToUI::set_ui_signal();
     }
 
@@ -426,7 +477,8 @@ impl State {
     }
 
     /// Answers one request line. `None`: the answer comes later (a `taps` that waits).
-    fn request(&mut self, line: &str, peer: &mut Peer, voice: &mut bool, client: &Client, asks: &mut Asks, waiters: usize) -> Option<String> {
+    #[allow(clippy::too_many_arguments)]
+    fn request(&mut self, line: &str, peer: &mut Peer, voice: &mut bool, puts: &mut (std::time::Instant, u32), client: &Client, asks: &mut Asks, waiters: usize) -> Option<String> {
         let request = match wire::parse_request(line) {
             Ok(r) => r,
             Err(e) => return Some(e.line()),
@@ -472,6 +524,81 @@ impl State {
                 let _ = self.to_ui.send(ToUi::Voice(text));
                 SignalToUI::set_ui_signal();
                 return Some("{\"type\":\"ok\"}\n".to_string());
+            }
+            Request::Put(values) => {
+                let refuse = |code: &'static str, msg: String| Some(WireErr { code, msg }.line());
+                if !*voice {
+                    return refuse("privileged", "put: only the voice client holds state in this version (hello with role \"voice\")".into());
+                }
+                // so many a second and no more: a refused put is said, not dropped
+                let now = std::time::Instant::now();
+                if now.duration_since(puts.0).as_secs() >= 1 {
+                    *puts = (now, 0);
+                }
+                puts.1 += 1;
+                if puts.1 > PUTS_PER_SECOND {
+                    return refuse("too_fast", format!("put: more than {PUTS_PER_SECOND} in a second on this connection"));
+                }
+                if let Some((key, _)) = values.iter().find(|(key, _)| !key.starts_with(VOICE_KEYS)) {
+                    return refuse("bad_put", format!("put: {key} is not this owner's key (its keys start with {VOICE_KEYS})"));
+                }
+                let new = values.iter().filter(|(key, value)| value.is_some() && !self.keys.contains(key)).count();
+                if self.keys.len() + new > state::OWNER_KEYS {
+                    return refuse("too_big", format!("put: an owner holds at most {} keys", state::OWNER_KEYS));
+                }
+                for (key, value) in &values {
+                    if value.is_some() {
+                        self.keys.insert(key.clone());
+                    } else {
+                        self.keys.remove(key);
+                    }
+                }
+                let _ = self.to_ui.send(ToUi::Put(values));
+                SignalToUI::set_ui_signal();
+                return Some("{\"type\":\"ok\"}\n".to_string());
+            }
+            Request::View(name, view) => {
+                let refuse = |code: &'static str, msg: String| Some(WireErr { code, msg }.line());
+                if !*voice {
+                    return refuse("privileged", "view: only the voice client has views in this version (hello with role \"voice\")".into());
+                }
+                if let Some(key) = view.as_ref().and_then(|view| state::keys_of(view).into_iter().find(|key| !key.starts_with(VOICE_KEYS))) {
+                    return refuse("bad_view", format!("view: {key} is not this owner's key (its keys start with {VOICE_KEYS})"));
+                }
+                let had = self.views.iter().position(|(this, _)| *this == name);
+                match (&view, had) {
+                    (Some(view), Some(at)) => self.views[at].1.clone_from(&view.title),
+                    (Some(_), None) if self.views.len() >= OWNER_VIEWS => return refuse("too_big", format!("view: an owner holds at most {OWNER_VIEWS} views")),
+                    (Some(view), None) => self.views.push((name.clone(), view.title.clone())),
+                    (None, Some(at)) => drop(self.views.remove(at)),
+                    (None, None) => {}
+                }
+                self.layers_at += 1;
+                let gone = view.is_none();
+                let _ = self.to_ui.send(ToUi::View(name.clone(), view));
+                if gone && self.front == Some(Layer::View) && self.view_front.as_deref() == Some(name.as_str()) {
+                    // the view on screen has gone: the screen falls to what is left
+                    self.view_front = None;
+                    let front = self.fall_back();
+                    self.set_front(front, false);
+                } else if !gone && self.front.is_none() {
+                    // with nothing else to show, an owner's first view comes up by itself
+                    self.view_front = Some(name);
+                    self.set_front(Some(Layer::View), false);
+                }
+                SignalToUI::set_ui_signal();
+                return Some("{\"type\":\"ok\"}\n".to_string());
+            }
+            Request::ShowView(name) => {
+                if peer != Peer::Root {
+                    return Some(WireErr { code: "privileged", msg: "only the runner chooses the layer on screen".into() }.line());
+                }
+                if !self.views.iter().any(|(this, _)| *this == name) {
+                    return Some(WireErr { code: "bad_request", msg: format!("show: there is no view {name}") }.line());
+                }
+                self.view_front = Some(name);
+                self.set_front(Some(Layer::View), false);
+                return Some(self.ack(peer));
             }
             _ => {}
         }
@@ -523,9 +650,10 @@ impl State {
                 // the other layer, if there is one, has the screen now
                 let other = match layer {
                     Layer::Root => Layer::Agent,
-                    Layer::Agent => Layer::Root,
+                    Layer::Agent | Layer::View => Layer::Root,
                 };
-                let front = if self.held(other).surface.is_some() { Some(other) } else { None };
+                // (with neither left, an owner's view has the screen)
+                let front = if self.held(other).surface.is_some() { Some(other) } else { self.fall_back() };
                 self.set_front(front, layer == Layer::Agent);
                 self.ack(peer)
             }
@@ -563,7 +691,7 @@ impl State {
                 asks.layers_at = self.layers_at;
                 self.taps_reply(peer, news)
             }
-            Request::Runner | Request::Voice | Request::Say(_) => unreachable!("answered above"),
+            Request::Runner | Request::Voice | Request::Say(_) | Request::Put(_) | Request::View(..) | Request::ShowView(_) => unreachable!("answered above"),
             Request::Done { seq } => {
                 let before = self.taps.len();
                 self.taps.retain(|t| !(t.seq <= seq && Self::sees(peer, t)));
@@ -655,9 +783,9 @@ impl Conn {
             let reply = match std::str::from_utf8(line) {
                 Ok(text) if text.trim().is_empty() => None,
                 Ok(text) => {
-                    let (mut asks, mut peer, mut voice) = (self.asks, self.peer, self.voice);
-                    let reply = state.request(text, &mut peer, &mut voice, &self.client, &mut asks, waiters);
-                    (self.asks, self.peer, self.voice) = (asks, peer, voice);
+                    let (mut asks, mut peer, mut voice, mut puts) = (self.asks, self.peer, self.voice, self.puts);
+                    let reply = state.request(text, &mut peer, &mut voice, &mut puts, &self.client, &mut asks, waiters);
+                    (self.asks, self.peer, self.voice, self.puts) = (asks, peer, voice, puts);
                     reply
                 }
                 Err(_) => Some(WireErr { code: "bad_json", msg: "the line is not UTF-8".into() }.line()),
@@ -685,6 +813,12 @@ impl Conn {
 
 fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut state: State) {
     let mut conns: Vec<Conn> = Vec::new();
+    // the view its owner was last told is on screen
+    let mut told: Option<String> = None;
+    let event = |view: &str, id: Option<&str>, kind: &str| {
+        let id = id.map(|id| format!("\"id\":{},", wire::json_str(id))).unwrap_or_default();
+        format!("{{\"type\":\"event\",\"view\":{},{id}\"kind\":\"{kind}\"}}\n", wire::json_str(view))
+    };
     loop {
         let mut fds = Vec::with_capacity(conns.len() + 2);
         fds.push(PollFd { fd: wake.as_raw_fd(), events: POLLIN, revents: 0 });
@@ -729,6 +863,12 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
                             state.layers_at += 1;
                         }
                     }
+                    // a tap on an owner's view goes to the owner, on the connection it holds
+                    Ok(ToIo::Event { view, id }) => {
+                        if let Some(owner) = conns.iter_mut().find(|c| c.voice) {
+                            owner.send(&event(&view, Some(&id), "tap"));
+                        }
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
@@ -757,11 +897,36 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
         if state.runner.is_some() && !conns.iter().any(|c| c.peer == Peer::Root) {
             state.runner = None;
         }
-        // the voice client has left: its strip goes with it, whatever it last said
+        // the voice client has left: its strip goes with it, whatever it last said, and so
+        // do its values and its views
         if state.voice.is_some() && !conns.iter().any(|c| c.voice) {
             state.voice = None;
             let _ = state.to_ui.send(ToUi::Voice(None));
+            let _ = state.to_ui.send(ToUi::Gone);
+            state.keys.clear();
+            state.view_front = None;
+            if !state.views.is_empty() {
+                state.views.clear();
+                state.layers_at += 1;
+                if state.front == Some(Layer::View) {
+                    let front = state.fall_back();
+                    state.set_front(front, false);
+                }
+            }
             SignalToUI::set_ui_signal();
+        }
+        // the owner hears when its view comes to the screen and when it leaves it
+        let shown = if state.front == Some(Layer::View) { state.view_front.clone() } else { None };
+        if shown != told {
+            if let Some(owner) = conns.iter_mut().find(|c| c.voice) {
+                if let Some(view) = &told {
+                    owner.send(&event(view, None, "hidden"));
+                }
+                if let Some(view) = &shown {
+                    owner.send(&event(view, None, "shown"));
+                }
+            }
+            told = shown;
         }
 
         // the layers changed (a request above, or the user went Home): the waiting clients
@@ -787,7 +952,7 @@ fn run(listener: UnixListener, wake: UnixStream, from_ui: Receiver<ToIo>, mut st
                         // the hello says how the layers are: this client has heard
                         let asks = Asks { layers_at: state.layers_at, ..Asks::default() };
                         // every client starts on the agent's layer, root too
-                        let mut conn = Conn { stream, peer: Peer::User, voice: false, client, buf: Vec::new(), asks, closed: false };
+                        let mut conn = Conn { stream, peer: Peer::User, voice: false, puts: (std::time::Instant::now(), 0), client, buf: Vec::new(), asks, closed: false };
                         conn.send(&state.hello(Peer::User));
                         if !conn.closed {
                             conns.push(conn);
