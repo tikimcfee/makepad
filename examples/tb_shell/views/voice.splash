@@ -1,13 +1,17 @@
-// VOICE: the live text from the key `voice` (voice.text), the wave and the level as
-// streams pushed on tb-voiced's connection (mic: up to 32 values, level: one value).
+// VOICE: the wave and the level (streams tb-voiced pushes: mic up to 32 values, level one),
+// then whom it goes to and the live text (voice.text). The text area has a fixed place and
+// keeps the end of the text in view (scrolling up lets go), so a client may send the whole take.
 width: Fill height: Fill flow: Down padding: 16 spacing: 12
+wave := StreamView{stream: "mic" height: 90}
+level := StreamView{stream: "level" height: 14 draw_bg.color_bar: #x3ddc84}
 main := View{
-    width: Fill height: Fit flow: Down spacing: 8
+    width: Fill height: Fill flow: Down spacing: 8
     on_render: || {
         let v = state.voice ?? nil
         Small{text: "to: " + agent_name(state.agents ?? nil, state.target ?? nil)}
-        Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }}
+        // follows the end while the text grows; a finger scrolling up lets go of it
+        text := ScrollYView{width: Fill height: Fill flow: Down scroll_bars +: {auto_tail: true}
+            Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }}
+        }
     }
 }
-wave := StreamView{stream: "mic" height: 90}
-level := StreamView{stream: "level" height: 14 draw_bg.color_bar: #x3ddc84}
