@@ -12,6 +12,7 @@ pub use makepad_widgets;
 mod io;
 mod paneltrace;
 mod shell;
+mod sched;
 mod split;
 mod stream;
 
@@ -199,6 +200,7 @@ struct State {
     /// Surfaces loaded from the views folder (the rest are the agents').
     views: HashSet<String>,
     notified: bool,
+    placement: sched::Placement,
 }
 
 #[derive(Script, ScriptHook)]
@@ -348,6 +350,8 @@ impl App {
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
         self.st.trace = paneltrace::PanelTrace::from_env();
+        self.st.placement = sched::Placement::from_env();
+        self.st.placement.apply();
         self.read_mic(cx);
         self.left_out(cx);
         self.load_views(cx);
@@ -407,6 +411,8 @@ impl App {
         if std::mem::replace(&mut self.st.notified, true) {
             return;
         }
+        // GL threads the driver started with the first frame get placed too.
+        self.st.placement.apply();
         let Some(path) = env("NOTIFY_SOCKET") else { return };
         use std::os::linux::net::SocketAddrExt;
         let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else { return };
