@@ -6,8 +6,9 @@
 //!   tbui set -j JSON | tbui set KEY=JSON...
 //!   tbui set -        one connection; each line of stdin is a patch (for a service: no
 //!                     process per update); exit 1 if any was refused
-//!   tbui push NAME    one connection; each line of stdin is the values of stream NAME
-//!                     (numbers, comma or space separated), for StreamView; no replies
+//!   tbui push NAME [--append]   one connection; each line of stdin is the values of
+//!                     stream NAME (numbers, comma or space separated), for StreamView; no
+//!                     replies. --append adds them to the stream's ring of the last 32.
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
@@ -286,7 +287,8 @@ fn main() {
             }
         }
         "push" => {
-            let name = rest.first().unwrap_or_else(|| die("push NAME (values on stdin)"));
+            let name = rest.first().unwrap_or_else(|| die("push NAME [--append] (values on stdin)"));
+            let append = if rest.iter().any(|a| a == "--append") { ",\"append\":true" } else { "" };
             let mut c = Client::connect();
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
@@ -294,7 +296,7 @@ fn main() {
                 if values.iter().any(|v| v.parse::<f64>().is_err()) {
                     die(&format!("not numbers: {line}"));
                 }
-                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
+                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]{append}}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
                 c.out.write_all(req.as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
             }
         }
