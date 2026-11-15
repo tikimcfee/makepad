@@ -86,7 +86,7 @@ and repeated keys included), which the app reads to the same surface.
 | `readout` | `id`, `text`, `value` (optional, a string) | a label and a monospace value on one line |
 | `row` | `id` (optional), `buttons`: a non-empty array of `{id, text, style, confirm, lock, dim}` | buttons side by side, three to a line |
 | `button` | `id`, `text`, `style`, `confirm`, `lock`, `dim` | a row of one button |
-| `pick` | `id`, `text`, `note` (optional), `dot` (optional: `green`, `amber`, `red` or `off`) | a full-width row to pick: a status dot, the text, the note under it |
+| `pick` | `id`, `text`, `note` (optional), `dot` (optional: `green`, `amber`, `red` or `off`), `selected` (optional, true or false) | a full-width row to pick: a status dot, the text, the note under it; the selected row is drawn as a primary button |
 | `divider` | | a thin line |
 
 - `style` is `primary`, `secondary` (the default) or `danger`; anything else
@@ -102,7 +102,8 @@ and repeated keys included), which the app reads to the same surface.
 - A `pick` is for a list to choose from (agents to send to, under a
   `heading` per host). A tap anywhere on its row is a tap with its `id`. It
   locks nothing and asks for no second tap; what the pick did, the agent
-  shows with an `update` of the row's `text`, `note` or `dot`. The dot is a
+  shows with an `update` of the row's `text`, `note`, `dot` or `selected`
+  (the row that is chosen now). The dot is a
   shape the app draws (`off` is grey; without `dot` there is none), not a
   character of a font.
 - A stepper's strings are the values: the app does not read them as
@@ -157,7 +158,7 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 | Request | Answer |
 |---|---|
 | `{"type":"set","surface":…,"rev":…,"title":…,"items":[…]}` | `{"type":"ack","surface":…,"rev":…,"shown":B,"pending":N}` (`shown`: the client's layer is the one on screen) |
-| `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…,"note":…,"dot":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
+| `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…,"note":…,"dot":…,"selected":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
 | `{"type":"clear"}` | `{"type":"ack","surface":null,"rev":0,"pending":N}` |
 | `{"type":"status"}` | `{"type":"status","v":2,"surface":…,"rev":…,"privileged":…,"title":…,"items":N,"pending":N,"waiting":N}` |
 | `{"type":"taps","wait":false}` | every waiting `tap` line, then `{"type":"taps","count":N,"seq":LAST}` |
@@ -172,8 +173,8 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
 otherwise) and does not change the rev. `title` is a new header line. `items` names items by id: `text`
-for a heading, text, readout or pick, `value` for a readout, `note` and
-`dot` for a pick. `arm` names rows to
+for a heading, text, readout or pick, `value` for a readout, `note`,
+`dot` and `selected` for a pick. `arm` names rows to
 unlock, each by the row's own id or the id of one of its buttons. Both are
 optional. One id that does not fit (`bad_item`) refuses the whole request
 and nothing changes. It is the cheap way to show a result or a reading: no
@@ -393,7 +394,8 @@ instead. The files are read again each time Home or a panel is opened.
     at 2 s, its last stdout line), every `every_s` seconds (at least 1,
     default 2);
   - a button's `action` (below) or `open` (another panel's NAME). A button
-    with neither is a record of the tap and nothing more.
+    with neither is a record of the tap and nothing more;
+  - a `feed` (below): items another tool publishes in a file.
 - `stop` is the panel's all-off: the runner adds the button "Stop / all off"
   and a line under it for its result. Without `stop` there is neither.
 - `key`: `{"code":523,"button":ID}`, or an array of such for several
@@ -424,6 +426,68 @@ An action:
 
 `stop.argv`, `stop_post`, `checks` and `poll.argv` take no placeholders: what
 they run never depends on what was typed.
+
+### A feed: items from a file
+
+```json
+{"kind":"feed","id":"who","file":"/run/tinybot/voice/agents.json",
+ "action":{"argv":["/usr/bin/tb-voice","default","{_id}"],"as":"root","timeout_s":5,"result":"res"}}
+```
+
+A feed's items are not in the panel file. Another tool (root's) writes them
+to `file`, and the runner shows them where the feed stands:
+
+```json
+{"items":[
+ {"kind":"heading","text":"monolith1"},
+ {"kind":"pick","id":"tiny-monolith-optimizer@monolith1","text":"tiny-monolith-optimizer","note":"idle","dot":"green","selected":true},
+ {"kind":"readout","id":"seen","text":"Last look","value":"12:04"},
+ {"kind":"button","id":"refresh","text":"Look again"}
+]}
+```
+
+- **The kinds** are the surface's own, those that need no way back for a
+  value: `heading` (`text`), `text` (`text`, `id` optional), `readout`
+  (`id`, `text`, `value`), `pick` (`id`, `text`, `note`, `dot`, `selected`)
+  and `button` (`id`, `text`, `style`). Nothing in a feed arms or asks: no
+  `confirm`, no answer row. What needs a second tap or a check stays in a
+  panel file. Steppers, numbers and toggles are not feed items yet.
+- **The file** is root's alone to write (as a panel file), at most 64 KiB,
+  and is replaced at once (written beside and renamed). Ids are unique; an
+  unknown kind or field is refused. Of more than 200 items the first 200
+  are shown, fewer when the page would not fit in one line to the app, with
+  a line `… N more not shown`.
+- **A file that is not a feed** (missing, too large, not JSON, a wrong kind
+  or field, writable by others) is one line on the page, `feed unavailable:
+  WHY`; the rest of the page stays and the runner goes on.
+- **When it is read**: as the panel's page goes to the screen, and then once
+  a second only while that page is the one on screen and
+  `/sys/kernel/tinybot_panel/state` does not read `off`. Each second the
+  runner looks at the file's inode, size and time of change; it reads the
+  file only when one of them is another. On Home or another page nothing is
+  looked at and the runner sleeps.
+- **How the page follows**: the same items with other texts, values, notes,
+  dots or another selected pick are changed in place (`update`). Items that
+  came or went (or a button that reads otherwise) are a `set` of the same
+  surface: what the user set and where the page is scrolled to stay.
+- **A tap** on a pick or a button runs the feed's `action` with `{_id}` =
+  the item's id, one argv element (the argv may take values of the page's
+  inputs too). It is an action like a button's: one at a time (`busy`), not
+  on a locked panel (`locked`; the items stay on the page), recorded as a
+  try with `"button"` = the feed's id and `"_id"` among its values. A tap
+  that runs nothing leaves a `{"t":"dropped","feed":…,"id":…,"why":…}`
+  record. The action takes no `ask`, `retry` or `short`. After it the file
+  is looked at at once, so a tool that marks the picked item `selected`
+  shows it without waiting.
+- **An id** is 1 to 64 of letters, digits and `. _ @ : -`, not starting
+  with `-`. A pick or button with any other id is shown as a line of text
+  that says so and cannot be tapped: nothing a file holds becomes an
+  argument unchecked. (A text's or readout's id must be such a name too.)
+- The owner of the feed learns whether its page is the one on screen from
+  the runner's state file: `"page":NAME` and `"front":"root"`.
+
+`examples/agents.json` and `examples/agents-feed.json` are such a panel file
+and feed file.
 
 ### What the runner does
 

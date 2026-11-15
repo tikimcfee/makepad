@@ -12,6 +12,7 @@ use crate::app::{self, Conn, Refused};
 use crate::ask::{self, Asked, Question};
 use crate::exec::{self, Ran, Unit};
 use crate::json::Json;
+use crate::feed::{self, Feed};
 use crate::panel::{self, Does, Item, Panel, Poll};
 use crate::records;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +44,10 @@ const QUESTION: &str = "_question";
 const SHOWN_CHARS: usize = 120;
 /// The time a check or a readout command gets.
 const DIRECT_LIMIT: Duration = Duration::from_secs(2);
+/// How often a feed's file is looked at while its page is on screen.
+const FEED_EVERY: Duration = Duration::from_secs(1);
+/// The most a page's items may take in the `set` line: under the app's 64 KiB a line.
+const PAGE_LIMIT: usize = 60 * 1024;
 
 enum Event {
     /// The app is there: a connection for requests, a handle on the taps connection, the
@@ -188,6 +193,17 @@ struct Polled {
     due: Instant,
 }
 
+/// A feed of the page on screen: its file as it was last read.
+struct Fed {
+    /// the feed item's id, which is also the id of its action
+    id: String,
+    file: String,
+    /// what the file was when it was read: it is read again when it is another
+    stamp: Option<feed::Stamp>,
+    feed: Feed,
+    due: Instant,
+}
+
 struct Runner {
     options: Options,
     tries: Sender<Job>,
@@ -223,6 +239,8 @@ struct Runner {
     /// the last try of each panel, for its state file
     last: HashMap<String, Json>,
     readouts: Vec<Polled>,
+    /// the feeds of the page on screen (none for any other page: nothing is read for them)
+    feeds: Vec<Fed>,
     /// readout commands that have not come back yet
     polling: HashSet<String>,
 
@@ -531,6 +549,7 @@ pub fn run(options: Options) -> i32 {
         live: HashMap::new(),
         last: HashMap::new(),
         readouts: Vec::new(),
+        feeds: Vec::new(),
         polling: HashSet::new(),
         questions: Vec::new(),
         answered: HashMap::new(),
@@ -829,7 +848,7 @@ impl Runner {
 
     /// A panel's page: its items, then what the runner adds. `keep_user`: the user is on
     /// this page already, and what they set stays.
-    fn panel_items(&self, panel: &Panel, keep_user: bool) -> (String, Vec<Json>) {
+    fn panel_items(&self, panel: &Panel, keep_user: bool, feed_items: usize) -> (String, Vec<Json>) {
         let locked = self.locks.get(&panel.name);
         let asking = self.asking.as_ref().filter(|a| a.panel == panel.name);
         // the answer row goes under the try's result, or under its button when it has none
@@ -889,6 +908,13 @@ impl Runner {
                     items.push(json);
                 }
                 Item::Input { .. } => items.push(item.json(keep_user)),
+                // the items of its file as they were last read; they stay on a locked panel
+                // (they are what is there), and a tap on one is refused like any action
+                Item::Feed { id, .. } => {
+                    if let Some(fed) = self.feeds.iter().find(|fed| fed.id == *id) {
+                        items.extend(fed.feed.page_items(id, feed_items));
+                    }
+                }
             }
             if let (true, Some((_, words, question))) = (is_ask_place, &ask_after) {
                 if let Some(question) = question {
@@ -953,6 +979,7 @@ impl Runner {
     /// or taken away.
     fn show(&mut self, keep_user: bool) {
         self.readouts.clear();
+        self.feeds.clear();
         let (title, items) = match &self.page {
             Page::Home => self.home_items(),
             Page::Question => match self.questions.first() {
@@ -963,11 +990,27 @@ impl Runner {
                 Some(panel) => {
                     let now = Instant::now();
                     for item in &panel.items {
-                        if let Item::Readout { id, poll: Some(poll), every_s, .. } = item {
-                            self.readouts.push(Polled { id: id.clone(), poll: poll.clone(), every: Duration::from_secs_f64(*every_s), due: now });
+                        match item {
+                            Item::Readout { id, poll: Some(poll), every_s, .. } => {
+                                self.readouts.push(Polled { id: id.clone(), poll: poll.clone(), every: Duration::from_secs_f64(*every_s), due: now });
+                            }
+                            // a feed's file is read as its page goes to the screen
+                            Item::Feed { id, file, .. } => {
+                                self.feeds.push(Fed { id: id.clone(), file: file.clone(), stamp: feed::stamp(file), feed: feed::read(file), due: now + FEED_EVERY });
+                            }
+                            _ => {}
                         }
                     }
-                    self.panel_items(panel, keep_user)
+                    // a long feed is cut to what one `set` line holds
+                    let mut rows = feed::ITEMS;
+                    loop {
+                        let (title, items) = self.panel_items(panel, keep_user, rows);
+                        let size = items.iter().map(|item| item.to_string().len() + 1).sum::<usize>() + title.len();
+                        if size <= PAGE_LIMIT || rows == 0 {
+                            break (title, items);
+                        }
+                        rows = rows * 3 / 4;
+                    }
                 }
                 None => self.home_items(),
             },
@@ -1003,6 +1046,13 @@ impl Runner {
         }
         update.set("items", Json::Obj(items));
         update.set("arm", arm.iter().map(|id| id.to_string()).collect::<Vec<_>>().into());
+        self.send(&update);
+    }
+
+    /// Changes items of the page on screen in place, each by the fields of its change.
+    fn update_items(&mut self, items: Vec<(String, Json)>) {
+        let mut update = Json::obj([("type", "update".into()), ("surface", self.surface().into()), ("rev", self.rev.into())]);
+        update.set("items", Json::Obj(items));
         self.send(&update);
     }
 
@@ -1090,9 +1140,10 @@ impl Runner {
             (Page::Panel(panel), "_stop") => self.stop(&panel, None),
             (Page::Panel(panel), "_unlock") => self.unlock(&panel),
             (Page::Panel(panel), "_offer") => self.take_offer(&panel, &values),
-            (Page::Panel(panel), id) => match id.strip_prefix("_ans_").and_then(|n| n.parse().ok()) {
-                Some(word) => self.answer_try(&panel, word),
-                None => self.press(&panel, id, values),
+            (Page::Panel(panel), id) => match (id.strip_prefix("_feed:"), id.strip_prefix("_ans_").and_then(|n| n.parse().ok())) {
+                (Some(item), _) => self.feed_tap(&panel, item, values),
+                (None, Some(word)) => self.answer_try(&panel, word),
+                (None, None) => self.press(&panel, id, values),
             },
         }
     }
@@ -1131,6 +1182,24 @@ impl Runner {
         }
     }
 
+    /// A tap on an item of a feed: the feed's action runs with the item's id as its `{_id}`.
+    /// It is an action like a button's: one at a time, not on a locked panel, recorded as a
+    /// try. An item the page no longer has, or one whose id cannot be an argument, runs nothing.
+    fn feed_tap(&mut self, panel_name: &str, item: &str, mut values: Json) {
+        let t_tap = records::now();
+        let Some(feed_id) = self.feeds.iter().find(|fed| fed.feed.taps(item)).map(|fed| fed.id.clone()) else {
+            return;
+        };
+        values.set(panel::FEED_ID, item.into());
+        let result = self.panels.get(panel_name).and_then(|p| p.action(&feed_id)).and_then(|action| action.result.clone());
+        if let Err(why) = self.start(panel_name, &feed_id, &values, t_tap, None, &[], None) {
+            self.record(panel_name, &Json::obj([("t", "dropped".into()), ("feed", feed_id.as_str().into()), ("id", item.into()), ("why", why.into()), ("t_seen", t_tap.into())]));
+            if let Some(result) = &result {
+                self.show_result(panel_name, result, why, None);
+            }
+        }
+    }
+
     /// Starts the try of an action button, for a tap or for a key. `Err`: why nothing runs.
     /// `add`: arguments after the action's own, and `parent`: the try whose offer this is.
     #[allow(clippy::too_many_arguments)]
@@ -1140,7 +1209,8 @@ impl Runner {
             self.expire_offer("another action");
         }
         let panel = self.panels.get(panel_name).ok_or("no such panel")?;
-        let Some(Does::Action(action)) = panel.button(button_id).map(|b| &b.does) else {
+        // a button's action, or a feed's (`button_id` is then the feed's id)
+        let Some(action) = panel.action(button_id) else {
             return Err("no such action");
         };
         if self.locks.contains_key(panel_name) {
@@ -1304,10 +1374,7 @@ impl Runner {
             return;
         };
         let (panel, button) = (run.panel.clone(), run.button.clone());
-        let item = match self.panels.get(&panel).and_then(|p| p.button(&button)).map(|b| &b.does) {
-            Some(Does::Action(action)) => action.live.clone(),
-            _ => None,
-        };
+        let item = self.panels.get(&panel).and_then(|p| p.action(&button)).and_then(|action| action.live.clone());
         if let Some(item) = item {
             self.show_result(&panel, &item, text, None);
         }
@@ -1318,10 +1385,17 @@ impl Runner {
         let Some(run) = self.running.take() else {
             return;
         };
-        let (result, asks, exit_3, offers) = match self.panels.get(&run.panel).and_then(|p| p.button(&run.button)).map(|b| &b.does) {
-            Some(Does::Action(action)) => (action.result.clone(), !action.ask.is_empty(), tried.ran.rc == 3, action.retry.iter().any(|(code, _)| *code == tried.ran.rc)),
-            _ => (None, false, false, false),
+        let (result, asks, exit_3, offers) = match self.panels.get(&run.panel).and_then(|p| p.action(&run.button)) {
+            Some(action) => (action.result.clone(), !action.ask.is_empty(), tried.ran.rc == 3, action.retry.iter().any(|(code, _)| *code == tried.ran.rc)),
+            None => (None, false, false, false),
         };
+        // only a button has a row to arm again; a feed's action has none
+        let button = self.panels.get(&run.panel).is_some_and(|p| p.button(&run.button).is_some()).then(|| run.button.clone());
+        // a feed's action has most likely changed its feed: looked at now, not in a second
+        if button.is_none() {
+            let now = Instant::now();
+            self.feeds.iter_mut().for_each(|fed| fed.due = now);
+        }
         let failed: Vec<&str> = tried.checks.iter().filter(|(_, rc)| *rc != 0).map(|(name, _)| name.as_str()).collect();
         let timed_out = tried.result == "timeout";
         let what = format!("{}/{}", run.panel, run.button);
@@ -1373,11 +1447,11 @@ impl Runner {
         let on_page = self.page == Page::Panel(run.panel.clone());
         let changes_page = self.locks.contains_key(&run.panel) || self.asking.is_some() || self.offer.is_some();
         match &result {
-            Some(result) if on_page && !changes_page => self.show_result(&run.panel, result, &text, Some(&run.button)),
+            Some(result) if on_page && !changes_page => self.show_result(&run.panel, result, &text, button.as_deref()),
             Some(result) => {
                 self.live.insert((run.panel.clone(), result.clone()), shown(&text));
             }
-            None if on_page && !changes_page => self.update(&[], &[run.button.as_str()], None),
+            None if on_page && !changes_page && button.is_some() => self.update(&[], &[run.button.as_str()], None),
             None => {}
         }
         // a lock or an answer row is a page with other items; Home says what runs
@@ -1404,10 +1478,7 @@ impl Runner {
         if let Some(run) = self.running.as_mut().filter(|run| run.panel == panel_name) {
             run.stopped = true;
             ends = Some(run.unit.clone());
-            result = match self.panels.get(panel_name).and_then(|p| p.button(&run.button)).map(|b| &b.does) {
-                Some(Does::Action(action)) => action.result.clone(),
-                _ => None,
-            };
+            result = self.panels.get(panel_name).and_then(|p| p.action(&run.button)).and_then(|action| action.result.clone());
         }
         self.stopping = Some(Stopping { seq: self.seq, panel: panel_name.to_string(), unit: unit.clone(), t_tap, result, key });
         if self.stops.send(StopJob::Stop { unit: ends, command }).is_err() {
@@ -1554,6 +1625,11 @@ impl Runner {
         });
         let was_front = self.agent_front;
         self.agent_front = layers.get("front").and_then(|f| f.as_str()) == Some("agent");
+        // the runner's page is on screen again: its feeds are looked at now
+        if was_front && !self.agent_front {
+            let now = Instant::now();
+            self.feeds.iter_mut().for_each(|fed| fed.due = now);
+        }
         let new_page = agent.is_some() && agent != self.agent;
         let changed = agent != self.agent;
         self.agent = agent;
@@ -1597,6 +1673,39 @@ impl Runner {
             }
         }
         self.show_readouts(&panel, read);
+        self.poll_feeds(now, off);
+    }
+
+    /// The feeds that are due: a file that is another than the one last read is read, and
+    /// the page follows, in place when its items are the same ones, set again when not.
+    /// `off`: the page is not what the user sees (the phone's panel is dark, or an agent's
+    /// page is in front): nothing is read.
+    fn poll_feeds(&mut self, now: Instant, off: bool) {
+        let mut changes = Vec::new();
+        let mut other_items = false;
+        for fed in self.feeds.iter_mut().filter(|fed| fed.due <= now) {
+            fed.due = now + FEED_EVERY;
+            if off {
+                continue;
+            }
+            let stamp = feed::stamp(&fed.file);
+            if stamp == fed.stamp {
+                continue;
+            }
+            let new = feed::read(&fed.file);
+            fed.stamp = stamp;
+            match new.changes_from(&fed.feed) {
+                Some(more) => changes.extend(more),
+                None => other_items = true,
+            }
+            fed.feed = new;
+        }
+        if other_items {
+            // the same surface: what the user set and where the page is scrolled to stay
+            self.show(true);
+        } else if !changes.is_empty() {
+            self.update_items(changes);
+        }
     }
 
     /// The values that changed go to the page, in one update; a value that is the same is
@@ -1621,7 +1730,9 @@ impl Runner {
     fn serve(&mut self, inbox: Receiver<Event>) -> i32 {
         loop {
             // with the surface there and readouts on the page, wake for the next one
-            let due = if self.conn.is_some() { self.readouts.iter().map(|r| r.due).min() } else { None };
+            // (a feed is not looked at behind an agent's page: no wakeup for it there)
+            let feeds = self.feeds.iter().filter(|_| !self.agent_front).map(|fed| fed.due);
+            let due = if self.conn.is_some() { self.readouts.iter().map(|r| r.due).chain(feeds).min() } else { None };
             // and for the end of an offer
             let due = match (due, self.offer.as_ref().map(|offer| offer.until)) {
                 (Some(a), Some(b)) => Some(a.min(b)),
