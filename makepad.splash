@@ -66,6 +66,7 @@ hub.set_run_items([
     RunStudioRelease{name: "makepad-example-splash"}
     RunStudioRelease{name: "makepad-example-slides"}
     RunStudioRelease{name: "makepad-example-isolate"}
+    RunStudioRelease{name: "tb-shell"}
     RunStudioRelease{name: "makepad-example-gl-interop"}
     RunAndroid{name: "makepad-example-pdf"}
     RunStudioRelease{name: "makepad-example-map"}
