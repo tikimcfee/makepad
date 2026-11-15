@@ -21,17 +21,24 @@ pub const MAX_VALUES: usize = 32;
 
 thread_local! {
     /// stream name -> (version, values). UI thread only, like the isolates.
-    static STREAMS: RefCell<HashMap<String, (u64, Vec<f32>)>> = RefCell::new(HashMap::new());
+    /// stream name -> (version, values, ring: appended to, so drawn as a full ring of MAX_VALUES)
+    static STREAMS: RefCell<HashMap<String, (u64, Vec<f32>, bool)>> = RefCell::new(HashMap::new());
 }
 
 /// Stores the newest values of a stream; the views pick them up on the next event.
 /// `append`: the values are added to the stream's own ring of the last MAX_VALUES (a
-/// client sends one new value a time); otherwise they replace it.
-pub fn push(name: &str, values: Vec<f32>, append: bool) {
+/// client sends one new value a time), and the stream is drawn as that full ring, newest at
+/// the right, slots not filled yet at zero; otherwise they replace it. `clear` empties it
+/// first (a new take starts).
+pub fn push(name: &str, values: Vec<f32>, append: bool, clear: bool) {
     STREAMS.with(|s| {
         let mut s = s.borrow_mut();
-        let e = s.entry(name.to_string()).or_insert((0, Vec::new()));
+        let e = s.entry(name.to_string()).or_insert((0, Vec::new(), false));
         e.0 += 1;
+        if clear {
+            e.1.clear();
+        }
+        e.2 |= append;
         if append {
             e.1.extend(values);
             let over = e.1.len().saturating_sub(MAX_VALUES);
@@ -42,8 +49,8 @@ pub fn push(name: &str, values: Vec<f32>, append: bool) {
     });
 }
 
-fn current(name: &str, seen: u64) -> Option<(u64, Vec<f32>)> {
-    STREAMS.with(|s| s.borrow().get(name).filter(|(v, _)| *v != seen).cloned())
+fn current(name: &str, seen: u64) -> Option<(u64, Vec<f32>, bool)> {
+    STREAMS.with(|s| s.borrow().get(name).filter(|(v, _, _)| *v != seen).cloned())
 }
 
 script_mod! {
@@ -52,6 +59,7 @@ script_mod! {
     set_type_default() do #(DrawStreamBars::script_shader(vm)){
         ..mod.draw.DrawQuad
         color_bg: #x0b0e14
+        color_track: #x1c2230
         color_bar: #x5fd4ff
         pick: fn(i) {
             let q = floor(i / 4.0)
@@ -68,6 +76,11 @@ script_mod! {
             return dot(v, lane)
         }
         pixel: fn() {
+            // meter: one value, as a length from the left over a dim track
+            if self.meter > 0.5 {
+                let on = step(self.pos.x, clamp(self.v0.x, 0.0, 1.0))
+                return mix(self.color_track, self.color_bar, on)
+            }
             let n = max(self.count, 1.0)
             let h = clamp(self.pick(floor(self.pos.x * n)), 0.0, 1.0)
             let y = abs(self.pos.y - 0.5) * 2.0
@@ -90,6 +103,7 @@ pub struct DrawStreamBars {
     #[deref]
     draw_super: DrawQuad,
     #[live] count: f32,
+    #[live] meter: f32,
     #[live] v0: Vec4f, #[live] v1: Vec4f, #[live] v2: Vec4f, #[live] v3: Vec4f,
     #[live] v4: Vec4f, #[live] v5: Vec4f, #[live] v6: Vec4f, #[live] v7: Vec4f,
 }
@@ -103,7 +117,15 @@ impl DrawStreamBars {
         [&mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3, &mut self.v4, &mut self.v5, &mut self.v6, &mut self.v7]
     }
 
-    fn set_values(&mut self, values: &[f32]) {
+    fn set_values(&mut self, values: &[f32], ring: bool) {
+        // A ring always has all its slots, so a bar's width never changes; newest at the right.
+        let padded: Vec<f32>;
+        let values = if ring {
+            padded = std::iter::repeat(0.0).take(MAX_VALUES.saturating_sub(values.len())).chain(values.iter().copied()).collect();
+            &padded[..]
+        } else {
+            values
+        };
         let n = values.len().min(MAX_VALUES);
         self.count = n as f32;
         for (i, slot) in self.slots_mut().into_iter().enumerate() {
@@ -130,6 +152,8 @@ pub struct StreamView {
     #[walk] walk: Walk,
     #[redraw] #[live] draw_bg: DrawStreamBars,
     #[live] stream: ArcStringMut,
+    /// One value drawn as a horizontal meter (a level), not as bars.
+    #[live] meter: bool,
     #[rust] seen: u64,
 }
 
@@ -137,19 +161,20 @@ impl Widget for StreamView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         // A push arrives as a signal; the shell has stored it before the event reaches here.
         if let Event::Signal = event {
-            if let Some((version, values)) = current(self.stream.as_ref(), self.seen) {
+            if let Some((version, values, ring)) = current(self.stream.as_ref(), self.seen) {
                 self.seen = version;
-                self.draw_bg.set_values(&values);
+                self.draw_bg.set_values(&values, ring);
                 self.draw_bg.write_in_place(cx);
             }
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some((version, values)) = current(self.stream.as_ref(), u64::MAX) {
+        if let Some((version, values, ring)) = current(self.stream.as_ref(), u64::MAX) {
             self.seen = version;
-            self.draw_bg.set_values(&values);
+            self.draw_bg.set_values(&values, ring);
         }
+        self.draw_bg.meter = if self.meter { 1.0 } else { 0.0 };
         self.draw_bg.draw_walk(cx, walk);
         DrawStep::done()
     }

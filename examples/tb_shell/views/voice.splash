@@ -1,17 +1,19 @@
-// VOICE: the wave and the level (streams tb-voiced pushes: mic up to 32 values, level one),
-// then whom it goes to and the live text (voice.text). The text area has a fixed place and
-// keeps the end of the text in view (scrolling up lets go), so a client may send the whole take.
+// VOICE: the wave and the level (streams tb-voiced pushes: mic one value at a time with
+// "append", a new take with "clear"; level one value, drawn as a meter), then whom it goes
+// to and the live text (voice.text). The text box keeps the end of the text in view
+// (scrolling up lets go); after a take (voice.live false) the last text stays, dimmed.
 width: Fill height: Fill flow: Down padding: 16 spacing: 12
 wave := StreamView{stream: "mic" height: 90}
-level := StreamView{stream: "level" height: 14 draw_bg.color_bar: #x3ddc84}
+level := StreamView{stream: "level" meter: true height: 10 draw_bg.color_bar: #x3ddc84}
 main := View{
     width: Fill height: Fill flow: Down spacing: 8
     on_render: || {
         let v = state.voice ?? nil
+        let live = if v == nil { true } else { v.live ?? true }
         Small{text: "to: " + agent_name(state.agents ?? nil, state.target ?? nil)}
-        // follows the end while the text grows; a finger scrolling up lets go of it
         text := ScrollYView{width: Fill height: Fill flow: Down scroll_bars +: {auto_tail: true}
-            Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }}
+            Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }
+                draw_text.color: if live { #xeeeeee } else { #x7d8696 }}
         }
     }
 }
