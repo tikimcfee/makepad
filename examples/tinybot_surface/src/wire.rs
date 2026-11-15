@@ -43,7 +43,8 @@ pub enum Item {
     Heading { id: String, text: String },
     Text { id: String, text: String },
     Toggle { id: String, text: String, value: Option<bool> },
-    /// one of `values`, the device's own steps as strings; `value` is a position in them
+    /// one of `values`, the device's own steps as strings; `value` is a position in them.
+    /// The values go back in taps as they came; the app draws them through `drawable`
     Stepper { id: String, text: String, values: Vec<String>, value: Option<usize> },
     /// a text field; what was typed is sent as it is
     Number { id: String, text: String, value: Option<String> },
@@ -141,21 +142,67 @@ pub enum Request {
     Say(Option<String>),
 }
 
+/// What stands for a run of characters the app does not draw.
+pub const PLACEHOLDER: char = '\u{25A1}';
+
+/// The characters the app draws: those that every face of the Latin font set it runs with
+/// has, the text faces (IBM Plex Sans, Noto Sans, the symbol face) and the monospace face of
+/// the readouts alike. A character outside them would make Makepad open its CJK or emoji
+/// face to look for the glyph, and each of those costs tens of megabytes for good (a
+/// packaged build holds several copies of the whole file). Text from clients is data: it
+/// must not be able to do that.
+fn drawn(c: char) -> bool {
+    matches!(c as u32,
+        0x20..=0x7E                 // ASCII
+        | 0xA0..=0xFF               // Latin-1: accents, the middle dot, degree, micro, times
+        | 0x100..=0x17F             // Latin Extended-A
+        | 0x391..=0x3A1 | 0x3A3..=0x3C9             // Greek letters
+        | 0x401 | 0x410..=0x44F | 0x451             // Cyrillic letters
+        | 0x2010 | 0x2012..=0x2015                  // hyphen and dashes
+        | 0x2018..=0x201E                           // typographic quotes
+        | 0x2020..=0x2022 | 0x2026 | 0x2030         // daggers, bullet, ellipsis, per mille
+        | 0x2032..=0x2033 | 0x2039..=0x203A | 0x2044 // primes, single angle quotes, fraction slash
+        | 0x20AC | 0x2122                           // euro, trade mark
+        | 0x2190..=0x2195                           // arrows
+        | 0x2212 | 0x221A | 0x221E | 0x2248 | 0x2260 | 0x2264..=0x2265 // minus, root, infinity, comparisons
+        | 0x25A0..=0x25A1 | 0x25AA..=0x25AB | 0x25B2 | 0x25BA | 0x25BC | 0x25C4 | 0x25CB | 0x25CF // squares, triangles, circles
+    )
+}
+
+/// Characters that take no room and only steer others (joiners, variation selectors,
+/// direction marks, the byte order mark): left out without a trace.
+fn unseen(c: char) -> bool {
+    matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFE00..=0xFE0F | 0xFEFF | 0xE0100..=0xE01EF)
+}
+
+/// `text` as the app draws it: every run of characters it does not draw is one
+/// `PLACEHOLDER`; a tab is a space, a line end stays, other control characters go.
+pub fn drawable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        let c = if c == '\t' { ' ' } else { c };
+        if c == '\n' || drawn(c) {
+            out.push(c);
+            in_run = false;
+        } else if c.is_control() || unseen(c) {
+            // nothing; a run goes on across it
+        } else if !std::mem::replace(&mut in_run, true) {
+            out.push(PLACEHOLDER);
+        }
+    }
+    out
+}
+
 /// The most of a voice text that is kept, in bytes: its end, which is what the strip shows.
 pub const VOICE_BYTES: usize = 600;
 
 /// A voice text as the strip takes it: line ends and tabs are spaces, other control
-/// characters are left out, and of a long text the last `VOICE_BYTES` bytes are kept (from a
-/// character's start). `None` when nothing is left to show.
+/// characters are left out, what the app does not draw is a placeholder (`drawable`), and of
+/// a long text the last `VOICE_BYTES` bytes are kept (from a character's start). `None` when
+/// nothing is left to show.
 pub fn voice_text(raw: &str) -> Option<String> {
-    let clean: String = raw
-        .chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect();
+    let clean = drawable(&raw.replace(['\n', '\r'], " "));
     let clean = clean.trim();
     let mut from = clean.len().saturating_sub(VOICE_BYTES);
     while !clean.is_char_boundary(from) {
@@ -253,7 +300,7 @@ pub fn parse_request(line: &str) -> Result<Request, WireErr> {
 
 fn text_of(item: &JsonValue, n: usize, kind: &str) -> Result<String, WireErr> {
     match item.key("text").and_then(|t| t.as_str()) {
-        Some(t) => Ok(t.to_string()),
+        Some(t) => Ok(drawable(t)),
         None => err("bad_item", format!("item {n} ({kind}): text is missing or not a string")),
     }
 }
@@ -281,7 +328,7 @@ fn parse_button(v: &JsonValue, what: &str, seen: &mut HashSet<String>) -> Result
     }
     let id = id_of(v, what, true, seen)?;
     let text = match v.key("text").and_then(|t| t.as_str()) {
-        Some(t) => t.to_string(),
+        Some(t) => drawable(t),
         None => return err("bad_item", format!("{what}: text is missing or not a string")),
     };
     // an unknown style is drawn as the plain button rather than refused
@@ -339,7 +386,7 @@ fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
     let title = match value.key("title") {
         None => None,
         Some(title) => match title.as_str() {
-            Some(title) => Some(title.to_string()),
+            Some(title) => Some(drawable(title)),
             None => return err("bad_request", "update: title is not a string"),
         },
     };
@@ -353,7 +400,9 @@ fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
                 return err("bad_request", format!("update: {id} is not an object"));
             }
             let what = format!("update {id}");
-            changes.push(Change { id: id.clone(), text: string_of(change, "text", &what)?, value: string_of(change, "value", &what)? });
+            // both are drawn
+            let shown = |name: &str| Ok::<_, WireErr>(string_of(change, name, &what)?.map(|text| drawable(&text)));
+            changes.push(Change { id: id.clone(), text: shown("text")?, value: shown("value")? });
         }
     }
     let mut arm = Vec::new();
@@ -376,7 +425,7 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
     let title = match value.key("title") {
         None => String::new(),
         Some(t) => match t.as_str() {
-            Some(t) => t.to_string(),
+            Some(t) => drawable(t),
             None => return err("bad_set", "title is not a string"),
         },
     };
@@ -434,11 +483,12 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
             }
             "number" => {
                 let id = id_of(item, &what, true, &mut seen)?;
-                Item::Number { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)? }
+                // the value is drawn in the field and is the user's from then on
+                Item::Number { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)?.map(|value| drawable(&value)) }
             }
             "readout" => {
                 let id = id_of(item, &what, true, &mut seen)?;
-                Item::Readout { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)?.unwrap_or_default() }
+                Item::Readout { id, text: text_of(item, n, kind)?, value: drawable(&string_of(item, "value", &what)?.unwrap_or_default()) }
             }
             "button" => Item::Row { id: String::new(), buttons: vec![parse_button(item, &what, &mut seen)?] },
             "row" => {

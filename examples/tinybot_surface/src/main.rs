@@ -876,8 +876,15 @@ impl SurfaceList {
                     }
                 }
                 Some(Entry::Number { id, .. }) => {
-                    if let Some(text) = item.text_input(cx, ids!(input)).changed(actions) {
-                        self.values.insert(id.clone(), Held::Text(text));
+                    let input = item.text_input(cx, ids!(input));
+                    if let Some(text) = input.changed(actions) {
+                        // what the user types is drawn too: a character the app does not
+                        // draw (an emoji from the on-screen keyboard) is taken out again
+                        let shown = wire::drawable(&text);
+                        if shown != text {
+                            input.set_text(cx, &shown);
+                        }
+                        self.values.insert(id.clone(), Held::Text(shown));
                     }
                 }
                 Some(Entry::Stepper { .. }) => {
@@ -979,7 +986,8 @@ impl Widget for SurfaceList {
                                 Some(Held::Step(at)) => *at,
                                 _ => 0,
                             };
-                            row.label(cx, ids!(value)).set_text(cx, values.get(at).map_or("", |v| v.as_str()));
+                            // drawn through the filter; the tap sends the value as it came
+                            row.label(cx, ids!(value)).set_text(cx, &wire::drawable(values.get(at).map_or("", |v| v.as_str())));
                             // a button at the end of the values fades; a press there does nothing
                             for (button, end) in [(ids!(less), 0), (ids!(more), values.len().saturating_sub(1))] {
                                 let button = row.widget(cx, button);

@@ -152,7 +152,9 @@ fn client_of(c: &UnixStream) -> Option<Client> {
     let own = unsafe { getuid() };
     // the name a process gives itself (it can set it to anything) and its uid (it cannot)
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-    let who = format!("{} (uid {uid})", if comm.trim().is_empty() { "?" } else { comm.trim() });
+    // drawn in the app's band, so through the same filter as a client's own text
+    let comm = wire::drawable(comm.trim());
+    let who = format!("{} (uid {uid})", if comm.is_empty() { "?" } else { comm.as_str() });
     if uid == 0 || uid == own {
         Some(Client { pid, root: uid == 0 || test_root(pid, own), who })
     } else {

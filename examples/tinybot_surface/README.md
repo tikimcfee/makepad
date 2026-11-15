@@ -109,6 +109,35 @@ and repeated keys included), which the app reads to the same surface.
   stepper only when its new `values` still hold it); a new `surface` id
   starts each from its `value` (or off, the first of `values`, empty).
 
+## Which characters are drawn
+
+Text from outside is data, and the app draws only what its fonts have. Every
+text of a page (titles, headings, texts, labels, readout values, button
+texts, the start value of a number), every `update`, the strip's text, the
+name in the agent's band and what the user types into a number field go
+through one filter:
+
+| Kept | |
+|---|---|
+| ASCII, Latin-1, Latin Extended-A | `a` to `z`, accented letters, `·` `°` `µ` `×` `±` `«` `»` |
+| Greek and Cyrillic letters | `Α` to `ω`, `А` to `я`, `Ё` `ё` |
+| dashes, quotes, marks | `‐` `‒` `–` `—` `―` `‘` `’` `‚` `“` `”` `„` `†` `‡` `•` `…` `‰` `′` `″` `‹` `›` `⁄` `€` `™` |
+| arrows, signs | `←` `↑` `→` `↓` `↔` `↕` `−` `√` `∞` `≈` `≠` `≤` `≥` |
+| shapes | `■` `□` `▪` `▫` `▲` `►` `▼` `◄` `○` `●` |
+
+Every run of other characters (Chinese, Japanese, Korean, emoji, `✓`, box
+drawing, ...) is drawn as one `□`. A tab is a space, a line end stays, other
+control characters and the unseen ones (joiners, variation selectors,
+direction marks) are left out. Ids are not changed, and a stepper's values go
+back in taps as they came; only what is drawn of them is filtered.
+
+Why: the kept set is what every face the app runs with has (IBM Plex Sans,
+Noto Sans, the symbol face, and Liberation Mono for readouts). One character
+outside it makes Makepad open its CJK or its emoji face, and in a packaged
+build each use of such a face copies the whole file several times: one strip
+line with a Chinese word and an emoji took the app from 78 MB to 258 MB on the
+phone, until a restart. No client text can do that now.
+
 ## What the app does with it
 
 - A tapped row locks: its buttons dim, stop taking presses and a line under
@@ -253,7 +282,8 @@ line: a band with what a voice service hears, as it comes.
   Every request is answered with one line, which the client has to read.
 - The band is the app's: a tag `voice` and two lines of text, the newest
   words (the end of TEXT as the band's width breaks it). Line ends and tabs
-  in TEXT count as spaces, other control characters are left out, and of a
+  in TEXT count as spaces, other control characters are left out, what the
+  app does not draw is a `□` (see "Which characters are drawn"), and of a
   long TEXT the last 600 bytes are kept.
 - The band takes its 58 points from the foot of the page: the list above
   gets shorter and its rows stay where they are. Nothing is drawn over a
