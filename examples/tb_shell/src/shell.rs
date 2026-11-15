@@ -50,6 +50,20 @@ pub struct GuardView {
 pub struct Marks {
     pub mic: bool,
     pub loud: bool,
+    /// Root's test switch is on: injected input may answer a guard.
+    pub test_taps: bool,
+}
+
+/// Who may answer a guard. Only a person's input from the device, except under
+/// root's test switch.
+#[derive(Default)]
+pub struct GuardInput {
+    /// The --remote endpoint is open: input can be injected into this process.
+    pub remote_on: bool,
+    /// Root's test switch (a root-owned file read at start): injected taps count.
+    pub test_taps: bool,
+    /// The HAL's count of native input when the last event reached the shell.
+    last_seq: u64,
 }
 
 #[derive(Script, ScriptHook, WidgetRef, WidgetRegister)]
@@ -71,6 +85,7 @@ pub struct Shell {
     #[rust] pub surfaces: Vec<(String, WidgetRef)>,
     #[rust] pub front: String,
     #[rust] pub marks: Marks,
+    #[rust] pub guard_input: GuardInput,
     #[rust] guard: Option<GuardView>,
     #[rust] armed: bool,
     #[rust] arm_timer: Timer,
@@ -96,6 +111,13 @@ fn is_input(event: &Event) -> bool {
 
 impl Widget for Shell {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Was this event the device's? The HAL counts native input before the app sees
+        // it (while --remote is open); input injected through --remote does not count.
+        // With --remote closed nothing in the process injects, and the count stands still.
+        let seq = makepad_widgets::makepad_platform::makepad_hal::a11y::user_seq();
+        let native = !self.guard_input.remote_on || seq != self.guard_input.last_seq;
+        self.guard_input.last_seq = seq;
+        let trusted = native || self.guard_input.test_taps;
         if self.guard.is_some() {
             if self.arm_timer.is_event(event).is_some() {
                 self.armed = true;
@@ -114,6 +136,11 @@ impl Widget for Shell {
                 }
                 _ => (None, None),
             };
+            if !trusted && (down.is_some() || up.is_some()) {
+                // Injected: it neither presses nor answers, and a press it would end stays.
+                log!("tb-shell: guard: injected input ignored");
+                return;
+            }
             let button_at = |p: Vec2d| [(true, self.yes_rect), (false, self.no_rect)].into_iter().find(|(_, r)| r.contains(p)).map(|(yes, _)| yes);
             if let Some(p) = down {
                 // A press that began before the guard was armed is not an answer.
@@ -183,7 +210,7 @@ impl Shell {
         self.draw_label.draw_abs(cx, rect.pos + dvec2(12.0, 8.0), &label);
         let mut x = rect.pos.x + rect.size.x - 12.0;
         // The loud mark's place is kept; its source (the sound tool's state) comes later.
-        for (on, text, color) in [(self.marks.mic, "MIC", vec4(1.0, 0.35, 0.35, 1.0)), (self.marks.loud, "LOUD", vec4(1.0, 0.75, 0.2, 1.0))] {
+        for (on, text, color) in [(self.marks.mic, "MIC", vec4(1.0, 0.35, 0.35, 1.0)), (self.marks.loud, "LOUD", vec4(1.0, 0.75, 0.2, 1.0)), (self.marks.test_taps, "TEST", vec4(1.0, 0.2, 1.0, 1.0))] {
             if on {
                 x -= 8.0 * text.len() as f64 + 10.0;
                 self.draw_mark.color = color;
