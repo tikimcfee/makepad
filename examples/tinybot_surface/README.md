@@ -317,6 +317,20 @@ which is where most of the app's memory at rest went on the phone.
 `GLIBC_TUNABLES` that sets `glibc.malloc.arena_max`, or `MALLOC_ARENA_MAX`,
 is left to decide.
 
+## Drawing and the driver: what can be switched off
+
+From Makepad's `work` branch (dc110e5) on, three things reach the GL driver that
+the earlier base did not use. Each has a switch for a try by hand:
+
+| What | Off with | Notes |
+|---|---|---|
+| Only the changed parts of a window are repainted and handed to the display (the back buffer's age, `eglSwapBuffersWithDamage`, `eglSetDamageRegionKHR` where EGL lists them) | `TINYBOT_PARTIAL_REPAINT=0` (the app's own switch): whole frames, plain `eglSwapBuffers` | `MAKEPAD_HAL_LOG=1` prints which of the three EGL paths were found: `[hal-gl] partial repaint: buffer_age=… set_damage_region=… swap_with_damage=…` |
+| Linked shader programs are kept on disk (`glGetProgramBinary`) and loaded at the next start | `MAKEPAD_HAL_CACHE_DIR=/dev/null` (a place no directory can be made in; one `[hal-gl] program cache …` line on stderr) | written only under `$MAKEPAD_HAL_CACHE_DIR/makepad-hal/gl-HASH/`, else `$XDG_CACHE_HOME`, else `$HOME/.cache`; a unit can keep it in the app's own directory with `CacheDirectory=tinybot-surface` and `Environment=MAKEPAD_HAL_CACHE_DIR=%C/tinybot-surface` |
+| A frame's GPU time is measured where the driver lists `GL_EXT_disjoint_timer_query` | no switch | `MAKEPAD_HAL_LOG=1` says when it is off and why |
+
+The EGL window config is now the first RGBA8 one without depth, stencil or
+samples (the window only receives a blit); there is no switch for that.
+
 ## tb-panel: panels of tries
 
 Hardware tries as pages the user taps. A panel file describes a page and

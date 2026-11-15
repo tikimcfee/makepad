@@ -1348,6 +1348,13 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
+        // Makepad repaints only what changed of a window and hands the display only that
+        // (the driver's buffer age, swap with damage). `TINYBOT_PARTIAL_REPAINT=0` goes back
+        // to whole frames, for a driver or compositor that shows stale parts.
+        if std::env::var_os("TINYBOT_PARTIAL_REPAINT").is_some_and(|v| v == "0") {
+            cx.set_partial_repainting(false);
+            eprintln!("[tinybot-surface] whole frames (TINYBOT_PARTIAL_REPAINT=0)");
+        }
         self.start_socket();
         self.settle = cx.start_timeout(SETTLE_SECONDS);
         self.settle_again = true;
