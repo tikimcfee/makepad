@@ -1,4 +1,5 @@
-// BATTERY: readouts a service puts in the key `battery`; it reads them on `shown` or `refresh`.
+// BATTERY: readouts a service puts in the key `battery`. The service watches this surface
+// (`tbui watch --surfaces battery`) and reads the battery on `shown` and on the `refresh` emit.
 let Cell = Squircle{
     width: Fill height: 96 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
     k := Small{}
