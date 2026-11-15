@@ -23,6 +23,8 @@ mod exec;
 #[cfg(unix)]
 mod json;
 #[cfg(unix)]
+mod feed;
+#[cfg(unix)]
 mod panel;
 #[cfg(unix)]
 mod records;

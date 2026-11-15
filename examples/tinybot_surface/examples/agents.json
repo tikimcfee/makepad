@@ -1,0 +1,7 @@
+{"panel":"agents","title":"Agents","summary":"who a voice take goes to","order":30,
+ "items":[
+  {"kind":"text","text":"Tap an agent to make it the default for voice."},
+  {"kind":"feed","id":"who","file":"/run/tinybot/voice/agents.json",
+   "action":{"argv":["/usr/bin/tb-voice","default","{_id}"],"as":"root","timeout_s":5,"result":"res"}},
+  {"kind":"readout","id":"res","text":"Last pick","value":"-"}
+ ]}
