@@ -1,0 +1,11 @@
+// The voice strip with the wave as a stream: tbui push mic (values 0..1, up to 64).
+// The text still comes from the store (it changes at speaking rate, not 20 times a second).
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 12
+    on_render: || {
+        let v = state.voice ?? nil
+        Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }}
+    }
+}
+wave := StreamView{stream: "mic" height: 90}

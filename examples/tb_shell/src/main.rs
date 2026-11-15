@@ -13,6 +13,7 @@ mod io;
 mod paneltrace;
 mod shell;
 mod split;
+mod stream;
 
 use io::{Msg, Peer};
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
@@ -200,6 +201,8 @@ pub struct App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
+        // StreamView in every surface's isolate (before the first one is made).
+        makepad_widgets::widget_async::register_splash_isolate_mod(stream::isolate_mod);
         crate::shell::script_mod(vm);
         self::script_mod(vm)
     }
@@ -400,7 +403,7 @@ impl App {
                 }
                 Msg::Changed => sources_changed = true,
                 Msg::Line { conn, line } => {
-                    if self.st.split.on() && line.contains("\"op\":\"set\"") {
+                    if self.st.split.on() && (line.contains("\"op\":\"set\"") || line.contains("\"op\":\"push\"")) {
                         self.st.split.begin();
                         self.st.split.add_count("req-bytes", line.len() as f64);
                     }
@@ -439,7 +442,7 @@ impl App {
 
     fn request(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<Option<JsonValue>, String> {
         let t = std::time::Instant::now();
-        if req.get("op").and_then(|v| v.as_str()) != Some("set") {
+        if !matches!(req.get("op").and_then(|v| v.as_str()), Some("set") | Some("push")) {
             self.st.split.taint();
         }
         let r = self.request_inner(cx, conn, req);
@@ -468,6 +471,22 @@ impl App {
                 }
                 self.apply(cx, patch, &format!("client:{}", peer.label()));
                 Ok(Some(obj(vec![])))
+            }
+            "push" => {
+                // A stream, not the store: no merge, no script, no reply when it is taken.
+                let name = req.get("stream").and_then(|v| v.as_str()).ok_or("push needs stream")?;
+                let values: Vec<f32> = req.get("values").and_then(|v| v.as_array()).ok_or("push needs values")?
+                    .iter().map(|v| match v {
+                        JsonValue::F64(f) => *f as f32,
+                        JsonValue::I64(i) => *i as f32,
+                        JsonValue::U64(u) => *u as f32,
+                        _ => 0.0,
+                    }).collect();
+                if values.len() > stream::MAX_VALUES {
+                    log!("tb-shell: push to {name}: {} values, a view shows the first {}", values.len(), stream::MAX_VALUES);
+                }
+                stream::push(name, values);
+                Ok(None)
             }
             "get" => {
                 let keys = strings(req.get("keys"));
