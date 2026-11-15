@@ -86,6 +86,7 @@ and repeated keys included), which the app reads to the same surface.
 | `readout` | `id`, `text`, `value` (optional, a string) | a label and a monospace value on one line |
 | `row` | `id` (optional), `buttons`: a non-empty array of `{id, text, style, confirm, lock, dim}` | buttons side by side, three to a line |
 | `button` | `id`, `text`, `style`, `confirm`, `lock`, `dim` | a row of one button |
+| `pick` | `id`, `text`, `note` (optional), `dot` (optional: `green`, `amber`, `red` or `off`) | a full-width row to pick: a status dot, the text, the note under it |
 | `divider` | | a thin line |
 
 - `style` is `primary`, `secondary` (the default) or `danger`; anything else
@@ -98,6 +99,12 @@ and repeated keys included), which the app reads to the same surface.
   stays live when another button has locked the row.
 - `dim: true`: the button is drawn faded and still takes taps (the runner
   uses it while another button is the better answer).
+- A `pick` is for a list to choose from (agents to send to, under a
+  `heading` per host). A tap anywhere on its row is a tap with its `id`. It
+  locks nothing and asks for no second tap; what the pick did, the agent
+  shows with an `update` of the row's `text`, `note` or `dot`. The dot is a
+  shape the app draws (`off` is grey; without `dot` there is none), not a
+  character of a font.
 - A stepper's strings are the values: the app does not read them as
   numbers, and a stepper stops at its first and last value. A number is sent
   exactly as typed; the app does not parse it or hold it to a range.
@@ -150,7 +157,7 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 | Request | Answer |
 |---|---|
 | `{"type":"set","surface":…,"rev":…,"title":…,"items":[…]}` | `{"type":"ack","surface":…,"rev":…,"shown":B,"pending":N}` (`shown`: the client's layer is the one on screen) |
-| `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
+| `{"type":"update","surface":S,"rev":R,"title":…,"items":{ID:{"text":…,"value":…,"note":…,"dot":…},…},"arm":[ID,…]}` | `{"type":"ack","surface":S,"rev":R,"pending":N}` |
 | `{"type":"clear"}` | `{"type":"ack","surface":null,"rev":0,"pending":N}` |
 | `{"type":"status"}` | `{"type":"status","v":2,"surface":…,"rev":…,"privileged":…,"title":…,"items":N,"pending":N,"waiting":N}` |
 | `{"type":"taps","wait":false}` | every waiting `tap` line, then `{"type":"taps","count":N,"seq":LAST}` |
@@ -165,7 +172,8 @@ the layer on screen (`"root"`, `"agent"` or `null` for the idle line);
 
 An `update` is for exactly the surface and rev on screen (`stale_rev`
 otherwise) and does not change the rev. `title` is a new header line. `items` names items by id: `text`
-for a heading, text or readout, `value` for a readout. `arm` names rows to
+for a heading, text, readout or pick, `value` for a readout, `note` and
+`dot` for a pick. `arm` names rows to
 unlock, each by the row's own id or the id of one of its buttons. Both are
 optional. One id that does not fit (`bad_item`) refuses the whole request
 and nothing changes. It is the cheap way to show a result or a reading: no
