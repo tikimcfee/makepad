@@ -10,6 +10,10 @@ After=graphical-session.target
 Type=notify
 NotifyAccess=main
 ExecStart=/opt/tinybot/surface/makepad-example-tinybot-surface
+# Linked shader programs are kept on disk for the next start. Here: in a cache directory
+# of the app's own (~/.cache/tinybot-surface), not the one all Makepad apps of the user share.
+CacheDirectory=tinybot-surface
+Environment=MAKEPAD_HAL_CACHE_DIR=%C/tinybot-surface
 Restart=on-failure
 RestartSec=1
 
