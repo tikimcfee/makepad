@@ -2,6 +2,8 @@
 // "append", a new take with "clear"; level one value, drawn as a meter), then whom it goes
 // to and the live text (voice.text). The text box keeps the end of the text in view
 // (scrolling up lets go); after a take (voice.live false) the last text stays, dimmed.
+// Undo: while tb-voiced counts down before sending (voice.pending N, voice.id the take), a
+// "Don't send" button sets voice_cancel to the take's id.
 width: Fill height: Fill flow: Down padding: 16 spacing: 12
 wave := StreamView{stream: "mic" height: 90}
 level := StreamView{stream: "level" meter: true height: 10 draw_bg.color_bar: #x3ddc84}
@@ -10,7 +12,9 @@ main := View{
     on_render: || {
         let v = state.voice ?? nil
         let live = if v == nil { true } else { v.live ?? true }
+        let n = if v == nil { 0 } else { v.pending ?? 0 }
         Small{text: "to: " + agent_name(state.agents ?? nil, state.target ?? nil)}
+        if n > 0 { Big{text: "Don't send  (" + show(n, ")") on_click: || set("voice_cancel", v.id ?? "")} }
         text := ScrollYView{width: Fill height: Fill flow: Down scroll_bars +: {auto_tail: true}
             Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }
                 draw_text.color: if live { #xeeeeee } else { #x7d8696 }}
