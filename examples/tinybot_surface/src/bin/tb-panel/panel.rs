@@ -35,7 +35,13 @@ pub enum Item {
     Input { id: String, kind: Input, json: Json },
     Readout { id: String, json: Json, poll: Option<Poll>, every_s: f64 },
     Row { id: String, buttons: Vec<Button> },
+    /// Items another tool publishes in `file` (`feed.rs`), shown where the feed stands. A
+    /// tap on one of them runs `action` with the item's id as the value of `{_id}`.
+    Feed { id: String, file: String, action: Action },
 }
+
+/// The placeholder a feed's action takes the tapped item's id by.
+pub const FEED_ID: &str = "_id";
 
 pub enum Input {
     Toggle,
@@ -195,7 +201,8 @@ impl Panel {
         }
         let panel = Panel { name, title, summary, order, stop, keys, items };
         panel.check_references()?;
-        let page = panel.items.iter().map(|item| item.json(false).to_string().len() + 1).sum::<usize>() + panel.title.len();
+        // (a feed's items are not in the file: the runner fits them into what is left)
+        let page = panel.items.iter().filter(|item| !matches!(item, Item::Feed { .. })).map(|item| item.json(false).to_string().len() + 1).sum::<usize>() + panel.title.len();
         if page > PAGE_BYTES {
             return Err(format!("the page is {page} bytes, more than the {PAGE_BYTES} the app takes in one line"));
         }
@@ -205,17 +212,28 @@ impl Panel {
     /// What can only be checked with every item known: placeholders, result items, the
     /// all-off an answer asks for.
     fn check_references(&self) -> Result<(), String> {
-        for button in self.buttons() {
-            let Does::Action(action) = &button.does else {
-                continue;
-            };
-            let what = format!("button {}", button.id);
+        // every action of the file: those of buttons, and those of feeds (which take an id)
+        let buttons = self.buttons().filter_map(|button| match &button.does {
+            Does::Action(action) => Some((format!("button {}", button.id), action, false)),
+            _ => None,
+        });
+        let feeds = self.items.iter().filter_map(|item| match item {
+            Item::Feed { id, action, .. } => Some((format!("feed {id}"), action, true)),
+            _ => None,
+        });
+        for (what, action, of_feed) in buttons.chain(feeds) {
             for part in action.argv.iter().flatten() {
                 if let Part::Value(id) = part {
+                    if id == FEED_ID && of_feed {
+                        continue;
+                    }
                     if self.input(id).is_none() {
                         return Err(format!("{what}: unknown placeholder {{{id}}}: no toggle, stepper or number has this id"));
                     }
                 }
+            }
+            if of_feed && !action.argv.iter().flatten().any(|part| matches!(part, Part::Value(id) if id == FEED_ID)) {
+                return Err(format!("{what}: the action's argv has no {{{FEED_ID}}}: it would not know which item was tapped"));
             }
             for (field, id) in [("result", &action.result), ("live", &action.live)] {
                 let Some(id) = id else {
@@ -270,6 +288,18 @@ impl Panel {
         self.buttons().find(|b| b.id == id)
     }
 
+    /// The action with this id: a button's, or a feed's (the feed's own id).
+    pub fn action(&self, id: &str) -> Option<&Action> {
+        self.items.iter().find_map(|item| match item {
+            Item::Feed { id: this, action, .. } if this == id => Some(action),
+            Item::Row { buttons, .. } => buttons.iter().find(|b| b.id == id).and_then(|b| match &b.does {
+                Does::Action(action) => Some(action),
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
     pub fn input(&self, id: &str) -> Option<&Input> {
         self.items.iter().find_map(|item| match item {
             Item::Input { id: this, kind, .. } if this == id => Some(kind),
@@ -297,6 +327,8 @@ impl Item {
                 json
             }
             Item::Row { id, buttons } => row_json(id, buttons.iter()),
+            // its items come from its file, through the runner
+            Item::Feed { .. } => Json::Null,
         }
     }
 }
@@ -518,6 +550,18 @@ fn parse_item(item: &Json, n: usize, ids: &mut HashSet<String>) -> Result<Item, 
             json.remove("every_s");
             Item::Readout { id: id_of(item, what, true, ids)?, json, poll, every_s }
         }
+        "feed" => {
+            known(members, &["kind", "id", "file", "action"], what)?;
+            let id = id_of(item, what, true, ids)?;
+            let file = string(item, "file", what)?.ok_or(format!("{what}: file is missing"))?;
+            absolute(&file, what)?;
+            let action = parse_action(item.get("action").ok_or(format!("{what}: action is missing"))?, &format!("feed {id}"))?;
+            // an item of a feed is one tap: it cannot arm, offer a follow-up or hold an answer row
+            if !action.ask.is_empty() || !action.retry.is_empty() || action.short {
+                return Err(format!("{what}: a feed's action has no ask, retry or short"));
+            }
+            Item::Feed { id, file, action }
+        }
         "button" => Item::Row { id: String::new(), buttons: vec![parse_button(item, what, true, ids)?] },
         "row" => {
             known(members, &["kind", "id", "buttons"], what)?;
@@ -691,6 +735,8 @@ impl Action {
             for part in parts {
                 match part {
                     Part::Text(text) => element.push_str(text),
+                    // the tapped item of a feed: the runner put it there, checked
+                    Part::Value(id) if id == FEED_ID => element.push_str(values.get(FEED_ID)?.as_str().filter(|id| crate::feed::id_ok(id))?),
                     Part::Value(id) => element.push_str(&tap_value(panel.input(id)?, values.get(id))?),
                 }
             }

@@ -1,0 +1,9 @@
+{"items":[
+ {"kind":"heading","text":"linux-node"},
+ {"kind":"pick","id":"tiny-monolith-optimizer@linux-node","text":"tiny-monolith-optimizer","note":"idle","dot":"green","selected":true},
+ {"kind":"pick","id":"tinybot-building@linux-node","text":"tinybot-building","note":"processing","dot":"amber"},
+ {"kind":"heading","text":"mac-host"},
+ {"kind":"pick","id":"tinybot-m2@mac-host","text":"tinybot-m2","note":"ended","dot":"off"},
+ {"kind":"readout","id":"seen","text":"Last look","value":"12:04"},
+ {"kind":"button","id":"refresh","text":"Look again"}
+]}
