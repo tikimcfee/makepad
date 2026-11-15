@@ -653,7 +653,8 @@ impl App {
                 if values.len() > stream::MAX_VALUES {
                     log!("tb-shell: push to {name}: {} values, a view shows the first {}", values.len(), stream::MAX_VALUES);
                 }
-                stream::push(name, values, req.get("append") == Some(&JsonValue::Bool(true)));
+                let flag = |k: &str| req.get(k) == Some(&JsonValue::Bool(true));
+                stream::push(name, values, flag("append"), flag("clear"));
                 Ok(None)
             }
             "get" => {

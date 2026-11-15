@@ -6,9 +6,10 @@
 //!   tbui set -j JSON | tbui set KEY=JSON...
 //!   tbui set -        one connection; each line of stdin is a patch (for a service: no
 //!                     process per update); exit 1 if any was refused
-//!   tbui push NAME [--append]   one connection; each line of stdin is the values of
+//!   tbui push NAME [--append] [--clear]   one connection; each line of stdin is the values of
 //!                     stream NAME (numbers, comma or space separated), for StreamView; no
-//!                     replies. --append adds them to the stream's ring of the last 32.
+//!                     replies. --append adds them to the stream's ring of the last 32;
+//!                     --clear empties it before the first line (a new take).
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
@@ -289,6 +290,8 @@ fn main() {
         "push" => {
             let name = rest.first().unwrap_or_else(|| die("push NAME [--append] (values on stdin)"));
             let append = if rest.iter().any(|a| a == "--append") { ",\"append\":true" } else { "" };
+            // --clear: the first line starts a new take (the ring is emptied before it).
+            let mut clear = rest.iter().any(|a| a == "--clear");
             let mut c = Client::connect();
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
@@ -296,7 +299,8 @@ fn main() {
                 if values.iter().any(|v| v.parse::<f64>().is_err()) {
                     die(&format!("not numbers: {line}"));
                 }
-                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]{append}}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
+                let cl = if std::mem::take(&mut clear) { ",\"clear\":true" } else { "" };
+                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]{append}{cl}}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
                 c.out.write_all(req.as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
             }
         }
