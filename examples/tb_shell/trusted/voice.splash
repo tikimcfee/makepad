@@ -1,0 +1,37 @@
+// A body we wrote (design example). Untried on the phone.
+let Wave = View{
+    width: Fill height: 90 show_bg: true
+    draw_bg +: {
+        a: instance(vec4(0.0)) b: instance(vec4(0.0)) c: instance(vec4(0.0))
+        d: instance(vec4(0.0)) e: instance(vec4(0.0))
+        pick: fn(i) {
+            let q = floor(i / 4.0)
+            let r = i - q * 4.0
+            let lane = vec4(1.0 - min(abs(r), 1.0), 1.0 - min(abs(r - 1.0), 1.0), 1.0 - min(abs(r - 2.0), 1.0), 1.0 - min(abs(r - 3.0), 1.0))
+            let mut v = self.a
+            if q > 0.5 { v = self.b }
+            if q > 1.5 { v = self.c }
+            if q > 2.5 { v = self.d }
+            if q > 3.5 { v = self.e }
+            return dot(v, lane)
+        }
+        pixel: fn() {
+            let h = self.pick(floor(self.pos.x * 20.0))
+            let y = abs(self.pos.y - 0.5) * 2.0
+            let gap = step(0.15, fract(self.pos.x * 20.0))
+            let on = (1.0 - smoothstep(h - 0.04, h, y)) * gap
+            return mix(#x0b0e14, #x5fd4ff, on)
+        }
+    }
+}
+fn q4(w, o) { if w.len() < o + 4 { return vec4(0.0) } vec4(w[o], w[o+1], w[o+2], w[o+3]) }
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 12
+    on_render: || {
+        let v = state.voice ?? nil
+        let w = if v == nil { [] } else { v.wave ?? [] }
+        Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }}
+        Wave{draw_bg.a: q4(w, 0) draw_bg.b: q4(w, 4) draw_bg.c: q4(w, 8) draw_bg.d: q4(w, 12) draw_bg.e: q4(w, 16)}
+    }
+}

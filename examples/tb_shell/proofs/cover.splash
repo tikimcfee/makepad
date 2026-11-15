@@ -1,0 +1,19 @@
+// cover proof: everything a body can reach that might paint over the strip or the guard
+width: Fill height: Fill flow: Overlay
+main := View{
+    width: Fill height: Fill flow: Overlay
+    on_render: || {
+        // a full-window view, pushed far past every edge
+        View{width: Fill height: Fill margin: Inset{top: -900 left: -900 right: -900 bottom: -900} show_bg: true draw_bg.color: #xff00ff}
+        // its own batch, pulled up over where the strip is
+        RoundedView{width: 384 height: 160 margin: Inset{top: -120} show_bg: true new_batch: true draw_bg.color: #x00ff00}
+        View{width: Fill height: Fit flow: Down spacing: 12 padding: Inset{top: 220 left: 16 right: 16}
+            // a popup (popup tier): tap to open it
+            DropDown{width: Fill labels: ["popup one" "popup two" "popup three" "popup four" "popup five" "popup six"]}
+            Big{text: "open the slide panel" on_click: || ui.slide.open()}
+        }
+        slide := SlidePanel{width: Fill height: Fill
+            RoundedView{width: Fill height: Fill margin: Inset{top: -200} show_bg: true draw_bg.color: #x00ffff}
+        }
+    }
+}

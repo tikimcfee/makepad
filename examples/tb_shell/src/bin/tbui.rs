@@ -1,12 +1,17 @@
 //! tbui: the client of tb-shell. One request per line, one reply per line.
 //!
-//!   tbui show NAME [-f FILE] [--back]     body from FILE or stdin; --back keeps the front surface
+//!   tbui show NAME [-f FILE] [--back] [--wait MS]
+//!        body from FILE or stdin; --back keeps the front surface; --wait prints the
+//!        surface's script errors (its first render, taps, timers) for MS ms, exit 1 if any
 //!   tbui set -j JSON | tbui set KEY=JSON...
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
 //!   tbui ask "QUESTION" CHOICE... [--from TEXT] [--timeout SECS]
 //!        prints the choice; exit 0 for the first choice, 1 for another, 2 on timeout
+//!   tbui guard "TEXT" [--yes LABEL] [--no LABEL]
+//!        the shell's own guard (a uid it allows, root by default); waits for a person's tap;
+//!        exit 0 yes, 1 no, 3 when the guard went away unanswered (the shell ended)
 
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use std::collections::HashMap;
@@ -195,7 +200,29 @@ fn main() {
                     m.insert("front".into(), JsonValue::Bool(false));
                 }
             }
-            report(&Client::connect().call(req));
+            let wait = rest.iter().position(|a| a == "--wait").map(|i| {
+                rest.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| die("--wait MS"))
+            });
+            let mut c = Client::connect();
+            if wait.is_some() {
+                report_quiet(c.call(obj(vec![("op", "watch".into()), ("surfaces", list(name))])));
+            }
+            let reply = c.call(req);
+            report(&reply);
+            if let Some(ms) = wait {
+                // Errors after the reply: the first render runs after it.
+                c.out.set_read_timeout(Some(Duration::from_millis(ms.max(1)))).ok();
+                let mut errors = 0;
+                while let Some(ev) = c.next() {
+                    if ev.get("ev").and_then(|v| v.as_str()) == Some("error") {
+                        println!("{}", ev.serialize_json());
+                        errors += 1;
+                    }
+                }
+                if errors > 0 {
+                    exit(1);
+                }
+            }
         }
         "set" => {
             let patch = if rest.first().map(String::as_str) == Some("-j") {
@@ -250,6 +277,34 @@ fn main() {
             report(&Client::connect().call(obj(vec![("op", "close".into()), ("surface", name.as_str().into())])));
         }
         "ask" => ask(rest),
+        "guard" => {
+            let text = rest.first().unwrap_or_else(|| die("guard TEXT [--yes LABEL] [--no LABEL]"));
+            let mut req = obj(vec![("op", "guard".into()), ("text", text.as_str().into())]);
+            for (flag, key) in [("--yes", "yes"), ("--no", "no")] {
+                if let Some(i) = rest.iter().position(|a| a == flag) {
+                    let v = rest.get(i + 1).unwrap_or_else(|| die("a label after the flag"));
+                    if let JsonValue::Object(m) = &mut req {
+                        m.insert(key.into(), v.as_str().into());
+                    }
+                }
+            }
+            let mut c = Client::connect();
+            c.send(&req);
+            match c.next() {
+                Some(reply) => {
+                    println!("{}", reply.serialize_json());
+                    match reply.get("answer").and_then(|a| a.as_str()) {
+                        Some("yes") => exit(0),
+                        Some(_) => exit(1),
+                        None => exit(4), // refused
+                    }
+                }
+                None => {
+                    eprintln!("tbui: the guard went away unanswered");
+                    exit(3)
+                }
+            }
+        }
         _ => die("show | set | get | watch | close | ask   (see the top of src/bin/tbui.rs)"),
     }
 }

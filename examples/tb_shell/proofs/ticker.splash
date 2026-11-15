@@ -1,0 +1,7 @@
+let mut n = 0
+mod.std.start_interval(0.1, || { n = n + 1 set("tick", n) })
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 10
+    on_render: || { Title{text: "ticker: a body timer writes tick ten times a second"} Small{text: "tick " + (state.tick ?? 0)} }
+}
