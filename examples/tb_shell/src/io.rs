@@ -121,14 +121,22 @@ const IN_CLOEXEC: i32 = 0o2000000;
 
 /// Watches a sound device directory for opens and closes of capture nodes
 /// (`pcmC*D*c`) with inotify; the thread blocks in read(), so nothing wakes
-/// at rest, and playback or control opens do not wake the UI.
+/// at rest, and playback or control opens do not wake the UI. The events only
+/// say WHEN to read the capture status: the mark is the status, never a count.
+/// If the directory itself goes (replaced by the device manager), the watch is
+/// armed again on the new one, and a read is asked for.
 pub fn watch_capture(dir: &str, tx: Sender<Msg>) {
+    const IN_DELETE_SELF: u32 = 0x400;
+    const IN_MOVE_SELF: u32 = 0x800;
+    const IN_IGNORED: u32 = 0x8000;
+    let mask = IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_DELETE_SELF | IN_MOVE_SELF;
     let fd = unsafe { inotify_init1(IN_CLOEXEC) };
     let Ok(c) = CString::new(dir) else { return };
-    if fd < 0 || unsafe { inotify_add_watch(fd, c.as_ptr(), IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) } < 0 {
+    if fd < 0 || unsafe { inotify_add_watch(fd, c.as_ptr(), mask) } < 0 {
         error!("tb-shell: cannot watch {dir}: {}; the recording mark is not kept", std::io::Error::last_os_error());
         return;
     }
+    let dir = dir.to_string();
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     spawn("tb-watch", move || {
         let mut buf = vec![0u8; 4096];
@@ -136,11 +144,26 @@ pub fn watch_capture(dir: &str, tx: Sender<Msg>) {
             let Ok(n) = file.read(&mut buf) else { break };
             let mut at = 0;
             let mut hit = false;
+            let mut gone = false;
             while at + 16 <= n {
+                let ev = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
                 let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
                 let name = String::from_utf8_lossy(&buf[at + 16..(at + 16 + len).min(n)]).trim_end_matches('\0').to_string();
                 hit |= name.starts_with("pcm") && name.ends_with('c');
+                gone |= ev & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED) != 0;
                 at += 16 + len;
+            }
+            if gone {
+                // The directory was replaced: arm the watch on the new one (once a second
+                // until it is there: this happens only when the device manager rebuilds it).
+                log!("tb-shell: {dir} went away; watching it again");
+                loop {
+                    if unsafe { inotify_add_watch(file.as_raw_fd(), c.as_ptr(), mask) } >= 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                hit = true;
             }
             if hit {
                 let _ = tx.send(Msg::Changed);
