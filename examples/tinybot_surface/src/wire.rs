@@ -50,7 +50,20 @@ pub enum Item {
     /// a label and a value the agent changes with `update`
     Readout { id: String, text: String, value: String },
     Row { id: String, buttons: Vec<Button> },
+    /// a full-width row to pick: a status dot, a name and a line under it; a tap on it is a
+    /// tap with its id. It does not lock: the agent says with an `update` what the pick did
+    Pick { id: String, text: String, note: String, dot: Option<Dot> },
     Divider,
+}
+
+/// The status dot of a `pick`, drawn by the app as a shape. Without one the row has no dot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dot {
+    Green,
+    Amber,
+    Red,
+    /// grey: known and not there
+    Off,
 }
 
 /// What a tap says of an item the user sets.
@@ -71,6 +84,8 @@ pub enum Target {
     Row,
     /// toggle, stepper, number: the user's, not for `update`
     Input,
+    /// pick: `text`, `note` and `dot`
+    Pick,
 }
 
 impl Spec {
@@ -81,6 +96,7 @@ impl Spec {
             match item {
                 Item::Heading { id, .. } | Item::Text { id, .. } => out.push((id.clone(), Target::Label)),
                 Item::Readout { id, .. } => out.push((id.clone(), Target::Readout)),
+                Item::Pick { id, .. } => out.push((id.clone(), Target::Pick)),
                 Item::Toggle { id, .. } | Item::Stepper { id, .. } | Item::Number { id, .. } => out.push((id.clone(), Target::Input)),
                 Item::Row { id, buttons } => {
                     out.push((id.clone(), Target::Row));
@@ -100,6 +116,10 @@ pub struct Change {
     pub id: String,
     pub text: Option<String>,
     pub value: Option<String>,
+    /// a pick's second line
+    pub note: Option<String>,
+    /// a pick's dot
+    pub dot: Option<Dot>,
 }
 
 /// A checked `update`: changes to items in place and rows to arm again. Whether the ids
@@ -311,6 +331,18 @@ fn flag_of(v: &JsonValue, name: &str, default: bool, what: &str) -> Result<bool,
     }
 }
 
+/// The optional `dot` of a pick: one of four words.
+fn dot_of(v: &JsonValue, what: &str) -> Result<Option<Dot>, WireErr> {
+    match string_of(v, "dot", what)?.as_deref() {
+        None => Ok(None),
+        Some("green") => Ok(Some(Dot::Green)),
+        Some("amber") => Ok(Some(Dot::Amber)),
+        Some("red") => Ok(Some(Dot::Red)),
+        Some("off") => Ok(Some(Dot::Off)),
+        Some(other) => err("bad_item", format!("{what}: dot is \"green\", \"amber\", \"red\" or \"off\", not {other:?}")),
+    }
+}
+
 /// An optional string field.
 fn string_of(v: &JsonValue, name: &str, what: &str) -> Result<Option<String>, WireErr> {
     match v.key(name) {
@@ -353,7 +385,13 @@ fn parse_update(value: &JsonValue) -> Result<Update, WireErr> {
                 return err("bad_request", format!("update: {id} is not an object"));
             }
             let what = format!("update {id}");
-            changes.push(Change { id: id.clone(), text: string_of(change, "text", &what)?, value: string_of(change, "value", &what)? });
+            changes.push(Change {
+                id: id.clone(),
+                text: string_of(change, "text", &what)?,
+                value: string_of(change, "value", &what)?,
+                note: string_of(change, "note", &what)?,
+                dot: dot_of(change, &what)?,
+            });
         }
     }
     let mut arm = Vec::new();
@@ -439,6 +477,10 @@ fn parse_set(value: &JsonValue) -> Result<Spec, WireErr> {
             "readout" => {
                 let id = id_of(item, &what, true, &mut seen)?;
                 Item::Readout { id, text: text_of(item, n, kind)?, value: string_of(item, "value", &what)?.unwrap_or_default() }
+            }
+            "pick" => {
+                let id = id_of(item, &what, true, &mut seen)?;
+                Item::Pick { id, text: text_of(item, n, kind)?, note: string_of(item, "note", &what)?.unwrap_or_default(), dot: dot_of(item, &what)? }
             }
             "button" => Item::Row { id: String::new(), buttons: vec![parse_button(item, &what, &mut seen)?] },
             "row" => {

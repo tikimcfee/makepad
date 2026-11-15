@@ -292,6 +292,78 @@ script_mod! {
                     draw_text.text_style.font_size: 10
                 }
             }
+            // a row to pick: a status dot, a name and a line under it. The button under
+            // them is the whole row; the dot is a shape, one of four, not a glyph
+            Pick := View{
+                width: Fill
+                height: Fit
+                padding: Inset{left: 16 right: 16 top: 3 bottom: 3}
+                flow: Overlay
+                hit := Button{
+                    width: Fill
+                    height: 54
+                    text: ""
+                }
+                View{
+                    width: Fill
+                    height: 54
+                    flow: Right
+                    spacing: 12
+                    align: Align{y: 0.5}
+                    padding: Inset{left: 14 right: 14}
+                    dots := View{
+                        visible: false
+                        width: 12
+                        height: 12
+                        flow: Overlay
+                        dot_green := CircleView{
+                            visible: false
+                            width: 12
+                            height: 12
+                            draw_bg.color: #x3ecf6a
+                        }
+                        dot_amber := CircleView{
+                            visible: false
+                            width: 12
+                            height: 12
+                            draw_bg.color: #f0b429
+                        }
+                        dot_red := CircleView{
+                            visible: false
+                            width: 12
+                            height: 12
+                            draw_bg.color: #ff5a4a
+                        }
+                        dot_off := CircleView{
+                            visible: false
+                            width: 12
+                            height: 12
+                            draw_bg.color: #6a6f75
+                        }
+                    }
+                    View{
+                        width: Fill
+                        height: Fit
+                        flow: Down
+                        spacing: 1
+                        label := Label{
+                            width: Fill
+                            max_lines: 1
+                            text: ""
+                            draw_text.color: #fff
+                            draw_text.text_style.font_size: 12
+                        }
+                        note := Label{
+                            visible: false
+                            width: Fill
+                            max_lines: 1
+                            text: ""
+                            draw_text.color: #9aa4ad
+                            draw_text.text_style.font_size: 9
+                        }
+                    }
+                }
+            }
             Divider := View{
                 width: Fill
                 height: Fit
@@ -649,6 +721,7 @@ enum Entry {
     /// `tapped`: the button that was pressed. The row is locked from then until the agent
     /// sends the next surface, arms the row with an `update`, or clears.
     Row { id: String, buttons: Vec<wire::Button>, tapped: Option<usize> },
+    Pick { id: String, text: String, note: String, dot: Option<wire::Dot> },
     Divider,
 }
 
@@ -724,6 +797,7 @@ impl SurfaceList {
                 wire::Item::Heading { id, text } => Entry::Heading { id, text },
                 wire::Item::Text { id, text } => Entry::Text { id, text },
                 wire::Item::Divider => Entry::Divider,
+                wire::Item::Pick { id, text, note, dot } => Entry::Pick { id, text, note, dot },
                 wire::Item::Row { id, buttons } => Entry::Row { id, buttons, tapped: None },
                 wire::Item::Readout { id, text, value } => Entry::Readout { id, text, value },
                 wire::Item::Toggle { id, text, value } => {
@@ -778,6 +852,17 @@ impl SurfaceList {
                         }
                         if let Some(new) = &change.value {
                             value.clone_from(new);
+                        }
+                    }
+                    Entry::Pick { id, text, note, dot } if *id == change.id => {
+                        if let Some(new) = &change.text {
+                            text.clone_from(new);
+                        }
+                        if let Some(new) = &change.note {
+                            note.clone_from(new);
+                        }
+                        if change.dot.is_some() {
+                            *dot = change.dot;
                         }
                     }
                     _ => {}
@@ -868,8 +953,14 @@ impl SurfaceList {
     pub fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) -> Vec<Pressed> {
         let list = self.view.portal_list(cx, ids!(list));
         let mut clicked = Vec::new();
+        let mut picked = Vec::new();
         for (index, item) in list.items_with_actions(actions) {
             match self.entries.get(index) {
+                Some(Entry::Pick { id, .. }) => {
+                    if item.button(cx, ids!(hit)).clicked(actions) {
+                        picked.push(id.clone());
+                    }
+                }
                 Some(Entry::Toggle { id, .. }) => {
                     if let Some(value) = item.check_box(cx, ids!(toggle)).changed(actions) {
                         self.values.insert(id.clone(), Held::Bool(value));
@@ -907,7 +998,11 @@ impl SurfaceList {
                 _ => {}
             }
         }
-        let mut ids = Vec::new();
+        // a pick is a tap at once: it locks nothing, and ends a button's wait for its second tap
+        let mut ids = picked;
+        if !ids.is_empty() {
+            self.disarm(cx);
+        }
         for (index, k) in clicked {
             let Some(Entry::Row { buttons, tapped, .. }) = self.entries.get(index) else {
                 continue;
@@ -1004,6 +1099,17 @@ impl Widget for SurfaceList {
                             row
                         }
                         Entry::Divider => list.item(cx, index, id!(Divider)),
+                        Entry::Pick { text, note, dot, .. } => {
+                            let row = list.item(cx, index, id!(Pick));
+                            row.label(cx, ids!(label)).set_text(cx, text);
+                            row.label(cx, ids!(note)).set_text(cx, note);
+                            row.label(cx, ids!(note)).set_visible(cx, !note.is_empty());
+                            row.view(cx, ids!(dots)).set_visible(cx, dot.is_some());
+                            for (shape, which) in [(ids!(dot_green), wire::Dot::Green), (ids!(dot_amber), wire::Dot::Amber), (ids!(dot_red), wire::Dot::Red), (ids!(dot_off), wire::Dot::Off)] {
+                                row.view(cx, shape).set_visible(cx, *dot == Some(which));
+                            }
+                            row
+                        }
                         Entry::Toggle { id, text } => {
                             let row = list.item(cx, index, id!(Toggle));
                             let toggle = row.check_box(cx, ids!(toggle));
