@@ -4,3 +4,4 @@ fn set(k, v) { host.request("set", {key: k, value: v}, nil) }
 fn front(n) { set("front", n) }
 fn __assign(text) { let p = text.parse_json(); for k, v in p { state[k] = v } }
 fn __render() { ui.main.render() }
+fn __noop(text) { }

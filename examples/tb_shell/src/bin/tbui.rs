@@ -4,6 +4,8 @@
 //!        body from FILE or stdin; --back keeps the front surface; --wait prints the
 //!        surface's script errors (its first render, taps, timers) for MS ms, exit 1 if any
 //!   tbui set -j JSON | tbui set KEY=JSON...
+//!   tbui set -        one connection; each line of stdin is a patch (for a service: no
+//!                     process per update); exit 1 if any was refused
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
 //!   tbui close NAME
@@ -223,6 +225,29 @@ fn main() {
                     exit(1);
                 }
             }
+        }
+        "set" if rest.first().map(String::as_str) == Some("-") => {
+            let mut c = Client::connect();
+            let mut failed = false;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // The shell parses and checks the patch; the client only frames it.
+                c.out.write_all(format!("{{\"op\":\"set\",\"patch\":{}}}\n", line.trim()).as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
+                let reply = loop {
+                    let msg = c.next().unwrap_or_else(|| die("the shell closed the connection"));
+                    if msg.get("ok").is_some() {
+                        break msg;
+                    }
+                };
+                if reply.get("ok") != Some(&JsonValue::Bool(true)) {
+                    eprintln!("{}", reply.serialize_json());
+                    failed = true;
+                }
+            }
+            exit(failed as i32)
         }
         "set" => {
             let patch = if rest.first().map(String::as_str) == Some("-j") {
