@@ -460,12 +460,17 @@ to `file`, and the runner shows them where the feed stands:
 - **A file that is not a feed** (missing, too large, not JSON, a wrong kind
   or field, writable by others) is one line on the page, `feed unavailable:
   WHY`; the rest of the page stays and the runner goes on.
-- **When it is read**: as the panel's page goes to the screen, and then once
-  a second only while that page is the one on screen and
-  `/sys/kernel/tinybot_panel/state` does not read `off`. Each second the
-  runner looks at the file's inode, size and time of change; it reads the
-  file only when one of them is another. On Home or another page nothing is
-  looked at and the runner sleeps.
+- **When it is read**: as the panel's page goes to the screen, and from
+  then on when it changes, while that page is the one on screen and
+  `/sys/kernel/tinybot_panel/state` does not read `off`. The runner watches
+  the file's directory (inotify), so a file that is replaced shows at once
+  and the page costs no wakeup while nothing changes; every 10 s it looks
+  once more by itself, for a watch that was lost. It reads the file only
+  when its inode, size or time of change is another. A change while the
+  panel is off is read when the panel is on again (the runner then looks
+  every 2 s until it is). Where the directory is not there yet, or the
+  kernel gives no watch, the file is looked at once a second. On Home or
+  another page nothing is watched and the runner sleeps.
 - **How the page follows**: the same items with other texts, values, notes,
   dots or another selected pick are changed in place (`update`). Items that
   came or went (or a button that reads otherwise) are a `set` of the same
@@ -476,9 +481,12 @@ to `file`, and the runner shows them where the feed stands:
   on a locked panel (`locked`; the items stay on the page), recorded as a
   try with `"button"` = the feed's id and `"_id"` among its values. A tap
   that runs nothing leaves a `{"t":"dropped","feed":…,"id":…,"why":…}`
-  record. The action takes no `ask`, `retry` or `short`. After it the file
-  is looked at at once, so a tool that marks the picked item `selected`
-  shows it without waiting.
+  record. The action takes no `ask`, `retry` or `short`.
+- **A tapped pick is drawn as the selected one at once**, before its action
+  has run: the tap is seen in the next frame, whatever the action takes.
+  What is true is the file: it is read when the action rewrites it and, in
+  any case, when the action has ended, and a pick the action did not select
+  is put back then.
 - **An id** is 1 to 64 of letters, digits and `. _ @ : -`, not starting
   with `-`. A pick or button with any other id is shown as a line of text
   that says so and cannot be tapped: nothing a file holds becomes an
