@@ -27,12 +27,33 @@ use std::os::unix::net::UnixStream;
 use std::process::exit;
 use std::time::Duration;
 
+/// The shell's socket: TB_SHELL_SOCK; else XDG_RUNTIME_DIR's; else (root under sudo, or
+/// a root service) the sudo user's /run/user/UID/tb-shell.sock; else the only
+/// /run/user/*/tb-shell.sock there is.
 fn socket_path() -> String {
-    if let Ok(p) = std::env::var("TB_SHELL_SOCK") {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(p) = var("TB_SHELL_SOCK") {
         return p;
     }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    format!("{dir}/tb-shell.sock")
+    if let Some(dir) = var("XDG_RUNTIME_DIR") {
+        return format!("{dir}/tb-shell.sock");
+    }
+    if let Some(uid) = var("SUDO_UID") {
+        let p = format!("/run/user/{uid}/tb-shell.sock");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    let found: Vec<String> = std::fs::read_dir("/run/user").into_iter().flatten().flatten()
+        .map(|e| e.path().join("tb-shell.sock"))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    match found.len() {
+        1 => found[0].clone(),
+        0 => die("no tb-shell socket: set TB_SHELL_SOCK or XDG_RUNTIME_DIR (none in /run/user/*/)"),
+        _ => die(&format!("more than one tb-shell socket ({}): set TB_SHELL_SOCK", found.join(", "))),
+    }
 }
 
 fn die(msg: &str) -> ! {
