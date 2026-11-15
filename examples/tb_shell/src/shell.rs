@@ -228,7 +228,12 @@ impl Shell {
             self.draw_guard_text.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
             y += 26.0;
         }
-        self.draw_guard_small.draw_abs(cx, dvec2(rect.pos.x + 24.0, y + 8.0), &guard.who);
+        // Who asked, from the kernel; wrapped like the question, so the uid is never cut off.
+        y += 8.0;
+        for line in wrap(&guard.who, ((w - 48.0) / 7.8) as usize) {
+            self.draw_guard_small.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
+            y += 18.0;
+        }
         let bw = w - 48.0;
         let (yes_y, no_y) = (top + h - 200.0, top + h - 110.0);
         let dim = if self.armed { 1.0 } else { 0.45 };

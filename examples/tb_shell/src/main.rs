@@ -319,8 +319,11 @@ fn locate(text: &str, name: &str) -> Option<(usize, usize, String)> {
     Some((line, col, message))
 }
 
+/// A surface's name shows in the strip: none may start with "guard", the word the
+/// strip uses for the shell's own guard.
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && !name.to_ascii_lowercase().starts_with("guard")
 }
 
 impl App {
@@ -711,7 +714,7 @@ impl App {
 
     fn show(&mut self, cx: &mut Cx, name: &str, body: &str, front: bool) -> Result<JsonValue, String> {
         if !valid_name(name) {
-            return Err("a surface name is 1 to 64 of A-Z a-z 0-9 - _ .".into());
+            return Err("a surface name is 1 to 64 of A-Z a-z 0-9 - _ . and does not start with \"guard\"".into());
         }
         if !self.st.trusted.contains(body) {
             if let Some(at) = shader_text(body) {
