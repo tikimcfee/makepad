@@ -404,8 +404,8 @@ impl State {
         let bad = |msg: String| Err(WireErr { code: "bad_item", msg });
         for change in &update.changes {
             let pick = held.targets.get(&change.id) == Some(&Target::Pick);
-            if !pick && (change.note.is_some() || change.dot.is_some()) {
-                return bad(format!("update {}: only a pick has a note and a dot", change.id));
+            if !pick && (change.note.is_some() || change.dot.is_some() || change.selected.is_some()) {
+                return bad(format!("update {}: only a pick has a note, a dot and selected", change.id));
             }
             match held.targets.get(&change.id) {
                 Some(Target::Readout) => {}
