@@ -1073,10 +1073,27 @@ impl Cx {
         self.get_resource_font_bytes_by_path(&path)
     }
 
+    /// The file a packaged desktop build keeps the font resource `path` in (through the package
+    /// map, or under the package root beside the executable). `None` when the build is not
+    /// packaged, `path` is not a resource, or the file is not there or cannot be opened: the
+    /// font then comes from the resource table as before.
+    pub fn packaged_font_file(&self, path: &str) -> Option<std::path::PathBuf> {
+        let resources = self.script_data.resources.resources.borrow();
+        let dep_path = resources.iter().find(|res| res.abs_path == path)?.dependency_path.as_deref()?;
+        crate::script::res::packaged_resource_file(self, dep_path).filter(|file| std::fs::File::open(file).is_ok())
+    }
+
     /// Font identity captured in its owning script heap. A local handle alone
     /// cannot identify a resource once a draw object leaves that heap.
     pub fn get_resource_font_bytes_by_path(&self, path: &str) -> Option<HostBuf> {
         if let Ok(bytes) = HostBuf::from_file_mmap_or_read(path) {
+            return Some(bytes);
+        }
+        // A packaged desktop build has the font as a file too, only not at the path the build
+        // knew it by. Mapped from there it costs no memory of its own and goes to the font
+        // service by its path; read into the resource table it is copied whole at every step
+        // from here to each font worker (a CJK face: 19 MB, eight times).
+        if let Some(bytes) = self.packaged_font_file(path).and_then(|file| HostBuf::from_file_mmap_or_read(file).ok()) {
             return Some(bytes);
         }
         #[cfg(target_os = "android")]

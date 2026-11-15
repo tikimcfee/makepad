@@ -258,6 +258,30 @@ fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
     crate::os::cx_native::read_file_cwd_or_exe_relative(&cx.package_paths, &full_path).map(Rc::new)
 }
 
+/// The file a packaged desktop build keeps `dep_path` in: where `load_packaged_resource` reads
+/// it from. `None` when the build is not packaged or the file is not there.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(all(target_os = "macos", apple_bundle))
+))]
+pub(crate) fn packaged_resource_file(cx: &Cx, dep_path: &str) -> Option<std::path::PathBuf> {
+    let root = cx.package_root.as_deref()?;
+    let full_path = crate::os::cx_native::packaged_resource_path(&cx.package_paths, root, dep_path);
+    crate::os::cx_native::find_file_cwd_or_exe_relative(&cx.package_paths, &full_path)
+}
+
+/// Other targets keep their packaged resources where no path leads (an APK, an app bundle
+/// read through its own API, a web server).
+#[cfg(not(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(all(target_os = "macos", apple_bundle))
+)))]
+pub(crate) fn packaged_resource_file(_cx: &Cx, _dep_path: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// An unpackaged native build reads a crate's resources from the directory that crate was built
 /// in (its `CARGO_MANIFEST_DIR`, fixed at compile time). A binary whose tree was moved or renamed
 /// after the build finds none of them, and its fonts, icons and images are blank without a word:
