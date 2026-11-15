@@ -180,9 +180,11 @@ struct State {
     conns: HashMap<u64, Conn>,
     reads: HashMap<String, Reads>,
     bodies: HashMap<String, String>,
-    /// Surfaces in the order they were last shown; closing the front one
-    /// brings back the one before it.
-    order: Vec<String>,
+    /// The views that were in front before the current one, newest last: closing
+    /// the front surface brings back the newest that still exists, else home.
+    front_history: Vec<String>,
+    /// Surfaces a connection showed with "owned": true (a question): they close with it.
+    owned: HashMap<u64, Vec<String>>,
     guards: Vec<Guard>,
     guard_uids: HashSet<u32>,
     trusted: HashSet<String>,
@@ -548,6 +550,10 @@ impl App {
                 }
                 Msg::Closed { conn } => {
                     self.st.conns.remove(&conn);
+                    // A question whose asker is gone goes too.
+                    for name in self.st.owned.remove(&conn).unwrap_or_default() {
+                        let _ = self.close(cx, &name);
+                    }
                     // A guard whose asker is gone is withdrawn, never answered.
                     let raised = self.st.guards.first().map(|g| g.conn);
                     self.st.guards.retain(|g| g.conn != conn);
@@ -613,7 +619,11 @@ impl App {
                 let name = surface.ok_or("show needs surface")?;
                 let body = req.get("body").and_then(|v| v.as_str()).ok_or("show needs body")?;
                 let front = req.get("front") != Some(&JsonValue::Bool(false));
-                self.show(cx, name, body, front).map(Some)
+                let reply = self.show(cx, name, body, front)?;
+                if req.get("owned") == Some(&JsonValue::Bool(true)) && reply.get("ok") != Some(&JsonValue::Bool(false)) {
+                    self.st.owned.entry(conn).or_default().push(name.to_string());
+                }
+                Ok(Some(reply))
             }
             "set" => {
                 let patch = req.get("patch").ok_or("set needs patch")?;
@@ -746,8 +756,6 @@ impl App {
         self.st.bodies.insert(name.to_string(), body.to_string());
         self.write_surfaces_file();
         self.st.reads.insert(name.to_string(), Reads::scan(body));
-        self.st.order.retain(|n| n != name);
-        self.st.order.push(name.to_string());
         if !self.st.panel_off {
             self.feed_all(cx, name, &splash);
         }
@@ -773,9 +781,12 @@ impl App {
         self.st.reads.remove(name);
         self.st.bodies.remove(name);
         self.write_surfaces_file();
-        self.st.order.retain(|n| n != name);
+        self.st.front_history.retain(|n| n != name);
         if self.st.store.get("front").and_then(|v| v.as_str()) == Some(name) {
-            let back = self.st.order.last().map_or(JsonValue::Null, |n| JsonValue::String(n.clone()));
+            // Back to what was in front before it; if that is gone too, home.
+            let back = self.st.front_history.iter().rev().find(|n| self.st.bodies.contains_key(*n)).cloned()
+                .or_else(|| self.st.bodies.contains_key("home").then(|| "home".to_string()));
+            let back = back.map_or(JsonValue::Null, JsonValue::String);
             self.apply(cx, &obj(vec![("front", back)]), "shell");
         }
         Ok(obj(vec![]))
@@ -877,6 +888,10 @@ impl App {
             // A service does its work only while its view is looked at: `shown` and `hidden`
             // go to the watchers of those surfaces.
             if before != front {
+                self.st.front_history.retain(|n| *n != front && *n != before);
+                if !before.is_empty() {
+                    self.st.front_history.push(before.clone());
+                }
                 if !before.is_empty() {
                     self.to_surface_watchers(&before, obj(vec![("ev", "hidden".into()), ("surface", before.as_str().into())]));
                 }

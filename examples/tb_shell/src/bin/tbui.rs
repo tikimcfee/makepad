@@ -186,7 +186,8 @@ fn ask(args: &[String]) -> ! {
     // Watch first, so the answer cannot arrive before we listen for it.
     report_quiet(c.call(obj(vec![("op", "watch".into()), ("surfaces", list(&id))])));
     let body = ask_body(&id, &question, &from, &choices);
-    report_quiet(c.call(obj(vec![("op", "show".into()), ("surface", id.as_str().into()), ("body", body.into())])));
+    // Owned: if this process ends without closing it, the shell closes it.
+    report_quiet(c.call(obj(vec![("op", "show".into()), ("surface", id.as_str().into()), ("body", body.into()), ("owned", JsonValue::Bool(true))])));
     if timeout > 0 {
         c.out.set_read_timeout(Some(Duration::from_secs(timeout))).ok();
     }
