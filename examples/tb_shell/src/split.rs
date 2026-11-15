@@ -45,6 +45,7 @@ struct Rec {
     ui: f64,
     gl: f64,
     other: f64,
+    mhz: f64,
 }
 
 impl Rec {
@@ -71,6 +72,7 @@ impl Rec {
         self.ui += r.ui;
         self.gl += r.gl;
         self.other += r.other;
+        self.mhz += r.mhz;
     }
 }
 
@@ -78,7 +80,8 @@ impl Rec {
 pub struct Split {
     left: u32,
     ui_tid: i32,
-    cur: Option<(Rec, [u64; 3])>,
+    cur: Option<(Rec, Snap)>,
+    lines: bool,
     entered: u64,
     left_app: Option<(usize, u64)>,
     sum: Rec,
@@ -97,18 +100,43 @@ fn self_ns() -> u64 {
     ts[0] as u64 * 1_000_000_000 + ts[1] as u64
 }
 
-/// (ui, gl, other) ns on CPU so far.
-fn cpu(ui_tid: i32) -> [u64; 3] {
-    let mut out = [0u64; 3];
+/// Per thread: (tid, group 0 ui / 1 gl / 2 other, ns on CPU so far).
+type Snap = Vec<(i32, usize, u64)>;
+
+fn cpu(ui_tid: i32) -> Snap {
+    let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc/self/task").into_iter().flatten().flatten() {
         let path = entry.path();
         let tid: i32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
         let ns = ns_of(&path.join("schedstat"));
         let comm = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
-        let i = if tid == ui_tid { 0 } else if comm.starts_with("makepad-gl-rend") { 1 } else { 2 };
-        out[i] += ns;
+        let g = if tid == ui_tid { 0 } else if comm.starts_with("makepad-gl-rend") { 1 } else { 2 };
+        out.push((tid, g, ns));
     }
     out
+}
+
+/// CPU per group between two snapshots, thread by thread: a thread that ended
+/// in between drops out, one that began counts from zero (a sum over groups
+/// went below zero when a GL thread ended).
+fn delta(old: &Snap, now: &Snap) -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (tid, g, ns) in now {
+        let before = old.iter().find(|(t, _, _)| t == tid).map_or(0, |(_, _, n)| *n);
+        out[*g] += ns.saturating_sub(before);
+    }
+    out
+}
+
+/// The clock of the core the UI thread is on now (MHz): CPU time per update
+/// means little without it (schedutil runs a lightly loaded core slower).
+fn mhz() -> f64 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap_or_default();
+    let after = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    // field 39 (processor) is the 37th after the closing parenthesis of comm
+    let cpu: usize = after.split_whitespace().nth(36).and_then(|v| v.parse().ok()).unwrap_or(0);
+    std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"))
+        .ok().and_then(|v| v.trim().parse::<f64>().ok()).map_or(0.0, |khz| khz / 1000.0)
 }
 
 fn kind(event: &Event) -> usize {
@@ -123,7 +151,8 @@ fn kind(event: &Event) -> usize {
 impl Split {
     pub fn from_env() -> Split {
         let left = std::env::var("TB_SHELL_SPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        Split { left, ui_tid: unsafe { gettid() }, ..Default::default() }
+        let lines = std::env::var("TB_SHELL_SPLIT_LINES").map_or(false, |v| v == "1");
+        Split { left, ui_tid: unsafe { gettid() }, lines, ..Default::default() }
     }
 
     pub fn on(&self) -> bool {
@@ -134,17 +163,21 @@ impl Split {
     pub fn begin(&mut self) {
         let before = self_ns();
         let now = cpu(self.ui_tid);
+        let clock = mhz();
         let probe = self_ns() - before; // the snapshot's own cost, not the update's
         if let Some((mut r, c0)) = self.cur.take() {
-            r.ui = (now[0] - c0[0]).saturating_sub(probe) as f64 / 1e3;
-            r.gl = (now[1] - c0[1]) as f64 / 1e3;
-            r.other = (now[2] - c0[2]) as f64 / 1e3;
+            let d = delta(&c0, &now);
+            r.ui = d[0].saturating_sub(probe) as f64 / 1e3;
+            r.gl = d[1] as f64 / 1e3;
+            r.other = d[2] as f64 / 1e3;
             if r.tainted {
                 log!("tb-split (not in the mean: it held a show) {}", line(&r, 1.0));
             } else {
                 self.n += 1;
                 self.sum.add(&r);
-                log!("tb-split #{}: {}", self.n, line(&r, 1.0));
+                if self.lines {
+                    log!("tb-split #{}: {}", self.n, line(&r, 1.0));
+                }
             }
             if self.left == 0 {
                 log!("tb-split MEAN over {}: {}", self.n, line(&self.sum, self.n as f64));
@@ -154,6 +187,7 @@ impl Split {
             self.left -= 1;
             let mut rec = Rec::default();
             rec.probe = probe as f64 / 1e3;
+            rec.mhz = clock;
             self.cur = Some((rec, now));
         }
         // The snapshot was taken inside this handler: start its count after it.
@@ -257,6 +291,6 @@ fn line(r: &Rec, n: f64) -> String {
             accounted += r.inside[k] + r.after[k];
         }
     }
-    s += &format!(" unaccounted {:.0} = {:.0} | gl {:.0} other {:.0} us", (r.ui - accounted) / n, r.ui / n, r.gl / n, r.other / n);
+    s += &format!(" unaccounted {:.0} = {:.0} | gl {:.0} other {:.0} us | ui core at {:.0} MHz", (r.ui - accounted) / n, r.ui / n, r.gl / n, r.other / n, r.mhz / n);
     s
 }

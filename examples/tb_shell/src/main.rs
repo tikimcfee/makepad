@@ -190,6 +190,10 @@ struct State {
     log_cursor: u64,
     split: split::Split,
     trace: paneltrace::PanelTrace,
+    /// Surfaces whose `on_render` runs at the next frame: at most once a frame each,
+    /// with the newest state, however many updates arrive before it.
+    render_pending: Vec<WidgetRef>,
+    render_frame: NextFrame,
 }
 
 #[derive(Script, ScriptHook)]
@@ -214,6 +218,9 @@ impl AppMain for App {
         self.st.split.event_start();
         self.st.trace.event(event);
         self.check_panel(cx);
+        if self.st.render_frame.is_event(event).is_some() {
+            self.render_pending(cx);
+        }
         if let Event::Signal = event {
             if self.st.split.on() {
                 let t = std::time::Instant::now();
@@ -645,8 +652,8 @@ impl App {
         // the tree cannot read its children, and `ui.main` would not resolve.
         let split = &mut self.st.split;
         split.timed(5, || { let _ = splash.widget(cx, ids!(main)); });
-        // Two calls, so their costs can be told apart (TB_SHELL_SPLIT): the
-        // assignment, then `on_render` and the reload of its result.
+        // The values are assigned now; `on_render` and the reload of its result
+        // wait for the next frame (render_pending).
         if let Some(mut inner) = splash.borrow_mut::<Splash>() {
             let split = &mut self.st.split;
             if split.on() {
@@ -657,7 +664,20 @@ impl App {
                 split.add_named("noop-call", t.elapsed());
             }
             split.timed(2, || inner.call_script_fn_with_strings(cx, live_id!(__assign), &[&text]));
-            split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
+        }
+        if !self.st.render_pending.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
+            self.st.render_pending.push(splash.clone());
+        }
+        self.st.render_frame = cx.new_next_frame();
+    }
+
+    /// The frame has come: each surface fed since the last one renders once.
+    fn render_pending(&mut self, cx: &mut Cx) {
+        for splash in std::mem::take(&mut self.st.render_pending) {
+            let _ = splash.widget(cx, ids!(main)); // the tree warm-up, as in feed
+            if let Some(mut inner) = splash.borrow_mut::<Splash>() {
+                self.st.split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
+            }
         }
     }
 

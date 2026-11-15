@@ -13,8 +13,11 @@ use makepad_widgets::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// Values a view holds: 16 vec4 instance slots.
-pub const MAX_VALUES: usize = 64;
+/// Values a view holds: 8 vec4 instance slots. Instance values reach the pixel
+/// shader as vertex outputs, and the GE8320 allows 64 components in all: 16
+/// slots (76 with the quad's own) failed to link there. More values would go
+/// through a texture.
+pub const MAX_VALUES: usize = 32;
 
 thread_local! {
     /// stream name -> (version, values). UI thread only, like the isolates.
@@ -54,14 +57,6 @@ script_mod! {
             if q > 4.5 { v = self.v5 }
             if q > 5.5 { v = self.v6 }
             if q > 6.5 { v = self.v7 }
-            if q > 7.5 { v = self.v8 }
-            if q > 8.5 { v = self.v9 }
-            if q > 9.5 { v = self.v10 }
-            if q > 10.5 { v = self.v11 }
-            if q > 11.5 { v = self.v12 }
-            if q > 12.5 { v = self.v13 }
-            if q > 13.5 { v = self.v14 }
-            if q > 14.5 { v = self.v15 }
             return dot(v, lane)
         }
         pixel: fn() {
@@ -89,21 +84,15 @@ pub struct DrawStreamBars {
     #[live] count: f32,
     #[live] v0: Vec4f, #[live] v1: Vec4f, #[live] v2: Vec4f, #[live] v3: Vec4f,
     #[live] v4: Vec4f, #[live] v5: Vec4f, #[live] v6: Vec4f, #[live] v7: Vec4f,
-    #[live] v8: Vec4f, #[live] v9: Vec4f, #[live] v10: Vec4f, #[live] v11: Vec4f,
-    #[live] v12: Vec4f, #[live] v13: Vec4f, #[live] v14: Vec4f, #[live] v15: Vec4f,
 }
 
-const SLOTS: [LiveId; 16] = [
+const SLOTS: [LiveId; 8] = [
     live_id!(v0), live_id!(v1), live_id!(v2), live_id!(v3), live_id!(v4), live_id!(v5), live_id!(v6), live_id!(v7),
-    live_id!(v8), live_id!(v9), live_id!(v10), live_id!(v11), live_id!(v12), live_id!(v13), live_id!(v14), live_id!(v15),
 ];
 
 impl DrawStreamBars {
-    fn slots_mut(&mut self) -> [&mut Vec4f; 16] {
-        [
-            &mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3, &mut self.v4, &mut self.v5, &mut self.v6, &mut self.v7,
-            &mut self.v8, &mut self.v9, &mut self.v10, &mut self.v11, &mut self.v12, &mut self.v13, &mut self.v14, &mut self.v15,
-        ]
+    fn slots_mut(&mut self) -> [&mut Vec4f; 8] {
+        [&mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3, &mut self.v4, &mut self.v5, &mut self.v6, &mut self.v7]
     }
 
     fn set_values(&mut self, values: &[f32]) {
@@ -119,7 +108,7 @@ impl DrawStreamBars {
     fn write_in_place(&mut self, cx: &mut Cx) {
         let count = self.count;
         self.draw_vars.set_instance_on_area(cx, live_id!(count), &[count]);
-        for i in 0..16 {
+        for i in 0..8 {
             let v = *self.slots_mut()[i];
             self.draw_vars.set_instance_on_area(cx, SLOTS[i], &[v.x, v.y, v.z, v.w]);
         }
