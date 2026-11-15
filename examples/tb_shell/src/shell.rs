@@ -82,6 +82,11 @@ pub struct Shell {
     #[rust] no_rect: Rect,
     /// The person's answer to the raised guard, for the app to take.
     #[rust] answer: Option<bool>,
+    #[rust] strip_rect: Rect,
+    /// A tap on the strip: the app brings `home` to the front.
+    #[rust] go_home: bool,
+    /// A short note the strip shows after the front's name (the shell's own words).
+    #[rust] pub note: String,
 }
 
 /// Input events: while a guard is up none of these reach a surface.
@@ -119,6 +124,17 @@ impl Widget for Shell {
                     self.answer = self.pressed;
                 }
                 self.pressed = None;
+            }
+        }
+        // A tap on the strip, read from the raw pointer like the guard's: home.
+        if self.guard.is_none() {
+            let up = match event {
+                Event::MouseUp(e) if e.button == MouseButton::PRIMARY => Some(e.abs),
+                Event::TouchUpdate(e) => e.touches.iter().find(|t| t.state == TouchState::Stop).map(|t| t.abs),
+                _ => None,
+            };
+            if up.map_or(false, |p| self.strip_rect.contains(p)) {
+                self.go_home = true;
             }
         }
         let gated = self.guard.is_some() && is_input(event);
@@ -159,9 +175,10 @@ impl Shell {
     fn draw_strip(&mut self, cx: &mut Cx2d, rect: Rect) {
         // A raised guard turns the whole strip one solid colour no surface can set.
         self.draw_strip.color = if self.guard.is_some() { vec4(0.96, 0.62, 0.1, 1.0) } else { vec4(0.02, 0.027, 0.043, 1.0) };
-        self.draw_strip.draw_abs(cx, Rect { pos: rect.pos, size: dvec2(rect.size.x, self.strip_height) });
+        self.strip_rect = Rect { pos: rect.pos, size: dvec2(rect.size.x, self.strip_height) };
+        self.draw_strip.draw_abs(cx, self.strip_rect);
         let front = if self.front.is_empty() { "-" } else { self.front.as_str() };
-        let label = if self.guard.is_some() { "tb-shell   GUARD".to_string() } else { format!("tb-shell   {front}") };
+        let label = if self.guard.is_some() { "tb-shell   GUARD".to_string() } else { format!("tb-shell   {front}   {}", self.note) };
         self.draw_label.color = if self.guard.is_some() { vec4(0.0, 0.0, 0.0, 1.0) } else { vec4(0.6, 0.64, 0.7, 1.0) };
         self.draw_label.draw_abs(cx, rect.pos + dvec2(12.0, 8.0), &label);
         let mut x = rect.pos.x + rect.size.x - 12.0;
@@ -244,6 +261,10 @@ impl Shell {
 
     pub fn take_answer(&mut self) -> Option<bool> {
         self.answer.take()
+    }
+
+    pub fn take_go_home(&mut self) -> bool {
+        std::mem::take(&mut self.go_home)
     }
 }
 
