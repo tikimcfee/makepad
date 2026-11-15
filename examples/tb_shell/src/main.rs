@@ -201,6 +201,8 @@ struct State {
     views: HashSet<String>,
     notified: bool,
     placement: sched::Placement,
+    /// The note's end (a one-shot timer, only while a note is up).
+    note_timer: Timer,
 }
 
 #[derive(Script, ScriptHook)]
@@ -249,7 +251,13 @@ impl AppMain for App {
         if let Event::Draw(_) = event {
             self.notify_ready();
         }
+        if self.st.note_timer.is_event(event).is_some() {
+            self.clear_note(cx);
+        }
         let home = self.shell(cx).borrow_mut::<Shell>().map_or(false, |mut sh| sh.take_go_home());
+        if home {
+            self.clear_note(cx);
+        }
         if home && self.st.guards.is_empty() && self.st.bodies.contains_key("home") {
             self.apply(cx, &obj(vec![("front", "home".into())]), "shell");
         }
@@ -353,8 +361,9 @@ impl App {
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
         self.read_mic(cx);
-        self.left_out(cx);
+        let before = Self::surfaces_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         self.load_views(cx);
+        self.left_out(cx, &before);
     }
 
     /// The views folder (TB_SHELL_VIEWS, else `views/` beside the binary): every
@@ -370,13 +379,20 @@ impl App {
         for path in files {
             let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let Ok(body) = std::fs::read_to_string(&path) else { continue };
+            // A view before it is shown, so the agents' surfaces file never lists it.
+            self.st.views.insert(name.clone());
             match self.show(cx, &name, &body, false) {
                 Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
                     log!("tb-shell: view {name} shown in {} ms", reply.get("ms").map_or(String::new(), |m| m.serialize_json()));
-                    self.st.views.insert(name);
                 }
-                Ok(reply) => error!("tb-shell: view {name}: {}", reply.serialize_json()),
-                Err(e) => error!("tb-shell: view {name}: {e}"),
+                Ok(reply) => {
+                    self.st.views.remove(&name);
+                    error!("tb-shell: view {name}: {}", reply.serialize_json())
+                }
+                Err(e) => {
+                    self.st.views.remove(&name);
+                    error!("tb-shell: view {name}: {e}")
+                }
             }
         }
         log!("tb-shell: {} views from {}", self.st.views.len(), dir.display());
@@ -392,18 +408,29 @@ impl App {
         env("XDG_RUNTIME_DIR").map(|d| format!("{d}/tb-shell.agent-surfaces"))
     }
 
-    fn left_out(&mut self, cx: &mut Cx) {
-        let Some(file) = Self::surfaces_file() else { return };
-        let names = std::fs::read_to_string(&file).unwrap_or_default();
-        let names: Vec<&str> = names.split_whitespace().collect();
+    /// `before`: the file as the last run left it. The shell's own views are never named;
+    /// the note goes on a tap on the strip or after ten seconds.
+    fn left_out(&mut self, cx: &mut Cx, before: &str) {
+        let names: Vec<&str> = before.split_whitespace().filter(|n| !self.st.views.contains(*n)).collect();
         if !names.is_empty() {
             let note = format!("left out: {}", names.join(", "));
             log!("tb-shell: after a restart, {note}");
             if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
                 sh.note = note;
             }
+            self.st.note_timer = cx.start_timeout(10.0);
         }
-        let _ = std::fs::write(&file, "");
+        self.write_surfaces_file();
+    }
+
+    fn clear_note(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.st.note_timer);
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            if !sh.note.is_empty() {
+                sh.note.clear();
+                cx.redraw_all();
+            }
+        }
     }
 
     /// systemd's Type=notify: READY=1 once the first frame is drawn.
