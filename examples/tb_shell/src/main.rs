@@ -358,6 +358,7 @@ impl App {
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
         self.st.trace = paneltrace::PanelTrace::from_env();
+        self.guard_input(cx);
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
         self.read_mic(cx);
@@ -457,6 +458,29 @@ impl App {
         let mut names: Vec<&String> = self.st.bodies.keys().filter(|n| !self.st.views.contains(*n)).collect();
         names.sort();
         let _ = std::fs::write(&file, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(" "));
+    }
+
+    /// Who may answer a guard: the --remote endpoint decides whether input can be
+    /// injected; root's test switch, a root-owned file at a fixed path (a path given
+    /// by env would let any process of the user point it at a root-owned file), lets
+    /// injected taps count, for the proof scripts. The log and the strip say so.
+    fn guard_input(&mut self, cx: &mut Cx) {
+        const TEST_TAPS: &str = "/etc/tb-shell/guard-test-taps";
+        let remote_on = std::env::args().any(|a| a.starts_with("--remote")) || env("MAKEPAD_REMOTE").is_some();
+        let roots = |p: &str| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).map_or(false, |m| m.uid() == 0 && m.mode() & 0o022 == 0)
+        };
+        let test_taps = roots(TEST_TAPS) && roots("/etc/tb-shell");
+        if test_taps {
+            log!("tb-shell: TEST SWITCH ON ({TEST_TAPS}, root's): injected input may answer a guard");
+        }
+        log!("tb-shell: guard answers: {}", if !remote_on { "the device only (no --remote endpoint)" } else if test_taps { "any input (test switch)" } else { "the device only (injected input through --remote is ignored)" });
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            sh.guard_input.remote_on = remote_on;
+            sh.guard_input.test_taps = test_taps;
+            sh.marks.test_taps = test_taps;
+        }
     }
 
     /// The recording mark, from the kernel's capture status (on start and on
