@@ -182,6 +182,22 @@ pub fn read_file_cwd_or_exe_relative(
         .or_else(|| read(path)).or_else(|| read(&exe_relative_path(path)?))
 }
 
+/// The file `read_file_cwd_or_exe_relative` would read `path` from: the first of its places
+/// that holds one. For a caller that maps the file instead of reading it.
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(all(target_os = "macos", apple_bundle))
+))]
+pub(crate) fn find_file_cwd_or_exe_relative(
+    packages: &std::collections::HashMap<String, PathBuf>,
+    path: impl AsRef<Path>,
+) -> Option<PathBuf> {
+    let path = path.as_ref();
+    source_resource_path(packages, path).filter(|p| p.is_file())
+        .or_else(|| path.is_file().then(|| path.to_path_buf()))
+        .or_else(|| exe_relative_path(path).filter(|p| p.is_file()))
+}
+
 // lets start a websocket thread
 
 impl Cx {
