@@ -416,9 +416,10 @@ impl App {
             log!("tb-shell: {} trusted bodies from {dir}", self.st.trusted.len());
         }
 
-        // The panel and the marks: files and device nodes, watched by inotify.
+        // The panel and the marks: files and device nodes, watched by sysfs poll / inotify.
         let s = &mut self.st.sources;
         if let Some(file) = env("TB_SHELL_PANEL_FILE") {
+            io::watch_panel_sysfs(&file, tx.clone());
             s.panel = Some((file, env("TB_SHELL_PANEL_OFF").unwrap_or("off".into())));
         }
         if let (Some(dir), Some(status)) = (env("TB_SHELL_MIC_DIR"), env("TB_SHELL_MIC_STATUS")) {
@@ -815,9 +816,13 @@ impl App {
     }
 
     fn check_panel(&mut self, cx: &mut Cx) {
+        self.check_panel_inner(cx, false);
+    }
+
+    fn check_panel_inner(&mut self, cx: &mut Cx, force: bool) {
         let s = &mut self.st.sources;
         let Some((file, off_value)) = &s.panel else { return };
-        if s.panel_read.map_or(false, |t| t.elapsed().as_millis() < 250) {
+        if !force && s.panel_read.map_or(false, |t| t.elapsed().as_millis() < 250) {
             return;
         }
         s.panel_read = Some(Instant::now());
@@ -861,6 +866,7 @@ impl App {
         let Some(rx) = self.st.rx.take() else { return };
         let mut mic_changed = false;
         let mut loud_changed = false;
+        let mut panel_changed = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Open { conn, tx, peer } => {
@@ -879,6 +885,7 @@ impl App {
                 }
                 Msg::MicChanged => mic_changed = true,
                 Msg::LoudChanged => loud_changed = true,
+                Msg::PanelChanged => panel_changed = true,
                 Msg::Line { conn, line } => {
                     if self.st.split.on() && (line.contains("\"op\":\"set\"") || line.contains("\"op\":\"push\"")) {
                         self.st.split.begin();
@@ -911,6 +918,9 @@ impl App {
         }
         if loud_changed {
             self.read_loud(cx);
+        }
+        if panel_changed {
+            self.check_panel_inner(cx, true);
         }
     }
 

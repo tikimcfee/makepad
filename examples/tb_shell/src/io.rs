@@ -38,12 +38,23 @@ pub enum Msg {
     MicChanged,
     /// Speaker state file written or moved into place: re-read the loud mark status.
     LoudChanged,
+    /// Kernel `sysfs_notify` on `/sys/kernel/tinybot_panel/state`: re-read panel state now.
+    PanelChanged,
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 extern "C" {
     fn getsockopt(fd: i32, level: i32, name: i32, val: *mut c_void, len: *mut u32) -> i32;
     fn inotify_init1(flags: i32) -> i32;
     fn inotify_add_watch(fd: i32, path: *const std::ffi::c_char, mask: u32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
 }
 
 const SOL_SOCKET: i32 = 1;
@@ -232,6 +243,57 @@ pub fn watch_speaker_state(state_file: &str, tx: Sender<Msg>) {
                 let _ = tx.send(Msg::LoudChanged);
                 SignalToUI::set_ui_signal();
             }
+        }
+    });
+}
+
+/// Watches a sysfs attribute (e.g. `/sys/kernel/tinybot_panel/state`) via
+/// `poll(POLLPRI | POLLERR)` after `read + lseek(0)` (`sysfs_notify` in kernel).
+/// Zero timers and zero wake-ups at rest. Skipped for non-`/sys/` test files.
+pub fn watch_panel_sysfs(state_file: &str, tx: Sender<Msg>) {
+    const POLLPRI: i16 = 0x0002;
+    const POLLERR: i16 = 0x0008;
+    const SEEK_SET: i32 = 0;
+    if !state_file.starts_with("/sys/") {
+        return;
+    }
+    let mut file = match std::fs::File::open(state_file) {
+        Ok(f) => f,
+        Err(e) => {
+            log!("tb-shell: cannot open {state_file} for sysfs poll: {e}");
+            return;
+        }
+    };
+    let path = state_file.to_string();
+    spawn("tb-watch-panel", move || {
+        let fd = file.as_raw_fd();
+        let mut buf = [0u8; 64];
+        // Initial read arms kernfs `of->event` to the current notification counter.
+        let _ = file.read(&mut buf);
+        unsafe {
+            lseek(fd, 0, SEEK_SET);
+        }
+        log!("tb-shell: watching {path} via sysfs poll(POLLPRI)");
+        loop {
+            let mut pfd = PollFd { fd, events: POLLPRI | POLLERR, revents: 0 };
+            let rc = unsafe { poll(&mut pfd, 1, -1) };
+            if rc < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(4) {
+                    continue; // EINTR
+                }
+                break;
+            }
+            if pfd.revents & (POLLPRI | POLLERR) == 0 {
+                break;
+            }
+            unsafe {
+                lseek(fd, 0, SEEK_SET);
+            }
+            if file.read(&mut buf).is_err() {
+                break;
+            }
+            let _ = tx.send(Msg::PanelChanged);
+            SignalToUI::set_ui_signal();
         }
     });
 }
