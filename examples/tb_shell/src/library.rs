@@ -1,10 +1,13 @@
-//! Persistent reusable Splash library (`~/.local/share/tb-shell/lib/`), saved agent
-//! screens (`~/.local/share/tb-shell/screens/`), and 60-second crash-loop guard.
+//! Live `ui/lib` (`base.splash` + system pieces in `/usr/share/tinybot/ui/lib/`),
+//! user reusable Splash library (`~/.local/share/tb-shell/lib/`), saved agent screens
+//! (`~/.local/share/tb-shell/screens/`), and 60-second crash-loop guard.
 
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_UI_ROOT: &str = "/usr/share/tinybot/ui";
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -25,6 +28,36 @@ fn data_root() -> PathBuf {
         return PathBuf::from(home).join(".local/share/tb-shell");
     }
     PathBuf::from("/tmp/tb-shell-data")
+}
+
+/// Resolves a live UI subdirectory (`views`, `trusted`, `lib`):
+/// 1. Explicit `env_var` if set;
+/// 2. `$TB_SHELL_UI_DIR/<sub_name>` or `/usr/share/tinybot/ui/<sub_name>` if that directory exists;
+/// 3. `<bundle_or_exe_dir>/<sub_name>` fallback.
+pub fn resolve_ui_subdir(env_var: &str, sub_name: &str) -> Option<PathBuf> {
+    if let Some(custom) = env_nonempty(env_var) {
+        return Some(PathBuf::from(custom));
+    }
+    let ui_root = env_nonempty("TB_SHELL_UI_DIR").unwrap_or_else(|| DEFAULT_UI_ROOT.to_string());
+    let live = PathBuf::from(ui_root).join(sub_name);
+    if live.is_dir() {
+        return Some(live);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let direct = parent.join(sub_name);
+            if direct.is_dir() {
+                return Some(direct);
+            }
+            if let Some(grand) = parent.parent() {
+                let bundled = grand.join(sub_name);
+                if bundled.is_dir() {
+                    return Some(bundled);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn valid_piece_name(name: &str) -> bool {
@@ -92,7 +125,9 @@ fn atomic_write(dir: &Path, filename: &str, content: &str) -> Result<(), String>
 pub struct StorePersistence {
     pub lib_dir: PathBuf,
     pub screens_dir: PathBuf,
-    /// Sorted `(name, normalized_source_with_trailing_newline)`.
+    /// Active `base.splash` + any extra `/usr/share/tinybot/ui/lib/*.splash` pieces.
+    pub sys_base_source: String,
+    /// Sorted user pieces `(name, normalized_source_with_trailing_newline)` from `~/.local/share/tb-shell/lib/`.
     pub pieces: Vec<(String, String)>,
     /// Last-used unix epoch seconds per piece name.
     pub used: HashMap<String, u64>,
@@ -101,21 +136,54 @@ pub struct StorePersistence {
 }
 
 impl StorePersistence {
-    pub fn load() -> Self {
+    pub fn load(compiled_base: &str) -> Self {
         let root = data_root();
         let lib_dir = env_nonempty("TB_SHELL_LIB_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("lib"));
         let screens_dir = env_nonempty("TB_SHELL_SCREENS_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("screens"));
         let mut me = Self {
             lib_dir,
             screens_dir,
+            sys_base_source: ensure_trailing_newline(compiled_base),
             pieces: Vec::new(),
             used: HashMap::new(),
             titles: HashMap::new(),
         };
-        me.reload_lib();
+        me.reload_all(compiled_base);
         me.load_used();
         me.load_titles();
         me
+    }
+
+    /// Reloads `base.splash`, system `/usr/share/tinybot/ui/lib/*.splash`, and user `~/.local/share/tb-shell/lib/*.splash`.
+    pub fn reload_all(&mut self, compiled_base: &str) {
+        let ui_lib = resolve_ui_subdir("TB_SHELL_UI_LIB", "lib");
+        let base_text = env_nonempty("TB_SHELL_BASE")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .or_else(|| ui_lib.as_ref().and_then(|d| std::fs::read_to_string(d.join("base.splash")).ok()))
+            .unwrap_or_else(|| compiled_base.to_string());
+        let mut sys_src = ensure_trailing_newline(&base_text);
+
+        if let Some(dir) = ui_lib {
+            let mut sys_paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |x| x == "splash"))
+                .collect();
+            sys_paths.sort();
+            for p in sys_paths {
+                let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else { continue };
+                if stem == "base" {
+                    continue;
+                }
+                if let Ok(body) = std::fs::read_to_string(&p) {
+                    sys_src.push_str(&ensure_trailing_newline(&body));
+                }
+            }
+        }
+        self.sys_base_source = sys_src;
+        self.reload_lib();
     }
 
     pub fn reload_lib(&mut self) {
@@ -180,18 +248,16 @@ impl StorePersistence {
         let _ = atomic_write(&self.screens_dir, ".titles.json", &text);
     }
 
-    /// Concatenated source of all library pieces in deterministic order.
-    pub fn lib_source(&self) -> String {
-        let mut out = String::new();
+    pub fn base_and_lib_source(&self) -> String {
+        let mut out = self.sys_base_source.clone();
         for (_, src) in &self.pieces {
             out.push_str(src);
         }
         out
     }
 
-    /// Concatenated source of all library pieces except `skip` (for validating a replacement).
-    pub fn lib_source_except(&self, skip: &str) -> String {
-        let mut out = String::new();
+    pub fn base_and_lib_except(&self, skip: &str) -> String {
+        let mut out = self.sys_base_source.clone();
         for (name, src) in &self.pieces {
             if name != skip {
                 out.push_str(src);
@@ -200,8 +266,8 @@ impl StorePersistence {
         out
     }
 
-    pub fn lib_lines(&self) -> usize {
-        self.pieces.iter().map(|(_, src)| src.lines().count()).sum()
+    pub fn base_and_lib_lines(&self) -> usize {
+        self.sys_base_source.lines().count() + self.pieces.iter().map(|(_, src)| src.lines().count()).sum::<usize>()
     }
 
     pub fn record_usage(&mut self, body: &str) {
@@ -342,9 +408,6 @@ impl CrashGuard {
             .map(|d| PathBuf::from(d).join(format!("tb-shell.{suffix}")))
     }
 
-    /// Checks whether the previous instance died without reaching `Event::Shutdown`,
-    /// updates the 60-second crash window, arms `.running`, and returns
-    /// `(previous_died_uncleanly, crashes_in_last_60s)`.
     pub fn check_on_start() -> (bool, usize) {
         let Some(running) = Self::runtime_file("running") else { return (false, 0) };
         let Some(crashes_file) = Self::runtime_file("crashes") else { return (false, 0) };
