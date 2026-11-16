@@ -1,21 +1,31 @@
 // HOME: the views, one tap away. The strip at the top always comes back here.
-let Tile = Squircle{height: 96 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
+let Tile = Squircle{
+    height: 86 flow: Down spacing: 3 align: Align{x: 0.0 y: 0.5}
     t := Title{}
-    s := Small{}
+    s := Small{width: Fill max_lines: 1 text_overflow: Ellipsis}
 }
 width: Fill height: Fill flow: Down padding: 16
 main := View{
-    width: Fill height: Fit flow: Down spacing: 12
+    width: Fill height: Fit flow: Down spacing: 10
     on_item_tap: |i| {
         if i == 0 { front("agents") }
         if i == 1 { front("voice") }
         if i == 2 { front("battery") }
+        if i == 3 { front("chat") }
+        if i == 4 { front("sound") }
+        if i == 5 { front("display") }
     }
     on_render: || {
         let b = state.battery ?? nil
         let v = state.voice ?? nil
+        let c = state.chat ?? nil
+        let snd = state.sound ?? nil
+        let d = state.display ?? nil
         Tile{t.text: "Agents" s.text: "default: " + agent_name(state.agents ?? nil, state.target ?? nil)}
         Tile{t.text: "Voice" s.text: if v == nil { "quiet" } else { v.text ?? "quiet" }}
         Tile{t.text: "Battery" s.text: if b == nil { "no reading yet" } else { show(b.pct ?? nil, " %") + "  " + (b.state ?? "") }}
+        Tile{t.text: "Chat" s.text: if c == nil { "no replies yet" } else { (c.agent ?? "chat") + ": " + (c.preview ?? "no replies yet") }}
+        Tile{t.text: "Sound" s.text: if snd == nil { "no reading yet" } else { show(snd.volume_db ?? nil, " dB") + "  " + (snd.speaker_state ?? "") }}
+        Tile{t.text: "Display" s.text: if d == nil { "no reading yet" } else { show(d.brightness ?? nil, "") + " / " + show(d.max ?? 255, "") + "  panel " + (d.panel ?? "?") }}
     }
 }
