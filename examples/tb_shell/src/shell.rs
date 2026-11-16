@@ -102,6 +102,8 @@ pub struct Shell {
     #[rust] go_home: bool,
     /// A short note the strip shows after the front's name (the shell's own words).
     #[rust] pub note: String,
+    /// `(surface_name, cpu_draw_ms)` from the latest `draw_walk` of the front surface.
+    #[rust] pub last_draw_ms: Option<(String, f64)>,
 }
 
 /// Input events: while a guard is up none of these reach a surface.
@@ -179,8 +181,10 @@ impl Widget for Shell {
         let layout = Layout { padding: Inset { top: self.strip_height, ..Inset::default() }, ..Layout::flow_down() };
         cx.begin_turtle(walk, layout);
         let rect = cx.turtle().rect();
-        if let Some((_, splash)) = self.surfaces.iter().find(|(n, _)| *n == self.front) {
+        if let Some((name, splash)) = self.surfaces.iter().find(|(n, _)| *n == self.front).map(|(n, s)| (n.clone(), s.clone())) {
+            let t0 = std::time::Instant::now();
             splash.draw_walk_all(cx, scope, Walk::fill());
+            self.last_draw_ms = Some((name, t0.elapsed().as_secs_f64() * 1000.0));
         }
         self.top_list.begin_overlay_last(cx);
         if let Some(guard) = self.guard.clone() {
@@ -209,7 +213,7 @@ impl Shell {
         self.draw_label.color = if self.guard.is_some() { vec4(0.0, 0.0, 0.0, 1.0) } else { vec4(0.6, 0.64, 0.7, 1.0) };
         self.draw_label.draw_abs(cx, rect.pos + dvec2(12.0, 8.0), &label);
         let mut x = rect.pos.x + rect.size.x - 12.0;
-        // The loud mark's place is kept; its source (the sound tool's state) comes later.
+        // Marks from kernel and speaker-service state (`MIC`, `LOUD`, and root's `TEST` switch).
         for (on, text, color) in [(self.marks.mic, "MIC", vec4(1.0, 0.35, 0.35, 1.0)), (self.marks.loud, "LOUD", vec4(1.0, 0.75, 0.2, 1.0)), (self.marks.test_taps, "TEST", vec4(1.0, 0.2, 1.0, 1.0))] {
             if on {
                 x -= 8.0 * text.len() as f64 + 10.0;

@@ -1,0 +1,373 @@
+//! Persistent reusable Splash library (`~/.local/share/tb-shell/lib/`), saved agent
+//! screens (`~/.local/share/tb-shell/screens/`), and 60-second crash-loop guard.
+
+use makepad_micro_serde::{DeJson, JsonValue, SerJson};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+pub fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn data_root() -> PathBuf {
+    if let Some(d) = env_nonempty("TB_SHELL_DATA_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Some(d) = env_nonempty("XDG_DATA_HOME") {
+        return PathBuf::from(d).join("tb-shell");
+    }
+    if let Some(home) = env_nonempty("HOME") {
+        return PathBuf::from(home).join(".local/share/tb-shell");
+    }
+    PathBuf::from("/tmp/tb-shell-data")
+}
+
+pub fn valid_piece_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    name.len() <= 64
+        && name != "base"
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// True if `ident` appears as a whole identifier token in `text`.
+pub fn ident_in(text: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let b = text.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut at = 0;
+    while let Some(off) = text[at..].find(ident) {
+        let i = at + off;
+        let end = i + ident.len();
+        let before_ok = i == 0 || !is_id(b[i - 1]);
+        let after_ok = end >= b.len() || !is_id(b[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        at = i + 1;
+    }
+    false
+}
+
+/// Extracts a one-line description from line 1 of a Splash library file (`// ...`).
+pub fn first_line_desc(body: &str) -> String {
+    let first = body.lines().next().unwrap_or("").trim();
+    if let Some(rest) = first.strip_prefix("//") {
+        rest.trim().to_string()
+    } else if let Some(rest) = first.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")) {
+        rest.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.ends_with('\n') {
+        s.to_string()
+    } else {
+        format!("{s}\n")
+    }
+}
+
+fn atomic_write(dir: &Path, filename: &str, content: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".{filename}.tmp.{}", std::process::id()));
+    let dst = dir.join(filename);
+    std::fs::write(&tmp, content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {}: {e}", dst.display())
+    })
+}
+
+#[derive(Default)]
+pub struct StorePersistence {
+    pub lib_dir: PathBuf,
+    pub screens_dir: PathBuf,
+    /// Sorted `(name, normalized_source_with_trailing_newline)`.
+    pub pieces: Vec<(String, String)>,
+    /// Last-used unix epoch seconds per piece name.
+    pub used: HashMap<String, u64>,
+    /// Optional human title per saved screen name.
+    pub titles: HashMap<String, String>,
+}
+
+impl StorePersistence {
+    pub fn load() -> Self {
+        let root = data_root();
+        let lib_dir = env_nonempty("TB_SHELL_LIB_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("lib"));
+        let screens_dir = env_nonempty("TB_SHELL_SCREENS_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("screens"));
+        let mut me = Self {
+            lib_dir,
+            screens_dir,
+            pieces: Vec::new(),
+            used: HashMap::new(),
+            titles: HashMap::new(),
+        };
+        me.reload_lib();
+        me.load_used();
+        me.load_titles();
+        me
+    }
+
+    pub fn reload_lib(&mut self) {
+        self.pieces.clear();
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.lib_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "splash"))
+            .collect();
+        paths.sort();
+        for p in paths {
+            let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else { continue };
+            if !valid_piece_name(&stem) {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(&p) {
+                self.pieces.push((stem, ensure_trailing_newline(&body)));
+            }
+        }
+    }
+
+    fn load_used(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.lib_dir.join(".used")) else { return };
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                if let Ok(ts) = v.trim().parse::<u64>() {
+                    self.used.insert(k.trim().to_string(), ts);
+                }
+            }
+        }
+    }
+
+    fn save_used(&self) {
+        if !self.lib_dir.exists() && self.used.is_empty() {
+            return;
+        }
+        let mut keys: Vec<&String> = self.used.keys().collect();
+        keys.sort();
+        let text: String = keys.into_iter().map(|k| format!("{k}={}\n", self.used[k])).collect();
+        let _ = atomic_write(&self.lib_dir, ".used", &text);
+    }
+
+    fn load_titles(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.screens_dir.join(".titles.json")) else { return };
+        if let Ok(JsonValue::Object(map)) = JsonValue::deserialize_json(&text) {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    self.titles.insert(k, s.to_string());
+                }
+            }
+        }
+    }
+
+    fn save_titles(&self) {
+        if !self.screens_dir.exists() && self.titles.is_empty() {
+            return;
+        }
+        let map: HashMap<String, JsonValue> = self.titles.iter().map(|(k, v)| (k.clone(), JsonValue::String(v.clone()))).collect();
+        let text = JsonValue::Object(map).serialize_json();
+        let _ = atomic_write(&self.screens_dir, ".titles.json", &text);
+    }
+
+    /// Concatenated source of all library pieces in deterministic order.
+    pub fn lib_source(&self) -> String {
+        let mut out = String::new();
+        for (_, src) in &self.pieces {
+            out.push_str(src);
+        }
+        out
+    }
+
+    /// Concatenated source of all library pieces except `skip` (for validating a replacement).
+    pub fn lib_source_except(&self, skip: &str) -> String {
+        let mut out = String::new();
+        for (name, src) in &self.pieces {
+            if name != skip {
+                out.push_str(src);
+            }
+        }
+        out
+    }
+
+    pub fn lib_lines(&self) -> usize {
+        self.pieces.iter().map(|(_, src)| src.lines().count()).sum()
+    }
+
+    pub fn record_usage(&mut self, body: &str) {
+        let now = now_unix();
+        let mut dirty = false;
+        for (name, _) in &self.pieces {
+            if ident_in(body, name) {
+                self.used.insert(name.clone(), now);
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_used();
+        }
+    }
+
+    pub fn put_piece(&mut self, name: &str, body: &str) -> Result<(), String> {
+        if !valid_piece_name(name) {
+            return Err("a library piece name is 1..64 of A-Z a-z 0-9 _ - (starting with a letter or _, not \"base\")".into());
+        }
+        let norm = ensure_trailing_newline(body);
+        atomic_write(&self.lib_dir, &format!("{name}.splash"), &norm)?;
+        match self.pieces.iter_mut().find(|(n, _)| n == name) {
+            Some((_, slot)) => *slot = norm,
+            None => {
+                self.pieces.push((name.to_string(), norm));
+                self.pieces.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rm_piece(&mut self, name: &str) -> Result<(), String> {
+        let path = self.lib_dir.join(format!("{name}.splash"));
+        if !path.exists() {
+            return Err(format!("no library piece {name}"));
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        self.pieces.retain(|(n, _)| n != name);
+        self.used.remove(name);
+        self.save_used();
+        Ok(())
+    }
+
+    pub fn cat_piece(&self, name: &str) -> Option<&str> {
+        self.pieces.iter().find(|(n, _)| n == name).map(|(_, s)| s.as_str())
+    }
+
+    pub fn ls_pieces(&self, unused_days: Option<u64>) -> Vec<JsonValue> {
+        let now = now_unix();
+        let mut out = Vec::new();
+        for (name, src) in &self.pieces {
+            let last = self.used.get(name).copied();
+            let age_secs = last.map(|t| now.saturating_sub(t));
+            if let Some(days) = unused_days {
+                let threshold = days.saturating_mul(86_400);
+                let is_unused = match age_secs {
+                    None => true,
+                    Some(age) => age >= threshold,
+                };
+                if !is_unused {
+                    continue;
+                }
+            }
+            let mut m = HashMap::new();
+            m.insert("name".into(), JsonValue::String(name.clone()));
+            m.insert("description".into(), JsonValue::String(first_line_desc(src)));
+            m.insert("last_used".into(), last.map_or(JsonValue::Null, |t| JsonValue::U64(t)));
+            m.insert("age_secs".into(), age_secs.map_or(JsonValue::Null, |a| JsonValue::U64(a)));
+            out.push(JsonValue::Object(m));
+        }
+        out
+    }
+
+    pub fn save_screen(&mut self, surface: &str, body: &str, title: Option<&str>) -> Result<(), String> {
+        let norm = ensure_trailing_newline(body);
+        atomic_write(&self.screens_dir, &format!("{surface}.splash"), &norm)?;
+        if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+            self.titles.insert(surface.to_string(), t.trim().to_string());
+            self.save_titles();
+        }
+        Ok(())
+    }
+
+    pub fn unsave_screen(&mut self, surface: &str) -> Result<bool, String> {
+        let path = self.screens_dir.join(format!("{surface}.splash"));
+        let existed = path.exists();
+        if existed {
+            std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        }
+        if self.titles.remove(surface).is_some() {
+            self.save_titles();
+        }
+        Ok(existed)
+    }
+
+    pub fn is_saved(&self, surface: &str) -> bool {
+        self.screens_dir.join(format!("{surface}.splash")).exists()
+    }
+
+    pub fn title_of(&self, surface: &str) -> Option<&str> {
+        self.titles.get(surface).map(String::as_str)
+    }
+
+    pub fn saved_screen_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.screens_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "splash"))
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    pub fn load_saved_screens(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for name in self.saved_screen_names() {
+            let p = self.screens_dir.join(format!("{name}.splash"));
+            if let Ok(body) = std::fs::read_to_string(&p) {
+                out.push((name, body));
+            }
+        }
+        out
+    }
+}
+
+/// Tracks unclean exits across restarts in `$XDG_RUNTIME_DIR` so >= 2 crashes within
+/// 60 seconds skip saved agent screens and report them in the strip.
+pub struct CrashGuard;
+
+impl CrashGuard {
+    fn runtime_file(suffix: &str) -> Option<PathBuf> {
+        env_nonempty("TB_SHELL_RUNTIME_DIR")
+            .or_else(|| env_nonempty("XDG_RUNTIME_DIR"))
+            .map(|d| PathBuf::from(d).join(format!("tb-shell.{suffix}")))
+    }
+
+    /// Checks whether the previous instance died without reaching `Event::Shutdown`,
+    /// updates the 60-second crash window, arms `.running`, and returns
+    /// `(previous_died_uncleanly, crashes_in_last_60s)`.
+    pub fn check_on_start() -> (bool, usize) {
+        let Some(running) = Self::runtime_file("running") else { return (false, 0) };
+        let Some(crashes_file) = Self::runtime_file("crashes") else { return (false, 0) };
+        let now = now_unix();
+        let prev_unclean = running.exists();
+        let mut stamps: Vec<u64> = std::fs::read_to_string(&crashes_file)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .filter(|&t| now.saturating_sub(t) <= 60)
+            .collect();
+        if prev_unclean {
+            stamps.push(now);
+        }
+        let body = stamps.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
+        let _ = std::fs::write(&crashes_file, body);
+        let _ = std::fs::write(&running, format!("{}", std::process::id()));
+        (prev_unclean, stamps.len())
+    }
+
+    pub fn mark_clean_shutdown() {
+        if let Some(running) = Self::runtime_file("running") {
+            let _ = std::fs::remove_file(running);
+        }
+    }
+}
