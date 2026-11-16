@@ -1,5 +1,5 @@
 //! Threads that block, so the UI thread never does: the socket (an accept
-//! thread, and per connection a reader and a writer) and an inotify watcher.
+//! thread, and per connection a reader and a writer) and inotify watchers.
 //! Each wakes the UI with `SignalToUI` only when something arrived.
 
 use makepad_widgets::*;
@@ -7,6 +7,7 @@ use std::ffi::{c_void, CString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// Who is on the other end of a connection, from the kernel (SO_PEERCRED).
@@ -33,8 +34,10 @@ pub enum Msg {
     Open { conn: u64, tx: Sender<String>, peer: Peer },
     Line { conn: u64, line: String },
     Closed { conn: u64 },
-    /// A watched path changed: the app reads its sources again.
-    Changed,
+    /// Capture device node opened or closed: re-read the recording mark status.
+    MicChanged,
+    /// Speaker state file written or moved into place: re-read the loud mark status.
+    LoudChanged,
 }
 
 extern "C" {
@@ -117,28 +120,32 @@ pub fn listen(path: &str, tx: Sender<Msg>) {
 const IN_CLOSE_WRITE: u32 = 0x8;
 const IN_CLOSE_NOWRITE: u32 = 0x10;
 const IN_OPEN: u32 = 0x20;
+const IN_MOVED_FROM: u32 = 0x40;
+const IN_MOVED_TO: u32 = 0x80;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_DELETE_SELF: u32 = 0x400;
+const IN_MOVE_SELF: u32 = 0x800;
+const IN_IGNORED: u32 = 0x8000;
 const IN_CLOEXEC: i32 = 0o2000000;
 
 /// Watches a sound device directory for opens and closes of capture nodes
 /// (`pcmC*D*c`) with inotify; the thread blocks in read(), so nothing wakes
-/// at rest, and playback or control opens do not wake the UI. The events only
-/// say WHEN to read the capture status: the mark is the status, never a count.
-/// If the directory itself goes (replaced by the device manager), the watch is
-/// armed again on the new one, and a read is asked for.
+/// at rest, and playback or control opens do not wake the UI.
 pub fn watch_capture(dir: &str, tx: Sender<Msg>) {
-    const IN_DELETE_SELF: u32 = 0x400;
-    const IN_MOVE_SELF: u32 = 0x800;
-    const IN_IGNORED: u32 = 0x8000;
     let mask = IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_DELETE_SELF | IN_MOVE_SELF;
     let fd = unsafe { inotify_init1(IN_CLOEXEC) };
     let Ok(c) = CString::new(dir) else { return };
     if fd < 0 || unsafe { inotify_add_watch(fd, c.as_ptr(), mask) } < 0 {
         error!("tb-shell: cannot watch {dir}: {}; the recording mark is not kept", std::io::Error::last_os_error());
+        if fd >= 0 {
+            let _ = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
         return;
     }
     let dir = dir.to_string();
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    spawn("tb-watch", move || {
+    spawn("tb-watch-mic", move || {
         let mut buf = vec![0u8; 4096];
         loop {
             let Ok(n) = file.read(&mut buf) else { break };
@@ -154,8 +161,6 @@ pub fn watch_capture(dir: &str, tx: Sender<Msg>) {
                 at += 16 + len;
             }
             if gone {
-                // The directory was replaced: arm the watch on the new one (once a second
-                // until it is there: this happens only when the device manager rebuilds it).
                 log!("tb-shell: {dir} went away; watching it again");
                 loop {
                     if unsafe { inotify_add_watch(file.as_raw_fd(), c.as_ptr(), mask) } >= 0 {
@@ -166,7 +171,65 @@ pub fn watch_capture(dir: &str, tx: Sender<Msg>) {
                 hit = true;
             }
             if hit {
-                let _ = tx.send(Msg::Changed);
+                let _ = tx.send(Msg::MicChanged);
+                SignalToUI::set_ui_signal();
+            }
+        }
+    });
+}
+
+/// Watches the parent directory of `state_file` (e.g. `/run/tinybot/speaker-state`)
+/// for atomic renames (`IN_MOVED_TO`), writes (`IN_CLOSE_WRITE`), or removals of
+/// that exact filename. Blocks in `read()` with zero wake-ups at rest.
+pub fn watch_speaker_state(state_file: &str, tx: Sender<Msg>) {
+    let p = Path::new(state_file);
+    let Some(dir) = p.parent().and_then(|d| d.to_str()).filter(|d| !d.is_empty()) else { return };
+    let Some(target) = p.file_name().and_then(|f| f.to_str()).filter(|f| !f.is_empty()) else { return };
+    if !Path::new(dir).exists() {
+        log!("tb-shell: {dir} not present; loud mark watcher inactive");
+        return;
+    }
+    let mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF;
+    let fd = unsafe { inotify_init1(IN_CLOEXEC) };
+    let Ok(c) = CString::new(dir) else { return };
+    if fd < 0 || unsafe { inotify_add_watch(fd, c.as_ptr(), mask) } < 0 {
+        error!("tb-shell: cannot watch {dir}: {}; the loud mark is not kept", std::io::Error::last_os_error());
+        if fd >= 0 {
+            let _ = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        return;
+    }
+    let dir = dir.to_string();
+    let target = target.to_string();
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    spawn("tb-watch-loud", move || {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok(n) = file.read(&mut buf) else { break };
+            let mut at = 0;
+            let mut hit = false;
+            let mut gone = false;
+            while at + 16 <= n {
+                let ev = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
+                let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
+                let raw = String::from_utf8_lossy(&buf[at + 16..(at + 16 + len).min(n)]);
+                let name = raw.trim_end_matches('\0');
+                hit |= name == target;
+                gone |= ev & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED) != 0;
+                at += 16 + len;
+            }
+            if gone {
+                log!("tb-shell: {dir} went away; watching it again");
+                for _ in 0..30 {
+                    if unsafe { inotify_add_watch(file.as_raw_fd(), c.as_ptr(), mask) } >= 0 {
+                        hit = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            if hit {
+                let _ = tx.send(Msg::LoudChanged);
                 SignalToUI::set_ui_signal();
             }
         }
