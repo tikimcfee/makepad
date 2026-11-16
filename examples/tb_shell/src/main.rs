@@ -214,6 +214,8 @@ struct State {
     placement: sched::Placement,
     note_timer: Timer,
     mic_timer: Timer,
+    panel_wake_timer: Timer,
+    panel_wake_ticks: u8,
     mic_unreadable: bool,
     persist: library::StorePersistence,
     surfaces_json: String,
@@ -278,6 +280,16 @@ impl AppMain for App {
         }
         if self.st.note_timer.is_event(event).is_some() {
             self.clear_note(cx);
+        }
+        if self.st.panel_wake_timer.is_event(event).is_some() {
+            if self.st.panel_wake_ticks > 0 && !self.st.panel_off {
+                self.st.panel_wake_ticks -= 1;
+                cx.redraw_all();
+            }
+            if self.st.panel_wake_ticks == 0 || self.st.panel_off {
+                cx.stop_timer(self.st.panel_wake_timer);
+                self.st.panel_wake_ticks = 0;
+            }
         }
         let home = self.shell(cx).borrow_mut::<Shell>().map_or(false, |mut sh| sh.take_go_home());
         if home {
@@ -838,6 +850,8 @@ impl App {
         self.sync_gpu_timer_for_front(cx);
         self.st.trace.changed();
         log!("tb-shell: panel {} at {}", if on { "on: surfaces back" } else { "off: surfaces stopped" }, paneltrace::stamp());
+        cx.stop_timer(self.st.panel_wake_timer);
+        self.st.panel_wake_ticks = 0;
         let shell = self.shell(cx);
         let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
         for (name, splash) in surfaces {
@@ -854,7 +868,14 @@ impl App {
                 splash.set_text(cx, "");
             }
         }
-        cx.redraw_all();
+        if on {
+            self.render_pending(cx);
+            cx.redraw_all();
+            self.st.panel_wake_ticks = 2;
+            self.st.panel_wake_timer = cx.start_interval(0.18);
+        } else {
+            self.st.render_pending.clear();
+        }
         let ev = obj(vec![("ev", "panel".into()), ("on", JsonValue::Bool(on))]).serialize_json();
         for c in self.st.conns.values().filter(|c| c.watch.is_some()) {
             let _ = c.tx.send(ev.clone());
@@ -1473,6 +1494,7 @@ impl App {
     fn render_pending(&mut self, cx: &mut Cx) {
         let front_name = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let front = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(&front_name));
+        let mut rendered = false;
         for splash in std::mem::take(&mut self.st.render_pending) {
             if front.as_ref().map_or(true, |f| f.widget_uid() != splash.widget_uid()) {
                 if !self.st.stale.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
@@ -1484,11 +1506,15 @@ impl App {
             let t0 = Instant::now();
             if let Some(mut inner) = splash.borrow_mut::<Splash>() {
                 self.st.split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
+                rendered = true;
             }
             let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
             if self.is_watched_surface(&front_name) {
                 self.st.frame_watch.entry(front_name.clone()).or_default().pending_render_ms += render_ms;
             }
+        }
+        if rendered {
+            cx.redraw_all();
         }
     }
 
