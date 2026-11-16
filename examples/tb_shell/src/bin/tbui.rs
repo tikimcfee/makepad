@@ -3,6 +3,10 @@
 //!   tbui show NAME [-f FILE] [--back] [--wait MS]
 //!        body from FILE or stdin; --back keeps the front surface; --wait prints the
 //!        surface's errors (first render, taps, timers, frame budget) for MS ms, exit 1 if any
+//!   tbui reload [VIEW | --all] [--wait MS]
+//!        reloads `base.splash` + `ui/lib` + built-in view(s) in place without losing state/front
+//!   tbui screen <on|off|toggle|status>
+//!        drives or queries Wayland screen power via `tb-screen-power` (`tb-screen.sock`)
 //!   tbui save NAME [--title TITLE]
 //!        persists an active agent surface in ~/.local/share/tb-shell/screens/ for start restore
 //!   tbui unsave NAME
@@ -344,6 +348,75 @@ fn lib_cmd(args: &[String]) {
     }
 }
 
+fn screen_socket_path() -> Option<String> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(p) = var("TB_SCREEN_SOCK") {
+        return Some(p);
+    }
+    if let Some(dir) = var("XDG_RUNTIME_DIR") {
+        let p = format!("{dir}/tb-screen.sock");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    if let Some(uid) = var("SUDO_UID") {
+        let p = format!("/run/user/{uid}/tb-screen.sock");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    let found: Vec<String> = std::fs::read_dir("/run/user")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("tb-screen.sock"))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    if found.len() == 1 {
+        Some(found[0].clone())
+    } else {
+        var("XDG_RUNTIME_DIR").map(|d| format!("{dir}/tb-screen.sock", dir = d))
+    }
+}
+
+fn screen_cmd(args: &[String]) -> ! {
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    if !matches!(sub, "on" | "off" | "toggle" | "status") {
+        die("screen on | off | toggle | status");
+    }
+    if let Some(path) = screen_socket_path() {
+        if let Ok(mut sock) = UnixStream::connect(&path) {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+            if sock.write_all(format!("{sub}\n").as_bytes()).is_ok() {
+                let mut line = String::new();
+                if BufReader::new(sock).read_line(&mut line).is_ok() {
+                    let reply = line.trim();
+                    if let Some(err) = reply.strip_prefix("ERR:") {
+                        die(err.trim());
+                    }
+                    if !reply.is_empty() {
+                        println!("{reply}");
+                        exit(0);
+                    }
+                }
+            }
+        }
+    }
+    if sub == "status" {
+        let panel_file = std::env::var("TB_SHELL_PANEL_FILE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/sys/kernel/tinybot_panel/state".into());
+        if let Ok(s) = std::fs::read_to_string(&panel_file) {
+            let st = if s.trim() == "off" { "off" } else { "on" };
+            println!("{st}");
+            exit(0);
+        }
+    }
+    die("cannot reach tb-screen-power socket (start tb-screen-power.service or set TB_SCREEN_SOCK)");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -390,6 +463,53 @@ fn main() {
                 }
             }
         }
+        "reload" => {
+            let mut target_view: Option<String> = None;
+            let mut wait: Option<u64> = None;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--all" => target_view = None,
+                    "--wait" => {
+                        wait = Some(it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| die("--wait MS")));
+                    }
+                    v if !v.starts_with('-') => target_view = Some(v.to_string()),
+                    _ => die("reload [VIEW | --all] [--wait MS]"),
+                }
+            }
+            let mut req = obj(vec![("op", "reload".into())]);
+            if let Some(ref v) = target_view {
+                if let JsonValue::Object(m) = &mut req {
+                    m.insert("view".into(), v.as_str().into());
+                }
+            }
+            let mut c = Client::connect();
+            if wait.is_some() {
+                let mut wreq = obj(vec![("op", "watch".into())]);
+                if let Some(ref v) = target_view {
+                    if let JsonValue::Object(m) = &mut wreq {
+                        m.insert("surfaces".into(), list(v));
+                    }
+                }
+                report_quiet(c.call(wreq));
+            }
+            let reply = c.call(req);
+            report(&reply);
+            if let Some(ms) = wait {
+                c.out.set_read_timeout(Some(Duration::from_millis(ms.max(1)))).ok();
+                let mut errors = 0;
+                while let Some(ev) = c.next() {
+                    if ev.get("ev").and_then(|v| v.as_str()) == Some("error") {
+                        println!("{}", ev.serialize_json());
+                        errors += 1;
+                    }
+                }
+                if errors > 0 {
+                    exit(1);
+                }
+            }
+        }
+        "screen" => screen_cmd(rest),
         "save" => {
             let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("save NAME [--title TITLE]"));
             let mut req = obj(vec![("op", "save".into()), ("surface", name.as_str().into())]);
@@ -535,6 +655,6 @@ fn main() {
                 }
             }
         }
-        _ => die("show | save | unsave | close | lib | set | push | get | watch | ask | guard"),
+        _ => die("show | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | guard"),
     }
 }
