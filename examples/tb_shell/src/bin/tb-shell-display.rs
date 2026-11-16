@@ -125,7 +125,7 @@ fn main() {
         let Ok(ev) = JsonValue::deserialize_json(line.trim()) else { continue };
         let kind = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
-            "shown" => {
+            "shown" | "panel" => {
                 if let Ok(v) = publish(&writer, &paths, &last) {
                     (cur, max) = v;
                 }
