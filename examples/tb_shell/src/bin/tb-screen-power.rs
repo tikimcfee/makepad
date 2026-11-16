@@ -522,7 +522,6 @@ fn main() {
     let panel_file = env_opt("TB_SHELL_PANEL_FILE").unwrap_or_else(|| "/sys/kernel/tinybot_panel/state".into());
     let input_override = env_opt("TB_SCREEN_INPUT");
     let timeout_file = env_opt("TB_SCREEN_TIMEOUT_FILE").unwrap_or_else(|| "/userdata/tinybot/etc/screen-timeout".into());
-    let wake_on_resume = env_opt("TB_SCREEN_WAKE_ON_RESUME").as_deref() == Some("1");
     let sock_path = resolve_screen_sock();
 
     let mut wl = match WaylandConn::connect() {
@@ -555,7 +554,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut power_down_at: Option<Instant> = None;
+    // Captures `(pressed_at, was_on_at_key_down)` on KEY_POWER value==1 so compositor-side
+    // `kwin_idle::resumed` wakes during key hold never invert key-up's toggle direction.
+    let mut power_down: Option<(Instant, bool)> = None;
 
     loop {
         let mut fds = Vec::with_capacity(3 + inputs.len());
@@ -579,16 +580,81 @@ fn main() {
             break;
         }
 
-        // 1. Wayland socket events
+        // 1. `/dev/input/event*` (`mtk-pmic-keys`) KEY_POWER short press (< 800 ms):
+        //    processed BEFORE `wl.pump_events` so `was_on` at key-down (`value == 1`) is
+        //    sampled before any simultaneous Wayland mode/resumed event in the same poll turn.
+        let mut i = inputs.len();
+        while i > 0 {
+            i -= 1;
+            let rev = fds[inputs_base + i].revents;
+            if rev & (POLLIN | POLLERR | POLLHUP) == 0 {
+                continue;
+            }
+            let mut drop_input = false;
+            let iw = &mut inputs[i];
+            loop {
+                match iw.file.read(&mut iw.buf[iw.carry..]) {
+                    Ok(0) => {
+                        drop_input = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        let total = iw.carry + n;
+                        let ev_size = std::mem::size_of::<InputEvent>();
+                        let mut off = 0;
+                        while off + ev_size <= total {
+                            let mut ev = InputEvent::default();
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    iw.buf[off..].as_ptr(),
+                                    &mut ev as *mut InputEvent as *mut u8,
+                                    ev_size,
+                                );
+                            }
+                            if ev.type_ == EV_KEY && ev.code == KEY_POWER {
+                                if ev.value == 1 {
+                                    let was_on = read_panel_state(&panel_file, wl.compositor_power_on);
+                                    power_down = Some((Instant::now(), was_on));
+                                } else if ev.value == 0 {
+                                    if let Some((t0, was_on)) = power_down.take() {
+                                        if t0.elapsed() < Duration::from_millis(800) {
+                                            let next = !was_on;
+                                            eprintln!(
+                                                "tb-screen-power: KEY_POWER (was {}) -> {}",
+                                                if was_on { "on" } else { "off" },
+                                                if next { "on" } else { "off" }
+                                            );
+                                            let _ = wl.set_power(next);
+                                        }
+                                    }
+                                }
+                            }
+                            off += ev_size;
+                        }
+                        iw.carry = total - off;
+                        if iw.carry > 0 {
+                            iw.buf.copy_within(off..total, 0);
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
+                    Err(_) => {
+                        drop_input = true;
+                        break;
+                    }
+                }
+            }
+            if drop_input {
+                inputs.remove(i);
+            }
+        }
+
+        // 2. Wayland socket events (`kwin_idle::idle` -> off ONLY; `resumed` NEVER wakes an off panel)
         if fds[0].revents & (POLLIN | POLLERR | POLLHUP) != 0 {
             match wl.pump_events(timeout_secs) {
-                Ok((eof, saw_idle, saw_resumed)) => {
+                Ok((eof, saw_idle, _saw_resumed)) => {
                     if saw_idle && read_panel_state(&panel_file, wl.compositor_power_on) {
                         eprintln!("tb-screen-power: idle -> screen off");
                         let _ = wl.set_power(false);
-                    }
-                    if saw_resumed && wake_on_resume && !read_panel_state(&panel_file, wl.compositor_power_on) {
-                        let _ = wl.set_power(true);
                     }
                     if eof {
                         eprintln!("tb-screen-power: Wayland compositor closed socket");
@@ -602,7 +668,7 @@ fn main() {
             }
         }
 
-        // 2. Control socket (`tbui screen on|off|toggle|status`)
+        // 3. Control socket (`tbui screen on|off|toggle|status`)
         if fds[1].revents & POLLIN != 0 {
             while let Ok((mut stream, _)) = listener.accept() {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -637,67 +703,6 @@ fn main() {
                     _ => "ERR: expected on | off | toggle | status\n".into(),
                 };
                 let _ = stream.write_all(reply.as_bytes());
-            }
-        }
-
-        // 3. `/dev/input/event*` (`mtk-pmic-keys`) KEY_POWER short press (< 800 ms)
-        let mut i = inputs.len();
-        while i > 0 {
-            i -= 1;
-            let rev = fds[inputs_base + i].revents;
-            if rev & (POLLIN | POLLERR | POLLHUP) == 0 {
-                continue;
-            }
-            let mut drop_input = false;
-            let iw = &mut inputs[i];
-            loop {
-                match iw.file.read(&mut iw.buf[iw.carry..]) {
-                    Ok(0) => {
-                        drop_input = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        let total = iw.carry + n;
-                        let ev_size = std::mem::size_of::<InputEvent>();
-                        let mut off = 0;
-                        while off + ev_size <= total {
-                            let mut ev = InputEvent::default();
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    iw.buf[off..].as_ptr(),
-                                    &mut ev as *mut InputEvent as *mut u8,
-                                    ev_size,
-                                );
-                            }
-                            if ev.type_ == EV_KEY && ev.code == KEY_POWER {
-                                if ev.value == 1 {
-                                    power_down_at = Some(Instant::now());
-                                } else if ev.value == 0 {
-                                    if let Some(t0) = power_down_at.take() {
-                                        if t0.elapsed() < Duration::from_millis(800) {
-                                            let next = !read_panel_state(&panel_file, wl.compositor_power_on);
-                                            eprintln!("tb-screen-power: KEY_POWER -> {}", if next { "on" } else { "off" });
-                                            let _ = wl.set_power(next);
-                                        }
-                                    }
-                                }
-                            }
-                            off += ev_size;
-                        }
-                        iw.carry = total - off;
-                        if iw.carry > 0 {
-                            iw.buf.copy_within(off..total, 0);
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
-                    Err(_) => {
-                        drop_input = true;
-                        break;
-                    }
-                }
-            }
-            if drop_input {
-                inputs.remove(i);
             }
         }
 
