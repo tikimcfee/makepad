@@ -18,8 +18,13 @@ main := View{
         let cur = if d == nil { nil } else { d.brightness ?? nil }
         let max = if d == nil { 255 } else { d.max ?? 255 }
         let panel = if d == nil { nil } else { d.panel ?? nil }
+        let path = if d == nil { nil } else { d.path ?? nil }
+        let fb = if d == nil { false } else { d.fallback ?? false }
         let last = if d == nil { "" } else { d.last ?? "" }
-        Small{text: "Display backlight (1.." + show(max, ")")}
+        Small{text: "Display backlight (1.." + show(max, ")") + (if path == nil { "" } else { "  ·  path: " + path })}
+        if fb {
+            Small{width: Fill text: "Fallback display path active" draw_text.color: #xf5b942}
+        }
         View{width: Fill height: Fit flow: Right spacing: 10
             Cell{k.text: "brightness" v.text: if cur == nil { "-" } else { show(cur, "") + " / " + show(max, "") }}
             Cell{k.text: "panel" v.text: show(panel, "")}

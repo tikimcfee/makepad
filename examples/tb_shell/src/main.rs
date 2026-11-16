@@ -38,9 +38,9 @@ const BASE: &str = include_str!("../lib/base.splash");
 const SHELL_KEY: &str = "shell";
 const SURFACES_KEY: &str = "surfaces";
 
-/// Lines ahead of a body: Splash's own prefix, the prelude, `base.splash`, and `extra` library lines.
-fn lines_ahead(extra_lib_lines: usize) -> usize {
-    3 + PRELUDE.lines().count() + BASE.lines().count() + extra_lib_lines
+/// Lines ahead of a body: Splash's own prefix, the prelude, and `base_and_lib` lines.
+fn lines_ahead(base_and_lib_lines: usize) -> usize {
+    3 + PRELUDE.lines().count() + base_and_lib_lines
 }
 
 script_mod! {
@@ -363,12 +363,12 @@ impl App {
     }
 
     fn full_source(&self, body: &str) -> String {
-        let lib = self.st.persist.lib_source();
-        format!("{PRELUDE}{BASE}{lib}{body}")
+        let lib = self.st.persist.base_and_lib_source();
+        format!("{PRELUDE}{lib}{body}")
     }
 
     fn current_ahead(&self) -> usize {
-        lines_ahead(self.st.persist.lib_lines())
+        lines_ahead(self.st.persist.base_and_lib_lines())
     }
 
     fn is_watched_surface(&self, name: &str) -> bool {
@@ -390,6 +390,18 @@ impl App {
         }
     }
 
+    fn reload_trusted(&mut self) {
+        self.st.trusted.clear();
+        if let Some(dir) = library::resolve_ui_subdir("TB_SHELL_TRUSTED", "trusted") {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if let Ok(body) = std::fs::read_to_string(entry.path()) {
+                    self.st.trusted.insert(body);
+                }
+            }
+            log!("tb-shell: {} trusted bodies from {}", self.st.trusted.len(), dir.display());
+        }
+    }
+
     fn start(&mut self, cx: &mut Cx) {
         let (tx, rx) = io::new_channel();
         let path = env("TB_SHELL_SOCK").unwrap_or_else(|| format!("{}/tb-shell.sock", env("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())));
@@ -398,23 +410,13 @@ impl App {
         self.st.guard_uids = env("TB_SHELL_GUARD_UIDS").unwrap_or("0".into()).split(',').filter_map(|u| u.trim().parse().ok()).collect();
         self.st.frame_budget_ms = env("TB_SHELL_FRAME_BUDGET_MS").and_then(|v| v.parse().ok()).unwrap_or(120.0);
         self.st.agent_shaders_on = !matches!(env("TB_SHELL_AGENT_SHADERS").as_deref(), Some("0") | Some("false"));
-        self.st.persist = library::StorePersistence::load();
+        self.st.persist = library::StorePersistence::load(BASE);
         if !self.st.persist.pieces.is_empty() {
             log!("tb-shell: {} library pieces from {}", self.st.persist.pieces.len(), self.st.persist.lib_dir.display());
         }
 
         // Bodies we wrote and tried: their shader text and proof workloads are trusted.
-        let trusted = env("TB_SHELL_TRUSTED").or_else(|| {
-            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("trusted").to_string_lossy().to_string()))
-        });
-        if let Some(dir) = trusted {
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                if let Ok(body) = std::fs::read_to_string(entry.path()) {
-                    self.st.trusted.insert(body);
-                }
-            }
-            log!("tb-shell: {} trusted bodies from {dir}", self.st.trusted.len());
-        }
+        self.reload_trusted();
 
         // The panel and the marks: files and device nodes, watched by sysfs poll / inotify.
         let s = &mut self.st.sources;
@@ -464,10 +466,7 @@ impl App {
     }
 
     fn load_views(&mut self, cx: &mut Cx) {
-        let dir = env("TB_SHELL_VIEWS").map(std::path::PathBuf::from).or_else(|| {
-            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("views")))
-        });
-        let Some(dir) = dir else { return };
+        let Some(dir) = library::resolve_ui_subdir("TB_SHELL_VIEWS", "views") else { return };
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
@@ -1034,6 +1033,7 @@ impl App {
                 Ok(Some(obj(vec![("unsaved", name.into()), ("removed", JsonValue::Bool(removed))])))
             }
             "lib" => self.lib_op(cx, req).map(Some),
+            "reload" => self.reload_op(cx, req).map(Some),
             "guard" => {
                 if !self.st.guard_uids.contains(&peer.uid) {
                     return Err(format!("guard: uid {} may not raise a guard", peer.uid));
@@ -1081,9 +1081,9 @@ impl App {
                         return Err(format!("shader text is off (TB_SHELL_AGENT_SHADERS=0): {at}"));
                     }
                 }
-                let other_lib = self.st.persist.lib_source_except(name);
+                let other_lib = self.st.persist.base_and_lib_except(name);
                 let ahead = lines_ahead(other_lib.lines().count());
-                let check_code = format!("{PRELUDE}{BASE}{other_lib}{body}\nView{{}}\n");
+                let check_code = format!("{PRELUDE}{other_lib}{body}\nView{{}}\n");
                 let raw_errors = makepad_widgets::splash::validate_splash_body_with_host_io(cx, &check_code);
                 let _ = take_splash_host_requests();
                 if !raw_errors.is_empty() {
@@ -1141,6 +1141,124 @@ impl App {
             }
             _ => Err(format!("unknown lib subcommand {sub}")),
         }
+    }
+
+    /// Re-reads `base.splash`, `ui/lib/*.splash`, user `lib/*.splash`, `trusted/*.splash`,
+    /// and re-evaluates one or all built-in views in place without losing `state` or `front`.
+    fn reload_op(&mut self, cx: &mut Cx, req: &JsonValue) -> Result<JsonValue, String> {
+        let Some(dir) = library::resolve_ui_subdir("TB_SHELL_VIEWS", "views") else {
+            return Err("no views directory found".into());
+        };
+        let prev_sys_base = self.st.persist.sys_base_source.clone();
+        let prev_pieces = self.st.persist.pieces.clone();
+        self.st.persist.reload_all(BASE);
+        self.reload_trusted();
+
+        let target = req.get("view").and_then(|v| v.as_str()).filter(|s| !s.is_empty() && *s != "*");
+        if let Some(name) = target {
+            if !valid_name(name) {
+                self.st.persist.sys_base_source = prev_sys_base;
+                self.st.persist.pieces = prev_pieces;
+                return Err("invalid view name".into());
+            }
+            let path = dir.join(format!("{name}.splash"));
+            let body = match std::fs::read_to_string(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.st.persist.sys_base_source = prev_sys_base;
+                    self.st.persist.pieces = prev_pieces;
+                    return Err(format!("{}: {e}", path.display()));
+                }
+            };
+            let was_view = self.st.views.insert(name.to_string());
+            let reply = match self.show(cx, name, &body, false) {
+                Ok(r) => r,
+                Err(e) => {
+                    if !was_view {
+                        self.st.views.remove(name);
+                    }
+                    self.st.persist.sys_base_source = prev_sys_base;
+                    self.st.persist.pieces = prev_pieces;
+                    return Err(e);
+                }
+            };
+            if reply.get("ok") == Some(&JsonValue::Bool(false)) {
+                if !was_view {
+                    self.st.views.remove(name);
+                }
+                self.st.persist.sys_base_source = prev_sys_base;
+                self.st.persist.pieces = prev_pieces;
+                return Ok(reply);
+            }
+            self.sync_surfaces_key(cx);
+            return Ok(obj(vec![
+                ("view", name.into()),
+                ("dir", dir.to_string_lossy().to_string().into()),
+                ("ms", reply.get("ms").cloned().unwrap_or(JsonValue::Null)),
+                ("errors", JsonValue::Array(vec![])),
+            ]));
+        }
+
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "splash"))
+            .collect();
+        files.sort();
+        let mut reloaded = Vec::new();
+        let mut err_map: HashMap<String, JsonValue> = HashMap::new();
+        for path in files {
+            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else { continue };
+            let Ok(body) = std::fs::read_to_string(&path) else { continue };
+            let was_view = self.st.views.insert(name.clone());
+            match self.show(cx, &name, &body, false) {
+                Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
+                    reloaded.push(JsonValue::String(name));
+                }
+                Ok(reply) => {
+                    if !was_view {
+                        self.st.views.remove(&name);
+                    }
+                    err_map.insert(name, reply.get("errors").cloned().unwrap_or(JsonValue::Null));
+                }
+                Err(e) => {
+                    if !was_view {
+                        self.st.views.remove(&name);
+                    }
+                    err_map.insert(name, JsonValue::String(e));
+                }
+            }
+        }
+        // Also refresh any open agent surfaces so edits to `base.splash` / `ui/lib` apply everywhere.
+        let agent_bodies: Vec<(String, String)> = self
+            .st
+            .bodies
+            .iter()
+            .filter(|(n, _)| !self.st.views.contains(*n))
+            .map(|(n, b)| (n.clone(), b.clone()))
+            .collect();
+        for (name, body) in agent_bodies {
+            if let Ok(r) = self.show(cx, &name, &body, false) {
+                if r.get("ok") != Some(&JsonValue::Bool(false)) {
+                    reloaded.push(JsonValue::String(name));
+                }
+            }
+        }
+        self.sync_surfaces_key(cx);
+        if !err_map.is_empty() {
+            return Ok(obj(vec![
+                ("ok", JsonValue::Bool(false)),
+                ("error", "one or more views did not evaluate".into()),
+                ("reloaded", JsonValue::Array(reloaded)),
+                ("errors", JsonValue::Object(err_map)),
+            ]));
+        }
+        Ok(obj(vec![
+            ("dir", dir.to_string_lossy().to_string().into()),
+            ("reloaded", JsonValue::Array(reloaded)),
+        ]))
     }
 
     /// Shell-owned keys (`shell`, `surfaces`), and `front` while a guard is up.
@@ -1204,8 +1322,32 @@ impl App {
         };
         drop(sh);
         let ahead = self.current_ahead();
+        let full = self.full_source(body);
+        if !created || self.st.panel_off {
+            let raw_errors = makepad_widgets::splash::validate_splash_body_with_host_io(cx, &full);
+            let _ = take_splash_host_requests();
+            if !raw_errors.is_empty() {
+                let errors: Vec<JsonValue> = raw_errors
+                    .into_iter()
+                    .map(|e| match locate_with_ahead(&e, "validating", ahead) {
+                        Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
+                        None => obj(vec![("message", e.into())]),
+                    })
+                    .collect();
+                if created {
+                    shell.borrow_mut::<Shell>().map(|mut sh| sh.remove(cx, name));
+                }
+                return Ok(obj(vec![
+                    ("ok", JsonValue::Bool(false)),
+                    ("error", "body did not evaluate".into()),
+                    ("errors", JsonValue::Array(errors)),
+                ]));
+            }
+        }
         if !self.st.panel_off {
-            let full = self.full_source(body);
+            if !created {
+                splash.set_text(cx, "");
+            }
             splash.set_text(cx, &full);
             let errors: Vec<JsonValue> = splash
                 .as_splash()

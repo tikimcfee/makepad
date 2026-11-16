@@ -18,6 +18,7 @@ struct Paths {
     max: String,
     panel_summary: String,
     panel_state: String,
+    display_state: String,
     brightness_bin: String,
 }
 
@@ -28,6 +29,7 @@ impl Paths {
             max: env_or("TB_DISPLAY_MAX", "/sys/class/backlight/tinybot-lcd/max_brightness"),
             panel_summary: env_or("TB_DISPLAY_PANEL_SUMMARY", "/sys/kernel/tinybot_panel/summary"),
             panel_state: env_or("TB_DISPLAY_PANEL_STATE", "/sys/kernel/tinybot_panel/state"),
+            display_state: env_or("TB_DISPLAY_STATE", "/run/tinybot/display-state"),
             brightness_bin: env_or("TB_BRIGHTNESS_BIN", "/usr/local/sbin/tb-brightness"),
         }
     }
@@ -45,14 +47,34 @@ impl Paths {
         std::fs::read_to_string(&self.panel_state).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     }
 
+    fn read_display_state(&self) -> (Option<String>, Option<bool>) {
+        let Ok(text) = std::fs::read_to_string(&self.display_state) else { return (None, None) };
+        let mut path_val = None;
+        let mut fallback = None;
+        for line in text.lines() {
+            if let Some((k, v)) = line.trim().split_once('=') {
+                let v = v.trim();
+                match k.trim() {
+                    "path" if !v.is_empty() => path_val = Some(v.to_string()),
+                    "fallback" => fallback = Some(v == "1" || v.eq_ignore_ascii_case("true")),
+                    _ => {}
+                }
+            }
+        }
+        (path_val, fallback)
+    }
+
     fn snapshot(&self, last: &str) -> (Option<i64>, i64, JsonValue) {
         let cur = Self::read_i64(&self.actual);
         let max = Self::read_i64(&self.max).filter(|&m| m > 0).unwrap_or(255);
         let panel = self.read_panel();
+        let (disp_path, fallback) = self.read_display_state();
         let val = obj(vec![
             ("brightness", cur.map(JsonValue::I64).unwrap_or(JsonValue::Null)),
             ("max", JsonValue::I64(max)),
             ("panel", panel.map(JsonValue::String).unwrap_or(JsonValue::Null)),
+            ("path", disp_path.map(JsonValue::String).unwrap_or(JsonValue::Null)),
+            ("fallback", fallback.map(JsonValue::Bool).unwrap_or(JsonValue::Null)),
             ("last", JsonValue::String(last.to_string())),
         ]);
         (cur, max, val)

@@ -66,7 +66,7 @@ impl ShellWriter {
         guard.write_all(line.as_bytes()).map_err(|e| format!("socket write: {e}"))
     }
 
-    /// Sends a merge patch for top-level store key `key` without requesting a reply.
+    /// Sends a merge patch for top-level store key `key`, waiting for no reply (`reply: false`).
     pub fn patch_key(&self, key: &str, value: JsonValue) -> Result<(), String> {
         let req = obj(vec![
             ("op", "set".into()),
@@ -77,9 +77,46 @@ impl ShellWriter {
     }
 }
 
-/// Connects to `tb-shell.sock`, registers a `watch` on `surfaces`, waits for `{"ok":true}`,
-/// and returns `(sock_path, writer, line_reader)`.
+/// One-shot synchronous `set` (waits for `{"ok":true}`) for `--once` CLI mode.
+pub fn set_key_sync(key: &str, value: JsonValue) -> Result<(), String> {
+    let path = socket_path()?;
+    let mut stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
+    let req = obj(vec![("op", "set".into()), ("patch", obj(vec![(key, value)]))]);
+    let line = req.serialize_json() + "\n";
+    stream.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).map_err(|e| format!("read: {e}"))?;
+    Ok(())
+}
+
+/// One-shot synchronous `get` of top-level store keys.
+pub fn get_keys_sync(keys: &[&str]) -> Result<JsonValue, String> {
+    let path = socket_path()?;
+    let mut stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
+    let mut req = obj(vec![("op", "get".into())]);
+    if !keys.is_empty() {
+        if let JsonValue::Object(m) = &mut req {
+            m.insert("keys".into(), JsonValue::Array(keys.iter().map(|k| (*k).into()).collect()));
+        }
+    }
+    let line = req.serialize_json() + "\n";
+    stream.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).map_err(|e| format!("read: {e}"))?;
+    let parsed = JsonValue::deserialize_json(reply.trim()).map_err(|e| format!("bad json: {e:?}"))?;
+    Ok(parsed.get("state").cloned().unwrap_or(JsonValue::Null))
+}
+
+/// Connects to `tb-shell.sock`, registers a `watch` on `surfaces` (and optional `keys`),
+/// waits for `{"ok":true}`, and returns `(sock_path, writer, line_reader)`.
 pub fn connect_and_watch(surfaces: &[&str]) -> Result<(String, ShellWriter, BufReader<UnixStream>), String> {
+    connect_and_watch_ext(surfaces, &[])
+}
+
+pub fn connect_and_watch_ext(
+    surfaces: &[&str],
+    keys: &[&str],
+) -> Result<(String, ShellWriter, BufReader<UnixStream>), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (path, stream) = loop {
         let candidate = socket_path().and_then(|p| match UnixStream::connect(&p) {
@@ -98,8 +135,18 @@ pub fn connect_and_watch(surfaces: &[&str]) -> Result<(String, ShellWriter, BufR
     let write_half = stream.try_clone().map_err(|e| format!("clone socket: {e}"))?;
     let writer = ShellWriter { out: Arc::new(Mutex::new(write_half)) };
     let mut reader = BufReader::new(stream);
-    let surf_arr = JsonValue::Array(surfaces.iter().map(|s| (*s).into()).collect());
-    writer.send_raw(&obj(vec![("op", "watch".into()), ("surfaces", surf_arr)]))?;
+    let mut wreq = obj(vec![("op", "watch".into())]);
+    if !surfaces.is_empty() {
+        if let JsonValue::Object(m) = &mut wreq {
+            m.insert("surfaces".into(), JsonValue::Array(surfaces.iter().map(|s| (*s).into()).collect()));
+        }
+    }
+    if !keys.is_empty() {
+        if let JsonValue::Object(m) = &mut wreq {
+            m.insert("keys".into(), JsonValue::Array(keys.iter().map(|k| (*k).into()).collect()));
+        }
+    }
+    writer.send_raw(&wreq)?;
     let mut line = String::new();
     loop {
         line.clear();

@@ -21,6 +21,9 @@ main := View{
             View{width: Fill height: Fit flow: Right spacing: 10
                 Cell{k.text: "volts" v.text: show(b.volts ?? nil, " V")}
                 Cell{k.text: "temp" v.text: show(b.temp ?? nil, " C")}}
+            if (b.desk ?? nil) != nil {
+                Small{text: "desk power: " + show(b.desk ?? nil, "")}
+            }
         }
         Big{text: "refresh" on_click: || emit("refresh", {})}
     }
