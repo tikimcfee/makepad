@@ -1,0 +1,47 @@
+// DISPLAY: backlight readouts and presets (state.display).
+// Read from sysfs; presets and steps run /usr/local/sbin/tb-brightness set <1..255> (never 0).
+let Cell = Squircle{
+    width: Fill height: 92 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
+    k := Small{}
+    v := Title{draw_text.text_style.font_size: 24}
+}
+let Preset = ButtonFlat{
+    width: Fill height: 56 text: "" margin: 0
+    draw_text.text_style.font_size: 16
+}
+fn pick_bg(on) { if on { return #x284772 } #x1c2230 }
+width: Fill height: Fill flow: Down padding: 16
+main := View{
+    width: Fill height: Fit flow: Down spacing: 12
+    on_render: || {
+        let d = state.display ?? nil
+        let cur = if d == nil { nil } else { d.brightness ?? nil }
+        let max = if d == nil { 255 } else { d.max ?? 255 }
+        let panel = if d == nil { nil } else { d.panel ?? nil }
+        let last = if d == nil { "" } else { d.last ?? "" }
+        Small{text: "Display backlight (1.." + show(max, ")")}
+        View{width: Fill height: Fit flow: Right spacing: 10
+            Cell{k.text: "brightness" v.text: if cur == nil { "-" } else { show(cur, "") + " / " + show(max, "") }}
+            Cell{k.text: "panel" v.text: show(panel, "")}
+        }
+        Small{text: "Presets"}
+        View{width: Fill height: Fit flow: Right spacing: 8
+            Preset{text: "5" draw_bg.color: pick_bg(cur == 5) draw_bg.color_focus: pick_bg(cur == 5) draw_bg.color_hover: pick_bg(cur == 5) on_click: || emit("set", {level: 5})}
+            Preset{text: "25" draw_bg.color: pick_bg(cur == 25) draw_bg.color_focus: pick_bg(cur == 25) draw_bg.color_hover: pick_bg(cur == 25) on_click: || emit("set", {level: 25})}
+            Preset{text: "64" draw_bg.color: pick_bg(cur == 64) draw_bg.color_focus: pick_bg(cur == 64) draw_bg.color_hover: pick_bg(cur == 64) on_click: || emit("set", {level: 64})}
+        }
+        View{width: Fill height: Fit flow: Right spacing: 8
+            Preset{text: "128" draw_bg.color: pick_bg(cur == 128) draw_bg.color_focus: pick_bg(cur == 128) draw_bg.color_hover: pick_bg(cur == 128) on_click: || emit("set", {level: 128})}
+            Preset{text: "199" draw_bg.color: pick_bg(cur == 199) draw_bg.color_focus: pick_bg(cur == 199) draw_bg.color_hover: pick_bg(cur == 199) on_click: || emit("set", {level: 199})}
+            Preset{text: "255" draw_bg.color: pick_bg(cur == 255) draw_bg.color_focus: pick_bg(cur == 255) draw_bg.color_hover: pick_bg(cur == 255) on_click: || emit("set", {level: 255})}
+        }
+        View{width: Fill height: Fit flow: Right spacing: 8
+            Preset{text: "- step" on_click: || emit("step", {delta: -1})}
+            Preset{text: "+ step" on_click: || emit("step", {delta: 1})}
+        }
+        Big{height: 52 margin: 0 text: "Refresh" on_click: || emit("refresh", {})}
+        if last != "" {
+            Small{width: Fill text: last}
+        }
+    }
+}
