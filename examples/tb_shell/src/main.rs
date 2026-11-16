@@ -5,35 +5,42 @@
 //! A write from anywhere (a client's `set`, a tap's `set(k, v)`) is a JSON
 //! merge patch on the one store. The shell applies it, hands the new values
 //! of the touched top-level keys to each surface that reads them (the
-//! prelude's `__apply` re-renders `main`), and tells the watchers.
+//! prelude's `__assign` + `__render` re-renders `main`), and tells the watchers.
 
 pub use makepad_widgets;
 
 mod io;
+mod library;
 mod paneltrace;
-mod shell;
 mod sched;
+mod shell;
 mod split;
 mod stream;
 
 use io::{Msg, Peer};
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
-use makepad_widgets::makepad_platform::log_ring;
+use makepad_widgets::makepad_platform::{
+    log_ring,
+    perf_monitor::{PerfMonitorFrame, PERF_CHANNEL_DRAW, PERF_CHANNEL_GPU},
+};
 use makepad_widgets::splash_host::take_splash_host_requests;
 use makepad_widgets::*;
 use shell::{GuardView, Shell};
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 app_main!(App);
 
 const PRELUDE: &str = include_str!("prelude.splash");
 const BASE: &str = include_str!("../lib/base.splash");
-/// A key only the shell writes.
+/// Keys only the shell writes.
 const SHELL_KEY: &str = "shell";
-/// Lines ahead of a body: Splash's own prefix, the prelude, the library.
-fn lines_ahead() -> usize {
-    3 + PRELUDE.lines().count() + BASE.lines().count()
+const SURFACES_KEY: &str = "surfaces";
+
+/// Lines ahead of a body: Splash's own prefix, the prelude, `base.splash`, and `extra` library lines.
+fn lines_ahead(extra_lib_lines: usize) -> usize {
+    3 + PRELUDE.lines().count() + BASE.lines().count() + extra_lib_lines
 }
 
 script_mod! {
@@ -96,8 +103,7 @@ impl Reads {
 }
 
 /// Shader code in a body: an anonymous `fn(` (how a draw shader's methods
-/// are written) or a `pixel:` / `vertex:` key. Agents may not send it until a
-/// per-surface frame-time watch exists; bodies we wrote and tried are trusted.
+/// are written) or a `pixel:` / `vertex:` key.
 fn shader_text(body: &str) -> Option<String> {
     let b = body.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -150,7 +156,7 @@ impl WatchSpec {
 }
 
 struct Conn {
-    tx: Sender<String>,
+    tx: std::sync::mpsc::Sender<String>,
     peer: Peer,
     watch: Option<WatchSpec>,
 }
@@ -160,17 +166,26 @@ struct Guard {
     view: GuardView,
 }
 
-/// Where the panel state and the recording mark come from: kernel state, never the store.
+/// Kernel and speaker-service state sources for panel-off and the `MIC` / `LOUD` marks.
 #[derive(Default)]
 struct Sources {
-    /// The panel state file and the content that means asleep. It gives no
-    /// change event and is never polled: it is read when the shell is awake
-    /// anyway (an event), at most every quarter second.
     panel: Option<(String, String)>,
-    panel_read: Option<std::time::Instant>,
-    /// The capture stream's status file ("closed" when no capture is open),
-    /// read again on each open or close in the sound device directory.
+    panel_read: Option<Instant>,
     mic_status: Option<String>,
+    speaker_state: Option<String>,
+}
+
+/// Per-surface frame-time watch state for untrusted/agent surfaces.
+#[derive(Default)]
+struct SurfaceWatch {
+    cpu_frames: u32,
+    gpu_boundaries: u32,
+    last_painted: u64,
+    pending_render_ms: f64,
+    over_hits: u32,
+    last_over_at: Option<Instant>,
+    /// Post-show verification redraws for shader bodies (catches static heavy shaders too).
+    verify_redraws_left: u8,
 }
 
 #[derive(Default)]
@@ -180,10 +195,7 @@ struct State {
     conns: HashMap<u64, Conn>,
     reads: HashMap<String, Reads>,
     bodies: HashMap<String, String>,
-    /// The views that were in front before the current one, newest last: closing
-    /// the front surface brings back the newest that still exists, else home.
     front_history: Vec<String>,
-    /// Surfaces a connection showed with "owned": true (a question): they close with it.
     owned: HashMap<u64, Vec<String>>,
     guards: Vec<Guard>,
     guard_uids: HashSet<u32>,
@@ -193,21 +205,21 @@ struct State {
     log_cursor: u64,
     split: split::Split,
     trace: paneltrace::PanelTrace,
-    /// Surfaces whose `on_render` runs at the next frame: at most once a frame each,
-    /// with the newest state, however many updates arrive before it.
     render_pending: Vec<WidgetRef>,
-    /// Hidden surfaces fed since they last rendered: they render when they come to the front.
     stale: Vec<WidgetRef>,
     render_frame: NextFrame,
-    /// Surfaces loaded from the views folder (the rest are the agents').
+    watch_frame: NextFrame,
     views: HashSet<String>,
     notified: bool,
     placement: sched::Placement,
-    /// The note's end (a one-shot timer, only while a note is up).
     note_timer: Timer,
-    /// The recording mark's re-read (only while it may be on).
     mic_timer: Timer,
     mic_unreadable: bool,
+    persist: library::StorePersistence,
+    surfaces_json: String,
+    frame_watch: HashMap<String, SurfaceWatch>,
+    frame_budget_ms: f64,
+    agent_shaders_on: bool,
 }
 
 #[derive(Script, ScriptHook)]
@@ -229,6 +241,11 @@ impl AppMain for App {
         if let Event::Startup = event {
             self.start(cx);
         }
+        if let Event::Shutdown = event {
+            cx.perf_monitor.set_enabled(false);
+            library::CrashGuard::mark_clean_shutdown();
+            return;
+        }
         self.st.split.event_start();
         self.st.trace.event(event);
         self.check_panel(cx);
@@ -237,7 +254,7 @@ impl AppMain for App {
         }
         if let Event::Signal = event {
             if self.st.split.on() {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 self.drain_socket(cx);
                 let dt = t.elapsed();
                 self.st.split.add_drain(dt);
@@ -248,14 +265,14 @@ impl AppMain for App {
         self.drain_host_requests(cx);
         if let Event::Draw(_) = event {
             self.ui.handle_event(cx, event, &mut Scope::empty());
+            self.after_draw_watch(cx);
+            self.notify_ready();
         } else {
             let ui = &self.ui;
             self.st.split.timed(4, || ui.handle_event(cx, event, &mut Scope::empty()));
         }
+        self.drain_gpu_watch(cx);
         self.drain_host_requests(cx);
-        if let Event::Draw(_) = event {
-            self.notify_ready();
-        }
         if self.st.mic_timer.is_event(event).is_some() {
             self.mic_timer(cx);
         }
@@ -313,24 +330,30 @@ fn merge(target: &mut JsonValue, patch: &JsonValue) {
     }
 }
 
-/// Parses a log location `splash:<surface>:<line>:<col>` into body-relative
-/// numbers (line 0: in the prelude or the library).
-fn locate(text: &str, name: &str) -> Option<(usize, usize, String)> {
+/// Parses a log location `splash:<surface>:<line>:<col>` into body-relative numbers.
+fn locate_with_ahead(text: &str, name: &str, ahead: usize) -> Option<(usize, usize, String)> {
     let tag = format!("splash:{name}:");
     let at = text.find(&tag)?;
     let rest = &text[at + tag.len()..];
     let mut parts = rest.splitn(3, |c: char| c == ':' || c == ' ');
     let line: usize = parts.next()?.parse().ok()?;
     let col: usize = parts.next()?.trim_end_matches(':').parse().ok().unwrap_or(0);
-    let message = rest.split_once(" - ").map(|(_, m)| m).or_else(|| rest.split_once(": ").map(|(_, m)| m)).unwrap_or(rest).to_string();
-    let line = line.checked_sub(lines_ahead()).unwrap_or(0);
+    let message = rest
+        .split_once(" - ")
+        .map(|(_, m)| m)
+        .or_else(|| rest.split_once(": ").map(|(_, m)| m))
+        .unwrap_or(rest)
+        .to_string();
+    let line = line.checked_sub(ahead).unwrap_or(0);
     Some((line, col, message))
 }
 
 /// A surface's name shows in the strip: none may start with "guard", the word the
 /// strip uses for the shell's own guard.
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         && !name.to_ascii_lowercase().starts_with("guard")
 }
 
@@ -339,13 +362,48 @@ impl App {
         self.ui.widget(cx, ids!(shell))
     }
 
+    fn full_source(&self, body: &str) -> String {
+        let lib = self.st.persist.lib_source();
+        format!("{PRELUDE}{BASE}{lib}{body}")
+    }
+
+    fn current_ahead(&self) -> usize {
+        lines_ahead(self.st.persist.lib_lines())
+    }
+
+    fn is_watched_surface(&self, name: &str) -> bool {
+        self.st.frame_budget_ms > 0.0
+            && !self.st.views.contains(name)
+            && self.st.bodies.get(name).map_or(false, |b| !self.st.trusted.contains(b))
+    }
+
+    fn sync_gpu_timer_for_front(&mut self, cx: &mut Cx) {
+        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let want = !self.st.panel_off && self.is_watched_surface(&front);
+        cx.perf_monitor.set_enabled(false);
+        if want {
+            cx.perf_monitor.set_enabled(true);
+            let painted = cx.perf_monitor.frames_painted();
+            let w = self.st.frame_watch.entry(front).or_default();
+            w.last_painted = painted;
+            w.gpu_boundaries = 0;
+        }
+    }
+
     fn start(&mut self, cx: &mut Cx) {
         let (tx, rx) = io::new_channel();
         let path = env("TB_SHELL_SOCK").unwrap_or_else(|| format!("{}/tb-shell.sock", env("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())));
         io::listen(&path, tx.clone());
         self.st.rx = Some(rx);
         self.st.guard_uids = env("TB_SHELL_GUARD_UIDS").unwrap_or("0".into()).split(',').filter_map(|u| u.trim().parse().ok()).collect();
-        // Bodies we wrote and tried: their shader text is allowed.
+        self.st.frame_budget_ms = env("TB_SHELL_FRAME_BUDGET_MS").and_then(|v| v.parse().ok()).unwrap_or(120.0);
+        self.st.agent_shaders_on = !matches!(env("TB_SHELL_AGENT_SHADERS").as_deref(), Some("0") | Some("false"));
+        self.st.persist = library::StorePersistence::load();
+        if !self.st.persist.pieces.is_empty() {
+            log!("tb-shell: {} library pieces from {}", self.st.persist.pieces.len(), self.st.persist.lib_dir.display());
+        }
+
+        // Bodies we wrote and tried: their shader text and proof workloads are trusted.
         let trusted = env("TB_SHELL_TRUSTED").or_else(|| {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("trusted").to_string_lossy().to_string()))
         });
@@ -357,15 +415,20 @@ impl App {
             }
             log!("tb-shell: {} trusted bodies from {dir}", self.st.trusted.len());
         }
+
         // The panel and the marks: files and device nodes, watched by inotify.
         let s = &mut self.st.sources;
         if let Some(file) = env("TB_SHELL_PANEL_FILE") {
             s.panel = Some((file, env("TB_SHELL_PANEL_OFF").unwrap_or("off".into())));
         }
         if let (Some(dir), Some(status)) = (env("TB_SHELL_MIC_DIR"), env("TB_SHELL_MIC_STATUS")) {
-            io::watch_capture(&dir, tx);
+            io::watch_capture(&dir, tx.clone());
             s.mic_status = Some(status);
         }
+        let spk = env("TB_SHELL_SPEAKER_STATE").unwrap_or_else(|| "/run/tinybot/speaker-state".into());
+        io::watch_speaker_state(&spk, tx);
+        s.speaker_state = Some(spk);
+
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
         self.st.trace = paneltrace::PanelTrace::from_env();
@@ -373,25 +436,48 @@ impl App {
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
         self.mic_timer(cx); // read once at start; if it is on, keep reading
+        self.read_loud(cx); // read speaker-state once at start
+
+        let (prev_unclean, crashes_60s) = library::CrashGuard::check_on_start();
         let before = Self::surfaces_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         self.load_views(cx);
-        self.left_out(cx, &before);
+
+        if crashes_60s >= 2 {
+            let mut skipped: Vec<String> = self.st.persist.saved_screen_names();
+            for n in before.split_whitespace() {
+                if !self.st.views.contains(n) && !skipped.iter().any(|s| s == n) {
+                    skipped.push(n.to_string());
+                }
+            }
+            error!("tb-shell: {crashes_60s} crashes within 60 s: skipping saved agent screens");
+            self.left_out(cx, &skipped.join(" "));
+        } else {
+            self.load_saved_screens(cx);
+            if prev_unclean {
+                self.left_out(cx, &before);
+            } else {
+                self.write_surfaces_file();
+            }
+        }
+        self.sync_surfaces_key(cx);
     }
 
-    /// The views folder (TB_SHELL_VIEWS, else `views/` beside the binary): every
-    /// `NAME.splash` becomes surface NAME; `home` comes to the front.
     fn load_views(&mut self, cx: &mut Cx) {
         let dir = env("TB_SHELL_VIEWS").map(std::path::PathBuf::from).or_else(|| {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("views")))
         });
         let Some(dir) = dir else { return };
-        let mut files: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |x| x == "splash")).collect();
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "splash"))
+            .collect();
         files.sort();
         for path in files {
             let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let Ok(body) = std::fs::read_to_string(&path) else { continue };
-            // A view before it is shown, so the agents' surfaces file never lists it.
             self.st.views.insert(name.clone());
             match self.show(cx, &name, &body, false) {
                 Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
@@ -399,11 +485,11 @@ impl App {
                 }
                 Ok(reply) => {
                     self.st.views.remove(&name);
-                    error!("tb-shell: view {name}: {}", reply.serialize_json())
+                    error!("tb-shell: view {name}: {}", reply.serialize_json());
                 }
                 Err(e) => {
                     self.st.views.remove(&name);
-                    error!("tb-shell: view {name}: {e}")
+                    error!("tb-shell: view {name}: {e}");
                 }
             }
         }
@@ -413,26 +499,90 @@ impl App {
         }
     }
 
-    /// The agents' surfaces are not brought back after a restart (a body that
-    /// crashed the shell would crash it again). Their names live in a file in
-    /// XDG_RUNTIME_DIR (memory, not disk); after a restart the strip names them.
-    fn surfaces_file() -> Option<String> {
-        env("XDG_RUNTIME_DIR").map(|d| format!("{d}/tb-shell.agent-surfaces"))
+    fn load_saved_screens(&mut self, cx: &mut Cx) {
+        let saved = self.st.persist.load_saved_screens();
+        if saved.is_empty() {
+            return;
+        }
+        let mut count = 0usize;
+        for (name, body) in saved {
+            if self.st.views.contains(&name) {
+                continue;
+            }
+            match self.show(cx, &name, &body, false) {
+                Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
+                    count += 1;
+                }
+                Ok(reply) => error!("tb-shell: saved screen {name}: {}", reply.serialize_json()),
+                Err(e) => error!("tb-shell: saved screen {name}: {e}"),
+            }
+        }
+        if count > 0 {
+            log!("tb-shell: restored {count} saved screen(s) from {}", self.st.persist.screens_dir.display());
+        }
     }
 
-    /// `before`: the file as the last run left it. The shell's own views are never named;
-    /// the note goes on a tap on the strip or after ten seconds.
+    /// Updates read-only `state.surfaces` whenever loaded surfaces or saved status change.
+    fn sync_surfaces_key(&mut self, cx: &mut Cx) {
+        let mut names: Vec<String> = self.st.bodies.keys().filter(|n| n.as_str() != "home").cloned().collect();
+        names.sort_by(|a, b| {
+            let a_sys = self.st.views.contains(a);
+            let b_sys = self.st.views.contains(b);
+            b_sys.cmp(&a_sys).then_with(|| a.cmp(b))
+        });
+        let items: Vec<JsonValue> = names
+            .into_iter()
+            .map(|name| {
+                let is_sys = self.st.views.contains(&name);
+                let saved = is_sys || self.st.persist.is_saved(&name);
+                let title = self.st.persist.title_of(&name).unwrap_or(&name).to_string();
+                obj(vec![
+                    ("name", JsonValue::String(name)),
+                    ("kind", JsonValue::String(if is_sys { "system" } else { "agent" }.into())),
+                    ("saved", JsonValue::Bool(saved)),
+                    ("title", JsonValue::String(title)),
+                ])
+            })
+            .collect();
+        let arr = JsonValue::Array(items);
+        let ser = arr.serialize_json();
+        if ser == self.st.surfaces_json {
+            return;
+        }
+        self.st.surfaces_json = ser;
+        self.apply(cx, &obj(vec![(SURFACES_KEY, arr)]), "shell");
+    }
+
+    fn surfaces_file() -> Option<String> {
+        env("TB_SHELL_RUNTIME_DIR")
+            .or_else(|| env("XDG_RUNTIME_DIR"))
+            .map(|d| format!("{d}/tb-shell.agent-surfaces"))
+    }
+
     fn left_out(&mut self, cx: &mut Cx, before: &str) {
-        let names: Vec<&str> = before.split_whitespace().filter(|n| !self.st.views.contains(*n)).collect();
+        let names: Vec<&str> = before
+            .split_whitespace()
+            .filter(|n| !self.st.views.contains(*n) && !self.st.bodies.contains_key(*n))
+            .collect();
         if !names.is_empty() {
             let note = format!("left out: {}", names.join(", "));
             log!("tb-shell: after a restart, {note}");
             if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
                 sh.note = note;
+                cx.redraw_all();
             }
             self.st.note_timer = cx.start_timeout(10.0);
         }
         self.write_surfaces_file();
+    }
+
+    fn show_strip_note(&mut self, cx: &mut Cx, note: String) {
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            sh.note = note;
+            cx.redraw_all();
+        }
+        cx.stop_timer(self.st.note_timer);
+        self.st.note_timer = cx.start_timeout(10.0);
     }
 
     fn clear_note(&mut self, cx: &mut Cx) {
@@ -445,12 +595,10 @@ impl App {
         }
     }
 
-    /// systemd's Type=notify: READY=1 once the first frame is drawn.
     fn notify_ready(&mut self) {
         if std::mem::replace(&mut self.st.notified, true) {
             return;
         }
-        // GL threads the driver started with the first frame get placed too.
         self.st.placement.apply();
         let Some(path) = env("NOTIFY_SOCKET") else { return };
         use std::os::linux::net::SocketAddrExt;
@@ -471,10 +619,6 @@ impl App {
         let _ = std::fs::write(&file, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(" "));
     }
 
-    /// Who may answer a guard: the --remote endpoint decides whether input can be
-    /// injected; root's test switch, a root-owned file at a fixed path (a path given
-    /// by env would let any process of the user point it at a root-owned file), lets
-    /// injected taps count, for the proof scripts. The log and the strip say so.
     fn guard_input(&mut self, cx: &mut Cx) {
         const TEST_TAPS: &str = "/etc/tb-shell/guard-test-taps";
         let remote_on = std::env::args().any(|a| a.starts_with("--remote")) || env("MAKEPAD_REMOTE").is_some();
@@ -486,7 +630,16 @@ impl App {
         if test_taps {
             log!("tb-shell: TEST SWITCH ON ({TEST_TAPS}, root's): injected input may answer a guard");
         }
-        log!("tb-shell: guard answers: {}", if !remote_on { "the device only (no --remote endpoint)" } else if test_taps { "any input (test switch)" } else { "the device only (injected input through --remote is ignored)" });
+        log!(
+            "tb-shell: guard answers: {}",
+            if !remote_on {
+                "the device only (no --remote endpoint)"
+            } else if test_taps {
+                "any input (test switch)"
+            } else {
+                "the device only (injected input through --remote is ignored)"
+            }
+        );
         if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
             sh.guard_input.remote_on = remote_on;
             sh.guard_input.test_taps = test_taps;
@@ -494,15 +647,6 @@ impl App {
         }
     }
 
-    /// The recording mark, from the kernel's capture status (on start and on
-    /// each open or close in the sound device directory).
-    ///
-    /// The mark is the status file's content, read again; the events only say when.
-    /// The kernel sends a close event before the PCM is released (fsnotify_close comes
-    /// before ->release in __fput), so the read a close triggers can still find the
-    /// stream open. So every event is followed by a second read 300 ms later, and while
-    /// the mark is on the status is read every 2 s until it says closed. With the mark
-    /// off there is no timer at all.
     fn read_mic(&mut self, cx: &mut Cx) {
         let Some(status) = self.st.sources.mic_status.clone() else { return };
         let text = read_trim(&status);
@@ -520,19 +664,153 @@ impl App {
         }
     }
 
-    /// An open or close in the sound device directory: read now, and again shortly.
     fn mic_event(&mut self, cx: &mut Cx) {
         self.read_mic(cx);
         cx.stop_timer(self.st.mic_timer);
         self.st.mic_timer = cx.start_timeout(0.3);
     }
 
-    /// The re-read timer: read; while the mark is on, read again in 2 s.
     fn mic_timer(&mut self, cx: &mut Cx) {
         self.read_mic(cx);
         let on = self.shell(cx).borrow::<Shell>().map_or(false, |sh| sh.marks.mic);
         if on {
             self.st.mic_timer = cx.start_timeout(2.0);
+        }
+    }
+
+    /// Reads `/run/tinybot/speaker-state` (or `TB_SHELL_SPEAKER_STATE`) and sets `LOUD`
+    /// when `state=playing`, `holding`, or `parking`.
+    fn read_loud(&mut self, cx: &mut Cx) {
+        let Some(path) = self.st.sources.speaker_state.clone() else { return };
+        let text = std::fs::read_to_string(&path).ok();
+        let state_val = text.as_deref().and_then(|s| {
+            s.lines()
+                .map(str::trim)
+                .find_map(|l| l.strip_prefix("state=").map(str::trim))
+        });
+        let loud = matches!(state_val, Some("playing") | Some("holding") | Some("parking"));
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            if sh.marks.loud != loud {
+                sh.marks.loud = loud;
+                log!("tb-shell: loud mark {} (state: {:?}) at {}", if loud { "ON" } else { "off" }, state_val, paneltrace::stamp());
+                cx.redraw_all();
+            }
+        }
+    }
+
+    /// Records CPU frame time right after `Event::Draw` and schedules post-show shader verify frames.
+    fn after_draw_watch(&mut self, cx: &mut Cx) {
+        let drawn = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.last_draw_ms.take());
+        let Some((name, draw_ms)) = drawn else { return };
+        if !self.is_watched_surface(&name) {
+            return;
+        }
+        let (frame_idx, cpu_ms, verify_redraw) = {
+            let w = self.st.frame_watch.entry(name.clone()).or_default();
+            w.cpu_frames = w.cpu_frames.saturating_add(1);
+            let total = std::mem::take(&mut w.pending_render_ms) + draw_ms;
+            let vr = if !self.st.panel_off && w.verify_redraws_left > 0 {
+                w.verify_redraws_left -= 1;
+                true
+            } else {
+                false
+            };
+            (w.cpu_frames, total, vr)
+        };
+        if verify_redraw {
+            cx.redraw_all();
+            self.st.watch_frame = cx.new_next_frame();
+        }
+        // Frame 1 is shader-compile & first-layout grace.
+        if frame_idx >= 2 {
+            self.check_frame_sample(cx, &name, cpu_ms, "cpu");
+        }
+    }
+
+    /// Drains completed hardware GPU + pass-encode frame timings from `cx.perf_monitor`
+    /// for the active watched agent surface.
+    fn drain_gpu_watch(&mut self, cx: &mut Cx) {
+        if !cx.perf_monitor.enabled() {
+            return;
+        }
+        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !self.is_watched_surface(&front) {
+            return;
+        }
+        let painted = cx.perf_monitor.frames_painted();
+        let prev = self.st.frame_watch.get(&front).map_or(painted, |w| w.last_painted);
+        if painted <= prev {
+            return;
+        }
+        let delta = (painted - prev) as usize;
+        if let Some(w) = self.st.frame_watch.get_mut(&front) {
+            w.last_painted = painted;
+        }
+        let mut ring: Vec<PerfMonitorFrame> = Vec::new();
+        cx.perf_monitor.read(&mut ring);
+        if ring.is_empty() {
+            return;
+        }
+        let take_n = delta.min(ring.len());
+        let slice = &ring[ring.len() - take_n..];
+        for f in slice {
+            let b_idx = {
+                let w = self.st.frame_watch.entry(front.clone()).or_default();
+                w.gpu_boundaries = w.gpu_boundaries.saturating_add(1);
+                w.gpu_boundaries
+            };
+            // Boundary 1 initializes last_frame_time; boundary 2 holds Frame 1's compile/upload GPU time (grace).
+            if b_idx <= 2 {
+                continue;
+            }
+            let gpu_ms = f.channel_us[PERF_CHANNEL_GPU.0] as f64 / 1000.0;
+            let encode_ms = f.channel_us[PERF_CHANNEL_DRAW.0] as f64 / 1000.0;
+            let sample_ms = gpu_ms.max(encode_ms);
+            let label = if gpu_ms >= encode_ms { "gpu" } else { "encode" };
+            if sample_ms > 0.0 {
+                self.check_frame_sample(cx, &front, sample_ms, label);
+                if !self.st.bodies.contains_key(&front) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn check_frame_sample(&mut self, cx: &mut Cx, name: &str, ms: f64, kind: &str) {
+        let budget = self.st.frame_budget_ms;
+        if budget <= 0.0 || !self.st.bodies.contains_key(name) {
+            return;
+        }
+        let trip = {
+            let w = self.st.frame_watch.entry(name.to_string()).or_default();
+            if ms > budget {
+                let recent = w.last_over_at.map_or(false, |t| t.elapsed().as_secs_f64() <= 3.0);
+                w.over_hits = if recent { w.over_hits + 1 } else { 1 };
+                w.last_over_at = Some(Instant::now());
+                log!("tb-shell: surface {name} slow {kind} frame: {ms:.1} ms (budget {budget:.0} ms, hit {})", w.over_hits);
+                w.over_hits >= 2
+            } else {
+                if w.last_over_at.map_or(false, |t| t.elapsed().as_secs_f64() > 3.0) {
+                    w.over_hits = 0;
+                }
+                false
+            }
+        };
+        if trip {
+            let msg = format!("frame budget exceeded ({kind} {ms:.1} ms > {budget:.0} ms)");
+            error!("tb-shell: surface {name}: {msg}; tearing down and returning home");
+            let ms_round = (ms * 10.0).round() / 10.0;
+            let ev = obj(vec![
+                ("ev", "error".into()),
+                ("surface", name.into()),
+                ("error", msg.clone().into()),
+                ("message", msg.into()),
+                ("ms", JsonValue::F64(ms_round)),
+                ("budget_ms", JsonValue::F64(budget)),
+            ]);
+            self.to_surface_watchers(name, ev);
+            let _ = self.close_surface(cx, name, true);
+            self.show_strip_note(cx, format!("stopped slow: {name}"));
         }
     }
 
@@ -542,7 +820,7 @@ impl App {
         if s.panel_read.map_or(false, |t| t.elapsed().as_millis() < 250) {
             return;
         }
-        s.panel_read = Some(std::time::Instant::now());
+        s.panel_read = Some(Instant::now());
         let value = read_trim(file);
         let off = value.as_deref() == Some(off_value.as_str());
         self.st.trace.read(value.as_deref());
@@ -551,11 +829,9 @@ impl App {
         }
     }
 
-    /// Panel asleep: every isolate is torn down, so no timer runs and nothing
-    /// asks for a frame. Awake: every surface is shown again from its body
-    /// and the store, which holds all the state a view has.
     fn panel(&mut self, cx: &mut Cx, on: bool) {
         self.st.panel_off = !on;
+        self.sync_gpu_timer_for_front(cx);
         self.st.trace.changed();
         log!("tb-shell: panel {} at {}", if on { "on: surfaces back" } else { "off: surfaces stopped" }, paneltrace::stamp());
         let shell = self.shell(cx);
@@ -563,7 +839,12 @@ impl App {
         for (name, splash) in surfaces {
             if on {
                 let body = self.st.bodies.get(&name).cloned().unwrap_or_default();
-                splash.set_text(cx, &format!("{PRELUDE}{BASE}{body}"));
+                let code = self.full_source(&body);
+                if let Some(w) = self.st.frame_watch.get_mut(&name) {
+                    w.cpu_frames = 0;
+                    w.gpu_boundaries = 0;
+                }
+                splash.set_text(cx, &code);
                 self.feed_all(cx, &name, &splash);
             } else {
                 splash.set_text(cx, "");
@@ -578,7 +859,8 @@ impl App {
 
     fn drain_socket(&mut self, cx: &mut Cx) {
         let Some(rx) = self.st.rx.take() else { return };
-        let mut sources_changed = false;
+        let mut mic_changed = false;
+        let mut loud_changed = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Open { conn, tx, peer } => {
@@ -586,18 +868,17 @@ impl App {
                 }
                 Msg::Closed { conn } => {
                     self.st.conns.remove(&conn);
-                    // A question whose asker is gone goes too.
                     for name in self.st.owned.remove(&conn).unwrap_or_default() {
-                        let _ = self.close(cx, &name);
+                        let _ = self.close_surface(cx, &name, false);
                     }
-                    // A guard whose asker is gone is withdrawn, never answered.
                     let raised = self.st.guards.first().map(|g| g.conn);
                     self.st.guards.retain(|g| g.conn != conn);
                     if raised == Some(conn) {
                         self.raise_next_guard(cx);
                     }
                 }
-                Msg::Changed => sources_changed = true,
+                Msg::MicChanged => mic_changed = true,
+                Msg::LoudChanged => loud_changed = true,
                 Msg::Line { conn, line } => {
                     if self.st.split.on() && (line.contains("\"op\":\"set\"") || line.contains("\"op\":\"push\"")) {
                         self.st.split.begin();
@@ -609,7 +890,7 @@ impl App {
                         Err(e) => Err(format!("bad json: {e:?}")),
                     };
                     let reply = match reply {
-                        Ok(None) => continue, // answered later (a guard)
+                        Ok(None) => continue,
                         Ok(Some(mut v)) => {
                             if let JsonValue::Object(m) = &mut v {
                                 m.entry("ok".into()).or_insert(JsonValue::Bool(true));
@@ -618,15 +899,18 @@ impl App {
                         }
                         Err(e) => obj(vec![("ok", JsonValue::Bool(false)), ("error", JsonValue::String(e))]),
                     };
-                    let t = std::time::Instant::now();
+                    let t = Instant::now();
                     self.send(conn, reply.serialize_json());
                     self.st.split.add_named("reply", t.elapsed());
                 }
             }
         }
         self.st.rx = Some(rx);
-        if sources_changed {
+        if mic_changed {
             self.mic_event(cx);
+        }
+        if loud_changed {
+            self.read_loud(cx);
         }
     }
 
@@ -637,7 +921,7 @@ impl App {
     }
 
     fn request(&mut self, cx: &mut Cx, conn: u64, req: &JsonValue) -> Result<Option<JsonValue>, String> {
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         if !matches!(req.get("op").and_then(|v| v.as_str()), Some("set") | Some("push")) {
             self.st.split.taint();
         }
@@ -656,8 +940,11 @@ impl App {
                 let body = req.get("body").and_then(|v| v.as_str()).ok_or("show needs body")?;
                 let front = req.get("front") != Some(&JsonValue::Bool(false));
                 let reply = self.show(cx, name, body, front)?;
-                if req.get("owned") == Some(&JsonValue::Bool(true)) && reply.get("ok") != Some(&JsonValue::Bool(false)) {
-                    self.st.owned.entry(conn).or_default().push(name.to_string());
+                if reply.get("ok") != Some(&JsonValue::Bool(false)) {
+                    if req.get("owned") == Some(&JsonValue::Bool(true)) {
+                        self.st.owned.entry(conn).or_default().push(name.to_string());
+                    }
+                    self.sync_surfaces_key(cx);
                 }
                 Ok(Some(reply))
             }
@@ -670,22 +957,25 @@ impl App {
                     return Err(format!("the key {key} is the shell's"));
                 }
                 self.apply(cx, patch, &format!("client:{}", peer.label()));
-                // "reply": false: a service's stream of updates takes no answers (errors still come).
                 if req.get("reply") == Some(&JsonValue::Bool(false)) {
                     return Ok(None);
                 }
                 Ok(Some(obj(vec![])))
             }
             "push" => {
-                // A stream, not the store: no merge, no script, no reply when it is taken.
                 let name = req.get("stream").and_then(|v| v.as_str()).ok_or("push needs stream")?;
-                let values: Vec<f32> = req.get("values").and_then(|v| v.as_array()).ok_or("push needs values")?
-                    .iter().map(|v| match v {
+                let values: Vec<f32> = req
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .ok_or("push needs values")?
+                    .iter()
+                    .map(|v| match v {
                         JsonValue::F64(f) => *f as f32,
                         JsonValue::I64(i) => *i as f32,
                         JsonValue::U64(u) => *u as f32,
                         _ => 0.0,
-                    }).collect();
+                    })
+                    .collect();
                 if values.len() > stream::MAX_VALUES {
                     log!("tb-shell: push to {name}: {} values, a view shows the first {}", values.len(), stream::MAX_VALUES);
                 }
@@ -695,7 +985,10 @@ impl App {
             }
             "get" => {
                 let keys = strings(req.get("keys"));
-                let state = self.st.store.iter()
+                let state = self
+                    .st
+                    .store
+                    .iter()
                     .filter(|(k, _)| keys.as_ref().map_or(true, |ks| ks.contains(k)))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
@@ -708,8 +1001,29 @@ impl App {
             }
             "close" => {
                 let name = surface.ok_or("close needs surface")?;
-                self.close(cx, name).map(Some)
+                if req.get("unsave") == Some(&JsonValue::Bool(true)) {
+                    let _ = self.st.persist.unsave_screen(name)?;
+                }
+                self.close_surface(cx, name, false).map(Some)
             }
+            "save" => {
+                let name = surface.ok_or("save needs surface")?;
+                if self.st.views.contains(name) {
+                    return Err(format!("{name} is a built-in view"));
+                }
+                let body = self.st.bodies.get(name).cloned().ok_or_else(|| format!("no surface {name}"))?;
+                let title = req.get("title").and_then(|v| v.as_str());
+                self.st.persist.save_screen(name, &body, title)?;
+                self.sync_surfaces_key(cx);
+                Ok(Some(obj(vec![("saved", name.into())])))
+            }
+            "unsave" => {
+                let name = surface.ok_or("unsave needs surface")?;
+                let removed = self.st.persist.unsave_screen(name)?;
+                self.sync_surfaces_key(cx);
+                Ok(Some(obj(vec![("unsaved", name.into()), ("removed", JsonValue::Bool(removed))])))
+            }
+            "lib" => self.lib_op(cx, req).map(Some),
             "guard" => {
                 if !self.st.guard_uids.contains(&peer.uid) {
                     return Err(format!("guard: uid {} may not raise a guard", peer.uid));
@@ -728,10 +1042,104 @@ impl App {
         }
     }
 
-    /// The shell's own key, and `front` while a guard is up.
+    fn lib_op(&mut self, cx: &mut Cx, req: &JsonValue) -> Result<JsonValue, String> {
+        let sub = req.get("sub").and_then(|v| v.as_str()).ok_or("lib needs sub (ls | cat | put | rm)")?;
+        match sub {
+            "ls" => {
+                let unused_days = match req.get("unused_days") {
+                    Some(JsonValue::U64(n)) => Some(*n),
+                    Some(JsonValue::I64(n)) if *n >= 0 => Some(*n as u64),
+                    Some(JsonValue::F64(f)) if *f >= 0.0 => Some(*f as u64),
+                    _ if req.get("unused") == Some(&JsonValue::Bool(true)) => Some(30),
+                    _ => None,
+                };
+                Ok(obj(vec![("pieces", JsonValue::Array(self.st.persist.ls_pieces(unused_days)))]))
+            }
+            "cat" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("lib cat needs name")?;
+                let body = self.st.persist.cat_piece(name).ok_or_else(|| format!("no library piece {name}"))?;
+                Ok(obj(vec![("name", name.into()), ("body", body.into())]))
+            }
+            "put" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("lib put needs name")?;
+                let body = req.get("body").and_then(|v| v.as_str()).ok_or("lib put needs body")?;
+                if !library::valid_piece_name(name) {
+                    return Err("a library piece name is 1..64 of A-Z a-z 0-9 _ - (starting with a letter or _, not \"base\")".into());
+                }
+                if !self.st.agent_shaders_on {
+                    if let Some(at) = shader_text(body) {
+                        return Err(format!("shader text is off (TB_SHELL_AGENT_SHADERS=0): {at}"));
+                    }
+                }
+                let other_lib = self.st.persist.lib_source_except(name);
+                let ahead = lines_ahead(other_lib.lines().count());
+                let check_code = format!("{PRELUDE}{BASE}{other_lib}{body}\nView{{}}\n");
+                let raw_errors = makepad_widgets::splash::validate_splash_body_with_host_io(cx, &check_code);
+                let _ = take_splash_host_requests();
+                if !raw_errors.is_empty() {
+                    let errors: Vec<JsonValue> = raw_errors
+                        .into_iter()
+                        .map(|e| match locate_with_ahead(&e, "validating", ahead) {
+                            Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
+                            None => obj(vec![("message", e.into())]),
+                        })
+                        .collect();
+                    return Ok(obj(vec![
+                        ("ok", JsonValue::Bool(false)),
+                        ("error", "library piece did not validate".into()),
+                        ("errors", JsonValue::Array(errors)),
+                    ]));
+                }
+                self.st.persist.put_piece(name, body)?;
+                let front_now = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let dependents: Vec<(String, String)> = self
+                    .st
+                    .bodies
+                    .iter()
+                    .filter(|(_, b)| library::ident_in(b, name))
+                    .map(|(s, b)| (s.clone(), b.clone()))
+                    .collect();
+                let mut reshown = Vec::new();
+                for (surf, surf_body) in dependents {
+                    let is_front = surf == front_now;
+                    if let Ok(r) = self.show(cx, &surf, &surf_body, is_front) {
+                        if r.get("ok") != Some(&JsonValue::Bool(false)) {
+                            reshown.push(JsonValue::String(surf));
+                        }
+                    }
+                }
+                Ok(obj(vec![("name", name.into()), ("reshown", JsonValue::Array(reshown))]))
+            }
+            "rm" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("lib rm needs name")?;
+                let force = req.get("force") == Some(&JsonValue::Bool(true));
+                if !force {
+                    let mut users: Vec<&str> = self
+                        .st
+                        .bodies
+                        .iter()
+                        .filter(|(_, b)| library::ident_in(b, name))
+                        .map(|(s, _)| s.as_str())
+                        .collect();
+                    users.sort_unstable();
+                    if !users.is_empty() {
+                        return Err(format!("library piece {name} is in use by active surface(s): {} (close them or pass --force)", users.join(", ")));
+                    }
+                }
+                self.st.persist.rm_piece(name)?;
+                Ok(obj(vec![("removed", name.into())]))
+            }
+            _ => Err(format!("unknown lib subcommand {sub}")),
+        }
+    }
+
+    /// Shell-owned keys (`shell`, `surfaces`), and `front` while a guard is up.
     fn refused_key(&self, patch: &JsonValue) -> Option<&'static str> {
         if patch.get(SHELL_KEY).is_some() {
             return Some(SHELL_KEY);
+        }
+        if patch.get(SURFACES_KEY).is_some() {
+            return Some(SURFACES_KEY);
         }
         if !self.st.guards.is_empty() && patch.get("front").is_some() {
             return Some("front");
@@ -746,15 +1154,23 @@ impl App {
         }
     }
 
-    /// Only a tap on the raised guard gets here; it answers the asker's own connection.
     fn answer_guard(&mut self, cx: &mut Cx, yes: bool) {
         if self.st.guards.is_empty() {
             return;
         }
         let g = self.st.guards.remove(0);
         let choice = if yes { &g.view.yes } else { &g.view.no };
-        let drawn = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.guard_drawn_ms).map_or(JsonValue::Null, |ms| JsonValue::F64((ms * 10.0).round() / 10.0));
-        let reply = obj(vec![("ok", JsonValue::Bool(true)), ("answer", if yes { "yes" } else { "no" }.into()), ("choice", choice.as_str().into()), ("drawn_ms", drawn)]);
+        let drawn = self
+            .shell(cx)
+            .borrow::<Shell>()
+            .and_then(|sh| sh.guard_drawn_ms)
+            .map_or(JsonValue::Null, |ms| JsonValue::F64((ms * 10.0).round() / 10.0));
+        let reply = obj(vec![
+            ("ok", JsonValue::Bool(true)),
+            ("answer", if yes { "yes" } else { "no" }.into()),
+            ("choice", choice.as_str().into()),
+            ("drawn_ms", drawn),
+        ]);
         self.send(g.conn, reply.serialize_json());
         self.raise_next_guard(cx);
     }
@@ -763,12 +1179,13 @@ impl App {
         if !valid_name(name) {
             return Err("a surface name is 1 to 64 of A-Z a-z 0-9 - _ . and does not start with \"guard\"".into());
         }
-        if !self.st.trusted.contains(body) {
-            if let Some(at) = shader_text(body) {
-                return Err(format!("shader text is not taken from agents yet (no frame-time watch): {at}"));
+        let has_shader = shader_text(body);
+        if !self.st.trusted.contains(body) && !self.st.agent_shaders_on {
+            if let Some(at) = &has_shader {
+                return Err(format!("shader text is off (TB_SHELL_AGENT_SHADERS=0): {at}"));
             }
         }
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let shell = self.shell(cx);
         let Some(mut sh) = shell.borrow_mut::<Shell>() else { return Err("no shell".into()) };
         let (splash, created) = match sh.surface(name) {
@@ -776,91 +1193,120 @@ impl App {
             None => (sh.add(cx, name), true),
         };
         drop(sh);
+        let ahead = self.current_ahead();
         if !self.st.panel_off {
-            splash.set_text(cx, &format!("{PRELUDE}{BASE}{body}"));
-            let errors: Vec<JsonValue> = splash.as_splash().last_errors().into_iter().map(|e| match locate(&e, name) {
-                Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
-                None => obj(vec![("message", e.into())]),
-            }).collect();
+            let full = self.full_source(body);
+            splash.set_text(cx, &full);
+            let errors: Vec<JsonValue> = splash
+                .as_splash()
+                .last_errors()
+                .into_iter()
+                .map(|e| match locate_with_ahead(&e, name, ahead) {
+                    Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
+                    None => obj(vec![("message", e.into())]),
+                })
+                .collect();
             if !errors.is_empty() {
                 if created {
                     shell.borrow_mut::<Shell>().map(|mut sh| sh.remove(cx, name));
                 }
-                // The previous body (if any) keeps drawing.
-                return Ok(obj(vec![("ok", JsonValue::Bool(false)), ("error", "body did not evaluate".into()), ("errors", JsonValue::Array(errors))]));
+                return Ok(obj(vec![
+                    ("ok", JsonValue::Bool(false)),
+                    ("error", "body did not evaluate".into()),
+                    ("errors", JsonValue::Array(errors)),
+                ]));
             }
         }
         self.st.bodies.insert(name.to_string(), body.to_string());
+        self.st.persist.record_usage(body);
         self.write_surfaces_file();
         self.st.reads.insert(name.to_string(), Reads::scan(body));
+
+        // Arm per-surface frame watch for untrusted agent surfaces.
+        if self.is_watched_surface(name) {
+            let verify_redraws_left = if has_shader.is_some() { 3 } else { 0 };
+            self.st.frame_watch.insert(
+                name.to_string(),
+                SurfaceWatch { verify_redraws_left, ..Default::default() },
+            );
+        } else {
+            self.st.frame_watch.remove(name);
+        }
+
         if !self.st.panel_off {
             self.feed_all(cx, name, &splash);
         }
-        // Behind a raised guard the front does not change.
         if front && self.st.guards.is_empty() {
             self.apply(cx, &obj(vec![("front", JsonValue::String(name.into()))]), "shell");
+        } else {
+            self.sync_gpu_timer_for_front(cx);
         }
         cx.redraw_all();
         let reads = match &self.st.reads[name] {
             Reads::All => JsonValue::String("*".into()),
             Reads::Keys(k) => JsonValue::Array(k.iter().map(|k| k.as_str().into()).collect()),
         };
-        // Evaluation and the first feed; the frame that draws it comes after.
         let ms = JsonValue::F64((started.elapsed().as_secs_f64() * 1e4).round() / 10.0);
         Ok(obj(vec![("errors", JsonValue::Array(vec![])), ("reads", reads), ("ms", ms)]))
     }
 
-    fn close(&mut self, cx: &mut Cx, name: &str) -> Result<JsonValue, String> {
+    fn close_surface(&mut self, cx: &mut Cx, name: &str, force_home: bool) -> Result<JsonValue, String> {
         let removed = self.shell(cx).borrow_mut::<Shell>().map_or(false, |mut sh| sh.remove(cx, name));
         if !removed {
             return Err(format!("no surface {name}"));
         }
         self.st.reads.remove(name);
         self.st.bodies.remove(name);
+        self.st.frame_watch.remove(name);
         self.write_surfaces_file();
         self.st.front_history.retain(|n| n != name);
         if self.st.store.get("front").and_then(|v| v.as_str()) == Some(name) {
-            // Back to what was in front before it; if that is gone too, home.
-            let back = self.st.front_history.iter().rev().find(|n| self.st.bodies.contains_key(*n)).cloned()
-                .or_else(|| self.st.bodies.contains_key("home").then(|| "home".to_string()));
+            let back = if force_home && self.st.bodies.contains_key("home") {
+                Some("home".to_string())
+            } else {
+                self.st
+                    .front_history
+                    .iter()
+                    .rev()
+                    .find(|n| self.st.bodies.contains_key(*n))
+                    .cloned()
+                    .or_else(|| self.st.bodies.contains_key("home").then(|| "home".to_string()))
+            };
             let back = back.map_or(JsonValue::Null, JsonValue::String);
             self.apply(cx, &obj(vec![("front", back)]), "shell");
         }
+        self.sync_surfaces_key(cx);
         Ok(obj(vec![]))
     }
 
-    /// `on_render` does not run on first show: hand a surface every key it reads.
     fn feed_all(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) {
         let Some(reads) = self.st.reads.get(name).cloned() else { return };
         let keys: Vec<String> = self.st.store.keys().filter(|k| reads.any(std::slice::from_ref(k))).cloned().collect();
         self.feed(cx, splash, &keys);
     }
 
-    /// Hands a surface the current values of `keys` and re-renders it.
     fn feed(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let r = self.feed_inner(cx, splash, keys);
         self.st.split.add_named("feed", t.elapsed());
         r
     }
 
     fn feed_inner(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
-        let vals = keys.iter()
+        let vals = keys
+            .iter()
             .map(|k| (k.clone(), self.st.store.get(k).cloned().unwrap_or(JsonValue::Null)))
             .collect();
         let text = JsonValue::Object(vals).serialize_json();
-        // Warm the widget tree from here: while the Splash is borrowed below,
-        // the tree cannot read its children, and `ui.main` would not resolve.
         let split = &mut self.st.split;
-        split.timed(5, || { let _ = splash.widget(cx, ids!(main)); });
-        // The values are assigned now; `on_render` and the reload of its result
-        // wait for the next frame (render_pending).
+        split.timed(5, || {
+            let _ = splash.widget(cx, ids!(main));
+        });
         if let Some(mut inner) = splash.borrow_mut::<Splash>() {
             let split = &mut self.st.split;
             if split.on() {
-                // The bare cost of a host-to-script call carrying this text, for the split.
                 split.add_count("assign-bytes", text.len() as f64);
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 inner.call_script_fn_with_strings(cx, live_id!(__noop), &[&text]);
                 split.add_named("noop-call", t.elapsed());
             }
@@ -872,28 +1318,30 @@ impl App {
         self.st.render_frame = cx.new_next_frame();
     }
 
-    /// The frame has come: each surface fed since the last one renders once.
     fn render_pending(&mut self, cx: &mut Cx) {
-        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let front = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(&front));
+        let front_name = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let front = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(&front_name));
         for splash in std::mem::take(&mut self.st.render_pending) {
-            // Only the front surface renders; a hidden one waits until it is shown.
             if front.as_ref().map_or(true, |f| f.widget_uid() != splash.widget_uid()) {
                 if !self.st.stale.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
                     self.st.stale.push(splash);
                 }
                 continue;
             }
-            let _ = splash.widget(cx, ids!(main)); // the tree warm-up, as in feed
+            let _ = splash.widget(cx, ids!(main));
+            let t0 = Instant::now();
             if let Some(mut inner) = splash.borrow_mut::<Splash>() {
                 self.st.split.timed(3, || inner.call_script_fn(cx, live_id!(__render), &[]));
+            }
+            let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if self.is_watched_surface(&front_name) {
+                self.st.frame_watch.entry(front_name.clone()).or_default().pending_render_ms += render_ms;
             }
         }
     }
 
-    /// The one write path: merge, re-render the readers, tell the watchers.
     fn apply(&mut self, cx: &mut Cx, patch: &JsonValue, by: &str) {
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let r = self.apply_inner(cx, patch, by);
         self.st.split.add_named("apply", t.elapsed());
         r
@@ -912,7 +1360,7 @@ impl App {
                 }
             }
         });
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let shell = self.shell(cx);
         self.st.split.add_named("shell-lookup", t.elapsed());
         if touched.iter().any(|k| k == "front") {
@@ -922,8 +1370,6 @@ impl App {
             if let Some(mut sh) = shell.borrow_mut::<Shell>() {
                 sh.front = front.clone();
             }
-            // A service does its work only while its view is looked at: `shown` and `hidden`
-            // go to the watchers of those surfaces.
             if before != front {
                 self.st.front_history.retain(|n| *n != front && *n != before);
                 if !before.is_empty() {
@@ -936,7 +1382,7 @@ impl App {
                     self.to_surface_watchers(&front, obj(vec![("ev", "shown".into()), ("surface", front.as_str().into())]));
                 }
             }
-            // A surface that was fed while hidden renders now, with the newest state.
+            self.sync_gpu_timer_for_front(cx);
             if let Some(shown) = shown {
                 if let Some(at) = self.st.stale.iter().position(|w| w.widget_uid() == shown.widget_uid()) {
                     self.st.stale.remove(at);
@@ -946,7 +1392,6 @@ impl App {
             }
             cx.redraw_all();
         }
-        // Asleep, nothing renders: a surface gets the whole store when the panel wakes.
         if !self.st.panel_off {
             let readers: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
             for (name, splash) in readers {
@@ -977,14 +1422,13 @@ impl App {
         }
     }
 
-    /// Script errors land in the process log, wherever they happen (a render,
-    /// a tap, a timer). Those of a surface go to its watchers as `error` events.
     fn errors_to_watchers(&mut self) {
         let (cursor, lines) = log_ring::read_since(self.st.log_cursor, usize::MAX);
         if lines.is_empty() {
             return;
         }
         self.st.log_cursor = cursor;
+        let ahead = self.current_ahead();
         for l in lines {
             if !matches!(l.level, LogLevel::Error | LogLevel::Panic) {
                 continue;
@@ -994,14 +1438,18 @@ impl App {
             if !self.st.bodies.contains_key(&name) {
                 continue;
             }
-            let Some((line, col, message)) = locate(&l.text, &name) else { continue };
-            let ev = obj(vec![("ev", "error".into()), ("surface", name.as_str().into()), ("line", (line as u64).into()), ("col", (col as u64).into()), ("message", message.into())]);
+            let Some((line, col, message)) = locate_with_ahead(&l.text, &name, ahead) else { continue };
+            let ev = obj(vec![
+                ("ev", "error".into()),
+                ("surface", name.as_str().into()),
+                ("line", (line as u64).into()),
+                ("col", (col as u64).into()),
+                ("message", message.into()),
+            ]);
             self.to_surface_watchers(&name, ev);
         }
     }
 
-    /// `set`, `emit` (and `front`, which is a `set`) are the only doors out
-    /// of a body. Anything else a body asks for is refused by silence.
     fn drain_host_requests(&mut self, cx: &mut Cx) {
         loop {
             let reqs = take_splash_host_requests();

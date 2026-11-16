@@ -2,25 +2,27 @@
 //!
 //!   tbui show NAME [-f FILE] [--back] [--wait MS]
 //!        body from FILE or stdin; --back keeps the front surface; --wait prints the
-//!        surface's script errors (its first render, taps, timers) for MS ms, exit 1 if any
-//!   tbui set -j JSON | tbui set KEY=JSON...
-//!   tbui set -        one connection; each line of stdin is a patch (for a service: no
-//!                     process per update); exit 1 if any was refused
-//!   tbui push NAME [--append] [--clear]   one connection; each line of stdin is the values of
-//!                     stream NAME (numbers, comma or space separated), for StreamView; no
-//!                     replies. --append adds them to the stream's ring of the last 32;
-//!                     --clear empties it before the first line (a new take).
+//!        surface's errors (first render, taps, timers, frame budget) for MS ms, exit 1 if any
+//!   tbui save NAME [--title TITLE]
+//!        persists an active agent surface in ~/.local/share/tb-shell/screens/ for start restore
+//!   tbui unsave NAME
+//!        removes a saved screen from ~/.local/share/tb-shell/screens/
+//!   tbui close [--unsave] NAME
+//!        closes surface NAME (and removes any saved copy with --unsave)
+//!   tbui lib ls [--unused [DAYS]]
+//!        lists reusable Splash pieces in ~/.local/share/tb-shell/lib/ with line-1 descriptions
+//!   tbui lib cat NAME
+//!        prints library piece NAME
+//!   tbui lib put NAME [-f FILE | -]
+//!        validates and saves piece NAME, re-showing active surfaces that reference it
+//!   tbui lib rm NAME [--force]
+//!        removes piece NAME from the library
+//!   tbui set -j JSON | tbui set KEY=JSON... | tbui set -
+//!   tbui push NAME [--append] [--clear]
 //!   tbui get [KEY...]
 //!   tbui watch [--surfaces A,B] [--keys K,L]
-//!   tbui close NAME
 //!   tbui ask "QUESTION" CHOICE... [--from TEXT] [--timeout SECS]
-//!        prints the choice; exit 0 for the first choice, 1 for another, 2 on timeout.
-//!        Run as root it is the shell's GUARD (two choices: the first is yes, the second no):
-//!        drawn above everything, input to the views gated, the asker named by the kernel;
-//!        exit 3 when it went away unanswered. From any other user it is an ordinary view.
 //!   tbui guard "TEXT" [--yes LABEL] [--no LABEL]
-//!        the shell's own guard (a uid it allows, root by default); waits for a person's tap;
-//!        exit 0 yes, 1 no, 3 when the guard went away unanswered (the shell ended)
 
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use std::collections::HashMap;
@@ -29,9 +31,6 @@ use std::os::unix::net::UnixStream;
 use std::process::exit;
 use std::time::Duration;
 
-/// The shell's socket: TB_SHELL_SOCK; else XDG_RUNTIME_DIR's; else (root under sudo, or
-/// a root service) the sudo user's /run/user/UID/tb-shell.sock; else the only
-/// /run/user/*/tb-shell.sock there is.
 fn socket_path() -> String {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     if let Some(p) = var("TB_SHELL_SOCK") {
@@ -46,7 +45,10 @@ fn socket_path() -> String {
             return p;
         }
     }
-    let found: Vec<String> = std::fs::read_dir("/run/user").into_iter().flatten().flatten()
+    let found: Vec<String> = std::fs::read_dir("/run/user")
+        .into_iter()
+        .flatten()
+        .flatten()
         .map(|e| e.path().join("tb-shell.sock"))
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string())
@@ -93,13 +95,11 @@ impl Client {
         self.out.write_all(line.as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
     }
 
-    /// The next line, or None at end of stream or on a read timeout.
     fn next(&mut self) -> Option<JsonValue> {
         let line = self.lines.next()?.ok()?;
         Some(parse(&line))
     }
 
-    /// Sends a request and returns its reply (events before it are skipped).
     fn call(&mut self, req: JsonValue) -> JsonValue {
         self.send(&req);
         loop {
@@ -111,7 +111,6 @@ impl Client {
     }
 }
 
-/// Prints a reply; a refusal exits 1.
 fn report(reply: &JsonValue) {
     println!("{}", reply.serialize_json());
     if reply.get("ok") != Some(&JsonValue::Bool(true)) {
@@ -119,7 +118,6 @@ fn report(reply: &JsonValue) {
     }
 }
 
-/// A Splash string literal holding `s`.
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -169,8 +167,6 @@ fn ask(args: &[String]) -> ! {
         die("ask QUESTION CHOICE...");
     }
     let (question, choices) = (words[0].clone(), words[1..].to_vec());
-    // Root asks through the guard; TBUI_ASK_GUARD=1 does it for a test (the shell still
-    // refuses a guard from a uid it does not allow).
     extern "C" {
         fn geteuid() -> u32;
     }
@@ -179,11 +175,15 @@ fn ask(args: &[String]) -> ! {
             die("a root ask is the guard: exactly two choices, yes then no");
         }
         let mut c = Client::connect();
-        c.send(&obj(vec![("op", "guard".into()), ("text", question.as_str().into()), ("yes", choices[0].as_str().into()), ("no", choices[1].as_str().into())]));
+        c.send(&obj(vec![
+            ("op", "guard".into()),
+            ("text", question.as_str().into()),
+            ("yes", choices[0].as_str().into()),
+            ("no", choices[1].as_str().into()),
+        ]));
         if timeout > 0 {
             c.out.set_read_timeout(Some(Duration::from_secs(timeout))).ok();
         }
-        // On a timeout the connection closes with this process, and the guard goes with it.
         match c.next() {
             Some(reply) if reply.get("ok") == Some(&JsonValue::Bool(true)) => {
                 let choice = reply.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -206,19 +206,20 @@ fn ask(args: &[String]) -> ! {
         from = format!("asked by pid {}", std::os::unix::process::parent_id());
     }
     let mut c = Client::connect();
-    // Watch first, so the answer cannot arrive before we listen for it.
     report_quiet(c.call(obj(vec![("op", "watch".into()), ("surfaces", list(&id))])));
     let body = ask_body(&id, &question, &from, &choices);
-    // Owned: if this process ends without closing it, the shell closes it.
-    report_quiet(c.call(obj(vec![("op", "show".into()), ("surface", id.as_str().into()), ("body", body.into()), ("owned", JsonValue::Bool(true))])));
+    report_quiet(c.call(obj(vec![
+        ("op", "show".into()),
+        ("surface", id.as_str().into()),
+        ("body", body.into()),
+        ("owned", JsonValue::Bool(true)),
+    ])));
     if timeout > 0 {
         c.out.set_read_timeout(Some(Duration::from_secs(timeout))).ok();
     }
     let choice = loop {
         let Some(ev) = c.next() else { break None };
-        if ev.get("ev").and_then(|v| v.as_str()) == Some("emit")
-            && ev.get("name").and_then(|v| v.as_str()) == Some("answer")
-        {
+        if ev.get("ev").and_then(|v| v.as_str()) == Some("emit") && ev.get("name").and_then(|v| v.as_str()) == Some("answer") {
             break ev.get("data").and_then(|d| d.get("choice")).and_then(|v| v.as_str()).map(str::to_string);
         }
     };
@@ -237,6 +238,109 @@ fn report_quiet(reply: JsonValue) {
     if reply.get("ok") != Some(&JsonValue::Bool(true)) {
         eprintln!("{}", reply.serialize_json());
         exit(1);
+    }
+}
+
+fn format_age(age: Option<u64>) -> String {
+    let Some(s) = age else { return "unused".into() };
+    if s < 60 {
+        format!("used {s}s ago")
+    } else if s < 3600 {
+        format!("used {}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("used {}h ago", s / 3600)
+    } else {
+        format!("used {}d ago", s / 86_400)
+    }
+}
+
+fn lib_cmd(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let rest = &args[args.len().min(1)..];
+    match sub {
+        "ls" => {
+            let mut req = obj(vec![("op", "lib".into()), ("sub", "ls".into())]);
+            if let Some(pos) = rest.iter().position(|a| a == "--unused") {
+                let days = rest
+                    .get(pos + 1)
+                    .filter(|s| !s.starts_with('-'))
+                    .map(|s| s.trim_end_matches('d').parse::<u64>().unwrap_or_else(|_| die("--unused [DAYS]")))
+                    .unwrap_or(30);
+                if let JsonValue::Object(m) = &mut req {
+                    m.insert("unused_days".into(), JsonValue::U64(days));
+                }
+            }
+            let reply = Client::connect().call(req);
+            if reply.get("ok") != Some(&JsonValue::Bool(true)) {
+                report(&reply);
+            }
+            if rest.iter().any(|a| a == "-j") {
+                println!("{}", reply.serialize_json());
+                return;
+            }
+            if let Some(arr) = reply.get("pieces").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let desc = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let age = match item.get("age_secs") {
+                        Some(JsonValue::U64(n)) => Some(*n),
+                        Some(JsonValue::I64(n)) if *n >= 0 => Some(*n as u64),
+                        Some(JsonValue::F64(f)) if *f >= 0.0 => Some(*f as u64),
+                        _ => None,
+                    };
+                    if desc.is_empty() {
+                        println!("{name}\t({})", format_age(age));
+                    } else {
+                        println!("{name}\t{desc}\t({})", format_age(age));
+                    }
+                }
+            }
+        }
+        "cat" => {
+            let name = rest.first().unwrap_or_else(|| die("lib cat NAME"));
+            let reply = Client::connect().call(obj(vec![("op", "lib".into()), ("sub", "cat".into()), ("name", name.as_str().into())]));
+            if reply.get("ok") != Some(&JsonValue::Bool(true)) {
+                eprintln!("{}", reply.serialize_json());
+                exit(1);
+            }
+            let body = reply.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            print!("{body}");
+            if !body.ends_with('\n') {
+                println!();
+            }
+        }
+        "put" => {
+            let name = rest.first().unwrap_or_else(|| die("lib put NAME [-f FILE | -]"));
+            let mut body = String::new();
+            match rest.iter().position(|a| a == "-f") {
+                Some(i) => {
+                    let file = rest.get(i + 1).unwrap_or_else(|| die("-f FILE"));
+                    body = std::fs::read_to_string(file).unwrap_or_else(|e| die(&format!("{file}: {e}")));
+                }
+                None => {
+                    std::io::stdin().read_to_string(&mut body).unwrap_or_else(|e| die(&format!("stdin: {e}")));
+                }
+            }
+            let reply = Client::connect().call(obj(vec![
+                ("op", "lib".into()),
+                ("sub", "put".into()),
+                ("name", name.as_str().into()),
+                ("body", body.into()),
+            ]));
+            report(&reply);
+        }
+        "rm" => {
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("lib rm NAME [--force]"));
+            let force = rest.iter().any(|a| a == "--force");
+            let reply = Client::connect().call(obj(vec![
+                ("op", "lib".into()),
+                ("sub", "rm".into()),
+                ("name", name.as_str().into()),
+                ("force", JsonValue::Bool(force)),
+            ]));
+            report(&reply);
+        }
+        _ => die("lib ls [--unused [DAYS]] | lib cat NAME | lib put NAME [-f FILE | -] | lib rm NAME [--force]"),
     }
 }
 
@@ -273,7 +377,6 @@ fn main() {
             let reply = c.call(req);
             report(&reply);
             if let Some(ms) = wait {
-                // Errors after the reply: the first render runs after it.
                 c.out.set_read_timeout(Some(Duration::from_millis(ms.max(1)))).ok();
                 let mut errors = 0;
                 while let Some(ev) = c.next() {
@@ -287,10 +390,36 @@ fn main() {
                 }
             }
         }
+        "save" => {
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("save NAME [--title TITLE]"));
+            let mut req = obj(vec![("op", "save".into()), ("surface", name.as_str().into())]);
+            if let Some(i) = rest.iter().position(|a| a == "--title") {
+                let title = rest.get(i + 1).unwrap_or_else(|| die("--title TITLE"));
+                if let JsonValue::Object(m) = &mut req {
+                    m.insert("title".into(), title.as_str().into());
+                }
+            }
+            report(&Client::connect().call(req));
+        }
+        "unsave" => {
+            let name = rest.first().unwrap_or_else(|| die("unsave NAME"));
+            report(&Client::connect().call(obj(vec![("op", "unsave".into()), ("surface", name.as_str().into())])));
+        }
+        "close" => {
+            let unsave = rest.iter().any(|a| a == "--unsave");
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("close [--unsave] NAME"));
+            let mut req = obj(vec![("op", "close".into()), ("surface", name.as_str().into())]);
+            if unsave {
+                if let JsonValue::Object(m) = &mut req {
+                    m.insert("unsave".into(), JsonValue::Bool(true));
+                }
+            }
+            report(&Client::connect().call(req));
+        }
+        "lib" => lib_cmd(rest),
         "push" => {
             let name = rest.first().unwrap_or_else(|| die("push NAME [--append] (values on stdin)"));
             let append = if rest.iter().any(|a| a == "--append") { ",\"append\":true" } else { "" };
-            // --clear: the first line starts a new take (the ring is emptied before it).
             let mut clear = rest.iter().any(|a| a == "--clear");
             let mut c = Client::connect();
             for line in std::io::stdin().lock().lines() {
@@ -300,7 +429,11 @@ fn main() {
                     die(&format!("not numbers: {line}"));
                 }
                 let cl = if std::mem::take(&mut clear) { ",\"clear\":true" } else { "" };
-                let req = format!("{{\"op\":\"push\",\"stream\":{},\"values\":[{}]{append}{cl}}}\n", JsonValue::String(name.clone()).serialize_json(), values.join(","));
+                let req = format!(
+                    "{{\"op\":\"push\",\"stream\":{},\"values\":[{}]{append}{cl}}}\n",
+                    JsonValue::String(name.clone()).serialize_json(),
+                    values.join(",")
+                );
                 c.out.write_all(req.as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
             }
         }
@@ -312,7 +445,6 @@ fn main() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                // The shell parses and checks the patch; the client only frames it.
                 c.out.write_all(format!("{{\"op\":\"set\",\"patch\":{}}}\n", line.trim()).as_bytes()).unwrap_or_else(|e| die(&format!("write: {e}")));
                 let reply = loop {
                     let msg = c.next().unwrap_or_else(|| die("the shell closed the connection"));
@@ -334,7 +466,6 @@ fn main() {
                 let mut m = HashMap::new();
                 for kv in rest {
                     let (k, v) = kv.split_once('=').unwrap_or_else(|| die("set KEY=JSON..."));
-                    // A value that is not JSON is taken as a string.
                     let v = JsonValue::deserialize_json(v).unwrap_or_else(|_| v.into());
                     m.insert(k.to_string(), v);
                 }
@@ -375,10 +506,6 @@ fn main() {
                 }
             }
         }
-        "close" => {
-            let name = rest.first().unwrap_or_else(|| die("close NAME"));
-            report(&Client::connect().call(obj(vec![("op", "close".into()), ("surface", name.as_str().into())])));
-        }
         "ask" => ask(rest),
         "guard" => {
             let text = rest.first().unwrap_or_else(|| die("guard TEXT [--yes LABEL] [--no LABEL]"));
@@ -399,7 +526,7 @@ fn main() {
                     match reply.get("answer").and_then(|a| a.as_str()) {
                         Some("yes") => exit(0),
                         Some(_) => exit(1),
-                        None => exit(4), // refused
+                        None => exit(4),
                     }
                 }
                 None => {
@@ -408,6 +535,6 @@ fn main() {
                 }
             }
         }
-        _ => die("show | set | get | watch | close | ask   (see the top of src/bin/tbui.rs)"),
+        _ => die("show | save | unsave | close | lib | set | push | get | watch | ask | guard"),
     }
 }
