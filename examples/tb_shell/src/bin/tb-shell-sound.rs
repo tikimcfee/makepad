@@ -446,6 +446,11 @@ fn main() {
                             (floor_db, top_db) = v;
                         }
                     }
+                    "panel" if ev.get("on") == Some(&JsonValue::Bool(true)) => {
+                        if let Ok(v) = publish_fast(&writer, &cfg, vec![], Some(&mut last_fast_json)) {
+                            (floor_db, top_db) = v;
+                        }
+                    }
                     "emit" if ev.get("surface").and_then(|v| v.as_str()) == Some("sound") => {
                         let name = ev.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let data = ev.get("data");

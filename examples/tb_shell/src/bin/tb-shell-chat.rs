@@ -811,6 +811,10 @@ fn main() {
                         st.snapshot_fetch(false);
                         dirty = true;
                     }
+                    "panel" if ev.get("on") == Some(&JsonValue::Bool(true)) && !st.chat_visible => {
+                        st.snapshot_fetch(false);
+                        dirty = true;
+                    }
                     "emit" if surf == "chat" => {
                         match ev.get("name").and_then(|v| v.as_str()).unwrap_or("") {
                             "refresh" => {

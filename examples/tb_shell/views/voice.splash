@@ -1,40 +1,114 @@
-// VOICE: the wave and the level (streams tb-voiced pushes: mic one value at a time with
-// "append", a new take with "clear"; level one value, drawn as a meter), then whom it goes
-// to and the live text (voice.text). The text box keeps the end of the text in view
-// (scrolling up lets go); after a take (voice.live false) the last text stays, dimmed.
-// Undo / send now: while tb-voiced counts down before sending (voice.pending N, voice.id the
-// take), "Don't send (N)" sets voice_cancel and "Send now" sets voice_send to the take's id.
-width: Fill height: Fill flow: Down padding: 16 spacing: 12
-wave := StreamView{stream: "mic" height: 90}
-level := StreamView{stream: "level" meter: true height: 10 draw_bg.color_bar: #x3ddc84}
+// VOICE: pinned top-band & full view.
+// 1. 60 px soft visualizer header (`flow: Overlay`): `mic` wave + `level` meter behind
+//    the tappable `"to: <agent>"` selector pill and live status.
+// 2. Underneath: `ScrollYView` (`auto_tail: true`, no char limit; ~4-5 lines `height: 98`
+//    in `compact` mode, `Fill` in `full` mode).
+// 3. Underneath that: horizontal `"Don't send (N)"` and `"Send now"` buttons (`height: 48`)
+//    right where the thumb reaches at the top of the screen.
+width: Fill height: Fit flow: Down
 main := View{
-    width: Fill height: Fill flow: Down spacing: 8
+    width: Fill height: Fit flow: Down
     on_render: || {
+        let is_compact = (slot.mode ?? "full") == "compact"
         let v = state.voice ?? nil
-        let live = if v == nil { true } else { v.live ?? true }
+        let live = if v == nil { false } else { v.live ?? false }
         let n = if v == nil { 0 } else { v.pending ?? 0 }
-        Small{text: "to: " + agent_name(state.agents ?? nil, state.target ?? nil)}
-        if n > 0 {
+        let txt = if v == nil { "" } else { v.text ?? "" }
+        let st = if v == nil { "" } else { v.status ?? (if live { "Listening..." } else if n > 0 { "Sending..." } else { "Ready" }) }
+        let target_lbl = agent_name(state.agents ?? nil, state.target ?? nil)
+        let full_raw_h = (slot.height ?? 780.0) - (if n > 0 { 156.0 } else { 100.0 })
+        let full_text_h = if full_raw_h < 110.0 { 110.0 } else { full_raw_h }
+        let text_h = if is_compact { 98.0 } else { full_text_h }
+
+        View{
+            width: Fill
+            height: Fit
+            flow: Down
+            padding: if is_compact { Inset{left: 10 right: 10 top: 6 bottom: 8} } else { Inset{left: 14 right: 14 top: 12 bottom: 14} }
+            spacing: 8
+
+            // 1. 60 px soft background visualizer + foreground target pill & status
             View{
-                width: Fill height: Fit flow: Right spacing: 8
-                Big{
-                    width: Fill margin: 0
-                    padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
-                    text: "Don't send (" + show(n, ")")
-                    on_click: || set("voice_cancel", v.id ?? "")
+                width: Fill height: 60 flow: Overlay
+                View{
+                    width: Fill height: 60 flow: Down
+                    StreamView{
+                        stream: "mic" width: Fill height: 56
+                        draw_bg.soft: 1.0 draw_bg.border_radius: 12.0
+                        draw_bg.color_bg: #x121b29
+                        draw_bg.color_bar: if live { #x28608f } else { #x1b334d }
+                    }
+                    StreamView{
+                        stream: "level" meter: true width: Fill height: 4
+                        draw_bg.border_radius: 2.0
+                        draw_bg.color_track: #x121b29 draw_bg.color_bar: #x3ddc84
+                    }
                 }
-                Big{
-                    width: Fill margin: 0
-                    padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
-                    draw_bg.color: #x1e4d35 draw_bg.color_focus: #x1e4d35 draw_bg.color_hover: #x276345
-                    text: "Send now"
-                    on_click: || set("voice_send", v.id ?? "")
+                View{
+                    width: Fill height: 60 flow: Right align: Align{y: 0.5}
+                    padding: Inset{left: 10 right: 12} spacing: 8
+                    ButtonFlat{
+                        width: Fit height: 34 margin: 0
+                        padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
+                        draw_bg.color: #x1a283d draw_bg.color_focus: #x1a283d draw_bg.color_hover: #x243652
+                        draw_text.text_style.font_size: 13.5
+                        text: "to: " + target_lbl + " v"
+                        on_click: || front("agents")
+                    }
+                    View{width: Fill height: 1}
+                    Small{
+                        text: st
+                        draw_text.color: if live { #x3ddc84 } else if n > 0 { #xf5b942 } else { #x8b95a5 }
+                    }
                 }
             }
-        }
-        text := ScrollYView{width: Fill height: Fill flow: Down scroll_bars +: {auto_tail: true}
-            Title{width: Fill text: if v == nil { "" } else { v.text ?? "" }
-                draw_text.color: if live { #xeeeeee } else { #x7d8696 }}
+
+            // 2. Scrolling transcript (`auto_tail: true`, no character cap; 4-5 lines in compact)
+            RoundedView{
+                width: Fill
+                height: text_h
+                padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+                new_batch: true show_bg: true
+                draw_bg.color: #x141924 draw_bg.border_radius: 12.0
+                ScrollYView{
+                    width: Fill height: Fill flow: Down scroll_bars +: {auto_tail: true}
+                    if txt == "" {
+                        Small{
+                            width: Fill
+                            text: "Hold side PTT key to speak"
+                            draw_text.color: #x636d7d
+                        }
+                    } else {
+                        Label{
+                            width: Fill
+                            text: txt
+                            draw_text.text_style.font_size: if is_compact { 15.5 } else { 17.5 }
+                            draw_text.color: if live || n > 0 { #xeeeeee } else { #x8b95a5 }
+                        }
+                    }
+                }
+            }
+
+            // 3. Cancel / Send now row right underneath the 4-5 line text
+            if n > 0 {
+                View{
+                    width: Fill height: Fit flow: Right spacing: 8
+                    Big{
+                        height: 48 width: Fill margin: 0
+                        padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+                        draw_bg.color: #x5c232c draw_bg.color_focus: #x5c232c draw_bg.color_hover: #x732c37
+                        text: "Don't send (" + show(n, ")")
+                        on_click: || set("voice_cancel", v.id ?? "")
+                    }
+                    Big{
+                        height: 48 width: Fill margin: 0
+                        padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+                        draw_bg.color: #x1e4d35 draw_bg.color_focus: #x1e4d35 draw_bg.color_hover: #x276345
+                        text: "Send now"
+                        on_click: || set("voice_send", v.id ?? "")
+                    }
+                }
+            }
         }
     }
 }

@@ -1,0 +1,80 @@
+// STAGE: Task Deck, multi-surface tiler (`stack` / `grid` / `deck`), pin manager,
+// and workspace launcher. Opened by tapping the center of the top strip (`< focus >`).
+let RowCard = RoundedView{
+    width: Fill height: Fit flow: Right spacing: 6
+    padding: Inset{left: 12 right: 8 top: 6 bottom: 6} align: Align{y: 0.5}
+    new_batch: true show_bg: true
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 12.0
+}
+width: Fill height: Fill flow: Down padding: 12
+main := ScrollYView{
+    width: Fill height: Fill flow: Down spacing: 8
+    on_render: || {
+        let stg = (state.prev_stage ?? nil) ?? (state.stage ?? nil)
+        let mode = if stg == nil { "stack" } else { stg.mode ?? "stack" }
+        let slots = if stg == nil { [] } else { stg.slots ?? [] }
+        let surfs = state.surfaces ?? []
+        let wks = state.workspaces ?? []
+
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            Title{width: Fill text: "Stage (" + mode + ")"}
+            PillBtn{text: "Voice+Chat" on_click: || stage({sub: "stack", specs: ["voice:compact:pin", "chat"]})}
+            PillBtn{text: "2x2 Grid" on_click: || stage({sub: "grid", specs: ["battery", "wifi", "sound", "display"]})}
+        }
+
+        Small{text: "Active slots (" + show(slots.len(), ")")}
+        for sl in slots {
+            let sname = sl.surface ?? ""
+            let smode = sl.mode ?? "fill"
+            let spinned = sl.pinned ?? false
+            RowCard{
+                draw_bg.color: if spinned { #x182638 } else { #x1c2230 }
+                Title{
+                    width: Fill draw_text.text_style.font_size: 15
+                    text: sname + " · " + smode + (if spinned { " · pin" } else { "" })
+                }
+                PillBtn{
+                    height: 34
+                    text: if smode == "compact" { "Fill" } else { "Fit" }
+                    on_click: || stage({sub: "add", surface: sname, mode: if smode == "compact" { "fill" } else { "compact" }})
+                }
+                if spinned {
+                    PillBtn{height: 34 text: "Unpin" on_click: || stage({sub: "unpin", surface: sname})}
+                } else {
+                    PillBtn{height: 34 text: "Solo" on_click: || stage({sub: "solo", surface: sname})}
+                }
+                MiniBtn{height: 34 text: "x" on_click: || stage({sub: "rm", surface: sname})}
+            }
+        }
+
+        if wks.len() > 0 {
+            Small{text: "Saved workspaces"}
+            for wk in wks {
+                let wname = wk.name ?? ""
+                RowCard{
+                    ButtonFlat{
+                        width: Fill height: 36 margin: 0 text: wk.title ?? wname
+                        draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x263145
+                        on_click: || stage({sub: "open", name: wname})
+                    }
+                    MiniBtn{height: 34 text: "x" on_click: || stage({sub: "unsave", name: wname})}
+                }
+            }
+        }
+
+        Small{text: "All surfaces (Open / +Stack / Pin top)"}
+        for s in surfs {
+            let sname = s.name ?? ""
+            RowCard{
+                Title{
+                    width: Fill draw_text.text_style.font_size: 15
+                    text: (s.title ?? sname) + (if (s.kind ?? "") == "agent" { " · agent" } else { "" })
+                }
+                PillBtn{height: 34 text: "Open" on_click: || front(sname)}
+                PillBtn{height: 34 text: "+Stack" on_click: || stage({sub: "add", surface: sname})}
+                PillBtn{height: 34 text: "Pin" on_click: || stage({sub: "pin", surface: sname, mode: "compact"})}
+            }
+        }
+    }
+}

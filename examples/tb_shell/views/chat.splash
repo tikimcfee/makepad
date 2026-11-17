@@ -1,27 +1,38 @@
-// CHAT: conversation view for the selected agent (state.chat).
+// CHAT: conversation view for the selected agent (`state.chat`).
+// Tappable top header jumps to `Agents` selector; works seamlessly solo or below pinned `Voice`.
 let MsgCard = RoundedView{
     width: Fill height: Fit flow: Down spacing: 4
-    padding: Inset{top: 10 bottom: 10 left: 14 right: 14}
+    padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
     new_batch: true show_bg: true
-    draw_bg.color: #x1c2230 draw_bg.border_radius: 16.0
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 15.0
     who := Small{}
-    body := Label{width: Fill text: "" draw_text.text_style.font_size: 16 draw_text.color: #xeeeeee}
+    body := Label{width: Fill text: "" draw_text.text_style.font_size: 15.5 draw_text.color: #xeeeeee}
 }
-width: Fill height: Fill flow: Down padding: 14 spacing: 10
+width: Fill height: Fill flow: Down padding: 12 spacing: 8
 main := View{
-    width: Fill height: Fill flow: Down spacing: 10
+    width: Fill height: Fill flow: Down spacing: 8
     on_render: || {
         let c = state.chat ?? nil
         let target_name = agent_name(state.agents ?? nil, state.target ?? nil)
         let st = if c == nil { "" } else { c.status ?? "" }
         let act = if c == nil { "" } else { c.activity ?? "" }
         let msgs = if c == nil { [] } else { c.msgs ?? [] }
+
         View{
-            width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             Dot{draw_bg.color: status_color(st)}
-            Title{width: Fill text: if c == nil { target_name } else { c.agent ?? target_name }}
+            ButtonFlat{
+                width: Fit height: 34 margin: 0
+                padding: Inset{left: 10 right: 10 top: 0 bottom: 0}
+                draw_bg.color: #x182232 draw_bg.color_focus: #x182232 draw_bg.color_hover: #x223047
+                draw_text.text_style.font_size: 15
+                text: (if c == nil { target_name } else { c.agent ?? target_name }) + " v"
+                on_click: || front("agents")
+            }
+            View{width: Fill height: 1}
             Small{text: st}
         }
+
         if msgs.len() == 0 {
             View{
                 width: Fill height: Fill flow: Down align: Align{y: 0.5}
@@ -47,7 +58,7 @@ main := View{
                             who.text: (m.label ?? "Tool") + "  " + (m.ts ?? "")
                             who.draw_text.color: #x7d8696
                             body.text: m.text ?? ""
-                            body.draw_text.text_style.font_size: 13
+                            body.draw_text.text_style.font_size: 12.5
                             body.draw_text.color: #x9aa4b2
                         }
                     } else {
@@ -65,16 +76,17 @@ main := View{
                         who.text: "Working"
                         who.draw_text.color: #xf5b942
                         body.text: act
-                        body.draw_text.text_style.font_size: 14
+                        body.draw_text.text_style.font_size: 13.5
                         body.draw_text.color: #xf5d98a
                     }
                 }
             }
         }
+
         View{
             width: Fill height: Fit flow: Right spacing: 8
-            Big{width: Fill height: 48 text: "Refresh" on_click: || emit("refresh", {})}
-            Big{width: Fill height: 48 text: if c != nil && (c.tools ?? false) { "Tools: on" } else { "Tools: off" } on_click: || emit("toggle_tools", {})}
+            Big{width: Fill height: 46 text: "Refresh" on_click: || emit("refresh", {})}
+            Big{width: Fill height: 46 text: if c != nil && (c.tools ?? false) { "Tools: on" } else { "Tools: off" } on_click: || emit("toggle_tools", {})}
         }
     }
 }

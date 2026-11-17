@@ -125,6 +125,7 @@ fn atomic_write(dir: &Path, filename: &str, content: &str) -> Result<(), String>
 pub struct StorePersistence {
     pub lib_dir: PathBuf,
     pub screens_dir: PathBuf,
+    pub workspaces_dir: PathBuf,
     /// Active `base.splash` + any extra `/usr/share/tinybot/ui/lib/*.splash` pieces.
     pub sys_base_source: String,
     /// Sorted user pieces `(name, normalized_source_with_trailing_newline)` from `~/.local/share/tb-shell/lib/`.
@@ -140,9 +141,11 @@ impl StorePersistence {
         let root = data_root();
         let lib_dir = env_nonempty("TB_SHELL_LIB_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("lib"));
         let screens_dir = env_nonempty("TB_SHELL_SCREENS_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("screens"));
+        let workspaces_dir = env_nonempty("TB_SHELL_WORKSPACES_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("workspaces"));
         let mut me = Self {
             lib_dir,
             screens_dir,
+            workspaces_dir,
             sys_base_source: ensure_trailing_newline(compiled_base),
             pieces: Vec::new(),
             used: HashMap::new(),
@@ -392,6 +395,60 @@ impl StorePersistence {
             if let Ok(body) = std::fs::read_to_string(&p) {
                 out.push((name, body));
             }
+        }
+        out
+    }
+
+    pub fn save_workspace(&self, name: &str, title: Option<&str>, stage: &JsonValue) -> Result<(), String> {
+        let mut m = HashMap::new();
+        m.insert("name".to_string(), JsonValue::String(name.to_string()));
+        m.insert(
+            "title".to_string(),
+            JsonValue::String(title.filter(|s| !s.trim().is_empty()).unwrap_or(name).trim().to_string()),
+        );
+        m.insert("stage".to_string(), stage.clone());
+        let text = JsonValue::Object(m).serialize_json() + "\n";
+        atomic_write(&self.workspaces_dir, &format!("{name}.json"), &text)
+    }
+
+    pub fn unsave_workspace(&self, name: &str) -> Result<bool, String> {
+        let path = self.workspaces_dir.join(format!("{name}.json"));
+        let existed = path.exists();
+        if existed {
+            std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        }
+        Ok(existed)
+    }
+
+    pub fn load_workspace(&self, name: &str) -> Option<JsonValue> {
+        let path = self.workspaces_dir.join(format!("{name}.json"));
+        let text = std::fs::read_to_string(path).ok()?;
+        let parsed = JsonValue::deserialize_json(text.trim()).ok()?;
+        parsed.get("stage").cloned()
+    }
+
+    pub fn ls_workspaces(&self) -> Vec<JsonValue> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.workspaces_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "json"))
+            .collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for p in paths {
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let Ok(parsed) = JsonValue::deserialize_json(text.trim()) else { continue };
+            let Some(name) = parsed.get("name").and_then(|v| v.as_str()) else { continue };
+            let title = parsed.get("title").and_then(|v| v.as_str()).unwrap_or(name);
+            let Some(st) = parsed.get("stage") else { continue };
+            let mut item = HashMap::new();
+            item.insert("name".into(), JsonValue::String(name.to_string()));
+            item.insert("title".into(), JsonValue::String(title.to_string()));
+            item.insert("mode".into(), st.get("mode").cloned().unwrap_or_else(|| "stack".into()));
+            item.insert("slots".into(), st.get("slots").cloned().unwrap_or_else(|| JsonValue::Array(vec![])));
+            out.push(JsonValue::Object(item));
         }
         out
     }

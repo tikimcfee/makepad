@@ -1,0 +1,78 @@
+// WIFI: read-only non-secret network & link status from `/run/tinybot/wifi-state`,
+// `usb0`, and `tailscale0` (`bin/tb-shell-wifi`).
+let Cell = Squircle{
+    width: Fill height: 80 flow: Down spacing: 3
+    padding: Inset{left: 14 right: 14} align: Align{x: 0.0 y: 0.5}
+    draw_bg.border_radius: 16.0
+    k := Small{}
+    v := Title{draw_text.text_style.font_size: 18 max_lines: 1 text_overflow: Ellipsis}
+}
+width: Fill height: Fit flow: Down
+main := View{
+    width: Fill height: Fit flow: Down
+    on_render: || {
+        let smode = slot.mode ?? "full"
+        let is_compact = smode == "compact"
+        let is_grid = smode == "grid"
+        let w = state.wifi ?? nil
+        let st = if w == nil { "unknown" } else { w.state ?? "off" }
+        let ip = if w == nil { nil } else { w.ipv4 ?? nil }
+        let rssi = if w == nil { nil } else { w.rssi_dbm ?? nil }
+        let freq = if w == nil { nil } else { w.freq_mhz ?? nil }
+        let wpa = if w == nil { nil } else { w.wpa_state ?? nil }
+        let resets = if w == nil { nil } else { w.resets ?? nil }
+        let usb = if w == nil { nil } else { w.usb_ipv4 ?? nil }
+        let ts = if w == nil { nil } else { w.tailscale ?? nil }
+
+        if is_compact {
+            View{
+                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                CompactBar{
+                    Dot{draw_bg.color: status_color(st)}
+                    Title{width: Fill draw_text.text_style.font_size: 15 text: "Wi-Fi: " + st + (if ip == nil { "" } else { " · " + ip })}
+                    Small{text: if rssi == nil { "" } else { rssi + " dBm" }}
+                }
+            }
+        } else if is_grid {
+            View{
+                width: Fill height: Fit flow: Down padding: 10 spacing: 7
+                View{
+                    width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                    Dot{draw_bg.color: status_color(st)}
+                    Title{width: Fill draw_text.text_style.font_size: 15 text: "Wi-Fi"}
+                    Small{text: st}
+                }
+                Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "wlan0" v.draw_text.text_style.font_size: 14.5 v.text: show(ip, "")}
+                Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "signal" v.draw_text.text_style.font_size: 14.5 v.text: show(rssi, " dBm") + (if freq == nil { "" } else { " · " + freq })}
+                Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "tailscale / usb" v.draw_text.text_style.font_size: 14 v.text: (if ts != nil { ts } else { show(usb, "") })}
+                Big{height: 40 text: "Refresh" on_click: || emit("refresh", {})}
+            }
+        } else {
+            View{
+                width: Fill height: Fit flow: Down padding: 14 spacing: 10
+                View{
+                    width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                    Dot{draw_bg.color: status_color(st)}
+                    Title{width: Fill text: "Wi-Fi & Links"}
+                    Small{text: st}
+                }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 9
+                    Cell{k.text: "status" v.text: st + (if wpa == nil { "" } else { " (" + wpa + ")" })}
+                    Cell{k.text: "wlan0 IPv4" v.text: show(ip, "")}
+                }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 9
+                    Cell{k.text: "signal" v.text: show(rssi, " dBm")}
+                    Cell{k.text: "band / resets" v.text: show(freq, " MHz") + " · " + show(resets, "")}
+                }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 9
+                    Cell{k.text: "usb0" v.text: show(usb, "")}
+                    Cell{k.text: "tailscale0" v.text: show(ts, "")}
+                }
+                Big{height: 50 text: "Refresh" on_click: || emit("refresh", {})}
+            }
+        }
+    }
+}

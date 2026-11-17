@@ -1,7 +1,10 @@
 let state = "{}".parse_json()
+let slot = "{\"mode\":\"full\",\"pinned\":false,\"width\":384.0,\"height\":822.0}".parse_json()
 fn emit(name, data) { host.request("emit", {name: name, data: data}, nil) }
 fn set(k, v) { host.request("set", {key: k, value: v}, nil) }
 fn front(n) { set("front", n) }
+fn stage(req) { host.request("stage", req, nil) }
 fn __assign(text) { let p = text.parse_json(); for k, v in p { state[k] = v } }
+fn __slot(text) { let p = text.parse_json(); for k, v in p { slot[k] = v } }
 fn __render() { ui.main.render() }
 fn __noop(text) { }
