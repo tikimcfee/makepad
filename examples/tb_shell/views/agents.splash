@@ -1,20 +1,73 @@
-// AGENTS: a status dot per agent; a tap makes it the default target (the key `target`).
-let AgentRow = Squircle{
-    dot := Dot{}
-    name := Title{width: Fill}
-    mark := Small{}
+// AGENTS: pick default target (`state.target`) or jump straight to its `Chat`.
+// `compact` mode renders a horizontal scrollable pill strip; `full` mode renders cards.
+let AgentCard = RoundedView{
+    width: Fill height: 68 flow: Right spacing: 10
+    padding: Inset{left: 14 right: 10} align: Align{y: 0.5}
+    new_batch: true show_bg: true
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 16.0
 }
-width: Fill height: Fill flow: Down padding: 16 spacing: 10
-Small{text: "Agents. A tap picks the default target."}
-main := ScrollYView{
-    width: Fill height: Fill flow: Down spacing: 10
-    on_item_tap: |i| { set("target", state.agents[i].id) }
+width: Fill height: Fit flow: Down
+main := View{
+    width: Fill height: Fit flow: Down
     on_render: || {
-        for a in state.agents ?? [] {
-            AgentRow{
-                name.text: a.name
-                dot.draw_bg.color: status_color(a.status)
-                mark.text: if a.id == state.target { "default" } else { "" }
+        let is_compact = (slot.mode ?? "full") == "compact"
+        let list = state.agents ?? []
+        let cur_target = state.target ?? nil
+
+        if is_compact {
+            View{
+                width: Fill height: 58 padding: Inset{left: 10 right: 10 top: 8 bottom: 8}
+                ScrollXView{
+                    width: Fill height: 42 flow: Right spacing: 8 align: Align{y: 0.5}
+                    for a in list {
+                        let aid = a.id ?? ""
+                        let sel = aid == cur_target
+                        ButtonFlat{
+                            width: Fit height: 38 margin: 0
+                            padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
+                            draw_bg.color: if sel { #x284772 } else { #x1c2230 }
+                            draw_bg.color_focus: if sel { #x284772 } else { #x1c2230 }
+                            draw_bg.color_hover: #x2d5080
+                            draw_text.text_style.font_size: 13.5
+                            text: (a.name ?? aid) + " (" + (a.status ?? "?") + ")"
+                            on_click: || set("target", aid)
+                        }
+                    }
+                }
+            }
+        } else {
+            let list_h = ((slot.height ?? 780.0) - 56.0)
+            let safe_h = if list_h < 120.0 { 120.0 } else { list_h }
+            View{
+                width: Fill height: Fit flow: Down padding: 14 spacing: 10
+                Small{text: "Agents · tap to select target, or open Chat"}
+                ScrollYView{
+                    width: Fill height: safe_h flow: Down spacing: 8
+                    for a in list {
+                        let aid = a.id ?? ""
+                        let sel = aid == cur_target
+                        let host_sub = agent_host(aid)
+                        AgentCard{
+                            draw_bg.color: if sel { #x1f314a } else { #x1c2230 }
+                            Dot{draw_bg.color: status_color(a.status ?? "")}
+                            ButtonFlat{
+                                width: Fill height: 52 margin: 0
+                                padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+                                draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x00000000
+                                draw_text.text_style.font_size: 15.5
+                                text: (a.name ?? aid) + (if host_sub == "" { "" } else { "  " + host_sub })
+                                on_click: || set("target", aid)
+                            }
+                            PillBtn{
+                                height: 38 text: "Chat ->"
+                                on_click: || {
+                                    set("target", aid)
+                                    front("chat")
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

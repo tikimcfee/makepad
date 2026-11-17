@@ -2,16 +2,34 @@ let Squircle = RoundedView{
     width: Fill height: 72 flow: Right spacing: 14
     padding: Inset{left: 18 right: 18} align: Align{y: 0.5}
     new_batch: true show_bg: true
-    draw_bg.color: #x1c2230 draw_bg.border_radius: 22.0
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 20.0
 }
-let Dot = RoundedView{width: 16 height: 16 show_bg: true draw_bg.border_radius: 8.0 draw_bg.color: #x666666}
-let Title = Label{text: "" draw_text.text_style.font_size: 18 draw_text.color: #xeeeeee}
+let CompactBar = RoundedView{
+    width: Fill height: 56 flow: Right spacing: 10
+    padding: Inset{left: 14 right: 14} align: Align{y: 0.5}
+    new_batch: true show_bg: true
+    draw_bg.color: #x18202e draw_bg.border_radius: 14.0
+}
+let Dot = RoundedView{width: 12 height: 12 show_bg: true draw_bg.border_radius: 6.0 draw_bg.color: #x666666}
+let Title = Label{text: "" draw_text.text_style.font_size: 17.5 draw_text.color: #xeeeeee}
 let Small = Label{text: "" draw_text.text_style.font_size: 13 draw_text.color: #x9aa4b2}
-let Big = ButtonFlat{width: Fill height: 72 text: ""}
+let Big = ButtonFlat{width: Fill height: 64 text: "" margin: 0}
+let PillBtn = ButtonFlat{
+    width: Fit height: 36 text: "" margin: 0
+    padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
+    draw_bg.color: #x222c3e draw_bg.color_focus: #x222c3e draw_bg.color_hover: #x2c3950
+    draw_text.text_style.font_size: 13
+}
+let MiniBtn = ButtonFlat{
+    width: 38 height: 36 text: "" margin: 0
+    padding: 0
+    draw_bg.color: #x222c3e draw_bg.color_focus: #x222c3e draw_bg.color_hover: #x2c3950
+    draw_text.text_style.font_size: 14
+}
 fn status_color(s) {
-    if s == "busy" { return #xf5b942 }
-    if s == "idle" { return #x3ddc84 }
-    if s == "error" { return #xff5a5a }
+    if s == "busy" || s == "processing" { return #xf5b942 }
+    if s == "idle" || s == "online" { return #x3ddc84 }
+    if s == "error" || s == "failed" { return #xff5a5a }
     #x666666
 }
 fn show(v, unit) { if v == nil { return "-" } "" + v + unit }
@@ -19,4 +37,10 @@ fn agent_name(list, id) {
     for a in list ?? [] { if a.id == id { return a.name } }
     if id == nil { return "none" }
     id
+}
+fn agent_host(id) {
+    if id == nil { return "" }
+    let parts = ("" + id).split("@")
+    if parts.len() > 1 { return "@" + parts[1] }
+    ""
 }

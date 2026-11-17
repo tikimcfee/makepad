@@ -1,0 +1,32 @@
+// POWER: opened by 1.0 s KEY_POWER hold or Home -> Power.
+// `Power off` and `Restart` invoke `tinybot-power-ctl` (raising root GUARD as uid 0).
+width: Fill height: Fill flow: Down padding: 20 spacing: 14 align: Align{y: 0.5}
+main := View{
+    width: Fill height: Fit flow: Down spacing: 12
+    on_render: || {
+        Title{draw_text.text_style.font_size: 22 text: "Power"}
+        Small{text: "Power off and Restart require confirmation on the device GUARD."}
+        Big{
+            height: 60 text: "Screen off"
+            draw_bg.color: #x1e2738 draw_bg.color_focus: #x1e2738 draw_bg.color_hover: #x27334a
+            on_click: || {
+                front("home")
+                emit("screen_off", {})
+            }
+        }
+        Big{
+            height: 60 text: "Restart"
+            draw_bg.color: #x4a3519 draw_bg.color_focus: #x4a3519 draw_bg.color_hover: #x5e4420
+            on_click: || emit("reboot", {})
+        }
+        Big{
+            height: 60 text: "Power off"
+            draw_bg.color: #x631e27 draw_bg.color_focus: #x631e27 draw_bg.color_hover: #x7a2530
+            on_click: || emit("poweroff", {})
+        }
+        Big{
+            height: 52 text: "Cancel"
+            on_click: || front("home")
+        }
+    }
+}

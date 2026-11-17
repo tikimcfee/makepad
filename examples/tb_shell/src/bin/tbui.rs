@@ -382,13 +382,18 @@ fn screen_socket_path() -> Option<String> {
 
 fn screen_cmd(args: &[String]) -> ! {
     let sub = args.first().map(String::as_str).unwrap_or("status");
-    if !matches!(sub, "on" | "off" | "toggle" | "status") {
-        die("screen on | off | toggle | status");
-    }
+    let wire_line = match sub {
+        "on" | "off" | "toggle" | "status" => format!("{sub}\n"),
+        "inhibit" => {
+            let arg = args.get(1).map(String::as_str).unwrap_or("60");
+            format!("inhibit {arg}\n")
+        }
+        _ => die("screen on | off | toggle | status | inhibit [SECS|off]"),
+    };
     if let Some(path) = screen_socket_path() {
         if let Ok(mut sock) = UnixStream::connect(&path) {
             let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
-            if sock.write_all(format!("{sub}\n").as_bytes()).is_ok() {
+            if sock.write_all(wire_line.as_bytes()).is_ok() {
                 let mut line = String::new();
                 if BufReader::new(sock).read_line(&mut line).is_ok() {
                     let reply = line.trim();
@@ -415,6 +420,94 @@ fn screen_cmd(args: &[String]) -> ! {
         }
     }
     die("cannot reach tb-screen-power socket (start tb-screen-power.service or set TB_SCREEN_SOCK)");
+}
+
+fn stage_cmd(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("get");
+    let rest = &args[args.len().min(1)..];
+    let req = match sub {
+        "get" => obj(vec![("op", "stage".into()), ("sub", "get".into())]),
+        "stack" | "grid" | "deck" => {
+            if rest.is_empty() {
+                die(&format!("stage {sub} SPEC..."));
+            }
+            let specs: Vec<JsonValue> = rest.iter().map(|s| JsonValue::String(s.clone())).collect();
+            obj(vec![("op", "stage".into()), ("sub", sub.into()), ("specs", JsonValue::Array(specs))])
+        }
+        "add" | "pin" => {
+            let mut surf: Option<String> = None;
+            let mut mode: Option<String> = None;
+            let mut px: Option<f64> = None;
+            let mut ephemeral = false;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--mode" => mode = Some(it.next().unwrap_or_else(|| die("--mode compact|fill|header")).clone()),
+                    "--px" => px = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die("--px N"))),
+                    "--ephemeral" => ephemeral = true,
+                    s if !s.starts_with('-') && surf.is_none() => surf = Some(s.to_string()),
+                    _ => die(&format!("stage {sub} NAME [--mode compact|fill|header] [--px N] [--ephemeral]")),
+                }
+            }
+            let name = surf.unwrap_or_else(|| die(&format!("stage {sub} NAME")));
+            let mut m = HashMap::new();
+            m.insert("op".to_string(), "stage".into());
+            m.insert("sub".to_string(), sub.into());
+            m.insert("surface".to_string(), name.into());
+            if let Some(md) = mode {
+                m.insert("mode".to_string(), md.into());
+            }
+            if let Some(p) = px {
+                m.insert("px".to_string(), JsonValue::F64(p));
+            }
+            if ephemeral {
+                m.insert("ephemeral".to_string(), JsonValue::Bool(true));
+            }
+            JsonValue::Object(m)
+        }
+        "rm" => {
+            let name = rest.first().unwrap_or_else(|| die("stage rm NAME"));
+            obj(vec![("op", "stage".into()), ("sub", "rm".into()), ("surface", name.as_str().into())])
+        }
+        "unpin" => {
+            let ephemeral_only = rest.iter().any(|a| a == "--ephemeral-only");
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("stage unpin NAME [--ephemeral-only]"));
+            obj(vec![
+                ("op", "stage".into()),
+                ("sub", "unpin".into()),
+                ("surface", name.as_str().into()),
+                ("ephemeral_only", JsonValue::Bool(ephemeral_only)),
+            ])
+        }
+        "solo" | "focus" => {
+            let clear_pins = rest.iter().any(|a| a == "--clear-pins");
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die(&format!("stage {sub} NAME")));
+            obj(vec![
+                ("op", "stage".into()),
+                ("sub", sub.into()),
+                ("surface", name.as_str().into()),
+                ("clear_pins", JsonValue::Bool(clear_pins)),
+            ])
+        }
+        "next" | "prev" => obj(vec![("op", "stage".into()), ("sub", sub.into())]),
+        "save" => {
+            let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("stage save NAME [--title TITLE]"));
+            let mut req = obj(vec![("op", "stage".into()), ("sub", "save".into()), ("name", name.as_str().into())]);
+            if let Some(i) = rest.iter().position(|a| a == "--title") {
+                let title = rest.get(i + 1).unwrap_or_else(|| die("--title TITLE"));
+                if let JsonValue::Object(m) = &mut req {
+                    m.insert("title".into(), title.as_str().into());
+                }
+            }
+            req
+        }
+        "open" | "unsave" => {
+            let name = rest.first().unwrap_or_else(|| die(&format!("stage {sub} NAME")));
+            obj(vec![("op", "stage".into()), ("sub", sub.into()), ("name", name.as_str().into())])
+        }
+        _ => die("stage [stack|grid|deck|add|rm|pin|unpin|solo|focus|next|prev|save|open|unsave] ..."),
+    };
+    report(&Client::connect().call(req));
 }
 
 fn main() {
@@ -510,6 +603,27 @@ fn main() {
             }
         }
         "screen" => screen_cmd(rest),
+        "stage" => stage_cmd(rest),
+        "note" => {
+            let mut text = String::new();
+            let mut secs = 10.0f64;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                if a == "--secs" {
+                    secs = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die("--secs N"));
+                } else if text.is_empty() {
+                    text = a.clone();
+                } else {
+                    text.push(' ');
+                    text.push_str(a);
+                }
+            }
+            report(&Client::connect().call(obj(vec![
+                ("op", "note".into()),
+                ("text", text.as_str().into()),
+                ("secs", JsonValue::F64(secs)),
+            ])));
+        }
         "save" => {
             let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("save NAME [--title TITLE]"));
             let mut req = obj(vec![("op", "save".into()), ("surface", name.as_str().into())]);
@@ -655,6 +769,6 @@ fn main() {
                 }
             }
         }
-        _ => die("show | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | guard"),
+        _ => die("show | stage | note | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | guard"),
     }
 }

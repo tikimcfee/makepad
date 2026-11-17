@@ -1,5 +1,5 @@
-// SOUND: speaker volume (wpctl + tb-volume-bridge) and hardware tone/sweep tries (tb-sound).
-// Harm-rule confirms (exit 4 / 5) are raised only through tb-shell's root GUARD by the helper.
+// SOUND: everyday speaker volume (`wpctl` + `tb-volume-bridge`) + collapsible hardware
+// tone/sweep tries (`tb-sound` with root GUARD confirms). Supports `compact` strip mode.
 let Card = RoundedView{
     width: Fill height: Fit flow: Down spacing: 2
     padding: Inset{top: 8 bottom: 8 left: 12 right: 12}
@@ -7,15 +7,9 @@ let Card = RoundedView{
     draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
 let Chip = ButtonFlat{
-    width: Fill height: 36 text: "" margin: 0
-    padding: Inset{left: 2 right: 2 top: 0 bottom: 0}
-    draw_text.text_style.font_size: 12.5
-}
-let ChipOn = ButtonFlat{
-    width: Fill height: 36 text: "" margin: 0
-    padding: Inset{left: 2 right: 2 top: 0 bottom: 0}
-    draw_bg.color: #x284772 draw_bg.color_focus: #x284772 draw_bg.color_hover: #x284772
-    draw_text.text_style.font_size: 12.5
+    width: Fill height: 44 text: "" margin: 0
+    padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+    draw_text.text_style.font_size: 13.5
 }
 let ActBtn = ButtonFlat{
     width: Fill height: 46 text: "" margin: 0
@@ -36,20 +30,13 @@ fn total_db(lvl) {
     if lvl == "0"   { return "-10 dB total · red zone (3s)" }
     lvl
 }
-width: Fill height: Fill flow: Down padding: 12 spacing: 6
-View{
-    width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
-    Title{width: Fill text: "Sound"}
-    ButtonFlat{
-        width: 112 height: 40 margin: 0 text: "All off"
-        draw_bg.color: #x6e1f28 draw_bg.color_focus: #x6e1f28 draw_bg.color_hover: #x822630
-        draw_text.text_style.font_size: 14.5
-        on_click: || emit("stop", {})
-    }
-}
-main := ScrollYView{
-    width: Fill height: Fill flow: Down spacing: 6
+width: Fill height: Fit flow: Down
+main := View{
+    width: Fill height: Fit flow: Down
     on_render: || {
+        let smode = slot.mode ?? "full"
+        let is_compact = smode == "compact"
+        let is_grid = smode == "grid"
         let s = state.sound ?? nil
         let vol = if s == nil { nil } else { s.volume_db ?? nil }
         let heard = if s == nil { nil } else { s.heard_db ?? nil }
@@ -63,88 +50,154 @@ main := ScrollYView{
         let level = if s == nil { "-50" } else { s.level ?? "-50" }
         let freq = if s == nil { "1000" } else { s.freq ?? "1000" }
         let secs = if s == nil { "1" } else { s.secs ?? "1" }
+        let show_tones = if s == nil { false } else { s.show_tones ?? false }
         let last = if s == nil { "" } else { s.last ?? "" }
         let hw = if s == nil { "" } else { s.hw_state ?? "" }
 
-        Card{
-            View{width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
-                Title{width: Fill draw_text.text_style.font_size: 16 text: "Speaker " + show(vol, " dB")}
-                Small{text: show(spk, "")}
+        if is_compact {
+            View{
+                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                CompactBar{
+                    Title{width: Fill draw_text.text_style.font_size: 15 text: "Vol " + show(vol, " dB")}
+                    MiniBtn{text: "-" on_click: || emit("vol_down", {})}
+                    MiniBtn{text: "+" on_click: || emit("vol_up", {})}
+                    ButtonFlat{
+                        width: 66 height: 36 margin: 0 text: "All off"
+                        draw_bg.color: #x6e1f28 draw_bg.color_focus: #x6e1f28 draw_bg.color_hover: #x822630
+                        draw_text.text_style.font_size: 12.5
+                        on_click: || emit("stop", {})
+                    }
+                }
             }
-            Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: "plays " + show(plays, "") + " · heard " + show(heard, "") + " · top " + show(top, " dB")}
-            Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: (if top_why == "" { "-" } else { top_why }) + " · stream " + show(spk_tot, "") + " / cap " + show(spk_cap, " dB")}
-        }
-        View{width: Fill height: Fit flow: Right spacing: 6
-            ActBtn{height: 42 text: "Vol -" on_click: || emit("vol_down", {})}
-            ActBtn{height: 42 text: "Vol +" on_click: || emit("vol_up", {})}
-        }
-        View{width: Fill height: Fit flow: Right spacing: 6
-            Chip{text: "-55 dB" on_click: || emit("vol_db", {db: -55.0})}
-            Chip{text: "-40 dB" on_click: || emit("vol_db", {db: -40.0})}
-            Chip{text: "-30 dB" on_click: || emit("vol_db", {db: -30.0})}
-            Chip{text: "-20 dB" on_click: || emit("vol_db", {db: -20.0})}
-        }
-
-        if last != "" {
-            Card{
-                draw_bg.color: #x222636
-                Small{width: Fill text: last draw_text.color: #xeeeeee}
+        } else if is_grid {
+            View{
+                width: Fill height: Fit flow: Down padding: 10 spacing: 7
+                View{
+                    width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                    Title{width: Fill draw_text.text_style.font_size: 15 text: "Sound"}
+                    ButtonFlat{
+                        width: 62 height: 34 margin: 0 text: "All off"
+                        draw_bg.color: #x6e1f28 draw_bg.color_focus: #x6e1f28 draw_bg.color_hover: #x822630
+                        draw_text.text_style.font_size: 12.5
+                        on_click: || emit("stop", {})
+                    }
+                }
+                Card{
+                    Title{width: Fill draw_text.text_style.font_size: 15 text: "Speaker " + show(vol, " dB")}
+                    Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: "state: " + show(spk, "")}
+                }
+                View{width: Fill height: Fit flow: Right spacing: 6
+                    ActBtn{height: 40 text: "Vol -" on_click: || emit("vol_down", {})}
+                    ActBtn{height: 40 text: "Vol +" on_click: || emit("vol_up", {})}
+                }
+                View{width: Fill height: Fit flow: Right spacing: 5
+                    Chip{height: 38 text: "-55" on_click: || emit("vol_db", {db: -55.0})}
+                    Chip{height: 38 text: "-40" on_click: || emit("vol_db", {db: -40.0})}
+                    Chip{height: 38 text: "-30" on_click: || emit("vol_db", {db: -30.0})}
+                }
             }
-        }
-
-        Small{padding: 0 text: "Tone / sweep  ·  out: " + out}
-        View{width: Fill height: Fit flow: Right spacing: 5
-            Chip{text: "speaker" draw_bg.color: pick_bg(out == "speaker") draw_bg.color_focus: pick_bg(out == "speaker") draw_bg.color_hover: pick_bg(out == "speaker") on_click: || set("sound", {out: "speaker"})}
-            Chip{text: "receiver" draw_bg.color: pick_bg(out == "receiver") draw_bg.color_focus: pick_bg(out == "receiver") draw_bg.color_hover: pick_bg(out == "receiver") on_click: || set("sound", {out: "receiver"})}
-            Chip{text: "lineout" draw_bg.color: pick_bg(out == "lineout") draw_bg.color_focus: pick_bg(out == "lineout") draw_bg.color_hover: pick_bg(out == "lineout") on_click: || set("sound", {out: "lineout"})}
-            Chip{text: "handset" draw_bg.color: pick_bg(out == "handset") draw_bg.color_focus: pick_bg(out == "handset") draw_bg.color_hover: pick_bg(out == "handset") on_click: || set("sound", {out: "handset"})}
-        }
-
-        Small{padding: 0 text: "Level: " + level + " dBFS  (" + total_db(level) + ")"}
-        View{width: Fill height: Fit flow: Right spacing: 4
-            Chip{text: "-70" draw_bg.color: pick_bg(level == "-70") draw_bg.color_focus: pick_bg(level == "-70") draw_bg.color_hover: pick_bg(level == "-70") on_click: || set("sound", {level: "-70"})}
-            Chip{text: "-60" draw_bg.color: pick_bg(level == "-60") draw_bg.color_focus: pick_bg(level == "-60") draw_bg.color_hover: pick_bg(level == "-60") on_click: || set("sound", {level: "-60"})}
-            Chip{text: "-50" draw_bg.color: pick_bg(level == "-50") draw_bg.color_focus: pick_bg(level == "-50") draw_bg.color_hover: pick_bg(level == "-50") on_click: || set("sound", {level: "-50"})}
-            Chip{text: "-40" draw_bg.color: pick_bg(level == "-40") draw_bg.color_focus: pick_bg(level == "-40") draw_bg.color_hover: pick_bg(level == "-40") on_click: || set("sound", {level: "-40"})}
-            Chip{text: "-30" draw_bg.color: pick_bg(level == "-30") draw_bg.color_focus: pick_bg(level == "-30") draw_bg.color_hover: pick_bg(level == "-30") on_click: || set("sound", {level: "-30"})}
-            Chip{text: "-25" draw_bg.color: pick_bg(level == "-25") draw_bg.color_focus: pick_bg(level == "-25") draw_bg.color_hover: pick_bg(level == "-25") on_click: || set("sound", {level: "-25"})}
-        }
-        View{width: Fill height: Fit flow: Right spacing: 4
-            Chip{text: "-20" draw_bg.color: pick_bg(level == "-20") draw_bg.color_focus: pick_bg(level == "-20") draw_bg.color_hover: pick_bg(level == "-20") on_click: || set("sound", {level: "-20"})}
-            Chip{text: "-15" draw_bg.color: pick_bg(level == "-15") draw_bg.color_focus: pick_bg(level == "-15") draw_bg.color_hover: pick_bg(level == "-15") on_click: || set("sound", {level: "-15"})}
-            Chip{text: "-10" draw_bg.color: pick_bg(level == "-10") draw_bg.color_focus: pick_bg(level == "-10") draw_bg.color_hover: pick_bg(level == "-10") on_click: || set("sound", {level: "-10"})}
-            Chip{text: "-5" draw_bg.color: pick_bg(level == "-5") draw_bg.color_focus: pick_bg(level == "-5") draw_bg.color_hover: pick_bg(level == "-5") on_click: || set("sound", {level: "-5"})}
-            Chip{text: "0" draw_bg.color: pick_bg(level == "0") draw_bg.color_focus: pick_bg(level == "0") draw_bg.color_hover: pick_bg(level == "0") on_click: || set("sound", {level: "0"})}
-        }
-
-        Small{padding: 0 text: "Freq: " + freq + " Hz  ·  Secs: " + secs + " s"}
-        View{width: Fill height: Fit flow: Right spacing: 4
-            Chip{text: "400" draw_bg.color: pick_bg(freq == "400") draw_bg.color_focus: pick_bg(freq == "400") draw_bg.color_hover: pick_bg(freq == "400") on_click: || set("sound", {freq: "400"})}
-            Chip{text: "500" draw_bg.color: pick_bg(freq == "500") draw_bg.color_focus: pick_bg(freq == "500") draw_bg.color_hover: pick_bg(freq == "500") on_click: || set("sound", {freq: "500"})}
-            Chip{text: "1k" draw_bg.color: pick_bg(freq == "1000") draw_bg.color_focus: pick_bg(freq == "1000") draw_bg.color_hover: pick_bg(freq == "1000") on_click: || set("sound", {freq: "1000"})}
-            Chip{text: "2k" draw_bg.color: pick_bg(freq == "2000") draw_bg.color_focus: pick_bg(freq == "2000") draw_bg.color_hover: pick_bg(freq == "2000") on_click: || set("sound", {freq: "2000"})}
-            Chip{text: "3k" draw_bg.color: pick_bg(freq == "3000") draw_bg.color_focus: pick_bg(freq == "3000") draw_bg.color_hover: pick_bg(freq == "3000") on_click: || set("sound", {freq: "3000"})}
-            Chip{text: "5k" draw_bg.color: pick_bg(freq == "5000") draw_bg.color_focus: pick_bg(freq == "5000") draw_bg.color_hover: pick_bg(freq == "5000") on_click: || set("sound", {freq: "5000"})}
-            Chip{text: "8k" draw_bg.color: pick_bg(freq == "8000") draw_bg.color_focus: pick_bg(freq == "8000") draw_bg.color_hover: pick_bg(freq == "8000") on_click: || set("sound", {freq: "8000"})}
-        }
-        View{width: Fill height: Fit flow: Right spacing: 5
-            Chip{text: "0.5s" draw_bg.color: pick_bg(secs == "0.5") draw_bg.color_focus: pick_bg(secs == "0.5") draw_bg.color_hover: pick_bg(secs == "0.5") on_click: || set("sound", {secs: "0.5"})}
-            Chip{text: "1s" draw_bg.color: pick_bg(secs == "1") draw_bg.color_focus: pick_bg(secs == "1") draw_bg.color_hover: pick_bg(secs == "1") on_click: || set("sound", {secs: "1"})}
-            Chip{text: "2s" draw_bg.color: pick_bg(secs == "2") draw_bg.color_focus: pick_bg(secs == "2") draw_bg.color_hover: pick_bg(secs == "2") on_click: || set("sound", {secs: "2"})}
-            Chip{text: "3s" draw_bg.color: pick_bg(secs == "3") draw_bg.color_focus: pick_bg(secs == "3") draw_bg.color_hover: pick_bg(secs == "3") on_click: || set("sound", {secs: "3"})}
-        }
-
-        View{width: Fill height: Fit flow: Right spacing: 6
-            ActBtn{text: "Play tone" draw_bg.color: #x1f3b5c draw_bg.color_focus: #x1f3b5c draw_bg.color_hover: #x274970 on_click: || emit("play", {out: out, level: level, freq: freq, secs: secs})}
-            ActBtn{text: "Sweep 300-3k" draw_bg.color: #x1f3b5c draw_bg.color_focus: #x1f3b5c draw_bg.color_hover: #x274970 on_click: || emit("sweep", {out: out, level: level, secs: secs})}
-        }
-        View{width: Fill height: Fit flow: Right spacing: 6
-            Chip{height: 36 text: "Refresh" on_click: || emit("refresh", {})}
-            Chip{height: 36 text: "Tool state" on_click: || emit("tool_state", {})}
-        }
-        if hw != "" {
-            Card{
-                Small{width: Fill text: hw}
+        } else {
+            let sc_h = ((slot.height ?? 780.0) - 16.0)
+            let safe_h = if sc_h < 140.0 { 140.0 } else { sc_h }
+            ScrollYView{
+                width: Fill height: safe_h flow: Down padding: 12 spacing: 7
+                View{
+                    width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                    Title{width: Fill text: "Sound"}
+                    ButtonFlat{
+                        width: 112 height: 42 margin: 0 text: "All off"
+                        draw_bg.color: #x6e1f28 draw_bg.color_focus: #x6e1f28 draw_bg.color_hover: #x822630
+                        draw_text.text_style.font_size: 14.5
+                        on_click: || emit("stop", {})
+                    }
+                }
+                Card{
+                    View{width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                        Title{width: Fill draw_text.text_style.font_size: 16 text: "Speaker " + show(vol, " dB")}
+                        Small{text: show(spk, "")}
+                    }
+                    Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: "plays " + show(plays, "") + " · heard " + show(heard, "") + " · top " + show(top, " dB")}
+                    Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: (if top_why == "" { "-" } else { top_why }) + " · stream " + show(spk_tot, "") + " / cap " + show(spk_cap, " dB")}
+                }
+                View{width: Fill height: Fit flow: Right spacing: 6
+                    ActBtn{height: 46 text: "Vol -" on_click: || emit("vol_down", {})}
+                    ActBtn{height: 46 text: "Vol +" on_click: || emit("vol_up", {})}
+                }
+                View{width: Fill height: Fit flow: Right spacing: 6
+                    Chip{text: "-55 dB" on_click: || emit("vol_db", {db: -55.0})}
+                    Chip{text: "-40 dB" on_click: || emit("vol_db", {db: -40.0})}
+                    Chip{text: "-30 dB" on_click: || emit("vol_db", {db: -30.0})}
+                    Chip{text: "-20 dB" on_click: || emit("vol_db", {db: -20.0})}
+                }
+                if last != "" {
+                    Card{
+                        draw_bg.color: #x222636
+                        Small{width: Fill text: last draw_text.color: #xeeeeee}
+                    }
+                }
+                ActBtn{
+                    height: 42
+                    text: if show_tones { "Hide hardware tone / sweep v" } else { "Hardware tone / sweep >" }
+                    on_click: || set("sound", {show_tones: !show_tones})
+                }
+                if show_tones {
+                    Small{text: "Output: " + out}
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "speaker" draw_bg.color: pick_bg(out == "speaker") draw_bg.color_focus: pick_bg(out == "speaker") draw_bg.color_hover: pick_bg(out == "speaker") on_click: || set("sound", {out: "speaker"})}
+                        Chip{text: "receiver" draw_bg.color: pick_bg(out == "receiver") draw_bg.color_focus: pick_bg(out == "receiver") draw_bg.color_hover: pick_bg(out == "receiver") on_click: || set("sound", {out: "receiver"})}
+                        Chip{text: "lineout" draw_bg.color: pick_bg(out == "lineout") draw_bg.color_focus: pick_bg(out == "lineout") draw_bg.color_hover: pick_bg(out == "lineout") on_click: || set("sound", {out: "lineout"})}
+                        Chip{text: "handset" draw_bg.color: pick_bg(out == "handset") draw_bg.color_focus: pick_bg(out == "handset") draw_bg.color_hover: pick_bg(out == "handset") on_click: || set("sound", {out: "handset"})}
+                    }
+                    Small{text: "Level: " + level + " dBFS  (" + total_db(level) + ")"}
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "-70" draw_bg.color: pick_bg(level == "-70") draw_bg.color_focus: pick_bg(level == "-70") draw_bg.color_hover: pick_bg(level == "-70") on_click: || set("sound", {level: "-70"})}
+                        Chip{text: "-60" draw_bg.color: pick_bg(level == "-60") draw_bg.color_focus: pick_bg(level == "-60") draw_bg.color_hover: pick_bg(level == "-60") on_click: || set("sound", {level: "-60"})}
+                        Chip{text: "-50" draw_bg.color: pick_bg(level == "-50") draw_bg.color_focus: pick_bg(level == "-50") draw_bg.color_hover: pick_bg(level == "-50") on_click: || set("sound", {level: "-50"})}
+                        Chip{text: "-40" draw_bg.color: pick_bg(level == "-40") draw_bg.color_focus: pick_bg(level == "-40") draw_bg.color_hover: pick_bg(level == "-40") on_click: || set("sound", {level: "-40"})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "-30" draw_bg.color: pick_bg(level == "-30") draw_bg.color_focus: pick_bg(level == "-30") draw_bg.color_hover: pick_bg(level == "-30") on_click: || set("sound", {level: "-30"})}
+                        Chip{text: "-25" draw_bg.color: pick_bg(level == "-25") draw_bg.color_focus: pick_bg(level == "-25") draw_bg.color_hover: pick_bg(level == "-25") on_click: || set("sound", {level: "-25"})}
+                        Chip{text: "-20" draw_bg.color: pick_bg(level == "-20") draw_bg.color_focus: pick_bg(level == "-20") draw_bg.color_hover: pick_bg(level == "-20") on_click: || set("sound", {level: "-20"})}
+                        Chip{text: "-15" draw_bg.color: pick_bg(level == "-15") draw_bg.color_focus: pick_bg(level == "-15") draw_bg.color_hover: pick_bg(level == "-15") on_click: || set("sound", {level: "-15"})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "-10" draw_bg.color: pick_bg(level == "-10") draw_bg.color_focus: pick_bg(level == "-10") draw_bg.color_hover: pick_bg(level == "-10") on_click: || set("sound", {level: "-10"})}
+                        Chip{text: "-5" draw_bg.color: pick_bg(level == "-5") draw_bg.color_focus: pick_bg(level == "-5") draw_bg.color_hover: pick_bg(level == "-5") on_click: || set("sound", {level: "-5"})}
+                        Chip{text: "0" draw_bg.color: pick_bg(level == "0") draw_bg.color_focus: pick_bg(level == "0") draw_bg.color_hover: pick_bg(level == "0") on_click: || set("sound", {level: "0"})}
+                    }
+                    Small{text: "Freq: " + freq + " Hz  ·  Secs: " + secs + " s"}
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "400" draw_bg.color: pick_bg(freq == "400") draw_bg.color_focus: pick_bg(freq == "400") draw_bg.color_hover: pick_bg(freq == "400") on_click: || set("sound", {freq: "400"})}
+                        Chip{text: "500" draw_bg.color: pick_bg(freq == "500") draw_bg.color_focus: pick_bg(freq == "500") draw_bg.color_hover: pick_bg(freq == "500") on_click: || set("sound", {freq: "500"})}
+                        Chip{text: "1k" draw_bg.color: pick_bg(freq == "1000") draw_bg.color_focus: pick_bg(freq == "1000") draw_bg.color_hover: pick_bg(freq == "1000") on_click: || set("sound", {freq: "1000"})}
+                        Chip{text: "2k" draw_bg.color: pick_bg(freq == "2000") draw_bg.color_focus: pick_bg(freq == "2000") draw_bg.color_hover: pick_bg(freq == "2000") on_click: || set("sound", {freq: "2000"})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "3k" draw_bg.color: pick_bg(freq == "3000") draw_bg.color_focus: pick_bg(freq == "3000") draw_bg.color_hover: pick_bg(freq == "3000") on_click: || set("sound", {freq: "3000"})}
+                        Chip{text: "5k" draw_bg.color: pick_bg(freq == "5000") draw_bg.color_focus: pick_bg(freq == "5000") draw_bg.color_hover: pick_bg(freq == "5000") on_click: || set("sound", {freq: "5000"})}
+                        Chip{text: "8k" draw_bg.color: pick_bg(freq == "8000") draw_bg.color_focus: pick_bg(freq == "8000") draw_bg.color_hover: pick_bg(freq == "8000") on_click: || set("sound", {freq: "8000"})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 5
+                        Chip{text: "0.5s" draw_bg.color: pick_bg(secs == "0.5") draw_bg.color_focus: pick_bg(secs == "0.5") draw_bg.color_hover: pick_bg(secs == "0.5") on_click: || set("sound", {secs: "0.5"})}
+                        Chip{text: "1s" draw_bg.color: pick_bg(secs == "1") draw_bg.color_focus: pick_bg(secs == "1") draw_bg.color_hover: pick_bg(secs == "1") on_click: || set("sound", {secs: "1"})}
+                        Chip{text: "2s" draw_bg.color: pick_bg(secs == "2") draw_bg.color_focus: pick_bg(secs == "2") draw_bg.color_hover: pick_bg(secs == "2") on_click: || set("sound", {secs: "2"})}
+                        Chip{text: "3s" draw_bg.color: pick_bg(secs == "3") draw_bg.color_focus: pick_bg(secs == "3") draw_bg.color_hover: pick_bg(secs == "3") on_click: || set("sound", {secs: "3"})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 6
+                        ActBtn{text: "Play tone" draw_bg.color: #x1f3b5c draw_bg.color_focus: #x1f3b5c draw_bg.color_hover: #x274970 on_click: || emit("play", {out: out, level: level, freq: freq, secs: secs})}
+                        ActBtn{text: "Sweep 300-3k" draw_bg.color: #x1f3b5c draw_bg.color_focus: #x1f3b5c draw_bg.color_hover: #x274970 on_click: || emit("sweep", {out: out, level: level, secs: secs})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 6
+                        Chip{text: "Refresh" on_click: || emit("refresh", {})}
+                        Chip{text: "Tool state" on_click: || emit("tool_state", {})}
+                    }
+                    if hw != "" {
+                        Card{
+                            Small{width: Fill text: hw}
+                        }
+                    }
+                }
             }
         }
     }

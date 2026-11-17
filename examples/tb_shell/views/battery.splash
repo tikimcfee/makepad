@@ -1,30 +1,71 @@
-// BATTERY: readouts a service puts in the key `battery`. The service watches this surface
-// (`tbui watch --surfaces battery`) and reads the battery on `shown` and on the `refresh` emit.
+// BATTERY: readouts from `bin/tb-shell-battery` (`state.battery`).
+// Adapts cleanly to `compact`, `grid`, and `full` slot modes.
 let Cell = Squircle{
-    width: Fill height: 96 flow: Down spacing: 4 align: Align{x: 0.0 y: 0.5}
+    width: Fill height: 84 flow: Down spacing: 3
+    padding: Inset{left: 14 right: 14} align: Align{x: 0.0 y: 0.5}
+    draw_bg.border_radius: 16.0
     k := Small{}
-    v := Title{draw_text.text_style.font_size: 26}
+    v := Title{draw_text.text_style.font_size: 20 max_lines: 1 text_overflow: Ellipsis}
 }
-width: Fill height: Fill flow: Down padding: 16
+width: Fill height: Fit flow: Down
 main := View{
-    width: Fill height: Fit flow: Down spacing: 10
+    width: Fill height: Fit flow: Down
     on_render: || {
+        let smode = slot.mode ?? "full"
+        let is_compact = smode == "compact"
+        let is_grid = smode == "grid"
         let b = state.battery ?? nil
-        if b == nil { Small{text: "no reading yet"} }
-        else {
-            View{width: Fill height: Fit flow: Right spacing: 10
-                Cell{k.text: "level" v.text: show(b.pct ?? nil, " %")}
-                Cell{k.text: "current" v.text: show(b.ma ?? nil, " mA")}}
-            View{width: Fill height: Fit flow: Right spacing: 10
-                Cell{k.text: "charge" v.text: show(b.state ?? nil, "")}
-                Cell{k.text: "hours left" v.text: show(b.hours ?? nil, " h")}}
-            View{width: Fill height: Fit flow: Right spacing: 10
-                Cell{k.text: "volts" v.text: show(b.volts ?? nil, " V")}
-                Cell{k.text: "temp" v.text: show(b.temp ?? nil, " C")}}
-            if (b.desk ?? nil) != nil {
-                Small{text: "desk power: " + show(b.desk ?? nil, "")}
+        let desk = if b == nil { nil } else { b.desk ?? nil }
+        let desk_txt = if desk == "1" { "Desk 4.20V cap" } else if desk == "0" { "Portable" } else { show(desk, "") }
+
+        if is_compact {
+            View{
+                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                CompactBar{
+                    Title{
+                        width: Fill draw_text.text_style.font_size: 15
+                        text: if b == nil { "Battery: -" } else { show(b.pct ?? nil, "%") + " · " + show(b.ma ?? nil, " mA") + " · " + (b.state ?? "") }
+                    }
+                    PillBtn{height: 34 text: "Refresh" on_click: || emit("refresh", {})}
+                }
+            }
+        } else if is_grid {
+            View{
+                width: Fill height: Fit flow: Down padding: 10 spacing: 7
+                Title{draw_text.text_style.font_size: 15 text: "Battery"}
+                if b == nil {
+                    Small{text: "no reading yet"}
+                } else {
+                    Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "level" v.draw_text.text_style.font_size: 15 v.text: show(b.pct ?? nil, "%") + " · " + show(b.state ?? nil, "")}
+                    Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "current" v.draw_text.text_style.font_size: 15 v.text: show(b.ma ?? nil, " mA")}
+                    Cell{height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6} k.text: "volts / temp" v.draw_text.text_style.font_size: 14.5 v.text: show(b.volts ?? nil, " V") + " · " + show(b.temp ?? nil, " C")}
+                }
+                Big{height: 40 text: "Refresh" on_click: || emit("refresh", {})}
+            }
+        } else {
+            View{
+                width: Fill height: Fit flow: Down padding: 14 spacing: 9
+                if b == nil {
+                    Small{text: "no reading yet"}
+                } else {
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{k.text: "level" v.text: show(b.pct ?? nil, " %")}
+                        Cell{k.text: "current" v.text: show(b.ma ?? nil, " mA")}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{k.text: "charge" v.text: show(b.state ?? nil, "")}
+                        Cell{k.text: "hours left" v.text: show(b.hours ?? nil, " h")}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{k.text: "volts" v.text: show(b.volts ?? nil, " V")}
+                        Cell{k.text: "temp" v.text: show(b.temp ?? nil, " C")}
+                    }
+                    if desk != nil && desk != "" {
+                        Small{text: "mode: " + desk_txt}
+                    }
+                }
+                Big{height: 52 text: "Refresh" on_click: || emit("refresh", {})}
             }
         }
-        Big{text: "refresh" on_click: || emit("refresh", {})}
     }
 }

@@ -1,18 +1,19 @@
-// HOME: the six core system tiles in a 2-column grid, plus any live or saved agent
-// surfaces from `state.surfaces` below them. Tapping the top strip always returns here.
+// HOME: 4x2 core grid (`Agents`, `Voice`, `Chat`, `Battery`, `Sound`, `Display`, `Wi-Fi`,
+// `Stage`), quick `Power` button, saved `state.workspaces`, and live/saved agent surfaces
+// with one-tap `[+]` stack-add and `[x]` close.
 let CoreTile = Squircle{
-    width: Fill height: 92 flow: Down spacing: 4
+    width: Fill height: 82 flow: Down spacing: 3
     padding: Inset{left: 14 right: 14 top: 8 bottom: 8}
     align: Align{x: 0.0 y: 0.5}
-    t := Title{draw_text.text_style.font_size: 17}
+    draw_bg.border_radius: 16.0
+    t := Title{draw_text.text_style.font_size: 16.5}
     s := Small{width: Fill draw_text.text_style.font_size: 12 max_lines: 1 text_overflow: Ellipsis}
 }
-let AgentRow = Squircle{
-    width: Fill height: 64 flow: Right spacing: 10
-    padding: Inset{left: 16 right: 16}
-    align: Align{y: 0.5}
-    t := Title{width: Fill draw_text.text_style.font_size: 16}
-    tag := Small{}
+let SurfCard = RoundedView{
+    width: Fill height: 56 flow: Right spacing: 8
+    padding: Inset{left: 14 right: 10} align: Align{y: 0.5}
+    new_batch: true show_bg: true
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
 fn count_agent_surfaces(list) {
     let mut n = 0
@@ -21,62 +22,89 @@ fn count_agent_surfaces(list) {
     }
     n
 }
-fn nth_agent_surface(list, idx) {
-    let mut k = 0
-    for s in list ?? [] {
-        if (s.kind ?? "") == "agent" {
-            if k == idx { return s.name ?? "" }
-            k = k + 1
-        }
-    }
-    ""
-}
-width: Fill height: Fill flow: Down padding: 14
+width: Fill height: Fill flow: Down padding: 12
 main := ScrollYView{
-    width: Fill height: Fill flow: Down spacing: 10
+    width: Fill height: Fill flow: Down spacing: 9
     on_render: || {
         let b = state.battery ?? nil
         let v = state.voice ?? nil
         let c = state.chat ?? nil
         let snd = state.sound ?? nil
         let d = state.display ?? nil
+        let w = state.wifi ?? nil
+        let stg = state.stage ?? nil
+        let slots_n = if stg == nil { 1 } else { (stg.slots ?? []).len() }
         let surfs = state.surfaces ?? []
+        let wks = state.workspaces ?? []
 
         View{
-            width: Fill height: Fit flow: Right spacing: 10
+            width: Fill height: Fit flow: Right spacing: 9
             on_item_tap: |col| { if col == 0 { front("agents") } else { front("voice") } }
             CoreTile{t.text: "Agents" s.text: agent_name(state.agents ?? nil, state.target ?? nil)}
-            CoreTile{t.text: "Voice" s.text: if v == nil { "quiet" } else { v.text ?? "quiet" }}
+            CoreTile{t.text: "Voice" s.text: if v == nil || (v.text ?? "") == "" { "ready" } else { v.text ?? "ready" }}
         }
         View{
-            width: Fill height: Fit flow: Right spacing: 10
+            width: Fill height: Fit flow: Right spacing: 9
             on_item_tap: |col| { if col == 0 { front("chat") } else { front("battery") } }
-            CoreTile{t.text: "Chat" s.text: if c == nil { "no replies yet" } else { c.preview ?? "no replies yet" }}
-            CoreTile{t.text: "Battery" s.text: if b == nil { "no reading" } else { show(b.pct ?? nil, "%") + "  " + (b.state ?? "") }}
+            CoreTile{t.text: "Chat" s.text: if c == nil || (c.preview ?? "") == "" { "no replies yet" } else { c.preview ?? "" }}
+            CoreTile{t.text: "Battery" s.text: if b == nil { "reading..." } else { show(b.pct ?? nil, "%") + " · " + (b.state ?? "") }}
         }
         View{
-            width: Fill height: Fit flow: Right spacing: 10
+            width: Fill height: Fit flow: Right spacing: 9
             on_item_tap: |col| { if col == 0 { front("sound") } else { front("display") } }
-            CoreTile{t.text: "Sound" s.text: if snd == nil { "no reading" } else { show(snd.volume_db ?? nil, " dB") + " · " + (snd.speaker_state ?? "") }}
-            CoreTile{t.text: "Display" s.text: if d == nil { "no reading" } else { show(d.brightness ?? nil, "") + "/" + show(d.max ?? 255, "") + " · " + (d.panel ?? "?") }}
+            CoreTile{t.text: "Sound" s.text: if snd == nil { "reading..." } else { show(snd.volume_db ?? nil, " dB") + " · " + (snd.speaker_state ?? "") }}
+            CoreTile{t.text: "Display" s.text: if d == nil { "reading..." } else { show(d.brightness ?? nil, "") + "/" + show(d.max ?? 255, "") + " · " + (d.panel ?? "on") }}
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 9
+            on_item_tap: |col| { if col == 0 { front("wifi") } else { front("stage") } }
+            CoreTile{t.text: "Wi-Fi" s.text: if w == nil { "reading..." } else { (w.state ?? "off") + (if (w.ipv4 ?? nil) == nil { "" } else { " · " + w.ipv4 }) }}
+            CoreTile{t.text: "Stage" s.text: "" + slots_n + (if slots_n == 1 { " active slot" } else { " active slots" })}
+        }
+
+        if wks.len() > 0 {
+            Small{text: "Workspaces"}
+            for wk in wks {
+                let wname = wk.name ?? ""
+                SurfCard{
+                    ButtonFlat{
+                        width: Fill height: 42 margin: 0 text: wk.title ?? wname
+                        draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x252e40
+                        draw_text.text_style.font_size: 15
+                        on_click: || stage({sub: "open", name: wname})
+                    }
+                    MiniBtn{text: "x" on_click: || stage({sub: "unsave", name: wname})}
+                }
+            }
         }
 
         if count_agent_surfaces(surfs) > 0 {
             Small{text: "Surfaces"}
-            View{
-                width: Fill height: Fit flow: Down spacing: 8
-                on_item_tap: |i| {
-                    let target = nth_agent_surface(state.surfaces ?? [], i)
-                    if target != "" { front(target) }
-                }
-                for s in surfs {
-                    if (s.kind ?? "") == "agent" {
-                        AgentRow{
-                            t.text: s.title ?? s.name ?? ""
-                            tag.text: if s.saved ?? false { "saved" } else { "live" }
+            for s in surfs {
+                if (s.kind ?? "") == "agent" {
+                    let sname = s.name ?? ""
+                    SurfCard{
+                        ButtonFlat{
+                            width: Fill height: 42 margin: 0
+                            text: (s.title ?? sname) + (if s.saved ?? false { "  · saved" } else { "" })
+                            draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x252e40
+                            draw_text.text_style.font_size: 15
+                            on_click: || front(sname)
                         }
+                        MiniBtn{text: "+" on_click: || stage({sub: "add", surface: sname})}
                     }
                 }
+            }
+        }
+
+        View{
+            width: Fill height: Fit flow: Right spacing: 8
+            PillBtn{width: Fill height: 42 text: "Voice + Chat split" on_click: || stage({sub: "stack", specs: ["voice:compact:pin", "chat"]})}
+            ButtonFlat{
+                width: 96 height: 42 margin: 0 text: "Power"
+                draw_bg.color: #x3a1d24 draw_bg.color_focus: #x3a1d24 draw_bg.color_hover: #x4d2630
+                draw_text.text_style.font_size: 13.5
+                on_click: || front("power")
             }
         }
     }
