@@ -61,6 +61,8 @@ script_mod! {
         color_bg: #x0b0e14
         color_track: #x1c2230
         color_bar: #x5fd4ff
+        soft: 0.0
+        border_radius: 0.0
         pick: fn(i) {
             let q = floor(i / 4.0)
             let r = i - q * 4.0
@@ -76,12 +78,36 @@ script_mod! {
             return dot(v, lane)
         }
         pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
             // meter: one value, as a length from the left over a dim track
             if self.meter > 0.5 {
                 let on = step(self.pos.x, clamp(self.v0.x, 0.0, 1.0))
-                return mix(self.color_track, self.color_bar, on)
+                let col = mix(self.color_track, self.color_bar, on)
+                if self.border_radius > 0.5 {
+                    sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.border_radius)
+                    sdf.fill(col)
+                    return sdf.result
+                }
+                return col
             }
             let n = max(self.count, 1.0)
+            if self.soft > 0.5 {
+                let cell = self.pos.x * n
+                let idx = floor(cell)
+                let h0 = clamp(self.pick(idx), 0.0, 1.0)
+                let h1 = clamp(self.pick(min(idx + 1.0, n - 1.0)), 0.0, 1.0)
+                let h = mix(h0, h1, smoothstep(0.0, 1.0, fract(cell))) * 0.92 + 0.05
+                let from_bot = 1.0 - self.pos.y
+                let wave = (1.0 - smoothstep(h - 0.35, h + 0.08, from_bot)) * (0.45 + 0.55 * (1.0 - from_bot))
+                let rib = 0.82 + 0.18 * smoothstep(0.08, 0.35, fract(cell))
+                let col = mix(self.color_bg, self.color_bar, clamp(wave * rib, 0.0, 1.0))
+                if self.border_radius > 0.5 {
+                    sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.border_radius)
+                    sdf.fill(col)
+                    return sdf.result
+                }
+                return col
+            }
             let h = clamp(self.pick(floor(self.pos.x * n)), 0.0, 1.0)
             let y = abs(self.pos.y - 0.5) * 2.0
             let gap = step(0.15, fract(self.pos.x * n))
@@ -104,6 +130,8 @@ pub struct DrawStreamBars {
     draw_super: DrawQuad,
     #[live] count: f32,
     #[live] meter: f32,
+    #[live] soft: f32,
+    #[live] border_radius: f32,
     #[live] v0: Vec4f, #[live] v1: Vec4f, #[live] v2: Vec4f, #[live] v3: Vec4f,
     #[live] v4: Vec4f, #[live] v5: Vec4f, #[live] v6: Vec4f, #[live] v7: Vec4f,
 }

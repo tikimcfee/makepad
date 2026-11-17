@@ -1,11 +1,6 @@
-//! tb-shell: one JSON store, one Splash isolate per surface, a strip and a
-//! guard the shell draws itself, and a Unix socket that speaks
-//! newline-delimited JSON.
-//!
-//! A write from anywhere (a client's `set`, a tap's `set(k, v)`) is a JSON
-//! merge patch on the one store. The shell applies it, hands the new values
-//! of the touched top-level keys to each surface that reads them (the
-//! prelude's `__assign` + `__render` re-renders `main`), and tells the watchers.
+//! tb-shell: one JSON store, one Splash isolate per surface, a 3-zone protected
+//! strip and root GUARD drawn by the shell, general 1..N `Stage` multitasking,
+//! and a Unix socket speaking newline-delimited JSON.
 
 pub use makepad_widgets;
 
@@ -15,6 +10,7 @@ mod paneltrace;
 mod sched;
 mod shell;
 mod split;
+mod stage;
 mod stream;
 
 use io::{Msg, Peer};
@@ -25,10 +21,13 @@ use makepad_widgets::makepad_platform::{
 };
 use makepad_widgets::splash_host::take_splash_host_requests;
 use makepad_widgets::*;
-use shell::{GuardView, Shell};
-use std::collections::{HashMap, HashSet};
+use shell::{GuardView, Shell, ShellAction};
+use stage::{SlotMode, Stage, StageMode, StageSlot};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 app_main!(App);
 
@@ -37,6 +36,42 @@ const BASE: &str = include_str!("../lib/base.splash");
 /// Keys only the shell writes.
 const SHELL_KEY: &str = "shell";
 const SURFACES_KEY: &str = "surfaces";
+const WORKSPACES_KEY: &str = "workspaces";
+/// Maximum hidden warm isolates kept in memory before LRU parking.
+const MAX_WARM_HIDDEN: usize = 4;
+
+#[repr(C)]
+#[derive(Default)]
+struct LocalTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const std::ffi::c_char,
+}
+
+extern "C" {
+    fn localtime_r(timep: *const i64, result: *mut LocalTm) -> *mut LocalTm;
+}
+
+fn now_hhmm_and_rem_secs() -> (String, f64) {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let rem = (60 - (secs.rem_euclid(60))) as f64 + 0.05;
+    let mut tm = LocalTm::default();
+    let ok = unsafe { !localtime_r(&secs, &mut tm).is_null() };
+    let hhmm = if ok {
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    } else {
+        format!("{:02}:{:02}", (secs / 3600).rem_euclid(24), (secs / 60).rem_euclid(60))
+    };
+    (hhmm, rem)
+}
 
 /// Lines ahead of a body: Splash's own prefix, the prelude, and `base_and_lib` lines.
 fn lines_ahead(base_and_lib_lines: usize) -> usize {
@@ -102,8 +137,6 @@ impl Reads {
     }
 }
 
-/// Shader code in a body: an anonymous `fn(` (how a draw shader's methods
-/// are written) or a `pixel:` / `vertex:` key.
 fn shader_text(body: &str) -> Option<String> {
     let b = body.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -166,16 +199,16 @@ struct Guard {
     view: GuardView,
 }
 
-/// Kernel and speaker-service state sources for panel-off and the `MIC` / `LOUD` marks.
 #[derive(Default)]
 struct Sources {
     panel: Option<(String, String)>,
     panel_read: Option<Instant>,
     mic_status: Option<String>,
     speaker_state: Option<String>,
+    wifi_state: String,
+    power_state: String,
 }
 
-/// Per-surface frame-time watch state for untrusted/agent surfaces.
 #[derive(Default)]
 struct SurfaceWatch {
     cpu_frames: u32,
@@ -184,7 +217,6 @@ struct SurfaceWatch {
     pending_render_ms: f64,
     over_hits: u32,
     last_over_at: Option<Instant>,
-    /// Post-show verification redraws for shader bodies (catches static heavy shaders too).
     verify_redraws_left: u8,
 }
 
@@ -195,6 +227,13 @@ struct State {
     conns: HashMap<u64, Conn>,
     reads: HashMap<String, Reads>,
     bodies: HashMap<String, String>,
+    stage: Stage,
+    prev_stage_before_switcher: Option<Stage>,
+    visible: BTreeSet<String>,
+    parked: HashSet<String>,
+    warm_lru: VecDeque<String>,
+    slot_prelude_cache: HashMap<String, String>,
+    slot_dims: HashMap<String, (f64, f64)>,
     front_history: Vec<String>,
     owned: HashMap<u64, Vec<String>>,
     guards: Vec<Guard>,
@@ -205,8 +244,8 @@ struct State {
     log_cursor: u64,
     split: split::Split,
     trace: paneltrace::PanelTrace,
-    render_pending: Vec<WidgetRef>,
-    stale: Vec<WidgetRef>,
+    render_pending: Vec<(String, WidgetRef)>,
+    stale: HashSet<String>,
     render_frame: NextFrame,
     watch_frame: NextFrame,
     views: HashSet<String>,
@@ -214,14 +253,17 @@ struct State {
     placement: sched::Placement,
     note_timer: Timer,
     mic_timer: Timer,
+    clock_timer: Timer,
     panel_wake_timer: Timer,
     panel_wake_ticks: u8,
     mic_unreadable: bool,
     persist: library::StorePersistence,
     surfaces_json: String,
+    workspaces_json: String,
     frame_watch: HashMap<String, SurfaceWatch>,
     frame_budget_ms: f64,
     agent_shaders_on: bool,
+    pending_watch_shown: Vec<(u64, String)>,
 }
 
 #[derive(Script, ScriptHook)]
@@ -233,7 +275,6 @@ pub struct App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
-        // StreamView in every surface's isolate (before the first one is made).
         makepad_widgets::widget_async::register_splash_isolate_mod(stream::isolate_mod);
         crate::shell::script_mod(vm);
         self::script_mod(vm)
@@ -281,6 +322,14 @@ impl AppMain for App {
         if self.st.note_timer.is_event(event).is_some() {
             self.clear_note(cx);
         }
+        if self.st.clock_timer.is_event(event).is_some() {
+            if !self.st.panel_off {
+                self.update_strip_status(cx);
+                self.arm_clock_timer(cx);
+            } else {
+                cx.stop_timer(self.st.clock_timer);
+            }
+        }
         if self.st.panel_wake_timer.is_event(event).is_some() {
             if self.st.panel_wake_ticks > 0 && !self.st.panel_off {
                 self.st.panel_wake_ticks -= 1;
@@ -291,12 +340,13 @@ impl AppMain for App {
                 self.st.panel_wake_ticks = 0;
             }
         }
-        let home = self.shell(cx).borrow_mut::<Shell>().map_or(false, |mut sh| sh.take_go_home());
-        if home {
-            self.clear_note(cx);
+        let shell_actions = self.shell(cx).borrow_mut::<Shell>().map_or(vec![], |mut sh| sh.take_actions());
+        if !shell_actions.is_empty() {
+            self.handle_shell_actions(cx, shell_actions);
         }
-        if home && self.st.guards.is_empty() && self.st.bodies.contains_key("home") {
-            self.apply(cx, &obj(vec![("front", "home".into())]), "shell");
+        // Check if any hidden surface started a timer inside an event handler and park it.
+        if !matches!(event, Event::Draw(_)) && !self.st.panel_off {
+            self.park_timer_bearing_hidden(cx);
         }
         let answer = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.take_answer());
         if let Some(yes) = answer {
@@ -323,7 +373,6 @@ fn read_trim(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// RFC 7386: objects merge, everything else replaces, null deletes.
 fn merge(target: &mut JsonValue, patch: &JsonValue) {
     let JsonValue::Object(patch) = patch else {
         *target = patch.clone();
@@ -342,7 +391,6 @@ fn merge(target: &mut JsonValue, patch: &JsonValue) {
     }
 }
 
-/// Parses a log location `splash:<surface>:<line>:<col>` into body-relative numbers.
 fn locate_with_ahead(text: &str, name: &str, ahead: usize) -> Option<(usize, usize, String)> {
     let tag = format!("splash:{name}:");
     let at = text.find(&tag)?;
@@ -360,13 +408,28 @@ fn locate_with_ahead(text: &str, name: &str, ahead: usize) -> Option<(usize, usi
     Some((line, col, message))
 }
 
-/// A surface's name shows in the strip: none may start with "guard", the word the
-/// strip uses for the shell's own guard.
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         && !name.to_ascii_lowercase().starts_with("guard")
+}
+
+fn has_isolate_timers(cx: &mut Cx, splash: &WidgetRef) -> bool {
+    let Some(hk) = splash.borrow_mut::<Splash>().and_then(|mut s| s.isolate_heap_key(cx)) else {
+        return false;
+    };
+    cx.script_data.timers.timers.iter().any(|t| t.callback.heap_key() == hk)
+}
+
+fn notify_screen_inhibit(cmd: &str) {
+    let path = env("TB_SCREEN_SOCK").unwrap_or_else(|| {
+        format!("{}/tb-screen.sock", env("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/user/8000".into()))
+    });
+    if let Ok(mut sock) = UnixStream::connect(path) {
+        let _ = sock.set_write_timeout(Some(Duration::from_millis(80)));
+        let _ = sock.write_all(format!("{cmd}\n").as_bytes());
+    }
 }
 
 impl App {
@@ -389,16 +452,24 @@ impl App {
             && self.st.bodies.get(name).map_or(false, |b| !self.st.trusted.contains(b))
     }
 
-    fn sync_gpu_timer_for_front(&mut self, cx: &mut Cx) {
-        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let want = !self.st.panel_off && self.is_watched_surface(&front);
+    fn sync_gpu_timer_for_visible(&mut self, cx: &mut Cx) {
+        let watched_vis: Vec<String> = self
+            .st
+            .visible
+            .iter()
+            .filter(|n| self.is_watched_surface(n))
+            .cloned()
+            .collect();
+        let want = !self.st.panel_off && !watched_vis.is_empty();
         cx.perf_monitor.set_enabled(false);
         if want {
             cx.perf_monitor.set_enabled(true);
             let painted = cx.perf_monitor.frames_painted();
-            let w = self.st.frame_watch.entry(front).or_default();
-            w.last_painted = painted;
-            w.gpu_boundaries = 0;
+            for name in watched_vis {
+                let w = self.st.frame_watch.entry(name).or_default();
+                w.last_painted = painted;
+                w.gpu_boundaries = 0;
+            }
         }
     }
 
@@ -411,6 +482,71 @@ impl App {
                 }
             }
             log!("tb-shell: {} trusted bodies from {}", self.st.trusted.len(), dir.display());
+        }
+    }
+
+    fn arm_clock_timer(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.st.clock_timer);
+        if !self.st.panel_off {
+            let (_, rem) = now_hhmm_and_rem_secs();
+            self.st.clock_timer = cx.start_timeout(rem);
+        }
+    }
+
+    fn update_strip_status(&mut self, cx: &mut Cx) {
+        let (hhmm, _) = now_hhmm_and_rem_secs();
+        let wifi_tag = self
+            .st
+            .store
+            .get("wifi")
+            .and_then(|w| w.get("state"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                std::fs::read_to_string(&self.st.sources.wifi_state).ok().and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.trim().strip_prefix("state=").map(|v| v.trim().to_string()))
+                })
+            });
+        let wifi_short = match wifi_tag.as_deref() {
+            Some("online") => Some("wifi"),
+            Some("connecting") => Some("wifi.."),
+            Some("failed") => Some("wifi!"),
+            _ => None,
+        };
+
+        let bat_pct = self
+            .st
+            .store
+            .get("battery")
+            .and_then(|b| b.get("pct"))
+            .and_then(|v| match v {
+                JsonValue::I64(n) => Some(*n),
+                JsonValue::U64(n) => Some(*n as i64),
+                JsonValue::F64(f) => Some(f.round() as i64),
+                _ => None,
+            })
+            .or_else(|| {
+                std::fs::read_to_string(&self.st.sources.power_state).ok().and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.trim().strip_prefix("soc=").and_then(|v| v.trim().parse::<i64>().ok()))
+                })
+            });
+
+        let mut parts = Vec::with_capacity(3);
+        if let Some(w) = wifi_short {
+            parts.push(w.to_string());
+        }
+        if let Some(p) = bat_pct {
+            parts.push(format!("{p}%"));
+        }
+        parts.push(hhmm);
+        let next = parts.join(" · ");
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            if sh.status_right != next {
+                sh.status_right = next;
+                cx.redraw_all();
+            }
         }
     }
 
@@ -427,10 +563,8 @@ impl App {
             log!("tb-shell: {} library pieces from {}", self.st.persist.pieces.len(), self.st.persist.lib_dir.display());
         }
 
-        // Bodies we wrote and tried: their shader text and proof workloads are trusted.
         self.reload_trusted();
 
-        // The panel and the marks: files and device nodes, watched by sysfs poll / inotify.
         let s = &mut self.st.sources;
         if let Some(file) = env("TB_SHELL_PANEL_FILE") {
             io::watch_panel_sysfs(&file, tx.clone());
@@ -443,6 +577,8 @@ impl App {
         let spk = env("TB_SHELL_SPEAKER_STATE").unwrap_or_else(|| "/run/tinybot/speaker-state".into());
         io::watch_speaker_state(&spk, tx);
         s.speaker_state = Some(spk);
+        s.wifi_state = env("TB_WIFI_STATE").unwrap_or_else(|| "/run/tinybot/wifi-state".into());
+        s.power_state = env("TB_POWER_STATE").unwrap_or_else(|| "/run/tinybot/power-state".into());
 
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
@@ -450,8 +586,10 @@ impl App {
         self.guard_input(cx);
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
-        self.mic_timer(cx); // read once at start; if it is on, keep reading
-        self.read_loud(cx); // read speaker-state once at start
+        self.mic_timer(cx);
+        self.read_loud(cx);
+        self.update_strip_status(cx);
+        self.arm_clock_timer(cx);
 
         let (prev_unclean, crashes_60s) = library::CrashGuard::check_on_start();
         let before = Self::surfaces_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
@@ -475,6 +613,7 @@ impl App {
             }
         }
         self.sync_surfaces_key(cx);
+        self.sync_workspaces_key(cx);
     }
 
     fn load_views(&mut self, cx: &mut Cx) {
@@ -534,9 +673,14 @@ impl App {
         }
     }
 
-    /// Updates read-only `state.surfaces` whenever loaded surfaces or saved status change.
     fn sync_surfaces_key(&mut self, cx: &mut Cx) {
-        let mut names: Vec<String> = self.st.bodies.keys().filter(|n| n.as_str() != "home").cloned().collect();
+        let mut names: Vec<String> = self
+            .st
+            .bodies
+            .keys()
+            .filter(|n| !matches!(n.as_str(), "home" | "stage" | "power"))
+            .cloned()
+            .collect();
         names.sort_by(|a, b| {
             let a_sys = self.st.views.contains(a);
             let b_sys = self.st.views.contains(b);
@@ -565,6 +709,16 @@ impl App {
         self.apply(cx, &obj(vec![(SURFACES_KEY, arr)]), "shell");
     }
 
+    fn sync_workspaces_key(&mut self, cx: &mut Cx) {
+        let arr = JsonValue::Array(self.st.persist.ls_workspaces());
+        let ser = arr.serialize_json();
+        if ser == self.st.workspaces_json {
+            return;
+        }
+        self.st.workspaces_json = ser;
+        self.apply(cx, &obj(vec![(WORKSPACES_KEY, arr)]), "shell");
+    }
+
     fn surfaces_file() -> Option<String> {
         env("TB_SHELL_RUNTIME_DIR")
             .or_else(|| env("XDG_RUNTIME_DIR"))
@@ -579,22 +733,24 @@ impl App {
         if !names.is_empty() {
             let note = format!("left out: {}", names.join(", "));
             log!("tb-shell: after a restart, {note}");
-            if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
-                sh.note = note;
-                cx.redraw_all();
-            }
-            self.st.note_timer = cx.start_timeout(10.0);
+            self.show_strip_note_secs(cx, note, 10.0);
         }
         self.write_surfaces_file();
     }
 
     fn show_strip_note(&mut self, cx: &mut Cx, note: String) {
+        self.show_strip_note_secs(cx, note, 10.0);
+    }
+
+    fn show_strip_note_secs(&mut self, cx: &mut Cx, note: String, secs: f64) {
         if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
             sh.note = note;
             cx.redraw_all();
         }
         cx.stop_timer(self.st.note_timer);
-        self.st.note_timer = cx.start_timeout(10.0);
+        if secs > 0.0 {
+            self.st.note_timer = cx.start_timeout(secs.clamp(0.5, 300.0));
+        }
     }
 
     fn clear_note(&mut self, cx: &mut Cx) {
@@ -690,8 +846,6 @@ impl App {
         }
     }
 
-    /// Reads `/run/tinybot/speaker-state` (or `TB_SHELL_SPEAKER_STATE`) and sets `LOUD`
-    /// when `state=playing`, `holding`, or `parking`.
     fn read_loud(&mut self, cx: &mut Cx) {
         let Some(path) = self.st.sources.speaker_state.clone() else { return };
         let text = std::fs::read_to_string(&path).ok();
@@ -710,52 +864,91 @@ impl App {
         }
     }
 
-    /// Records CPU frame time right after `Event::Draw` and schedules post-show shader verify frames.
+    /// Records CPU frame time across all drawn slots and syncs measured slot sizes into `slot` prelude.
     fn after_draw_watch(&mut self, cx: &mut Cx) {
-        let drawn = self.shell(cx).borrow_mut::<Shell>().and_then(|mut sh| sh.last_draw_ms.take());
-        let Some((name, draw_ms)) = drawn else { return };
-        if !self.is_watched_surface(&name) {
-            return;
+        let (drawn_list, sizes) = self.shell(cx).borrow_mut::<Shell>().map_or((vec![], vec![]), |mut sh| {
+            (std::mem::take(&mut sh.last_draw_ms), std::mem::take(&mut sh.last_slot_sizes))
+        });
+        let mut slot_dirty = false;
+        for (name, w, h) in sizes {
+            let prev = self.st.slot_dims.insert(name.clone(), (w, h));
+            if prev.map_or(true, |(pw, ph)| (pw - w).abs() > 2.0 || (ph - h).abs() > 2.0) {
+                slot_dirty = true;
+            }
         }
-        let (frame_idx, cpu_ms, verify_redraw) = {
-            let w = self.st.frame_watch.entry(name.clone()).or_default();
-            w.cpu_frames = w.cpu_frames.saturating_add(1);
-            let total = std::mem::take(&mut w.pending_render_ms) + draw_ms;
-            let vr = if !self.st.panel_off && w.verify_redraws_left > 0 {
-                w.verify_redraws_left -= 1;
-                true
-            } else {
-                false
+        if slot_dirty && !self.st.panel_off {
+            self.sync_visible_slot_preludes(cx);
+        }
+
+        let mut request_verify = false;
+        for (name, draw_ms) in drawn_list {
+            if !self.is_watched_surface(&name) {
+                continue;
+            }
+            let (frame_idx, cpu_ms, verify_redraw) = {
+                let w = self.st.frame_watch.entry(name.clone()).or_default();
+                w.cpu_frames = w.cpu_frames.saturating_add(1);
+                let total = std::mem::take(&mut w.pending_render_ms) + draw_ms;
+                let vr = if !self.st.panel_off && w.verify_redraws_left > 0 {
+                    w.verify_redraws_left -= 1;
+                    true
+                } else {
+                    false
+                };
+                (w.cpu_frames, total, vr)
             };
-            (w.cpu_frames, total, vr)
-        };
-        if verify_redraw {
+            request_verify |= verify_redraw;
+            if frame_idx >= 2 {
+                self.check_frame_sample(cx, &name, cpu_ms, "cpu");
+            }
+        }
+        if request_verify {
             cx.redraw_all();
             self.st.watch_frame = cx.new_next_frame();
         }
-        // Frame 1 is shader-compile & first-layout grace.
-        if frame_idx >= 2 {
-            self.check_frame_sample(cx, &name, cpu_ms, "cpu");
-        }
     }
 
-    /// Drains completed hardware GPU + pass-encode frame timings from `cx.perf_monitor`
-    /// for the active watched agent surface.
     fn drain_gpu_watch(&mut self, cx: &mut Cx) {
         if !cx.perf_monitor.enabled() {
             return;
         }
-        let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !self.is_watched_surface(&front) {
+        let watched: Vec<String> = self
+            .st
+            .visible
+            .iter()
+            .filter(|n| self.is_watched_surface(n))
+            .cloned()
+            .collect();
+        let culprit = if watched.len() == 1 {
+            watched[0].clone()
+        } else if watched.len() > 1 {
+            let shader_bearers: Vec<&String> = watched
+                .iter()
+                .filter(|n| {
+                    self.st
+                        .bodies
+                        .get(*n)
+                        .map_or(false, |b| b.contains("pixel:") || b.contains("vertex:"))
+                })
+                .collect();
+            if shader_bearers.len() == 1 {
+                shader_bearers[0].clone()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        if culprit.is_empty() {
             return;
         }
         let painted = cx.perf_monitor.frames_painted();
-        let prev = self.st.frame_watch.get(&front).map_or(painted, |w| w.last_painted);
+        let prev = self.st.frame_watch.get(&culprit).map_or(painted, |w| w.last_painted);
         if painted <= prev {
             return;
         }
         let delta = (painted - prev) as usize;
-        if let Some(w) = self.st.frame_watch.get_mut(&front) {
+        if let Some(w) = self.st.frame_watch.get_mut(&culprit) {
             w.last_painted = painted;
         }
         let mut ring: Vec<PerfMonitorFrame> = Vec::new();
@@ -767,11 +960,10 @@ impl App {
         let slice = &ring[ring.len() - take_n..];
         for f in slice {
             let b_idx = {
-                let w = self.st.frame_watch.entry(front.clone()).or_default();
+                let w = self.st.frame_watch.entry(culprit.clone()).or_default();
                 w.gpu_boundaries = w.gpu_boundaries.saturating_add(1);
                 w.gpu_boundaries
             };
-            // Boundary 1 initializes last_frame_time; boundary 2 holds Frame 1's compile/upload GPU time (grace).
             if b_idx <= 2 {
                 continue;
             }
@@ -780,8 +972,8 @@ impl App {
             let sample_ms = gpu_ms.max(encode_ms);
             let label = if gpu_ms >= encode_ms { "gpu" } else { "encode" };
             if sample_ms > 0.0 {
-                self.check_frame_sample(cx, &front, sample_ms, label);
-                if !self.st.bodies.contains_key(&front) {
+                self.check_frame_sample(cx, &culprit, sample_ms, label);
+                if !self.st.bodies.contains_key(&culprit) {
                     break;
                 }
             }
@@ -810,7 +1002,7 @@ impl App {
         };
         if trip {
             let msg = format!("frame budget exceeded ({kind} {ms:.1} ms > {budget:.0} ms)");
-            error!("tb-shell: surface {name}: {msg}; tearing down and returning home");
+            error!("tb-shell: surface {name}: {msg}; evicting slot");
             let ms_round = (ms * 10.0).round() / 10.0;
             let ev = obj(vec![
                 ("ev", "error".into()),
@@ -847,39 +1039,363 @@ impl App {
 
     fn panel(&mut self, cx: &mut Cx, on: bool) {
         self.st.panel_off = !on;
-        self.sync_gpu_timer_for_front(cx);
         self.st.trace.changed();
         log!("tb-shell: panel {} at {}", if on { "on: surfaces back" } else { "off: surfaces stopped" }, paneltrace::stamp());
         cx.stop_timer(self.st.panel_wake_timer);
         self.st.panel_wake_ticks = 0;
-        let shell = self.shell(cx);
-        let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
-        for (name, splash) in surfaces {
-            if on {
-                let body = self.st.bodies.get(&name).cloned().unwrap_or_default();
-                let code = self.full_source(&body);
-                if let Some(w) = self.st.frame_watch.get_mut(&name) {
-                    w.cpu_frames = 0;
-                    w.gpu_boundaries = 0;
-                }
-                splash.set_text(cx, &code);
-                self.feed_all(cx, &name, &splash);
-            } else {
-                splash.set_text(cx, "");
-            }
-        }
+
         if on {
+            self.update_strip_status(cx);
+            self.arm_clock_timer(cx);
+            self.sync_visibility_and_lifecycle(cx);
             self.render_pending(cx);
             cx.redraw_all();
             self.st.panel_wake_ticks = 2;
             self.st.panel_wake_timer = cx.start_interval(0.18);
         } else {
+            cx.stop_timer(self.st.clock_timer);
+            let shell = self.shell(cx);
+            let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
+            for (name, splash) in surfaces {
+                splash.set_text(cx, "");
+                self.st.parked.insert(name);
+            }
+            self.st.slot_prelude_cache.clear();
             self.st.render_pending.clear();
+            self.sync_visibility_and_lifecycle(cx);
         }
+
         let ev = obj(vec![("ev", "panel".into()), ("on", JsonValue::Bool(on))]).serialize_json();
         for c in self.st.conns.values().filter(|c| c.watch.is_some()) {
             let _ = c.tx.send(ev.clone());
         }
+    }
+
+    /// Ensures a surface's isolate is evaluated and fed with current store & slot prelude.
+    fn ensure_surface_live(&mut self, cx: &mut Cx, name: &str) {
+        if self.st.panel_off || !self.st.parked.remove(name) {
+            return;
+        }
+        let Some(body) = self.st.bodies.get(name).cloned() else { return };
+        let Some(splash) = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(name)) else { return };
+        let code = self.full_source(&body);
+        if let Some(w) = self.st.frame_watch.get_mut(name) {
+            w.cpu_frames = 0;
+            w.gpu_boundaries = 0;
+        }
+        self.st.slot_prelude_cache.remove(name);
+        splash.set_text(cx, &code);
+        self.feed_slot_for(cx, name, &splash);
+        self.feed_all(cx, name, &splash);
+    }
+
+    fn feed_slot_for(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) -> bool {
+        let total = self.st.stage.slots.len();
+        let stage_mode = self.st.stage.mode;
+        let (mode_str, pinned) = self
+            .st
+            .stage
+            .slots
+            .iter()
+            .find(|s| s.surface == name)
+            .map(|s| (s.prelude_mode(stage_mode, total), s.pinned))
+            .unwrap_or(("full", false));
+        let (w, h) = self.st.slot_dims.get(name).copied().unwrap_or((384.0, 822.0));
+        let w_r = (w * 2.0).round() * 0.5;
+        let h_r = (h * 2.0).round() * 0.5;
+        let json = obj(vec![
+            ("mode", mode_str.into()),
+            ("pinned", JsonValue::Bool(pinned)),
+            ("width", JsonValue::F64(w_r)),
+            ("height", JsonValue::F64(h_r)),
+        ])
+        .serialize_json();
+        if self.st.slot_prelude_cache.get(name) == Some(&json) {
+            return false;
+        }
+        self.st.slot_prelude_cache.insert(name.to_string(), json.clone());
+        let _ = splash.widget(cx, ids!(main));
+        if let Some(mut inner) = splash.borrow_mut::<Splash>() {
+            inner.call_script_fn_with_strings(cx, live_id!(__slot), &[&json]);
+        }
+        self.queue_render(cx, name, splash);
+        true
+    }
+
+    fn sync_visible_slot_preludes(&mut self, cx: &mut Cx) {
+        let vis: Vec<String> = self.st.visible.iter().cloned().collect();
+        let shell = self.shell(cx);
+        for name in vis {
+            if self.st.parked.contains(&name) {
+                continue;
+            }
+            if let Some(splash) = shell.borrow::<Shell>().and_then(|sh| sh.surface(&name)) {
+                self.feed_slot_for(cx, &name, &splash);
+            }
+        }
+    }
+
+    fn park_surface(&mut self, cx: &mut Cx, name: &str) {
+        if self.st.parked.contains(name) {
+            return;
+        }
+        if let Some(splash) = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(name)) {
+            splash.set_text(cx, "");
+        }
+        self.st.parked.insert(name.to_string());
+        self.st.slot_prelude_cache.remove(name);
+        self.st.stale.remove(name);
+    }
+
+    fn park_timer_bearing_hidden(&mut self, cx: &mut Cx) {
+        let shell = self.shell(cx);
+        let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
+        let mut to_park = Vec::new();
+        for (name, splash) in surfaces {
+            if self.st.visible.contains(&name) || self.st.parked.contains(&name) {
+                continue;
+            }
+            if has_isolate_timers(cx, &splash) {
+                log!("tb-shell: parking hidden timer-bearing surface {name}");
+                to_park.push(name);
+            }
+        }
+        for name in to_park {
+            self.park_surface(cx, &name);
+            self.st.warm_lru.retain(|n| n != &name);
+        }
+    }
+
+    fn enforce_hidden_lifecycle(&mut self, cx: &mut Cx) {
+        self.park_timer_bearing_hidden(cx);
+        while self.st.warm_lru.len() > MAX_WARM_HIDDEN {
+            if let Some(oldest) = self.st.warm_lru.pop_front() {
+                if !self.st.visible.contains(&oldest) {
+                    self.park_surface(cx, &oldest);
+                }
+            }
+        }
+    }
+
+    /// Diffs `visible` set, emits `shown`/`hidden`, unparks newly visible isolates,
+    /// updates `slot` preludes, and parks hidden timer-bearing / excess LRU isolates.
+    fn sync_visibility_and_lifecycle(&mut self, cx: &mut Cx) {
+        let next_vis = self.st.stage.visible_surfaces(self.st.panel_off);
+        let added: Vec<String> = next_vis.difference(&self.st.visible).cloned().collect();
+        let removed: Vec<String> = self.st.visible.difference(&next_vis).cloned().collect();
+
+        for s in &removed {
+            if !self.st.panel_off && !self.st.parked.contains(s) {
+                self.st.warm_lru.retain(|x| x != s);
+                self.st.warm_lru.push_back(s.clone());
+            }
+            self.to_surface_watchers(s, obj(vec![("ev", "hidden".into()), ("surface", s.as_str().into())]));
+        }
+
+        self.st.visible = next_vis;
+
+        for s in &added {
+            self.st.warm_lru.retain(|x| x != s);
+            self.ensure_surface_live(cx, s);
+            if self.st.stale.remove(s) {
+                if let Some(splash) = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(s)) {
+                    self.queue_render(cx, s, &splash);
+                }
+            }
+            self.to_surface_watchers(s, obj(vec![("ev", "shown".into()), ("surface", s.as_str().into())]));
+        }
+
+        if !self.st.panel_off {
+            self.sync_visible_slot_preludes(cx);
+            self.enforce_hidden_lifecycle(cx);
+        }
+        self.sync_gpu_timer_for_visible(cx);
+    }
+
+    fn commit_stage(&mut self, cx: &mut Cx, by: &str) {
+        let bodies_ref = &self.st.bodies;
+        self.st.stage.slots.retain(|s| bodies_ref.contains_key(&s.surface));
+        self.st.stage.ensure_valid_focus(self.st.bodies.contains_key("home"));
+
+        let focus = self.st.stage.focus.clone();
+        let prev_focus = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if prev_focus != focus && !prev_focus.is_empty() && prev_focus != "stage" && prev_focus != "power" {
+            self.st.front_history.retain(|n| *n != focus && *n != prev_focus);
+            self.st.front_history.push(prev_focus);
+        }
+
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            if sh.stage.mode != self.st.stage.mode || sh.stage.slots.len() != self.st.stage.slots.len() {
+                sh.stage_scroll_y = 0.0;
+            }
+            sh.stage = self.st.stage.clone();
+        }
+
+        if focus != "stage" {
+            self.st.prev_stage_before_switcher = None;
+        }
+        let prev_stage_json = if focus == "stage" {
+            self.st.prev_stage_before_switcher.as_ref().map_or(JsonValue::Null, Stage::to_json)
+        } else {
+            JsonValue::Null
+        };
+
+        let stage_json = self.st.stage.to_json();
+        self.st.store.insert("stage".into(), stage_json.clone());
+        self.st.store.insert("prev_stage".into(), prev_stage_json.clone());
+        self.st.store.insert("front".into(), JsonValue::String(focus.clone()));
+
+        self.sync_visibility_and_lifecycle(cx);
+
+        // Notify store readers of `stage` / `front`
+        let touched = vec!["stage".to_string(), "prev_stage".to_string(), "front".to_string()];
+        if !self.st.panel_off {
+            let readers: Vec<(String, WidgetRef)> = self.shell(cx).borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
+            for (name, splash) in readers {
+                if self.st.parked.contains(&name) {
+                    continue;
+                }
+                let keys: Vec<String> = match self.st.reads.get(&name) {
+                    Some(Reads::All) => touched.clone(),
+                    Some(Reads::Keys(ks)) => touched.iter().filter(|k| ks.contains(k)).cloned().collect(),
+                    None => continue,
+                };
+                if !keys.is_empty() {
+                    self.feed(cx, &name, &splash, &keys);
+                }
+            }
+        }
+
+        let patch = obj(vec![("front", JsonValue::String(focus)), ("stage", stage_json)]);
+        let ev = obj(vec![("ev", "set".into()), ("patch", patch), ("by", by.into())]).serialize_json();
+        for c in self.st.conns.values() {
+            if c.watch.as_ref().map_or(false, |w| w.wants_keys(&touched)) {
+                let _ = c.tx.send(ev.clone());
+            }
+        }
+        cx.redraw_all();
+    }
+
+    fn handle_shell_actions(&mut self, cx: &mut Cx, actions: Vec<ShellAction>) {
+        if !self.st.guards.is_empty() {
+            return;
+        }
+        for act in actions {
+            match act {
+                ShellAction::GoHome => {
+                    self.clear_note(cx);
+                    if self.st.bodies.contains_key("home") {
+                        if self.st.stage.focus == "home" && self.st.stage.slots.len() > 1 {
+                            self.st.stage.mode = StageMode::Stack;
+                            self.st.stage.slots = vec![StageSlot::fill("home")];
+                            self.st.stage.focus = "home".into();
+                        } else {
+                            self.st.stage.apply_front("home");
+                        }
+                        self.commit_stage(cx, "shell");
+                    }
+                }
+                ShellAction::ToggleStageView => {
+                    if self.st.bodies.contains_key("stage") {
+                        if self.st.stage.focus == "stage" {
+                            if let Some(prev) = self.st.prev_stage_before_switcher.take() {
+                                self.st.stage = prev;
+                            } else if self.st.bodies.contains_key("home") {
+                                self.st.stage.apply_front("home");
+                            }
+                        } else {
+                            self.st.prev_stage_before_switcher = Some(self.st.stage.clone());
+                            self.st.stage.apply_front("stage");
+                        }
+                        self.commit_stage(cx, "shell");
+                    }
+                }
+                ShellAction::CycleTask(dir) => {
+                    self.cycle_task(cx, dir, "shell");
+                }
+                ShellAction::FocusSlot(name) => {
+                    if self.st.stage.slots.iter().any(|s| s.surface == name) {
+                        self.st.stage.focus = name;
+                        self.commit_stage(cx, "shell");
+                    }
+                }
+                ShellAction::ToggleHeader(name) => {
+                    if let Some(s) = self.st.stage.slots.iter_mut().find(|s| s.surface == name) {
+                        s.mode = if s.mode == SlotMode::Header {
+                            if s.pinned { SlotMode::Compact } else { SlotMode::Fill }
+                        } else {
+                            SlotMode::Header
+                        };
+                        self.commit_stage(cx, "shell");
+                    }
+                }
+                ShellAction::CycleSlotMode(name) => {
+                    let cur = self.st.stage.slots.iter().find(|s| s.surface == name).map(|s| s.mode);
+                    match cur {
+                        Some(SlotMode::Header) | Some(SlotMode::Fill) if self.st.stage.slots.len() > 1 => {
+                            if cur == Some(SlotMode::Fill) {
+                                self.st.stage.solo(&name);
+                            } else if let Some(s) = self.st.stage.slots.iter_mut().find(|s| s.surface == name) {
+                                s.mode = SlotMode::Compact;
+                            }
+                            self.commit_stage(cx, "shell");
+                        }
+                        Some(SlotMode::Compact) => {
+                            if let Some(s) = self.st.stage.slots.iter_mut().find(|s| s.surface == name) {
+                                s.mode = SlotMode::Fill;
+                            }
+                            self.commit_stage(cx, "shell");
+                        }
+                        _ => {}
+                    }
+                }
+                ShellAction::RemoveSlot(name) => {
+                    if self.st.stage.remove_surface(&name, self.st.bodies.contains_key("home")) {
+                        self.commit_stage(cx, "shell");
+                    }
+                }
+            }
+        }
+    }
+
+    fn cycle_task(&mut self, cx: &mut Cx, dir: i32, by: &str) {
+        if self.st.stage.mode == StageMode::Deck && self.st.stage.slots.len() > 1 {
+            let cur = self.st.stage.slots.iter().position(|s| s.surface == self.st.stage.focus).unwrap_or(0);
+            let n = self.st.stage.slots.len() as isize;
+            let next_idx = (cur as isize + dir as isize).rem_euclid(n) as usize;
+            self.st.stage.focus = self.st.stage.slots[next_idx].surface.clone();
+            self.commit_stage(cx, by);
+            return;
+        }
+        let mut order: Vec<String> = self
+            .st
+            .bodies
+            .keys()
+            .filter(|n| !matches!(n.as_str(), "stage" | "power"))
+            .cloned()
+            .collect();
+        order.sort_by(|a, b| {
+            let rank = |s: &str| match s {
+                "home" => 0,
+                "chat" => 1,
+                "voice" => 2,
+                "agents" => 3,
+                "battery" => 4,
+                "sound" => 5,
+                "display" => 6,
+                "wifi" => 7,
+                _ => 8,
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+        if order.is_empty() {
+            return;
+        }
+        let cur = order.iter().position(|s| *s == self.st.stage.focus).unwrap_or(0);
+        let n = order.len() as isize;
+        let next_idx = (cur as isize + dir as isize).rem_euclid(n) as usize;
+        self.st.stage.apply_front(&order[next_idx]);
+        self.commit_stage(cx, by);
     }
 
     fn drain_socket(&mut self, cx: &mut Cx) {
@@ -898,9 +1414,12 @@ impl App {
                         let _ = self.close_surface(cx, &name, false);
                     }
                     let raised = self.st.guards.first().map(|g| g.conn);
+                    let had_guards = !self.st.guards.is_empty();
                     self.st.guards.retain(|g| g.conn != conn);
                     if raised == Some(conn) {
                         self.raise_next_guard(cx);
+                    } else if had_guards && self.st.guards.is_empty() {
+                        notify_screen_inhibit("inhibit off");
                     }
                 }
                 Msg::MicChanged => mic_changed = true,
@@ -928,6 +1447,9 @@ impl App {
                     };
                     let t = Instant::now();
                     self.send(conn, reply.serialize_json());
+                    for (wconn, ev_line) in std::mem::take(&mut self.st.pending_watch_shown) {
+                        self.send(wconn, ev_line);
+                    }
                     self.st.split.add_named("reply", t.elapsed());
                 }
             }
@@ -992,6 +1514,17 @@ impl App {
                 }
                 Ok(Some(obj(vec![])))
             }
+            "stage" => self.stage_op(cx, req, &format!("client:{}", peer.label())).map(Some),
+            "note" => {
+                let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let secs = stage::json_num(req.get("secs")).unwrap_or(10.0);
+                if text.is_empty() {
+                    self.clear_note(cx);
+                } else {
+                    self.show_strip_note_secs(cx, text, secs);
+                }
+                Ok(Some(obj(vec![])))
+            }
             "push" => {
                 let name = req.get("stream").and_then(|v| v.as_str()).ok_or("push needs stream")?;
                 let values: Vec<f32> = req
@@ -1026,6 +1559,14 @@ impl App {
             }
             "watch" => {
                 let spec = WatchSpec { surfaces: strings(req.get("surfaces")), keys: strings(req.get("keys")) };
+                if !self.st.panel_off {
+                    for vis in &self.st.visible {
+                        if spec.wants_surface(vis) {
+                            let ev = obj(vec![("ev", "shown".into()), ("surface", vis.as_str().into())]).serialize_json();
+                            self.st.pending_watch_shown.push((conn, ev));
+                        }
+                    }
+                }
                 self.st.conns.get_mut(&conn).ok_or("no connection")?.watch = Some(spec);
                 Ok(Some(obj(vec![])))
             }
@@ -1071,6 +1612,208 @@ impl App {
             }
             _ => Err(format!("unknown op {op}")),
         }
+    }
+
+    fn stage_op(&mut self, cx: &mut Cx, req: &JsonValue, by: &str) -> Result<JsonValue, String> {
+        let sub = req.get("sub").and_then(|v| v.as_str()).unwrap_or("get");
+        if sub == "get" {
+            return Ok(obj(vec![("stage", self.st.stage.to_json())]));
+        }
+        if !self.st.guards.is_empty() && !matches!(sub, "save" | "unsave") {
+            return Err("cannot modify stage while a guard is up".into());
+        }
+        let check_exists = |s: &str, bodies: &HashMap<String, String>| -> Result<(), String> {
+            if bodies.contains_key(s) {
+                Ok(())
+            } else {
+                Err(format!("no surface {s}"))
+            }
+        };
+
+        if self.st.stage.focus == "stage" && matches!(sub, "add" | "rm" | "pin" | "unpin" | "solo") {
+            if let Some(prev) = self.st.prev_stage_before_switcher.take() {
+                self.st.stage = prev;
+            }
+        }
+
+        match sub {
+            "stack" | "grid" | "deck" | "set" => {
+                if sub == "set" {
+                    if let Some(st_obj) = req.get("stage") {
+                        let parsed = Stage::from_json(st_obj).ok_or("invalid stage json")?;
+                        for s in &parsed.slots {
+                            check_exists(&s.surface, &self.st.bodies)?;
+                        }
+                        self.st.stage = parsed;
+                        self.commit_stage(cx, by);
+                        return Ok(obj(vec![("stage", self.st.stage.to_json())]));
+                    }
+                }
+                let specs = req.get("specs").or_else(|| req.get("slots")).and_then(|v| v.as_array()).ok_or("stage needs specs array")?;
+                let mut slots = Vec::new();
+                for item in specs {
+                    let slot = StageSlot::from_json(item).ok_or("invalid slot spec")?;
+                    check_exists(&slot.surface, &self.st.bodies)?;
+                    if !slots.iter().any(|x: &StageSlot| x.surface == slot.surface) {
+                        slots.push(slot);
+                    }
+                }
+                if slots.is_empty() {
+                    return Err("stage requires at least one slot".into());
+                }
+                self.st.stage.mode = StageMode::from_str(sub);
+                self.st.stage.slots = slots;
+                if let Some(f) = req.get("focus").and_then(|v| v.as_str()).filter(|f| self.st.stage.slots.iter().any(|s| s.surface == *f)) {
+                    self.st.stage.focus = f.to_string();
+                } else {
+                    self.st.stage.focus.clear();
+                }
+                self.st.stage.ensure_valid_focus(false);
+                self.commit_stage(cx, by);
+            }
+            "add" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage add needs surface")?;
+                check_exists(name, &self.st.bodies)?;
+                let mode = req.get("mode").and_then(|v| v.as_str()).map(SlotMode::from_str).unwrap_or(SlotMode::Fill);
+                let px = stage::json_num(req.get("px")).map(|p| p.clamp(36.0, 720.0));
+                let weight = stage::json_num(req.get("weight")).unwrap_or(1.0).clamp(0.1, 20.0);
+                // If currently on `stage` or `home` alone, replace `stage` switcher so adding from switcher shows the real work!
+                self.st.stage.slots.retain(|s| s.surface != "stage");
+                if let Some(existing) = self.st.stage.slots.iter_mut().find(|s| s.surface == name) {
+                    existing.mode = mode;
+                    existing.px = px;
+                    existing.weight = weight;
+                } else {
+                    self.st.stage.slots.push(StageSlot {
+                        surface: name.to_string(),
+                        mode,
+                        weight,
+                        px,
+                        pinned: false,
+                        ephemeral: false,
+                    });
+                }
+                self.st.stage.focus = name.to_string();
+                self.commit_stage(cx, by);
+            }
+            "rm" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage rm needs surface")?;
+                self.st.stage.remove_surface(name, self.st.bodies.contains_key("home"));
+                self.commit_stage(cx, by);
+            }
+            "pin" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage pin needs surface")?;
+                check_exists(name, &self.st.bodies)?;
+                let mode = req.get("mode").and_then(|v| v.as_str()).map(SlotMode::from_str).unwrap_or(SlotMode::Compact);
+                let px = stage::json_num(req.get("px")).map(|p| p.clamp(36.0, 720.0));
+                let ephemeral = req.get("ephemeral") == Some(&JsonValue::Bool(true));
+                if let Some(existing) = self.st.stage.slots.iter_mut().find(|s| s.surface == name) {
+                    // If user already manually pinned it (`!existing.ephemeral`), don't downgrade to `ephemeral: true`!
+                    if !existing.pinned {
+                        existing.ephemeral = ephemeral;
+                    } else if !ephemeral {
+                        existing.ephemeral = false;
+                    }
+                    existing.pinned = true;
+                    existing.mode = mode;
+                    if px.is_some() {
+                        existing.px = px;
+                    }
+                } else {
+                    let insert_at = self.st.stage.slots.iter().take_while(|s| s.pinned).count();
+                    self.st.stage.slots.insert(
+                        insert_at,
+                        StageSlot {
+                            surface: name.to_string(),
+                            mode,
+                            weight: 1.0,
+                            px,
+                            pinned: true,
+                            ephemeral,
+                        },
+                    );
+                }
+                if self.st.stage.mode == StageMode::Deck {
+                    self.st.stage.mode = StageMode::Stack;
+                }
+                self.st.stage.ensure_valid_focus(self.st.bodies.contains_key("home"));
+                self.commit_stage(cx, by);
+            }
+            "unpin" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage unpin needs surface")?;
+                let ephemeral_only = req.get("ephemeral_only") == Some(&JsonValue::Bool(true));
+                if let Some(idx) = self.st.stage.slots.iter().position(|s| s.surface == name) {
+                    let is_ephem = self.st.stage.slots[idx].ephemeral;
+                    if ephemeral_only && !is_ephem {
+                        return Ok(obj(vec![("stage", self.st.stage.to_json()), ("kept_manual_pin", JsonValue::Bool(true))]));
+                    }
+                    if self.st.stage.slots.len() > 1 || is_ephem {
+                        self.st.stage.slots.remove(idx);
+                    } else {
+                        self.st.stage.slots[idx].pinned = false;
+                        self.st.stage.slots[idx].ephemeral = false;
+                        self.st.stage.slots[idx].mode = SlotMode::Fill;
+                    }
+                    self.st.stage.ensure_valid_focus(self.st.bodies.contains_key("home"));
+                    self.commit_stage(cx, by);
+                }
+            }
+            "solo" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage solo needs surface")?;
+                check_exists(name, &self.st.bodies)?;
+                if req.get("clear_pins") == Some(&JsonValue::Bool(true)) {
+                    self.st.stage.mode = StageMode::Stack;
+                    self.st.stage.slots = vec![StageSlot::fill(name)];
+                    self.st.stage.focus = name.to_string();
+                } else {
+                    self.st.stage.solo(name);
+                }
+                self.commit_stage(cx, by);
+            }
+            "focus" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage focus needs surface")?;
+                if self.st.stage.slots.iter().any(|s| s.surface == name) {
+                    self.st.stage.focus = name.to_string();
+                    self.commit_stage(cx, by);
+                } else {
+                    check_exists(name, &self.st.bodies)?;
+                    self.st.stage.apply_front(name);
+                    self.commit_stage(cx, by);
+                }
+            }
+            "next" => self.cycle_task(cx, 1, by),
+            "prev" => self.cycle_task(cx, -1, by),
+            "save" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage save needs name")?;
+                if !valid_name(name) {
+                    return Err("invalid workspace name".into());
+                }
+                let title = req.get("title").and_then(|v| v.as_str());
+                self.st.persist.save_workspace(name, title, &self.st.stage.to_json())?;
+                self.sync_workspaces_key(cx);
+                return Ok(obj(vec![("saved", name.into()), ("stage", self.st.stage.to_json())]));
+            }
+            "open" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage open needs name")?;
+                let saved = self.st.persist.load_workspace(name).ok_or_else(|| format!("no workspace {name}"))?;
+                let mut parsed = Stage::from_json(&saved).ok_or("corrupt workspace json")?;
+                parsed.slots.retain(|s| self.st.bodies.contains_key(&s.surface));
+                if parsed.slots.is_empty() {
+                    return Err(format!("workspace {name} has no active surfaces"));
+                }
+                parsed.ensure_valid_focus(false);
+                self.st.stage = parsed;
+                self.commit_stage(cx, by);
+            }
+            "unsave" => {
+                let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage unsave needs name")?;
+                let removed = self.st.persist.unsave_workspace(name)?;
+                self.sync_workspaces_key(cx);
+                return Ok(obj(vec![("unsaved", name.into()), ("removed", JsonValue::Bool(removed))]));
+            }
+            _ => return Err(format!("unknown stage subcommand {sub}")),
+        }
+        Ok(obj(vec![("stage", self.st.stage.to_json())]))
     }
 
     fn lib_op(&mut self, cx: &mut Cx, req: &JsonValue) -> Result<JsonValue, String> {
@@ -1122,7 +1865,6 @@ impl App {
                     ]));
                 }
                 self.st.persist.put_piece(name, body)?;
-                let front_now = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let dependents: Vec<(String, String)> = self
                     .st
                     .bodies
@@ -1132,8 +1874,7 @@ impl App {
                     .collect();
                 let mut reshown = Vec::new();
                 for (surf, surf_body) in dependents {
-                    let is_front = surf == front_now;
-                    if let Ok(r) = self.show(cx, &surf, &surf_body, is_front) {
+                    if let Ok(r) = self.show(cx, &surf, &surf_body, false) {
                         if r.get("ok") != Some(&JsonValue::Bool(false)) {
                             reshown.push(JsonValue::String(surf));
                         }
@@ -1164,8 +1905,6 @@ impl App {
         }
     }
 
-    /// Re-reads `base.splash`, `ui/lib/*.splash`, user `lib/*.splash`, `trusted/*.splash`,
-    /// and re-evaluates one or all built-in views in place without losing `state` or `front`.
     fn reload_op(&mut self, cx: &mut Cx, req: &JsonValue) -> Result<JsonValue, String> {
         let Some(dir) = library::resolve_ui_subdir("TB_SHELL_VIEWS", "views") else {
             return Err("no views directory found".into());
@@ -1220,6 +1959,7 @@ impl App {
             ]));
         }
 
+        // Atomic `--all` validation pass first so a broken base.splash / view never half-commits!
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
@@ -1228,31 +1968,48 @@ impl App {
             .filter(|p| p.extension().map_or(false, |x| x == "splash"))
             .collect();
         files.sort();
-        let mut reloaded = Vec::new();
+        let ahead = self.current_ahead();
+        let mut view_sources: Vec<(String, String)> = Vec::new();
         let mut err_map: HashMap<String, JsonValue> = HashMap::new();
         for path in files {
             let Some(name) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else { continue };
             let Ok(body) = std::fs::read_to_string(&path) else { continue };
-            let was_view = self.st.views.insert(name.clone());
-            match self.show(cx, &name, &body, false) {
-                Ok(reply) if reply.get("ok") != Some(&JsonValue::Bool(false)) => {
+            let full = self.full_source(&body);
+            let raw_errors = makepad_widgets::splash::validate_splash_body_with_host_io(cx, &full);
+            let _ = take_splash_host_requests();
+            if !raw_errors.is_empty() {
+                let errors: Vec<JsonValue> = raw_errors
+                    .into_iter()
+                    .map(|e| match locate_with_ahead(&e, "validating", ahead) {
+                        Some((line, col, msg)) => obj(vec![("line", (line as u64).into()), ("col", (col as u64).into()), ("message", msg.into())]),
+                        None => obj(vec![("message", e.into())]),
+                    })
+                    .collect();
+                err_map.insert(name, JsonValue::Array(errors));
+            } else {
+                view_sources.push((name, body));
+            }
+        }
+        if !err_map.is_empty() {
+            self.st.persist.sys_base_source = prev_sys_base;
+            self.st.persist.pieces = prev_pieces;
+            return Ok(obj(vec![
+                ("ok", JsonValue::Bool(false)),
+                ("error", "one or more views did not evaluate".into()),
+                ("reloaded", JsonValue::Array(vec![])),
+                ("errors", JsonValue::Object(err_map)),
+            ]));
+        }
+
+        let mut reloaded = Vec::new();
+        for (name, body) in view_sources {
+            self.st.views.insert(name.clone());
+            if let Ok(reply) = self.show(cx, &name, &body, false) {
+                if reply.get("ok") != Some(&JsonValue::Bool(false)) {
                     reloaded.push(JsonValue::String(name));
-                }
-                Ok(reply) => {
-                    if !was_view {
-                        self.st.views.remove(&name);
-                    }
-                    err_map.insert(name, reply.get("errors").cloned().unwrap_or(JsonValue::Null));
-                }
-                Err(e) => {
-                    if !was_view {
-                        self.st.views.remove(&name);
-                    }
-                    err_map.insert(name, JsonValue::String(e));
                 }
             }
         }
-        // Also refresh any open agent surfaces so edits to `base.splash` / `ui/lib` apply everywhere.
         let agent_bodies: Vec<(String, String)> = self
             .st
             .bodies
@@ -1268,27 +2025,24 @@ impl App {
             }
         }
         self.sync_surfaces_key(cx);
-        if !err_map.is_empty() {
-            return Ok(obj(vec![
-                ("ok", JsonValue::Bool(false)),
-                ("error", "one or more views did not evaluate".into()),
-                ("reloaded", JsonValue::Array(reloaded)),
-                ("errors", JsonValue::Object(err_map)),
-            ]));
-        }
         Ok(obj(vec![
             ("dir", dir.to_string_lossy().to_string().into()),
             ("reloaded", JsonValue::Array(reloaded)),
         ]))
     }
 
-    /// Shell-owned keys (`shell`, `surfaces`), and `front` while a guard is up.
     fn refused_key(&self, patch: &JsonValue) -> Option<&'static str> {
         if patch.get(SHELL_KEY).is_some() {
             return Some(SHELL_KEY);
         }
         if patch.get(SURFACES_KEY).is_some() {
             return Some(SURFACES_KEY);
+        }
+        if patch.get(WORKSPACES_KEY).is_some() {
+            return Some(WORKSPACES_KEY);
+        }
+        if patch.get("stage").is_some() {
+            return Some("stage");
         }
         if !self.st.guards.is_empty() && patch.get("front").is_some() {
             return Some("front");
@@ -1298,6 +2052,11 @@ impl App {
 
     fn raise_next_guard(&mut self, cx: &mut Cx) {
         let view = self.st.guards.first().map(|g| g.view.clone());
+        if view.is_some() {
+            notify_screen_inhibit("inhibit 60");
+        } else {
+            notify_screen_inhibit("inhibit off");
+        }
         if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
             sh.set_guard(cx, view);
         }
@@ -1342,9 +2101,14 @@ impl App {
             None => (sh.add(cx, name), true),
         };
         drop(sh);
+
         let ahead = self.current_ahead();
         let full = self.full_source(body);
-        if !created || self.st.panel_off {
+        let will_be_visible = !self.st.panel_off && (front || self.st.visible.contains(name));
+
+        // Always validate in throwaway isolate when panel is off, replacing an existing surface,
+        // or showing a background (`--back`) surface that starts parked!
+        if !created || self.st.panel_off || !will_be_visible {
             let raw_errors = makepad_widgets::splash::validate_splash_body_with_host_io(cx, &full);
             let _ = take_splash_host_requests();
             if !raw_errors.is_empty() {
@@ -1365,7 +2129,8 @@ impl App {
                 ]));
             }
         }
-        if !self.st.panel_off {
+
+        if will_be_visible {
             if !created {
                 splash.set_text(cx, "");
             }
@@ -1389,13 +2154,20 @@ impl App {
                     ("errors", JsonValue::Array(errors)),
                 ]));
             }
+            self.st.parked.remove(name);
+            self.st.slot_prelude_cache.remove(name);
+        } else {
+            // Keep hidden/asleep surface parked until brought onto the visible stage!
+            splash.set_text(cx, "");
+            self.st.parked.insert(name.to_string());
+            self.st.slot_prelude_cache.remove(name);
         }
+
         self.st.bodies.insert(name.to_string(), body.to_string());
         self.st.persist.record_usage(body);
         self.write_surfaces_file();
         self.st.reads.insert(name.to_string(), Reads::scan(body));
 
-        // Arm per-surface frame watch for untrusted agent surfaces.
         if self.is_watched_surface(name) {
             let verify_redraws_left = if has_shader.is_some() { 3 } else { 0 };
             self.st.frame_watch.insert(
@@ -1406,13 +2178,15 @@ impl App {
             self.st.frame_watch.remove(name);
         }
 
-        if !self.st.panel_off {
+        if will_be_visible {
+            self.feed_slot_for(cx, name, &splash);
             self.feed_all(cx, name, &splash);
         }
         if front && self.st.guards.is_empty() {
-            self.apply(cx, &obj(vec![("front", JsonValue::String(name.into()))]), "shell");
+            self.st.stage.apply_front(name);
+            self.commit_stage(cx, "shell");
         } else {
-            self.sync_gpu_timer_for_front(cx);
+            self.sync_gpu_timer_for_visible(cx);
         }
         cx.redraw_all();
         let reads = match &self.st.reads[name] {
@@ -1430,42 +2204,60 @@ impl App {
         }
         self.st.reads.remove(name);
         self.st.bodies.remove(name);
+        self.st.parked.remove(name);
+        self.st.stale.remove(name);
+        self.st.warm_lru.retain(|n| n != name);
+        self.st.slot_prelude_cache.remove(name);
+        self.st.slot_dims.remove(name);
         self.st.frame_watch.remove(name);
         self.write_surfaces_file();
         self.st.front_history.retain(|n| n != name);
-        if self.st.store.get("front").and_then(|v| v.as_str()) == Some(name) {
-            let back = if force_home && self.st.bodies.contains_key("home") {
-                Some("home".to_string())
-            } else {
-                self.st
-                    .front_history
-                    .iter()
-                    .rev()
-                    .find(|n| self.st.bodies.contains_key(*n))
-                    .cloned()
-                    .or_else(|| self.st.bodies.contains_key("home").then(|| "home".to_string()))
-            };
-            let back = back.map_or(JsonValue::Null, JsonValue::String);
-            self.apply(cx, &obj(vec![("front", back)]), "shell");
+
+        let was_in_stage = self.st.stage.remove_surface(name, false);
+        if was_in_stage {
+            if self.st.stage.slots.is_empty() {
+                let back = if force_home && self.st.bodies.contains_key("home") {
+                    Some("home".to_string())
+                } else {
+                    self.st
+                        .front_history
+                        .iter()
+                        .rev()
+                        .find(|n| self.st.bodies.contains_key(*n))
+                        .cloned()
+                        .or_else(|| self.st.bodies.contains_key("home").then(|| "home".to_string()))
+                };
+                if let Some(b) = back {
+                    self.st.stage.slots.push(StageSlot::fill(b.clone()));
+                    self.st.stage.focus = b;
+                }
+            }
+            self.commit_stage(cx, "shell");
         }
         self.sync_surfaces_key(cx);
         Ok(obj(vec![]))
     }
 
+    fn queue_render(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) {
+        if !self.st.render_pending.iter().any(|(n, _)| n == name) {
+            self.st.render_pending.push((name.to_string(), splash.clone()));
+        }
+        self.st.render_frame = cx.new_next_frame();
+    }
+
     fn feed_all(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) {
         let Some(reads) = self.st.reads.get(name).cloned() else { return };
         let keys: Vec<String> = self.st.store.keys().filter(|k| reads.any(std::slice::from_ref(k))).cloned().collect();
-        self.feed(cx, splash, &keys);
+        self.feed(cx, name, splash, &keys);
     }
 
-    fn feed(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
+    fn feed(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef, keys: &[String]) {
         let t = Instant::now();
-        let r = self.feed_inner(cx, splash, keys);
+        self.feed_inner(cx, name, splash, keys);
         self.st.split.add_named("feed", t.elapsed());
-        r
     }
 
-    fn feed_inner(&mut self, cx: &mut Cx, splash: &WidgetRef, keys: &[String]) {
+    fn feed_inner(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef, keys: &[String]) {
         let vals = keys
             .iter()
             .map(|k| (k.clone(), self.st.store.get(k).cloned().unwrap_or(JsonValue::Null)))
@@ -1485,21 +2277,17 @@ impl App {
             }
             split.timed(2, || inner.call_script_fn_with_strings(cx, live_id!(__assign), &[&text]));
         }
-        if !self.st.render_pending.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
-            self.st.render_pending.push(splash.clone());
-        }
-        self.st.render_frame = cx.new_next_frame();
+        self.queue_render(cx, name, splash);
     }
 
     fn render_pending(&mut self, cx: &mut Cx) {
-        let front_name = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let front = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(&front_name));
         let mut rendered = false;
-        for splash in std::mem::take(&mut self.st.render_pending) {
-            if front.as_ref().map_or(true, |f| f.widget_uid() != splash.widget_uid()) {
-                if !self.st.stale.iter().any(|w| w.widget_uid() == splash.widget_uid()) {
-                    self.st.stale.push(splash);
-                }
+        for (name, splash) in std::mem::take(&mut self.st.render_pending) {
+            if self.st.parked.contains(&name) {
+                continue;
+            }
+            if !self.st.visible.contains(&name) {
+                self.st.stale.insert(name);
                 continue;
             }
             let _ = splash.widget(cx, ids!(main));
@@ -1509,8 +2297,8 @@ impl App {
                 rendered = true;
             }
             let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if self.is_watched_surface(&front_name) {
-                self.st.frame_watch.entry(front_name.clone()).or_default().pending_render_ms += render_ms;
+            if self.is_watched_surface(&name) {
+                self.st.frame_watch.entry(name).or_default().pending_render_ms += render_ms;
             }
         }
         if rendered {
@@ -1520,9 +2308,8 @@ impl App {
 
     fn apply(&mut self, cx: &mut Cx, patch: &JsonValue, by: &str) {
         let t = Instant::now();
-        let r = self.apply_inner(cx, patch, by);
+        self.apply_inner(cx, patch, by);
         self.st.split.add_named("apply", t.elapsed());
-        r
     }
 
     fn apply_inner(&mut self, cx: &mut Cx, patch: &JsonValue, by: &str) {
@@ -1538,48 +2325,40 @@ impl App {
                 }
             }
         });
+
         let t = Instant::now();
         let shell = self.shell(cx);
         self.st.split.add_named("shell-lookup", t.elapsed());
+
+        if touched.iter().any(|k| k == "battery" || k == "wifi") && !self.st.panel_off {
+            self.update_strip_status(cx);
+        }
+
         if touched.iter().any(|k| k == "front") {
             let front = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let shown = shell.borrow::<Shell>().and_then(|sh| sh.surface(&front));
-            let before = shell.borrow::<Shell>().map(|sh| sh.front.clone()).unwrap_or_default();
+            self.st.stage.apply_front(&front);
+            let stage_json = self.st.stage.to_json();
+            self.st.store.insert("stage".into(), stage_json);
             if let Some(mut sh) = shell.borrow_mut::<Shell>() {
-                sh.front = front.clone();
+                sh.stage = self.st.stage.clone();
             }
-            if before != front {
-                self.st.front_history.retain(|n| *n != front && *n != before);
-                if !before.is_empty() {
-                    self.st.front_history.push(before.clone());
-                }
-                if !before.is_empty() {
-                    self.to_surface_watchers(&before, obj(vec![("ev", "hidden".into()), ("surface", before.as_str().into())]));
-                }
-                if !front.is_empty() {
-                    self.to_surface_watchers(&front, obj(vec![("ev", "shown".into()), ("surface", front.as_str().into())]));
-                }
-            }
-            self.sync_gpu_timer_for_front(cx);
-            if let Some(shown) = shown {
-                if let Some(at) = self.st.stale.iter().position(|w| w.widget_uid() == shown.widget_uid()) {
-                    self.st.stale.remove(at);
-                    self.st.render_pending.push(shown);
-                    self.st.render_frame = cx.new_next_frame();
-                }
-            }
+            self.sync_visibility_and_lifecycle(cx);
             cx.redraw_all();
         }
+
         if !self.st.panel_off {
             let readers: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
             for (name, splash) in readers {
+                if self.st.parked.contains(&name) {
+                    continue;
+                }
                 let keys: Vec<String> = match self.st.reads.get(&name) {
                     Some(Reads::All) => touched.clone(),
                     Some(Reads::Keys(ks)) => touched.iter().filter(|k| ks.contains(k)).cloned().collect(),
                     None => continue,
                 };
                 if !keys.is_empty() {
-                    self.feed(cx, &splash, &keys);
+                    self.feed(cx, &name, &splash, &keys);
                 }
             }
         }
@@ -1650,6 +2429,11 @@ impl App {
                         }
                         self.st.trace.body_write();
                         self.apply(cx, &patch, &format!("surface:{surface}"));
+                    }
+                    "stage" => {
+                        if let Err(e) = self.stage_op(cx, &args, &format!("surface:{surface}")) {
+                            log!("tb-shell: surface {surface} stage op refused: {e}");
+                        }
                     }
                     "emit" => {
                         let name = args.get("name").cloned().unwrap_or(JsonValue::Null);

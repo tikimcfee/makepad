@@ -468,29 +468,71 @@ fn discover_power_inputs(override_env: Option<&str>) -> Vec<InputWatch> {
     out
 }
 
-fn open_timeout_inotify(timeout_file: &str) -> Option<(File, String)> {
+fn resolve_user_timeout_file() -> Option<String> {
+    if let Some(p) = env_opt("TB_SCREEN_USER_TIMEOUT_FILE") {
+        return Some(p);
+    }
+    let home = env_opt("HOME")?;
+    let dir = format!("{home}/.config/tb-shell");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(format!("{dir}/screen-timeout"))
+}
+
+fn read_effective_timeout(user_file: Option<&str>, sys_file: &str) -> u32 {
+    if let Some(uf) = user_file {
+        if let Ok(s) = std::fs::read_to_string(uf) {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    read_timeout_secs(sys_file)
+}
+
+fn open_power_menu_on_shell() {
+    let sock = env_opt("TB_SHELL_SOCK").unwrap_or_else(|| {
+        let xdg = env_opt("XDG_RUNTIME_DIR").unwrap_or_else(|| "/run/user/8000".into());
+        format!("{xdg}/tb-shell.sock")
+    });
+    if let Ok(mut s) = UnixStream::connect(&sock) {
+        let _ = s.set_write_timeout(Some(Duration::from_millis(200)));
+        let _ = s.write_all(b"{\"op\":\"set\",\"reply\":false,\"patch\":{\"front\":\"power\"}}\n");
+    }
+}
+
+fn open_timeout_inotify(files: &[String]) -> Option<(File, Vec<String>)> {
     const IN_CLOSE_WRITE: u32 = 0x008;
     const IN_MOVED_TO: u32 = 0x080;
     const IN_CREATE: u32 = 0x100;
     const IN_DELETE: u32 = 0x200;
-    let p = Path::new(timeout_file);
-    let dir = p.parent()?.to_str()?;
-    let fname = p.file_name()?.to_str()?.to_string();
-    if !Path::new(dir).is_dir() {
-        return None;
-    }
     let fd = unsafe { inotify_init1(O_CLOEXEC) };
     if fd < 0 {
         return None;
     }
-    let c = CString::new(dir).ok()?;
-    if unsafe { inotify_add_watch(fd, c.as_ptr(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE) } < 0 {
+    let mut watched_names = Vec::new();
+    let mut added = 0;
+    for file in files {
+        let p = Path::new(file);
+        let Some(dir) = p.parent().and_then(|d| d.to_str()) else { continue };
+        let Some(fname) = p.file_name().and_then(|f| f.to_str()) else { continue };
+        if !Path::new(dir).is_dir() {
+            continue;
+        }
+        let Ok(c) = CString::new(dir) else { continue };
+        if unsafe { inotify_add_watch(fd, c.as_ptr(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE) } >= 0 {
+            added += 1;
+            if !watched_names.iter().any(|x| x == fname) {
+                watched_names.push(fname.to_string());
+            }
+        }
+    }
+    if added == 0 {
         let _ = unsafe { File::from_raw_fd(fd) };
         return None;
     }
     let f = unsafe { File::from_raw_fd(fd) };
     let _ = unsafe { libc_set_nonblock(f.as_raw_fd()) };
-    Some((f, fname))
+    Some((f, watched_names))
 }
 
 unsafe fn libc_set_nonblock(fd: RawFd) -> i32 {
@@ -503,18 +545,41 @@ unsafe fn libc_set_nonblock(fd: RawFd) -> i32 {
     if flags < 0 { -1 } else { fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
 }
 
-fn parse_client_op(raw: &str) -> &str {
+enum ClientOp {
+    On,
+    Off,
+    Toggle,
+    Status,
+    Inhibit(Option<u64>),
+    Unknown,
+}
+
+fn parse_client_op(raw: &str) -> ClientOp {
     let t = raw.trim();
+    if let Some(rest) = t.strip_prefix("inhibit") {
+        let arg = rest.trim();
+        if arg.is_empty() {
+            return ClientOp::Inhibit(Some(60));
+        }
+        if arg == "off" || arg == "0" || arg == "false" {
+            return ClientOp::Inhibit(None);
+        }
+        return match arg.trim_end_matches('s').parse::<u64>() {
+            Ok(0) => ClientOp::Inhibit(None),
+            Ok(secs) => ClientOp::Inhibit(Some(secs.min(86_400))),
+            Err(_) => ClientOp::Unknown,
+        };
+    }
     if t.contains("\"on\"") || t == "on" {
-        "on"
+        ClientOp::On
     } else if t.contains("\"off\"") || t == "off" {
-        "off"
+        ClientOp::Off
     } else if t.contains("\"toggle\"") || t == "toggle" {
-        "toggle"
+        ClientOp::Toggle
     } else if t.contains("\"status\"") || t == "status" {
-        "status"
+        ClientOp::Status
     } else {
-        ""
+        ClientOp::Unknown
     }
 }
 
@@ -522,6 +587,7 @@ fn main() {
     let panel_file = env_opt("TB_SHELL_PANEL_FILE").unwrap_or_else(|| "/sys/kernel/tinybot_panel/state".into());
     let input_override = env_opt("TB_SCREEN_INPUT");
     let timeout_file = env_opt("TB_SCREEN_TIMEOUT_FILE").unwrap_or_else(|| "/userdata/tinybot/etc/screen-timeout".into());
+    let user_timeout_file = resolve_user_timeout_file();
     let sock_path = resolve_screen_sock();
 
     let mut wl = match WaylandConn::connect() {
@@ -545,18 +611,22 @@ fn main() {
     eprintln!("tb-screen-power: listening on {sock_path}");
 
     let mut inputs = discover_power_inputs(input_override.as_deref());
-    let mut timeout_watch = open_timeout_inotify(&timeout_file);
-    let mut timeout_secs = read_timeout_secs(&timeout_file);
+    let mut watch_paths = Vec::new();
+    if let Some(ref uf) = user_timeout_file {
+        watch_paths.push(uf.clone());
+    }
+    watch_paths.push(timeout_file.clone());
+    let mut timeout_watch = open_timeout_inotify(&watch_paths);
+    let mut timeout_secs = read_effective_timeout(user_timeout_file.as_deref(), &timeout_file);
 
-    // Pump any already-buffered initial events
     if let Err(e) = wl.pump_events(timeout_secs) {
         eprintln!("tb-screen-power: {e}");
         std::process::exit(1);
     }
 
-    // Captures `(pressed_at, was_on_at_key_down)` on KEY_POWER value==1 so compositor-side
-    // `kwin_idle::resumed` wakes during key hold never invert key-up's toggle direction.
-    let mut power_down: Option<(Instant, bool)> = None;
+    // `(pressed_at, was_on_at_key_down, hold_menu_fired)`
+    let mut power_down: Option<(Instant, bool, bool)> = None;
+    let mut inhibit_until: Option<Instant> = None;
 
     loop {
         let mut fds = Vec::with_capacity(3 + inputs.len());
@@ -572,7 +642,14 @@ fn main() {
             idx
         });
 
-        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len(), -1) };
+        // Bounded poll timeout ONLY while KEY_POWER is physically held waiting for 1.0 s hold;
+        // `-1` at all other times -> strictly 0 wake-ups at rest!
+        let poll_timeout_ms: i32 = match power_down {
+            Some((t0, _, false)) => (1000i64 - t0.elapsed().as_millis() as i64).max(1) as i32,
+            _ => -1,
+        };
+
+        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len(), poll_timeout_ms) };
         if rc < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(4) {
                 continue;
@@ -580,9 +657,7 @@ fn main() {
             break;
         }
 
-        // 1. `/dev/input/event*` (`mtk-pmic-keys`) KEY_POWER short press (< 800 ms):
-        //    processed BEFORE `wl.pump_events` so `was_on` at key-down (`value == 1`) is
-        //    sampled before any simultaneous Wayland mode/resumed event in the same poll turn.
+        // 1. `/dev/input/event*` (`mtk-pmic-keys`) KEY_POWER short press (< 800 ms) vs 1.0 s hold:
         let mut i = inputs.len();
         while i > 0 {
             i -= 1;
@@ -614,10 +689,10 @@ fn main() {
                             if ev.type_ == EV_KEY && ev.code == KEY_POWER {
                                 if ev.value == 1 {
                                     let was_on = read_panel_state(&panel_file, wl.compositor_power_on);
-                                    power_down = Some((Instant::now(), was_on));
+                                    power_down = Some((Instant::now(), was_on, false));
                                 } else if ev.value == 0 {
-                                    if let Some((t0, was_on)) = power_down.take() {
-                                        if t0.elapsed() < Duration::from_millis(800) {
+                                    if let Some((t0, was_on, hold_fired)) = power_down.take() {
+                                        if !hold_fired && t0.elapsed() < Duration::from_millis(800) {
                                             let next = !was_on;
                                             eprintln!(
                                                 "tb-screen-power: KEY_POWER (was {}) -> {}",
@@ -648,13 +723,29 @@ fn main() {
             }
         }
 
-        // 2. Wayland socket events (`kwin_idle::idle` -> off ONLY; `resumed` NEVER wakes an off panel)
+        // Check 1.0 s continuous hold -> wake screen + open built-in `power` sheet!
+        if let Some((t0, _, ref mut hold_fired)) = power_down {
+            if !*hold_fired && t0.elapsed() >= Duration::from_millis(1000) {
+                *hold_fired = true;
+                eprintln!("tb-screen-power: KEY_POWER 1.0s hold -> power menu");
+                let _ = wl.set_power(true);
+                open_power_menu_on_shell();
+            }
+        }
+
+        // 2. Wayland socket events (`kwin_idle::idle` -> off unless inhibited; `resumed` NEVER wakes)
         if fds[0].revents & (POLLIN | POLLERR | POLLHUP) != 0 {
             match wl.pump_events(timeout_secs) {
                 Ok((eof, saw_idle, _saw_resumed)) => {
                     if saw_idle && read_panel_state(&panel_file, wl.compositor_power_on) {
-                        eprintln!("tb-screen-power: idle -> screen off");
-                        let _ = wl.set_power(false);
+                        if inhibit_until.is_some_and(|until| Instant::now() < until) {
+                            eprintln!("tb-screen-power: idle ignored (inhibited)");
+                            wl.simulate_activity();
+                        } else {
+                            inhibit_until = None;
+                            eprintln!("tb-screen-power: idle -> screen off");
+                            let _ = wl.set_power(false);
+                        }
                     }
                     if eof {
                         eprintln!("tb-screen-power: Wayland compositor closed socket");
@@ -668,7 +759,7 @@ fn main() {
             }
         }
 
-        // 3. Control socket (`tbui screen on|off|toggle|status`)
+        // 3. Control socket (`tbui screen on|off|toggle|status|inhibit <SECS|off>`)
         if fds[1].revents & POLLIN != 0 {
             while let Ok((mut stream, _)) = listener.accept() {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -678,29 +769,35 @@ fn main() {
                     let _ = BufReader::new(clone).read_line(&mut line);
                 }
                 let reply = match parse_client_op(&line) {
-                    "on" => match wl.set_power(true) {
+                    ClientOp::On => match wl.set_power(true) {
                         Ok(()) => "on\n".to_string(),
                         Err(e) => format!("ERR: {e}\n"),
                     },
-                    "off" => match wl.set_power(false) {
+                    ClientOp::Off => match wl.set_power(false) {
                         Ok(()) => "off\n".to_string(),
                         Err(e) => format!("ERR: {e}\n"),
                     },
-                    "toggle" => {
+                    ClientOp::Toggle => {
                         let next = !read_panel_state(&panel_file, wl.compositor_power_on);
                         match wl.set_power(next) {
                             Ok(()) => if next { "on\n".into() } else { "off\n".into() },
                             Err(e) => format!("ERR: {e}\n"),
                         }
                     }
-                    "status" => {
-                        if read_panel_state(&panel_file, wl.compositor_power_on) {
-                            "on\n".into()
-                        } else {
-                            "off\n".into()
-                        }
+                    ClientOp::Status => {
+                        let base = if read_panel_state(&panel_file, wl.compositor_power_on) { "on" } else { "off" };
+                        format!("{base}\n")
                     }
-                    _ => "ERR: expected on | off | toggle | status\n".into(),
+                    ClientOp::Inhibit(Some(secs)) => {
+                        inhibit_until = Some(Instant::now() + Duration::from_secs(secs));
+                        wl.simulate_activity();
+                        format!("inhibited {secs}s\n")
+                    }
+                    ClientOp::Inhibit(None) => {
+                        inhibit_until = None;
+                        "inhibit off\n".to_string()
+                    }
+                    ClientOp::Unknown => "ERR: expected on | off | toggle | status | inhibit [SECS|off]\n".into(),
                 };
                 let _ = stream.write_all(reply.as_bytes());
             }
@@ -710,7 +807,7 @@ fn main() {
         if let Some(idx) = watch_idx {
             if fds[idx].revents & POLLIN != 0 {
                 let mut hit = false;
-                if let Some((f, target)) = timeout_watch.as_mut() {
+                if let Some((f, targets)) = timeout_watch.as_mut() {
                     let mut buf = [0u8; 1024];
                     while let Ok(n) = f.read(&mut buf) {
                         if n == 0 {
@@ -720,7 +817,8 @@ fn main() {
                         while at + 16 <= n {
                             let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
                             let raw = String::from_utf8_lossy(&buf[at + 16..(at + 16 + len).min(n)]);
-                            if raw.trim_end_matches('\0') == target.as_str() {
+                            let fname = raw.trim_end_matches('\0');
+                            if targets.iter().any(|t| t == fname) {
                                 hit = true;
                             }
                             at += 16 + len;
@@ -728,7 +826,7 @@ fn main() {
                     }
                 }
                 if hit {
-                    timeout_secs = read_timeout_secs(&timeout_file);
+                    timeout_secs = read_effective_timeout(user_timeout_file.as_deref(), &timeout_file);
                     let _ = wl.apply_idle_timeout(timeout_secs);
                 }
             } else if fds[idx].revents & (POLLERR | POLLHUP) != 0 {

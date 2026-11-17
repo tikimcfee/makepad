@@ -106,6 +106,7 @@ fn main() {
         let kind = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
         let should_update = match kind {
             "shown" => true,
+            "panel" => ev.get("on") == Some(&JsonValue::Bool(true)),
             "emit" => {
                 ev.get("surface").and_then(|v| v.as_str()) == Some("battery")
                     && ev.get("name").and_then(|v| v.as_str()) == Some("refresh")
