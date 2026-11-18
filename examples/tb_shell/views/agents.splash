@@ -1,17 +1,80 @@
 // AGENTS: pick default target (`state.target`) or jump straight to its `Chat`.
-// `compact` mode renders a horizontal scrollable pill strip; `full` mode renders cards.
+// `compact` mode renders a horizontal scrollable pill strip; `full` mode renders
+// collapsible device sections sorted by name (all expanded by default, state
+// persisted in `state.agents_collapsed`).
+let SectionHdr = RoundedView{
+    width: Fill height: 44 flow: Right spacing: 8
+    padding: Inset{left: 12 right: 12} align: Align{y: 0.5}
+    new_batch: true show_bg: true
+    draw_bg.color: #x151b26 draw_bg.border_radius: 12.0
+}
 let AgentCard = RoundedView{
-    width: Fill height: 68 flow: Right spacing: 10
+    width: Fill height: 60 flow: Right spacing: 10
     padding: Inset{left: 14 right: 10} align: Align{y: 0.5}
     new_batch: true show_bg: true
-    draw_bg.color: #x1c2230 draw_bg.border_radius: 16.0
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
+}
+fn agent_host_name(a) {
+    let h = a.host ?? ""
+    if h != "" { return "" + h }
+    let parts = ("" + (a.id ?? "")).split("@")
+    if parts.len() > 1 && parts[1] != "" { return parts[1] }
+    "local"
+}
+fn has_str(list, target) {
+    for x in list ?? [] {
+        if x == target { return true }
+    }
+    false
+}
+fn toggle_host(collapsed, host) {
+    let mut next = []
+    let mut found = false
+    for h in collapsed ?? [] {
+        if h == host {
+            found = true
+        } else {
+            next.push(h)
+        }
+    }
+    if !found { next.push(host) }
+    next
+}
+fn sort_key(item, by_agent) {
+    if by_agent {
+        return ("" + (item.name ?? (item.id ?? ""))).to_lower()
+    }
+    ("" + item).to_lower()
+}
+fn sort_items(list, by_agent) {
+    let mut out = []
+    for x in list { out.push(x) }
+    let n = out.len()
+    for i in 0..n {
+        let mut min_i = i
+        let mut j = i + 1
+        loop {
+            if j >= n { break }
+            if sort_key(out[j], by_agent) < sort_key(out[min_i], by_agent) {
+                min_i = j
+            }
+            j = j + 1
+        }
+        if min_i != i {
+            let tmp = out[i]
+            out[i] = out[min_i]
+            out[min_i] = tmp
+        }
+    }
+    out
 }
 width: Fill height: Fit flow: Down
 main := View{
     width: Fill height: Fit flow: Down
     on_render: || {
         let is_compact = (slot.mode ?? "full") == "compact"
-        let list = state.agents ?? []
+        let raw_list = state.agents ?? []
+        let list = sort_items(raw_list, true)
         let cur_target = state.target ?? nil
 
         if is_compact {
@@ -36,33 +99,92 @@ main := View{
                 }
             }
         } else {
+            let collapsed = state.agents_collapsed ?? []
+            let mut raw_hosts = []
+            for a in list {
+                let h = agent_host_name(a)
+                if !has_str(raw_hosts, h) {
+                    raw_hosts.push(h)
+                }
+            }
+            let hosts = sort_items(raw_hosts, false)
             let list_h = ((slot.height ?? 780.0) - 56.0)
             let safe_h = if list_h < 120.0 { 120.0 } else { list_h }
             View{
                 width: Fill height: Fit flow: Down padding: 14 spacing: 10
-                Small{text: "Agents · tap to select target, or open Chat"}
+                Small{text: "Agents · tap device to fold, agent to target"}
                 ScrollYView{
                     width: Fill height: safe_h flow: Down spacing: 8
-                    for a in list {
-                        let aid = a.id ?? ""
-                        let sel = aid == cur_target
-                        let host_sub = agent_host(aid)
-                        AgentCard{
-                            draw_bg.color: if sel { #x1f314a } else { #x1c2230 }
-                            Dot{draw_bg.color: status_color(a.status ?? "")}
-                            ButtonFlat{
-                                width: Fill height: 52 margin: 0
-                                padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
-                                draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x00000000
-                                draw_text.text_style.font_size: 15.5
-                                text: (a.name ?? aid) + (if host_sub == "" { "" } else { "  " + host_sub })
-                                on_click: || set("target", aid)
+                    if hosts.len() == 0 {
+                        Small{text: "No agents online"}
+                    }
+                    for h in hosts {
+                        let host_name = h
+                        let is_col = has_str(collapsed, host_name)
+                        let mut total_n = 0
+                        let mut busy_n = 0
+                        let mut has_sel = false
+                        for a in list {
+                            if agent_host_name(a) == host_name {
+                                total_n = total_n + 1
+                                let st = a.status ?? ""
+                                if st == "busy" || st == "processing" { busy_n = busy_n + 1 }
+                                if (a.id ?? "") == cur_target { has_sel = true }
                             }
-                            PillBtn{
-                                height: 38 text: "Chat ->"
-                                on_click: || {
-                                    set("target", aid)
-                                    front("chat")
+                        }
+                        let count_txt = "" + total_n + (if busy_n > 0 { " · " + busy_n + " busy" } else { "" })
+                        View{
+                            width: Fill height: Fit flow: Down spacing: 6
+                            View{
+                                width: Fill height: Fit
+                                on_item_tap: |i| set("agents_collapsed", toggle_host(state.agents_collapsed ?? [], host_name))
+                                SectionHdr{
+                                    draw_bg.color: if is_col && has_sel { #x19283d } else { #x151b26 }
+                                    Small{
+                                        text: if is_col { ">" } else { "v" }
+                                        draw_text.color: #x9aa4b2
+                                    }
+                                    Title{
+                                        width: Fill
+                                        draw_text.text_style.font_size: 15
+                                        draw_text.color: #xe2e8f0
+                                        text: host_name
+                                    }
+                                    if is_col && has_sel {
+                                        Dot{width: 8 height: 8 draw_bg.border_radius: 4.0 draw_bg.color: #x60a5fa}
+                                    }
+                                    Small{
+                                        text: count_txt
+                                        draw_text.color: #x8b95a5
+                                    }
+                                }
+                            }
+                            if !is_col {
+                                for a in list {
+                                    if agent_host_name(a) == host_name {
+                                        let aid = a.id ?? ""
+                                        let sel = aid == cur_target
+                                        AgentCard{
+                                            draw_bg.color: if sel { #x1f314a } else { #x1c2230 }
+                                            Dot{draw_bg.color: status_color(a.status ?? "")}
+                                            ButtonFlat{
+                                                width: Fill height: 48 margin: 0
+                                                padding: Inset{left: 4 right: 4 top: 0 bottom: 0}
+                                                label_align: Align{x: 0.0 y: 0.5}
+                                                draw_bg.color: #x00000000 draw_bg.color_focus: #x00000000 draw_bg.color_hover: #x00000000
+                                                draw_text.text_style.font_size: 15
+                                                text: a.name ?? aid
+                                                on_click: || set("target", aid)
+                                            }
+                                            PillBtn{
+                                                height: 38 text: "Chat ->"
+                                                on_click: || {
+                                                    set("target", aid)
+                                                    front("chat")
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
