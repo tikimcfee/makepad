@@ -5,6 +5,7 @@
 pub use makepad_widgets;
 
 mod io;
+mod jit_slot;
 mod library;
 mod paneltrace;
 mod sched;
@@ -237,7 +238,6 @@ struct State {
     front_history: Vec<String>,
     owned: HashMap<u64, Vec<String>>,
     guards: Vec<Guard>,
-    guard_uids: HashSet<u32>,
     trusted: HashSet<String>,
     sources: Sources,
     panel_off: bool,
@@ -285,6 +285,9 @@ impl AppMain for App {
             self.start(cx);
         }
         if let Event::Shutdown = event {
+            if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+                sh.jit.shutdown_all();
+            }
             cx.perf_monitor.set_enabled(false);
             library::CrashGuard::mark_clean_shutdown();
             return;
@@ -303,6 +306,14 @@ impl AppMain for App {
                 self.st.split.add_drain(dt);
             } else {
                 self.drain_socket(cx);
+            }
+            if !self.st.panel_off {
+                let has_vis_jit = self.shell(cx).borrow::<Shell>().map_or(false, |sh| {
+                    self.st.visible.iter().any(|n| sh.jit.contains(n))
+                });
+                if has_vis_jit {
+                    cx.redraw_all();
+                }
             }
         }
         self.drain_host_requests(cx);
@@ -412,7 +423,6 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        && !name.to_ascii_lowercase().starts_with("guard")
 }
 
 fn has_isolate_timers(cx: &mut Cx, splash: &WidgetRef) -> bool {
@@ -449,7 +459,11 @@ impl App {
     fn is_watched_surface(&self, name: &str) -> bool {
         self.st.frame_budget_ms > 0.0
             && !self.st.views.contains(name)
-            && self.st.bodies.get(name).map_or(false, |b| !self.st.trusted.contains(b))
+            && self
+                .st
+                .bodies
+                .get(name)
+                .map_or(false, |b| !b.starts_with("__jit__:") && !self.st.trusted.contains(b))
     }
 
     fn sync_gpu_timer_for_visible(&mut self, cx: &mut Cx) {
@@ -555,7 +569,6 @@ impl App {
         let path = env("TB_SHELL_SOCK").unwrap_or_else(|| format!("{}/tb-shell.sock", env("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())));
         io::listen(&path, tx.clone());
         self.st.rx = Some(rx);
-        self.st.guard_uids = env("TB_SHELL_GUARD_UIDS").unwrap_or("0".into()).split(',').filter_map(|u| u.trim().parse().ok()).collect();
         self.st.frame_budget_ms = env("TB_SHELL_FRAME_BUDGET_MS").and_then(|v| v.parse().ok()).unwrap_or(120.0);
         self.st.agent_shaders_on = !matches!(env("TB_SHELL_AGENT_SHADERS").as_deref(), Some("0") | Some("false"));
         self.st.persist = library::StorePersistence::load(BASE);
@@ -583,7 +596,6 @@ impl App {
         self.st.log_cursor = log_ring::read_since(u64::MAX, 0).0;
         self.st.split = split::Split::from_env();
         self.st.trace = paneltrace::PanelTrace::from_env();
-        self.guard_input(cx);
         self.st.placement = sched::Placement::from_env();
         self.st.placement.apply();
         self.mic_timer(cx);
@@ -690,11 +702,13 @@ impl App {
             .into_iter()
             .map(|name| {
                 let is_sys = self.st.views.contains(&name);
+                let is_jit = self.st.bodies.get(&name).is_some_and(|b| b.starts_with("__jit__:"));
                 let saved = is_sys || self.st.persist.is_saved(&name);
                 let title = self.st.persist.title_of(&name).unwrap_or(&name).to_string();
+                let kind = if is_sys { "system" } else if is_jit { "jit" } else { "agent" };
                 obj(vec![
                     ("name", JsonValue::String(name)),
-                    ("kind", JsonValue::String(if is_sys { "system" } else { "agent" }.into())),
+                    ("kind", JsonValue::String(kind.into())),
                     ("saved", JsonValue::Bool(saved)),
                     ("title", JsonValue::String(title)),
                 ])
@@ -782,37 +796,15 @@ impl App {
 
     fn write_surfaces_file(&self) {
         let Some(file) = Self::surfaces_file() else { return };
-        let mut names: Vec<&String> = self.st.bodies.keys().filter(|n| !self.st.views.contains(*n)).collect();
+        let mut names: Vec<&String> = self
+            .st
+            .bodies
+            .iter()
+            .filter(|(n, b)| !self.st.views.contains(*n) && !b.starts_with("__jit__:"))
+            .map(|(n, _)| n)
+            .collect();
         names.sort();
         let _ = std::fs::write(&file, names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(" "));
-    }
-
-    fn guard_input(&mut self, cx: &mut Cx) {
-        const TEST_TAPS: &str = "/etc/tb-shell/guard-test-taps";
-        let remote_on = std::env::args().any(|a| a.starts_with("--remote")) || env("MAKEPAD_REMOTE").is_some();
-        let roots = |p: &str| {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::symlink_metadata(p).map_or(false, |m| m.uid() == 0 && m.mode() & 0o022 == 0)
-        };
-        let test_taps = roots(TEST_TAPS) && roots("/etc/tb-shell");
-        if test_taps {
-            log!("tb-shell: TEST SWITCH ON ({TEST_TAPS}, root's): injected input may answer a guard");
-        }
-        log!(
-            "tb-shell: guard answers: {}",
-            if !remote_on {
-                "the device only (no --remote endpoint)"
-            } else if test_taps {
-                "any input (test switch)"
-            } else {
-                "the device only (injected input through --remote is ignored)"
-            }
-        );
-        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
-            sh.guard_input.remote_on = remote_on;
-            sh.guard_input.test_taps = test_taps;
-            sh.marks.test_taps = test_taps;
-        }
     }
 
     fn read_mic(&mut self, cx: &mut Cx) {
@@ -1209,6 +1201,9 @@ impl App {
             self.sync_visible_slot_preludes(cx);
             self.enforce_hidden_lifecycle(cx);
         }
+        if let Some(sh) = self.shell(cx).borrow::<Shell>() {
+            sh.jit.sync_visibility(&self.st.visible, self.st.panel_off);
+        }
         self.sync_gpu_timer_for_visible(cx);
     }
 
@@ -1596,14 +1591,66 @@ impl App {
             }
             "lib" => self.lib_op(cx, req).map(Some),
             "reload" => self.reload_op(cx, req).map(Some),
-            "guard" => {
-                if !self.st.guard_uids.contains(&peer.uid) {
-                    return Err(format!("guard: uid {} may not raise a guard", peer.uid));
+            "jit" => {
+                let name = surface.ok_or("jit needs surface")?;
+                if !valid_name(name) {
+                    return Err("invalid surface name".into());
                 }
-                let text = req.get("text").and_then(|v| v.as_str()).ok_or("guard needs text")?.to_string();
+                if self.st.views.contains(name) {
+                    return Err(format!("{name} is a built-in view"));
+                }
+                let package = req
+                    .get("package")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("jit needs package")?;
+                let dir = req.get("dir").and_then(|v| v.as_str());
+                let src_store = req.get("src").and_then(|v| v.as_str());
+                let fps = stage::json_num(req.get("fps")).unwrap_or(24.0).clamp(1.0, 60.0);
+                let front = req.get("front").map_or(true, |v| v == &JsonValue::Bool(true));
+
+                // Remove any prior Splash isolate of the same name before installing the JIT slot.
+                if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+                    if let Some(at) = sh.surfaces.iter().position(|(n, _)| n == name) {
+                        let (_, sp) = sh.surfaces.remove(at);
+                        sp.set_text(cx, "");
+                    }
+                }
+                let will_vis = !self.st.panel_off && (front || self.st.visible.contains(name));
+                let inst = jit_slot::JitInstance::spawn(name, package, dir, src_store, fps, will_vis)?;
+                if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+                    sh.jit.insert(name.to_string(), inst);
+                }
+                self.st.bodies.insert(name.to_string(), format!("__jit__:{package}"));
+                self.st.parked.remove(name);
+                self.st.stale.remove(name);
+                if req.get("ephemeral") == Some(&JsonValue::Bool(true)) {
+                    let list = self.st.owned.entry(conn).or_default();
+                    if !list.iter().any(|n| n == name) {
+                        list.push(name.to_string());
+                    }
+                }
+                if front {
+                    self.st.stage.apply_front(name);
+                }
+                self.commit_stage(cx, "jit");
+                self.sync_surfaces_key(cx);
+                Ok(Some(obj(vec![
+                    ("surface", name.into()),
+                    ("package", package.into()),
+                    ("fps", JsonValue::F64(fps)),
+                ])))
+            }
+            "confirm" | "guard" => {
+                let text = req.get("text").and_then(|v| v.as_str()).ok_or("confirm needs text")?.to_string();
                 let yes = req.get("yes").and_then(|v| v.as_str()).unwrap_or("Proceed").to_string();
                 let no = req.get("no").and_then(|v| v.as_str()).unwrap_or("Cancel").to_string();
-                let view = GuardView { text, who: format!("asked by {}", peer.label()), yes, no };
+                let who = req
+                    .get("who")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("asked by {}", peer.label()));
+                let view = GuardView { text, who, yes, no };
                 self.st.guards.push(Guard { conn, view });
                 if self.st.guards.len() == 1 {
                     self.raise_next_guard(cx);
@@ -2014,7 +2061,7 @@ impl App {
             .st
             .bodies
             .iter()
-            .filter(|(n, _)| !self.st.views.contains(*n))
+            .filter(|(n, b)| !self.st.views.contains(*n) && !b.starts_with("__jit__:"))
             .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
         for (name, body) in agent_bodies {
