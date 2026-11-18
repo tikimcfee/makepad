@@ -39,6 +39,10 @@ pub(super) struct PassJob {
     pub attachments: [(u64, u32); 5],
     pub uint_colors: u32,
     pub depth_stencil: bool,
+    /// the depth is read by nothing after this pass (`exec::depth_kept` is false): it is
+    /// invalidated at the pass's end, so a tile GPU never writes it out (Metal's and Vulkan's
+    /// store DontCare)
+    pub depth_discard: bool,
     pub load: [u8; 5],
     pub clear: [[f32; 4]; 4],
     pub clear_depth: f32,
@@ -49,6 +53,12 @@ pub(super) struct PassJob {
     pub draws: Vec<DrawJob>,
     /// a partial repaint: only these rects are cleared, and the draws are cut to them
     pub damage: Option<Vec<[i32; 4]>>,
+}
+
+/// `MAKEPAD_GL_INVALIDATE=0` keeps every pass's depth stored, as before the depth discard.
+fn invalidate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAKEPAD_GL_INVALIDATE").map_or(true, |v| v != "0"))
 }
 
 pub(super) enum Instances {
@@ -418,8 +428,10 @@ impl GlBackend {
         if hosted {
             self.win.insert((s.id, target.index), Tex { gen: target.gen, obj: window.as_ref().unwrap().clone() });
         }
+        // a depth nothing reads later stays in tile memory, as on Metal and Vulkan
+        let depth_discard = depth.is_some() && invalidate_enabled() && !exec::depth_kept(s, s.id, pass, view, pass.depth);
         Ok((PassJob { attachments, uint_colors, depth_stencil: depth.as_ref().is_some_and(|d| d.desc.format == format::DEPTH24_STENCIL8),
-            load: pass.load, clear: pass.clear, clear_depth: pass.clear_depth,
+            depth_discard, load: pass.load, clear: pass.clear, clear_depth: pass.clear_depth,
             viewport: [v[0] as i32, v[1] as i32, v[2].round() as i32, v[3].round() as i32],
             views: if viewed { pviews.iter().map(|pv| { let r = pv.rect; [r[0] as i32, r[1] as i32, r[2].round() as i32, r[3].round() as i32] }).collect() } else { Vec::new() },
             mips, draws: prepared, damage }, window))
@@ -718,6 +730,10 @@ impl Renderer {
         unsafe {
             (gl.glBindVertexArray)(0);
             (gl.glUseProgram)(0);
+            if p.depth_discard {
+                let att = if p.depth_stencil { sys::DEPTH_STENCIL_ATTACHMENT } else { sys::DEPTH_ATTACHMENT };
+                (gl.glInvalidateFramebuffer)(sys::FRAMEBUFFER, 1, &att);
+            }
             (gl.glBindFramebuffer)(sys::FRAMEBUFFER, 0);
             for t in &p.mips {
                 if let Some(g) = self.textures.get(&t.key) {
