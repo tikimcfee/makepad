@@ -1,0 +1,1217 @@
+//! Virtualized `PortalList`-backed feed widget (`ChatFeed` / `VirtualFeed`) for `tb-shell`.
+//!
+//! Solves three scroll bottlenecks on mobile TBDR GPUs (PowerVR GE8320):
+//! 1. **Viewport Virtualization (`O(viewport)`):** Wraps Makepad's `PortalList` (`auto_tail`,
+//!    `keep_end_on_resize`, `keep_nearby_items`, `reuse_items`) so only the 2–4 visible rows
+//!    intersecting the viewport run layout/draw on a scroll frame, whether the feed holds 18
+//!    or 1,000+ messages.
+//! 2. **Fence-Aware Block Splitting (`> split_bytes`):** Messages exceeding `split_bytes`
+//!    (default `2200` B) are split once (cached by 64-bit content hash) at top-level Markdown
+//!    block boundaries (or clean ~45-line fenced code continuations) into seamless `Single` /
+//!    `Top` / `Mid` / `Bot` `RoundedYView` slices (all `new_batch: false`, batching into a
+//!    single instanced `DrawQuad` draw call).
+//! 3. **Plain-Text Fast Path + Hash-Gated Binding:** Chunks with no Markdown syntax route to
+//!    single-walk `Label` templates (0 `pulldown-cmark` parses, 1 `TurtleWalk`), Markdown
+//!    chunks route to `Markdown{ use_math_widget: false }`, and `existed` rows skip `set_text`
+//!    completely whenever their 64-bit row hash already matches `applied_hashes`.
+//!
+//! Data sources:
+//! - `store_key: "chat"` (default): reads `tb-shell`'s Rust store directly with zero Splash
+//!   JSON serialization (`{ msgs: [...], hidden_before, agent }` or any `[...]` array).
+//! - `items: [...]` in `.splash`: generic Splash array fallback (`VirtualFeed{ items: rows }`).
+
+use makepad_micro_serde::JsonValue;
+use makepad_widgets::makepad_script::ScriptFnRef;
+use makepad_widgets::portal_list::{PortalList, PortalListWidgetRefExt};
+use makepad_widgets::widget_async::CxWidgetToScriptCallExt;
+use makepad_widgets::widget_tree::CxWidgetExt;
+use makepad_widgets::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+thread_local! {
+    /// UI-thread mirror of top-level store entries (`key -> (version, Rc<JsonValue>)`).
+    static FEED_STORE: RefCell<HashMap<String, (u64, Rc<JsonValue>)>> = RefCell::new(HashMap::new());
+    static NEXT_VER: RefCell<u64> = const { RefCell::new(1) };
+}
+
+pub fn publish_store(key: &str, value: &JsonValue) {
+    let ver = NEXT_VER.with(|n| {
+        let mut n = n.borrow_mut();
+        let v = *n;
+        *n = n.wrapping_add(1);
+        v
+    });
+    FEED_STORE.with(|m| {
+        m.borrow_mut().insert(key.to_string(), (ver, Rc::new(value.clone())));
+    });
+}
+
+pub fn remove_store(key: &str) {
+    let ver = NEXT_VER.with(|n| {
+        let mut n = n.borrow_mut();
+        let v = *n;
+        *n = n.wrapping_add(1);
+        v
+    });
+    FEED_STORE.with(|m| {
+        m.borrow_mut().insert(key.to_string(), (ver, Rc::new(JsonValue::Null)));
+    });
+}
+
+fn read_store(key: &str, seen: u64) -> Option<(u64, Rc<JsonValue>)> {
+    FEED_STORE.with(|m| {
+        m.borrow()
+            .get(key)
+            .filter(|(v, _)| *v != seen)
+            .map(|(v, val)| (*v, Rc::clone(val)))
+    })
+}
+
+fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+const FNV_INIT: u64 = 0xcbf29ce484222325;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleKind {
+    You,
+    Tool,
+    Say,
+}
+
+impl RoleKind {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "you" | "user" | "prompt" => Self::You,
+            "tool" | "meta" | "dim" => Self::Tool,
+            _ => Self::Say,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::You => 1,
+            Self::Tool => 2,
+            Self::Say => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlicePos {
+    Single,
+    Top,
+    Mid,
+    Bot,
+}
+
+impl SlicePos {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Single => 1,
+            Self::Top => 2,
+            Self::Mid => 3,
+            Self::Bot => 4,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FeedMsg {
+    role: RoleKind,
+    hdr: String,
+    text: String,
+    msg_index: usize,
+}
+
+#[derive(Clone)]
+struct FlatRow {
+    role: RoleKind,
+    pos: SlicePos,
+    is_md: bool,
+    hdr: String,
+    body: String,
+    msg_index: usize,
+    hash: u64,
+}
+
+impl FlatRow {
+    fn template_id(&self) -> LiveId {
+        match (self.role, self.pos, self.is_md) {
+            (RoleKind::You, SlicePos::Single, false) => id!(YouSinglePlain),
+            (RoleKind::You, SlicePos::Single, true) => id!(YouSingleMd),
+            (RoleKind::You, SlicePos::Top, false) => id!(YouTopPlain),
+            (RoleKind::You, SlicePos::Top, true) => id!(YouTopMd),
+            (RoleKind::You, SlicePos::Mid, false) => id!(YouMidPlain),
+            (RoleKind::You, SlicePos::Mid, true) => id!(YouMidMd),
+            (RoleKind::You, SlicePos::Bot, false) => id!(YouBotPlain),
+            (RoleKind::You, SlicePos::Bot, true) => id!(YouBotMd),
+
+            (RoleKind::Tool, SlicePos::Single, false) => id!(ToolSinglePlain),
+            (RoleKind::Tool, SlicePos::Single, true) => id!(ToolSingleMd),
+            (RoleKind::Tool, SlicePos::Top, false) => id!(ToolTopPlain),
+            (RoleKind::Tool, SlicePos::Top, true) => id!(ToolTopMd),
+            (RoleKind::Tool, SlicePos::Mid, false) => id!(ToolMidPlain),
+            (RoleKind::Tool, SlicePos::Mid, true) => id!(ToolMidMd),
+            (RoleKind::Tool, SlicePos::Bot, false) => id!(ToolBotPlain),
+            (RoleKind::Tool, SlicePos::Bot, true) => id!(ToolBotMd),
+
+            (RoleKind::Say, SlicePos::Single, false) => id!(SaySinglePlain),
+            (RoleKind::Say, SlicePos::Single, true) => id!(SaySingleMd),
+            (RoleKind::Say, SlicePos::Top, false) => id!(SayTopPlain),
+            (RoleKind::Say, SlicePos::Top, true) => id!(SayTopMd),
+            (RoleKind::Say, SlicePos::Mid, false) => id!(SayMidPlain),
+            (RoleKind::Say, SlicePos::Mid, true) => id!(SayMidMd),
+            (RoleKind::Say, SlicePos::Bot, false) => id!(SayBotPlain),
+            (RoleKind::Say, SlicePos::Bot, true) => id!(SayBotMd),
+        }
+    }
+
+    fn has_header(&self) -> bool {
+        matches!(self.pos, SlicePos::Single | SlicePos::Top)
+    }
+}
+
+/// Fast syntax check: returns `false` when `s` is guaranteed plain prose with zero Markdown
+/// constructs, allowing `ChatFeed` to route it to a single-walk `Label` instead of `Markdown`.
+fn needs_markdown(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for &b in bytes {
+        if matches!(b, b'`' | b'*' | b'_' | b'~' | b'[' | b'|' | b'<' | b'\\') {
+            return true;
+        }
+    }
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        let b0 = t.as_bytes()[0];
+        if b0 == b'#' || b0 == b'>' {
+            return true;
+        }
+        if t.starts_with("- ") || t.starts_with("+ ") || t == "---" {
+            return true;
+        }
+        if b0.is_ascii_digit() {
+            let digits = t.bytes().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && digits <= 6 {
+                let rest = &t[digits..];
+                if rest.starts_with(". ") || rest.starts_with(") ") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn fence_marker(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("```") {
+        Some("```")
+    } else if trimmed.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
+}
+
+/// Splits `text` exceeding `target_bytes` cleanly at top-level Markdown block boundaries
+/// (blank lines / headings outside code fences and tables), or splits giant fenced code
+/// blocks cleanly at ~45-line newline boundaries while preserving the language tag.
+fn split_markdown_blocks(text: &str, target_bytes: usize) -> Vec<(String, bool)> {
+    let target = target_bytes.max(600);
+    if text.len() <= target {
+        let md = needs_markdown(text);
+        return vec![(text.to_string(), md)];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::with_capacity(target + 512);
+    let mut active_fence: Option<(&'static str, String)> = None;
+    let mut fence_lines = 0usize;
+    let mut in_table = false;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+
+        // Heading boundary outside fences starts a fresh slice once `cur` is substantial.
+        if active_fence.is_none()
+            && !in_table
+            && trimmed.starts_with('#')
+            && cur.len() >= target * 2 / 3
+            && !cur.trim().is_empty()
+        {
+            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+            cur.clear();
+        }
+
+        if let Some((marker, _)) = active_fence.as_ref() {
+            if trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty() {
+                cur.push_str(line);
+                active_fence = None;
+                fence_lines = 0;
+                if cur.len() >= target {
+                    chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+                    cur.clear();
+                }
+                continue;
+            }
+            cur.push_str(line);
+            fence_lines += 1;
+            // Giant single code block: split cleanly every ~45 lines once past `target`.
+            if cur.len() >= target && fence_lines >= 40 {
+                let (m, open_header) = active_fence.as_ref().unwrap().clone();
+                if !cur.ends_with('\n') {
+                    cur.push('\n');
+                }
+                cur.push_str(m);
+                chunks.push(cur.clone());
+                cur.clear();
+                cur.push_str(&open_header);
+                if !cur.ends_with('\n') {
+                    cur.push('\n');
+                }
+                fence_lines = 0;
+            }
+            continue;
+        }
+
+        if let Some(m) = fence_marker(trimmed) {
+            let header = trimmed.trim_end_matches(['\n', '\r']).to_string();
+            active_fence = Some((m, header));
+            fence_lines = 0;
+            in_table = false;
+            cur.push_str(line);
+            continue;
+        }
+
+        let looks_table = trimmed.starts_with('|');
+        if in_table && !looks_table {
+            in_table = false;
+            if cur.len() >= target && !cur.trim().is_empty() {
+                chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+                cur.clear();
+            }
+        } else if looks_table {
+            in_table = true;
+        }
+
+        cur.push_str(line);
+
+        let is_blank = trimmed.trim().is_empty();
+        if !in_table && is_blank && cur.len() >= target && !cur.trim().is_empty() {
+            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+            cur.clear();
+        } else if !in_table && cur.len() >= target * 2 && !cur.trim().is_empty() {
+            // Unbroken wall of single-newline lines without blank separators.
+            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+            cur.clear();
+        }
+    }
+
+    if !cur.trim().is_empty() {
+        chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
+    }
+    if chunks.is_empty() {
+        return vec![(String::new(), false)];
+    }
+    chunks
+        .into_iter()
+        .map(|s| {
+            let md = needs_markdown(&s);
+            (s, md)
+        })
+        .collect()
+}
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    mod.widgets.ChatFeedMdBody = mod.widgets.Markdown{
+        width: Fill height: Fit
+        padding: Inset{top: 0 right: 0 bottom: 3 left: 0}
+        font_size: 15.0
+        font_color: #xeeeeee
+        paragraph_spacing: 8
+        pre_code_spacing: 6
+        heading_base_scale: 1.35
+        use_math_widget: false
+        draw_text +: { color: #xeeeeee }
+        text_style_normal +: { font_size: 15.0 }
+        text_style_italic +: { font_size: 15.0 }
+        text_style_bold +: { font_size: 15.0 }
+        text_style_bold_italic +: { font_size: 15.0 }
+        text_style_fixed +: { font_size: 13.5 }
+        code_layout +: { padding: Inset{left: 10 right: 10 top: 8 bottom: 8} }
+        quote_layout +: { padding: Inset{left: 10 right: 10 top: 6 bottom: 6} }
+        draw_block +: {
+            code_color: #x101520
+            quote_bg_color: #x151d2b
+            quote_fg_color: #x93c5fd
+            table_header_bg_color: #x232f46
+            table_border_color: #x334155
+            sep_color: #x2d3748
+        }
+    }
+
+    mod.widgets.ChatFeedToolMdBody = mod.widgets.ChatFeedMdBody{
+        font_size: 13.5
+        font_color: #xb8c2d1
+        draw_text +: { color: #xb8c2d1 }
+        text_style_normal +: { font_size: 13.5 }
+        text_style_italic +: { font_size: 13.5 }
+        text_style_bold +: { font_size: 13.5 }
+        text_style_bold_italic +: { font_size: 13.5 }
+        text_style_fixed +: { font_size: 12.5 }
+    }
+
+    mod.widgets.ChatFeedPlainBody = mod.widgets.Label{
+        width: Fill height: Fit
+        padding: 0
+        draw_text +: {
+            color: #xeeeeee
+            text_style +: { font_size: 15.0 line_spacing: 1.25 }
+        }
+    }
+
+    mod.widgets.ChatFeedToolPlainBody = mod.widgets.Label{
+        width: Fill height: Fit
+        padding: 0
+        draw_text +: {
+            color: #xb8c2d1
+            text_style +: { font_size: 13.5 line_spacing: 1.22 }
+        }
+    }
+
+    mod.widgets.ChatFeedHdr = mod.widgets.Label{
+        width: Fill height: Fit
+        padding: 0
+        draw_text +: {
+            color: #x3ddc84
+            text_style +: { font_size: 13.0 }
+        }
+    }
+
+    mod.widgets.ChatCardBase = mod.widgets.RoundedYView{
+        width: Fill height: Fit flow: Down spacing: 4
+        new_batch: false show_bg: true clip_x: false clip_y: false
+        margin: Inset{top: 0 bottom: 8 left: 0 right: 0}
+        padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
+        draw_bg.color: #x1c2230
+        draw_bg.border_radius: vec2(15.0 15.0)
+    }
+
+    mod.widgets.ChatFeedList = mod.widgets.PortalList{
+        width: Fill height: Fill
+        flow: Down
+        auto_tail: true
+        keep_end_on_resize: true
+        keep_nearby_items: true
+        reuse_items: true
+        drag_scrolling: true
+        grab_key_focus: false
+        bounce_at_start: true
+        bounce_at_end: true
+
+        Empty := mod.widgets.View{
+            width: Fill height: Fit
+            padding: Inset{top: 18 bottom: 18 left: 4 right: 4}
+            note := mod.widgets.Label{
+                width: Fill height: Fit padding: 0
+                draw_text +: { color: #x9aa4b2 text_style +: { font_size: 13.0 } }
+                text: "No messages yet."
+            }
+        }
+
+        HistoryBar := mod.widgets.View{
+            width: Fill height: Fit flow: Right spacing: 6
+            margin: Inset{bottom: 8}
+            more_btn := mod.widgets.ButtonFlat{
+                width: Fill height: 36 margin: 0
+                draw_bg.color: #x1c2230 draw_bg.color_focus: #x1c2230 draw_bg.color_hover: #x263246
+                draw_bg.border_radius: 10.0
+                draw_text.color: #xeeeeee draw_text.text_style.font_size: 14.0
+                text: "Show earlier"
+            }
+            all_btn := mod.widgets.ButtonFlat{
+                width: Fit height: 36 margin: 0
+                padding: Inset{left: 14 right: 14 top: 0 bottom: 0}
+                draw_bg.color: #x1c2230 draw_bg.color_focus: #x1c2230 draw_bg.color_hover: #x263246
+                draw_bg.border_radius: 10.0
+                draw_text.color: #xeeeeee draw_text.text_style.font_size: 14.0
+                text: "Show all"
+            }
+        }
+
+        // --- SAY (agent / default card) ---
+        SaySinglePlain := mod.widgets.ChatCardBase{
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x3ddc84 } }
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        SaySingleMd := mod.widgets.ChatCardBase{
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x3ddc84 } }
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        SayTopPlain := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 1} padding: Inset{top: 9 bottom: 5 left: 13 right: 13}
+            draw_bg.border_radius: vec2(15.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x3ddc84 } }
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        SayTopMd := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 1} padding: Inset{top: 9 bottom: 5 left: 13 right: 13}
+            draw_bg.border_radius: vec2(15.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x3ddc84 } }
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        SayMidPlain := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 1} padding: Inset{top: 5 bottom: 5 left: 13 right: 13}
+            draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        SayMidMd := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 1} padding: Inset{top: 5 bottom: 5 left: 13 right: 13}
+            draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        SayBotPlain := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 8} padding: Inset{top: 5 bottom: 9 left: 13 right: 13}
+            draw_bg.border_radius: vec2(2.0 15.0)
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        SayBotMd := mod.widgets.ChatCardBase{
+            margin: Inset{bottom: 8} padding: Inset{top: 5 bottom: 9 left: 13 right: 13}
+            draw_bg.border_radius: vec2(2.0 15.0)
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+
+        // --- YOU (user prompt bubble) ---
+        YouSinglePlain := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 8} draw_bg.color: #x1e2c42
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x7db3ff } }
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        YouSingleMd := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 8} draw_bg.color: #x1e2c42
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x7db3ff } }
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        YouTopPlain := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 1} padding: Inset{top: 9 bottom: 5 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(15.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x7db3ff } }
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        YouTopMd := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 1} padding: Inset{top: 9 bottom: 5 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(15.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x7db3ff } }
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        YouMidPlain := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 1} padding: Inset{top: 5 bottom: 5 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        YouMidMd := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 1} padding: Inset{top: 5 bottom: 5 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+        YouBotPlain := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 8} padding: Inset{top: 5 bottom: 9 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(2.0 15.0)
+            body := mod.widgets.ChatFeedPlainBody{}
+        }
+        YouBotMd := mod.widgets.ChatCardBase{
+            margin: Inset{left: 22 bottom: 8} padding: Inset{top: 5 bottom: 9 left: 13 right: 13}
+            draw_bg.color: #x1e2c42 draw_bg.border_radius: vec2(2.0 15.0)
+            body := mod.widgets.ChatFeedMdBody{}
+        }
+
+        // --- TOOL (compact muted card) ---
+        ToolSinglePlain := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 8} padding: Inset{top: 7 bottom: 7 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(12.0 12.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x8b95a5 } }
+            body := mod.widgets.ChatFeedToolPlainBody{}
+        }
+        ToolSingleMd := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 8} padding: Inset{top: 7 bottom: 7 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(12.0 12.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x8b95a5 } }
+            body := mod.widgets.ChatFeedToolMdBody{}
+        }
+        ToolTopPlain := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 1} padding: Inset{top: 7 bottom: 4 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(12.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x8b95a5 } }
+            body := mod.widgets.ChatFeedToolPlainBody{}
+        }
+        ToolTopMd := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 1} padding: Inset{top: 7 bottom: 4 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(12.0 2.0)
+            hdr := mod.widgets.ChatFeedHdr{ draw_text +: { color: #x8b95a5 } }
+            body := mod.widgets.ChatFeedToolMdBody{}
+        }
+        ToolMidPlain := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 1} padding: Inset{top: 4 bottom: 4 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedToolPlainBody{}
+        }
+        ToolMidMd := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 1} padding: Inset{top: 4 bottom: 4 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(2.0 2.0)
+            body := mod.widgets.ChatFeedToolMdBody{}
+        }
+        ToolBotPlain := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 8} padding: Inset{top: 4 bottom: 7 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(2.0 12.0)
+            body := mod.widgets.ChatFeedToolPlainBody{}
+        }
+        ToolBotMd := mod.widgets.ChatCardBase{
+            spacing: 3 margin: Inset{bottom: 8} padding: Inset{top: 4 bottom: 7 left: 11 right: 11}
+            draw_bg.color: #x151923 draw_bg.border_radius: vec2(2.0 12.0)
+            body := mod.widgets.ChatFeedToolMdBody{}
+        }
+    }
+
+    mod.widgets.ChatFeedBase = #(ChatFeed::register_widget(vm))
+    mod.widgets.ChatFeed = set_type_default() do mod.widgets.ChatFeedBase{
+        width: Fill
+        height: Fill
+        store_key: "chat"
+        empty_text: "No messages yet."
+        split_bytes: 2200
+    }
+    mod.widgets.VirtualFeed = mod.widgets.ChatFeed{}
+}
+
+#[derive(Script, WidgetRef, WidgetRegister)]
+pub struct ChatFeed {
+    #[source]
+    source: ScriptObjectRef,
+    #[uid]
+    uid: WidgetUid,
+    #[walk]
+    walk: Walk,
+
+    #[live]
+    store_key: ArcStringMut,
+    #[live]
+    items: ScriptValue,
+    #[live]
+    empty_text: ArcStringMut,
+    #[live(2200usize)]
+    split_bytes: usize,
+    #[live]
+    on_more: ScriptFnRef,
+    #[live]
+    on_all: ScriptFnRef,
+    #[live]
+    on_item_tap: ScriptFnRef,
+
+    #[rust]
+    list: WidgetRef,
+    #[rust]
+    list_heap_key: usize,
+    #[rust]
+    seen_store_ver: u64,
+    #[rust]
+    has_inline_items: bool,
+
+    #[rust]
+    agent_id: String,
+    #[rust]
+    hidden_before: usize,
+    #[rust]
+    rows: Vec<FlatRow>,
+    #[rust]
+    rows_fingerprint: u64,
+    #[rust]
+    pending_range_sync: bool,
+    #[rust]
+    pending_reset_tail: bool,
+    #[rust]
+    pending_prepend_splice: Option<(usize, usize, usize)>,
+
+    /// Per-message split cache: `msg_hash -> Rc<Vec<(String, bool)>>` so untouched messages
+    /// are never re-scanned or re-split when new messages arrive.
+    #[rust]
+    split_cache: HashMap<u64, Rc<Vec<(String, bool)>>>,
+    /// Per-instantiated row `WidgetUid -> row.hash` so `existed` rows skip `set_text` on scroll.
+    #[rust]
+    applied_hashes: HashMap<WidgetUid, u64>,
+    #[rust]
+    press_pos: Option<DVec2>,
+}
+
+impl ScriptHook for ChatFeed {
+    fn on_after_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        _apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        let hk = vm.heap_key();
+        if self.list.is_empty() || self.list_heap_key != hk {
+            let list_val = script_eval!(vm, { mod.widgets.ChatFeedList{} });
+            let list_ref = WidgetRef::script_from_value(vm, list_val);
+            vm.cx_mut()
+                .widget_tree_insert_child(self.uid, live_id!(list), list_ref.clone());
+            self.list = list_ref;
+            self.list_heap_key = hk;
+            self.applied_hashes.clear();
+            self.pending_range_sync = true;
+            self.pending_reset_tail = true;
+        }
+
+        // Optional generic `VirtualFeed{ items: [...] }` inline Splash array support.
+        let _ = value;
+        let items_val = self.items;
+        if !items_val.is_nil() {
+            let mut raw_elems: Vec<ScriptValue> = Vec::new();
+            let mut had_collection = false;
+            if let Some(arr) = items_val.as_array() {
+                had_collection = true;
+                let len = vm.array_len(arr);
+                raw_elems.reserve(len);
+                for idx in 0..len {
+                    raw_elems.push(vm.array_index_trap(arr, idx));
+                }
+            } else if let Some(arr_obj) = items_val.as_object() {
+                if arr_obj != ScriptObject::ZERO {
+                    had_collection = true;
+                    vm.vec_with(arr_obj, |_vm, vec| {
+                        raw_elems.extend(vec.iter().map(|kv| kv.value));
+                    });
+                }
+            }
+            if had_collection {
+                let mut parsed = Vec::with_capacity(raw_elems.len());
+                for (idx, elem) in raw_elems.into_iter().enumerate() {
+                    if let Some(item_obj) = elem.as_object() {
+                        let get_str = |vm: &mut ScriptVm, k: LiveId| -> Option<String> {
+                            let v = vm.value(item_obj, k);
+                            if v.is_nil() || v.is_err() {
+                                let ks = vm.new_string(&k.to_string());
+                                let v2 = vm.value(item_obj, ks);
+                                (!v2.is_nil() && !v2.is_err())
+                                    .then(|| vm.cast_to_owned_string(v2, ""))
+                                    .flatten()
+                            } else {
+                                vm.cast_to_owned_string(v, "")
+                            }
+                        };
+                        let role_s = get_str(vm, live_id!(role)).unwrap_or_default();
+                        let label = get_str(vm, live_id!(label))
+                            .or_else(|| get_str(vm, live_id!(title)))
+                            .unwrap_or_default();
+                        let ts = get_str(vm, live_id!(ts)).unwrap_or_default();
+                        let hdr = if label.is_empty() && ts.is_empty() {
+                            role_s.clone()
+                        } else if ts.is_empty() {
+                            label
+                        } else if label.is_empty() {
+                            ts
+                        } else {
+                            format!("{label}  {ts}")
+                        };
+                        let text = get_str(vm, live_id!(text))
+                            .or_else(|| get_str(vm, live_id!(body)))
+                            .unwrap_or_default();
+                        parsed.push(FeedMsg {
+                            role: RoleKind::from_str(&role_s),
+                            hdr,
+                            text,
+                            msg_index: idx,
+                        });
+                    } else if let Some(s) = vm.cast_to_owned_string(elem, "") {
+                        parsed.push(FeedMsg {
+                            role: RoleKind::Say,
+                            hdr: String::new(),
+                            text: s,
+                            msg_index: idx,
+                        });
+                    }
+                }
+                self.has_inline_items = true;
+                self.rebuild_rows("", 0, &parsed, false);
+            }
+        }
+    }
+}
+
+impl WidgetNode for ChatFeed {
+    fn widget_uid(&self) -> WidgetUid {
+        self.uid
+    }
+
+    fn walk(&mut self, _cx: &mut Cx) -> Walk {
+        self.walk
+    }
+
+    fn area(&self) -> Area {
+        self.list.area()
+    }
+
+    fn redraw(&mut self, cx: &mut Cx) {
+        self.list.redraw(cx);
+    }
+
+    fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+        if !self.list.is_empty() {
+            visit(live_id!(list), self.list.clone());
+        }
+    }
+
+    fn cancel_children_impl(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        if !self.list.is_empty() {
+            visit(live_id!(list), self.list.clone());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl ChatFeed {
+    fn parse_json_value(val: &JsonValue) -> (String, usize, Vec<FeedMsg>) {
+        match val {
+            JsonValue::Object(map) => {
+                let agent = map
+                    .get("agent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let hidden_before = match map.get("hidden_before") {
+                    Some(JsonValue::U64(n)) => *n as usize,
+                    Some(JsonValue::I64(n)) if *n > 0 => *n as usize,
+                    Some(JsonValue::F64(f)) if *f > 0.0 => *f as usize,
+                    _ => 0,
+                };
+                let arr = map
+                    .get("msgs")
+                    .or_else(|| map.get("items"))
+                    .and_then(|v| v.as_array());
+                let msgs = arr
+                    .map(|a| Self::parse_json_msgs(a))
+                    .unwrap_or_default();
+                (agent, hidden_before, msgs)
+            }
+            JsonValue::Array(arr) => (String::new(), 0, Self::parse_json_msgs(arr)),
+            _ => (String::new(), 0, Vec::new()),
+        }
+    }
+
+    fn parse_json_msgs(arr: &[JsonValue]) -> Vec<FeedMsg> {
+        let mut out = Vec::with_capacity(arr.len());
+        for (idx, item) in arr.iter().enumerate() {
+            match item {
+                JsonValue::String(s) => out.push(FeedMsg {
+                    role: RoleKind::Say,
+                    hdr: String::new(),
+                    text: s.clone(),
+                    msg_index: idx,
+                }),
+                JsonValue::Object(m) => {
+                    let role_s = m.get("role").and_then(|v| v.as_str()).unwrap_or("say");
+                    let label = m
+                        .get("label")
+                        .or_else(|| m.get("title"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(role_s);
+                    let ts = m.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                    let hdr = if ts.is_empty() {
+                        label.to_string()
+                    } else if label.is_empty() {
+                        ts.to_string()
+                    } else {
+                        format!("{label}  {ts}")
+                    };
+                    let text = m
+                        .get("text")
+                        .or_else(|| m.get("body"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    out.push(FeedMsg {
+                        role: RoleKind::from_str(role_s),
+                        hdr,
+                        text,
+                        msg_index: idx,
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn sync_store_if_needed(&mut self) -> bool {
+        if self.has_inline_items {
+            return false;
+        }
+        let key = self.store_key.as_ref();
+        if key.is_empty() {
+            return false;
+        }
+        let Some((ver, val)) = read_store(key, self.seen_store_ver) else {
+            return false;
+        };
+        self.seen_store_ver = ver;
+        let (agent, hidden_before, msgs) = Self::parse_json_value(&val);
+        self.rebuild_rows(&agent, hidden_before, &msgs, true)
+    }
+
+    fn rebuild_rows(
+        &mut self,
+        agent: &str,
+        hidden_before: usize,
+        msgs: &[FeedMsg],
+        allow_splice: bool,
+    ) -> bool {
+        let split_target = self.split_bytes.max(600);
+        let mut new_rows = Vec::with_capacity(msgs.len().saturating_add(8));
+        let mut used_msg_hashes = Vec::with_capacity(msgs.len());
+        let mut fp = fnv1a(agent.as_bytes(), FNV_INIT);
+        fp = fnv1a(&hidden_before.to_le_bytes(), fp);
+        fp = fnv1a(&split_target.to_le_bytes(), fp);
+
+        for m in msgs {
+            let mut mh = fnv1a(&[m.role.tag()], FNV_INIT);
+            mh = fnv1a(m.text.as_bytes(), mh);
+            mh = fnv1a(&split_target.to_le_bytes(), mh);
+            used_msg_hashes.push(mh);
+
+            let slices = if let Some(cached) = self.split_cache.get(&mh) {
+                Rc::clone(cached)
+            } else {
+                let built = Rc::new(split_markdown_blocks(&m.text, split_target));
+                self.split_cache.insert(mh, Rc::clone(&built));
+                built
+            };
+
+            let n = slices.len();
+            for (i, (chunk_text, is_md)) in slices.iter().enumerate() {
+                let pos = if n == 1 {
+                    SlicePos::Single
+                } else if i == 0 {
+                    SlicePos::Top
+                } else if i + 1 == n {
+                    SlicePos::Bot
+                } else {
+                    SlicePos::Mid
+                };
+                let hdr = if matches!(pos, SlicePos::Single | SlicePos::Top) {
+                    m.hdr.clone()
+                } else {
+                    String::new()
+                };
+                let mut rh = fnv1a(&[m.role.tag(), pos.tag(), u8::from(*is_md)], FNV_INIT);
+                rh = fnv1a(hdr.as_bytes(), rh);
+                rh = fnv1a(chunk_text.as_bytes(), rh);
+                fp = fnv1a(&rh.to_le_bytes(), fp);
+
+                new_rows.push(FlatRow {
+                    role: m.role,
+                    pos,
+                    is_md: *is_md,
+                    hdr,
+                    body: chunk_text.clone(),
+                    msg_index: m.msg_index,
+                    hash: rh,
+                });
+            }
+        }
+
+        if self.split_cache.len() > used_msg_hashes.len() + 64 {
+            self.split_cache
+                .retain(|k, _| used_msg_hashes.contains(k));
+        }
+
+        if fp == self.rows_fingerprint && self.rows.len() == new_rows.len() {
+            return false;
+        }
+
+        let agent_changed = !self.agent_id.is_empty() && self.agent_id != agent;
+        let was_empty = self.rows.is_empty();
+        let old_has_bar = self.hidden_before > 0 && !self.rows.is_empty();
+        let new_has_bar = hidden_before > 0 && !new_rows.is_empty();
+
+        // Detect clean top-prepend ("Show earlier" / "Show all"): the tail matches `self.rows`.
+        let mut prepend_splice = None;
+        if allow_splice
+            && !agent_changed
+            && !was_empty
+            && new_rows.len() > self.rows.len()
+        {
+            let added = new_rows.len() - self.rows.len();
+            let tail_matches = self
+                .rows
+                .iter()
+                .zip(&new_rows[added..])
+                .all(|(a, b)| a.hash == b.hash);
+            if tail_matches {
+                match (old_has_bar, new_has_bar) {
+                    (true, true) => prepend_splice = Some((1, 0, added)),
+                    (true, false) => prepend_splice = Some((0, 1, added)),
+                    (false, false) => prepend_splice = Some((0, 0, added)),
+                    (false, true) => prepend_splice = Some((0, 0, added + 1)),
+                }
+            }
+        }
+
+        let session_replaced = !was_empty
+            && !new_rows.is_empty()
+            && prepend_splice.is_none()
+            && new_rows.len() < self.rows.len()
+            && self.rows[0].hash != new_rows[0].hash;
+
+        self.agent_id = agent.to_string();
+        self.hidden_before = hidden_before;
+        self.rows = new_rows;
+        self.rows_fingerprint = fp;
+        self.pending_range_sync = true;
+        if agent_changed || was_empty || session_replaced {
+            self.pending_reset_tail = true;
+            self.pending_prepend_splice = None;
+        } else if prepend_splice.is_some() {
+            self.pending_prepend_splice = prepend_splice;
+        }
+        true
+    }
+
+    fn display_item_count(&self) -> usize {
+        if self.rows.is_empty() {
+            1 // Empty placeholder row
+        } else if self.hidden_before > 0 {
+            1 + self.rows.len() // HistoryBar at 0 + rows
+        } else {
+            self.rows.len()
+        }
+    }
+
+    fn draw_rows(&mut self, cx: &mut Cx2d, list: &mut PortalList) {
+        let total = self.display_item_count();
+        if self.pending_range_sync {
+            self.pending_range_sync = false;
+            if self.pending_reset_tail {
+                self.pending_reset_tail = false;
+                self.pending_prepend_splice = None;
+                list.set_tail_range(true);
+                list.set_item_range(cx, 0, total);
+            } else if let Some((at, removed, added)) = self.pending_prepend_splice.take() {
+                list.splice_items(cx, at, removed, added);
+                list.set_item_range(cx, 0, total);
+            } else {
+                list.set_item_range(cx, 0, total);
+            }
+        } else {
+            list.set_item_range(cx, 0, total);
+        }
+
+        if self.rows.is_empty() {
+            while let Some(item_id) = list.next_visible_item(cx) {
+                if item_id > 0 {
+                    continue;
+                }
+                let item = list.item(cx, 0, id!(Empty));
+                let empty_txt = if self.empty_text.as_ref().is_empty() {
+                    "No messages yet."
+                } else {
+                    self.empty_text.as_ref()
+                };
+                item.widget(&**cx, ids!(note)).set_text(cx, empty_txt);
+                item.draw_all(cx, &mut Scope::empty());
+            }
+            return;
+        }
+
+        let has_bar = self.hidden_before > 0;
+        while let Some(item_id) = list.next_visible_item(cx) {
+            if item_id >= total {
+                continue;
+            }
+            if has_bar && item_id == 0 {
+                let (item, existed) = list.item_with_existed(cx, 0, id!(HistoryBar));
+                let bar_hash = fnv1a(&self.hidden_before.to_le_bytes(), 0x517cc1b727220a95);
+                let uid = item.widget_uid();
+                if !existed || self.applied_hashes.get(&uid) != Some(&bar_hash) {
+                    let more_txt = format!("Show earlier ({} more)", self.hidden_before);
+                    item.widget(&**cx, ids!(more_btn)).set_text(cx, &more_txt);
+                    self.applied_hashes.insert(uid, bar_hash);
+                }
+                item.draw_all(cx, &mut Scope::empty());
+                continue;
+            }
+
+            let row_idx = if has_bar { item_id - 1 } else { item_id };
+            let Some(row) = self.rows.get(row_idx) else {
+                continue;
+            };
+            let (item, existed) = list.item_with_existed(cx, item_id, row.template_id());
+            let uid = item.widget_uid();
+            if !existed || self.applied_hashes.get(&uid) != Some(&row.hash) {
+                if row.has_header() {
+                    item.widget(&**cx, ids!(hdr)).set_text(cx, &row.hdr);
+                }
+                item.widget(&**cx, ids!(body)).set_text(cx, &row.body);
+                self.applied_hashes.insert(uid, row.hash);
+            }
+            item.draw_all(cx, &mut Scope::empty());
+        }
+    }
+}
+
+impl Widget for ChatFeed {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::Signal = event {
+            if self.sync_store_if_needed() {
+                self.redraw(cx);
+            }
+        }
+        if self.list.is_empty() {
+            return;
+        }
+
+        // Track non-scroll tap coordinates for optional `on_item_tap`.
+        match event {
+            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
+                self.press_pos = Some(e.abs);
+            }
+            Event::TouchUpdate(e) => {
+                if let Some(t) = e.touches.iter().find(|t| {
+                    matches!(
+                        t.state,
+                        makepad_widgets::makepad_platform::event::TouchState::Start
+                    )
+                }) {
+                    self.press_pos = Some(t.abs);
+                }
+            }
+            _ => {}
+        }
+
+        let actions = cx.capture_actions(|cx| {
+            self.list.handle_event(cx, event, scope);
+        });
+
+        if !actions.is_empty() && self.hidden_before > 0 && !self.rows.is_empty() {
+            let bar_opt = self
+                .list
+                .borrow::<PortalList>()
+                .and_then(|list| list.get_item(0).map(|(_, w)| w));
+            if let Some(bar) = bar_opt {
+                if bar.button(&*cx, ids!(more_btn)).clicked(&actions) {
+                    cx.widget_to_script_call(
+                        self.uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_more.clone(),
+                        &[],
+                    );
+                }
+                if bar.button(&*cx, ids!(all_btn)).clicked(&actions) {
+                    cx.widget_to_script_call(
+                        self.uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_all.clone(),
+                        &[],
+                    );
+                }
+            }
+        }
+
+        if self.on_item_tap.as_object() != ScriptObject::ZERO {
+            let up_abs = match event {
+                Event::MouseUp(e) if e.button == MouseButton::PRIMARY => Some(e.abs),
+                Event::TouchUpdate(e) => e
+                    .touches
+                    .iter()
+                    .find(|t| {
+                        matches!(
+                            t.state,
+                            makepad_widgets::makepad_platform::event::TouchState::Stop
+                        )
+                    })
+                    .map(|t| t.abs),
+                _ => None,
+            };
+            if let (Some(down), Some(up)) = (self.press_pos, up_abs) {
+                self.press_pos = None;
+                let dist = ((up.x - down.x).powi(2) + (up.y - down.y).powi(2)).sqrt();
+                let tapped_msg = if dist < 10.0 {
+                    self.list.borrow::<PortalList>().and_then(|list| {
+                        if list.was_scrolling() {
+                            return None;
+                        }
+                        for (&entry_id, wi) in list.items().iter() {
+                            if wi.widget.area().rect(cx).contains(up) {
+                                let has_bar = self.hidden_before > 0 && !self.rows.is_empty();
+                                if has_bar && entry_id == 0 {
+                                    return None;
+                                }
+                                let r_idx = if has_bar { entry_id - 1 } else { entry_id };
+                                return self.rows.get(r_idx).map(|r| r.msg_index);
+                            }
+                        }
+                        None
+                    })
+                } else {
+                    None
+                };
+                if let Some(msg_idx) = tapped_msg {
+                    cx.widget_to_script_call(
+                        self.uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_item_tap.clone(),
+                        &[ScriptValue::from_f64(msg_idx as f64)],
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let _ = self.sync_store_if_needed();
+        if self.list.is_empty() {
+            return DrawStep::done();
+        }
+        if self.pending_reset_tail {
+            self.list.as_portal_list().stop_scrolling();
+            self.list.as_portal_list().set_first_id_and_scroll(0, 0.0);
+        }
+        while self.list.draw_walk(cx, scope, walk).is_step() {
+            let list_ref = self.list.clone();
+            if let Some(mut list) = list_ref.borrow_mut::<PortalList>() {
+                self.draw_rows(cx, &mut list);
+            };
+        }
+        DrawStep::done()
+    }
+}
+
+/// Installed into every Splash isolate (`ChatFeed` and generic alias `VirtualFeed`).
+pub fn isolate_mod(vm: &mut ScriptVm) {
+    self::script_mod(vm);
+    script_eval!(vm, {
+        mod.prelude.widgets = {
+            ..mod.prelude.widgets,
+            ChatFeed: mod.widgets.ChatFeed,
+            VirtualFeed: mod.widgets.VirtualFeed,
+        }
+    });
+}
