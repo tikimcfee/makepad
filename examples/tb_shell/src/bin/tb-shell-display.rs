@@ -9,7 +9,7 @@
 mod page_ipc;
 
 use makepad_micro_serde::{DeJson, JsonValue};
-use page_ipc::{connect_and_watch, env_opt, env_or, obj, run_cmd, run_root_tool, sudo_prog, ShellWriter};
+use page_ipc::{connect_and_watch, env_opt, env_or, obj, run_root_tool, ShellWriter};
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -19,7 +19,6 @@ const VALID_TIMEOUTS: &[i64] = &[0, 30, 60, 120, 300];
 
 #[derive(Clone)]
 struct Paths {
-    sock_path: String,
     actual: String,
     max: String,
     panel_summary: String,
@@ -29,22 +28,14 @@ struct Paths {
     sys_timeout: String,
     brightness_bin: String,
     power_ctl_bin: String,
-    tbui_bin: String,
 }
 
 impl Paths {
-    fn from_env(sock_path: String) -> Self {
+    fn from_env(_sock_path: String) -> Self {
         let user_timeout = env_opt("TB_SCREEN_USER_TIMEOUT_FILE").or_else(|| {
             env_opt("HOME").map(|h| format!("{h}/.config/tb-shell/screen-timeout"))
         });
-        let default_tbui = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("tbui")))
-            .filter(|p| p.exists())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/opt/tinybot/shell/bin/tbui".to_string());
         Self {
-            sock_path,
             actual: env_or("TB_DISPLAY_ACTUAL", "/sys/class/backlight/tinybot-lcd/actual_brightness"),
             max: env_or("TB_DISPLAY_MAX", "/sys/class/backlight/tinybot-lcd/max_brightness"),
             panel_summary: env_or("TB_DISPLAY_PANEL_SUMMARY", "/sys/kernel/tinybot_panel/summary"),
@@ -54,7 +45,6 @@ impl Paths {
             sys_timeout: env_or("TB_SCREEN_TIMEOUT_FILE", "/userdata/tinybot/etc/screen-timeout"),
             brightness_bin: env_or("TB_BRIGHTNESS_BIN", "/usr/local/sbin/tb-brightness"),
             power_ctl_bin: env_or("TB_POWER_CTL", "/usr/local/sbin/tinybot-power-ctl"),
-            tbui_bin: env_or("TB_TBUI_BIN", &default_tbui),
         }
     }
 
@@ -184,39 +174,13 @@ fn send_screen_off() -> String {
 
 fn spawn_power_ctl(paths: Paths, action: &'static str) {
     let _ = std::thread::Builder::new().name("tb-power-ctl".into()).spawn(move || {
-        // Prefer `/usr/local/sbin/tinybot-power-ctl` when present (raises root GUARD as uid 0).
+        // Inline confirmation already happened in `views/power.splash`; invoke `tinybot-power-ctl` directly.
         if Path::new(&paths.power_ctl_bin).exists() {
             let _ = run_root_tool(&paths.power_ctl_bin, &[action], Duration::from_secs(25), None);
             return;
         }
-        // Standalone fallback: raise root GUARD via `tbui ask`, then run `systemctl`.
-        let (question, yes_lbl) = if action == "reboot" {
-            ("Restart the phone now?", "Restart")
-        } else {
-            ("Power off the phone now?", "Power off")
-        };
-        let sock_env = format!("TB_SHELL_SOCK={}", paths.sock_path);
-        let ask = if let Some(sudo) = sudo_prog() {
-            run_cmd(
-                &sudo,
-                &["-n", "env", &sock_env, "timeout", "15", &paths.tbui_bin, "ask", question, yes_lbl, "Cancel"],
-                Duration::from_secs(18),
-                Some(&sudo),
-                None,
-            )
-        } else {
-            run_cmd(
-                "env",
-                &[&sock_env, "TBUI_ASK_GUARD=1", "timeout", "15", &paths.tbui_bin, "ask", question, yes_lbl, "Cancel"],
-                Duration::from_secs(18),
-                None,
-                None,
-            )
-        };
-        if !ask.timed_out && ask.code == Some(0) {
-            let systemctl = env_or("TB_SYSTEMCTL_BIN", "/bin/systemctl");
-            let _ = run_root_tool(&systemctl, &[action], Duration::from_secs(10), None);
-        }
+        let systemctl = env_or("TB_SYSTEMCTL_BIN", "/bin/systemctl");
+        let _ = run_root_tool(&systemctl, &[action], Duration::from_secs(10), None);
     });
 }
 
@@ -251,6 +215,9 @@ fn main() {
         let kind = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "shown" | "panel" => {
+                if kind == "shown" && ev.get("surface").and_then(|v| v.as_str()) == Some("power") {
+                    let _ = writer.patch_key("power_confirm", "".into());
+                }
                 if let Ok(v) = publish(&writer, &paths, &last) {
                     (cur, max) = v;
                 }

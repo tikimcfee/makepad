@@ -3,13 +3,29 @@
 //! the general `1..N` multi-surface `Stage` (`stack` / `grid` / `deck`) under it,
 //! and the root `GUARD` drawn in the final overlay tier gating all input.
 
+use crate::jit_slot::JitRegistry;
 use crate::stage::{SlotMode, Stage, StageMode};
 use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::*;
 use std::collections::HashMap;
 
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
+pub struct DrawJitTex {
+    #[deref]
+    draw_super: DrawQuad,
+}
+
 script_mod! {
     use mod.prelude.widgets.*
+
+    set_type_default() do #(DrawJitTex::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        tex: texture_2d(float)
+        pixel: fn() {
+            return self.tex.sample(self.pos)
+        }
+    }
 
     mod.widgets.ShellBase = #(Shell::register_widget(vm))
     mod.widgets.Shell = set_type_default() do mod.widgets.ShellBase {
@@ -20,6 +36,7 @@ script_mod! {
         draw_pill +: { color: #x141b28 }
         draw_slot_bar +: { color: #x121824 }
         draw_dot +: { color: #x3ddc84 }
+        draw_jit_tex +: {}
         draw_label +: {
             color: #xd6e2f0
             text_style: theme.font_regular{ font_size: 10.5 }
@@ -46,7 +63,7 @@ script_mod! {
     }
 }
 
-/// What a raised guard shows. Only the shell makes one.
+/// Plain two-button modal confirmation sheet (`tbui confirm` / `tbui guard`).
 #[derive(Clone)]
 pub struct GuardView {
     pub text: String,
@@ -59,17 +76,6 @@ pub struct GuardView {
 pub struct Marks {
     pub mic: bool,
     pub loud: bool,
-    /// Root's test switch is on: injected input may answer a guard.
-    pub test_taps: bool,
-}
-
-/// Who may answer a guard. Only a person's input from the device, except under
-/// root's test switch.
-#[derive(Default)]
-pub struct GuardInput {
-    pub remote_on: bool,
-    pub test_taps: bool,
-    last_seq: u64,
 }
 
 /// UI actions initiated by strip taps/swipes or per-slot mini-headers.
@@ -116,6 +122,7 @@ pub struct Shell {
     #[live] draw_pill: DrawColor,
     #[live] draw_slot_bar: DrawColor,
     #[live] draw_dot: DrawColor,
+    #[live] draw_jit_tex: DrawJitTex,
     #[live] draw_label: DrawText,
     #[live] draw_sub: DrawText,
     #[live] draw_mark: DrawText,
@@ -128,13 +135,11 @@ pub struct Shell {
     #[live] strip_height: f64,
     #[rust] area: Area,
     #[rust] pub surfaces: Vec<(String, WidgetRef)>,
+    #[rust] pub jit: JitRegistry,
     #[rust] pub stage: Stage,
     #[rust] pub marks: Marks,
     #[rust] pub status_right: String,
-    #[rust] pub guard_input: GuardInput,
     #[rust] guard: Option<GuardView>,
-    #[rust] armed: bool,
-    #[rust] arm_timer: Timer,
     #[rust] pressed: Option<bool>,
     #[rust] raised_at: Option<std::time::Instant>,
     #[rust] pub guard_drawn_ms: Option<f64>,
@@ -192,21 +197,8 @@ fn event_abs(event: &Event) -> Option<Vec2d> {
 
 impl Widget for Shell {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        let seq = makepad_widgets::makepad_platform::makepad_hal::a11y::user_seq();
-        let native = !self.guard_input.remote_on || seq != self.guard_input.last_seq;
-        self.guard_input.last_seq = seq;
-        let trusted = native || self.guard_input.test_taps;
-
         if self.guard.is_some() {
-            if self.arm_timer.is_event(event).is_some() {
-                self.armed = true;
-                cx.redraw_all();
-            }
             let (down, _, up) = pointer_down_move_up(event);
-            if !trusted && (down.is_some() || up.is_some()) {
-                log!("tb-shell: guard: injected input ignored");
-                return;
-            }
             let button_at = |p: Vec2d| {
                 [(true, self.yes_rect), (false, self.no_rect)]
                     .into_iter()
@@ -214,10 +206,10 @@ impl Widget for Shell {
                     .map(|(yes, _)| yes)
             };
             if let Some(p) = down {
-                self.pressed = if self.armed { button_at(p) } else { None };
+                self.pressed = button_at(p);
             }
             if let Some(p) = up {
-                if self.armed && self.pressed.is_some() && button_at(p) == self.pressed {
+                if self.pressed.is_some() && button_at(p) == self.pressed {
                     self.answer = self.pressed;
                 }
                 self.pressed = None;
@@ -354,7 +346,36 @@ impl Widget for Shell {
         }
 
         if let Some(ref target) = target_surface {
-            if let Some((_, splash)) = self.surfaces.iter().find(|(n, _)| n == target) {
+            if let Some(inst) = self.jit.slots.get(target) {
+                let body_pos = self
+                    .slot_hits
+                    .iter()
+                    .find(|h| &h.surface == target)
+                    .map(|h| h.body_rect.pos)
+                    .unwrap_or_default();
+                let (down, mv, up) = pointer_down_move_up(event);
+                if let Some(p) = down {
+                    let lx = (p.x - body_pos.x).max(0.0);
+                    let ly = (p.y - body_pos.y).max(0.0);
+                    inst.send_cmd(format!("mouse k=down x={lx:.1} y={ly:.1}"));
+                } else if let Some(p) = mv {
+                    let lx = (p.x - body_pos.x).max(0.0);
+                    let ly = (p.y - body_pos.y).max(0.0);
+                    inst.send_cmd(format!("mouse k=move x={lx:.1} y={ly:.1}"));
+                } else if let Some(p) = up {
+                    let lx = (p.x - body_pos.x).max(0.0);
+                    let ly = (p.y - body_pos.y).max(0.0);
+                    inst.send_cmd(format!("mouse k=up x={lx:.1} y={ly:.1}"));
+                } else if let Event::Scroll(e) = event {
+                    let lx = (e.abs.x - body_pos.x).max(0.0);
+                    let ly = (e.abs.y - body_pos.y).max(0.0);
+                    inst.send_cmd(format!("mouse k=scroll x={lx:.1} y={ly:.1} dx={:.1} dy={:.1}", e.scroll.x, e.scroll.y));
+                } else if let Event::TextInput(e) = event {
+                    if !e.input.is_empty() && !e.input.contains(char::is_whitespace) {
+                        inst.send_cmd(format!("text t={}", e.input));
+                    }
+                }
+            } else if let Some((_, splash)) = self.surfaces.iter().find(|(n, _)| n == target) {
                 splash.handle_event(cx, event, scope);
             }
         } else if let Event::Scroll(e) = event {
@@ -673,6 +694,41 @@ impl Shell {
     }
 
     fn draw_clipped_slot_body(&mut self, cx: &mut Cx2d, scope: &mut Scope, name: &str, walk: Walk) -> f64 {
+        if self.jit.contains(name) {
+            let walk_jit = match walk.height {
+                Size::Fit { .. } => Walk::fixed(
+                    match walk.width {
+                        Size::Fixed(w) => w,
+                        _ => 360.0,
+                    },
+                    240.0,
+                ),
+                _ => walk,
+            };
+            cx.begin_turtle(walk_jit, Layout { clip_x: true, clip_y: true, ..Layout::flow_down() });
+            let rect = cx.turtle().rect();
+            let (tex_opt, status) = if let Some(inst) = self.jit.slots.get_mut(name) {
+                inst.set_slot_size(rect.size.x.round().max(64.0) as u32, rect.size.y.round().max(64.0) as u32);
+                inst.poll_texture(cx.cx)
+            } else {
+                (None, String::new())
+            };
+            if let Some(tex) = tex_opt {
+                self.draw_jit_tex.draw_vars.set_texture(0, &tex);
+                self.draw_jit_tex.draw_abs(cx, rect);
+            } else {
+                self.draw_veil.draw_abs(cx, rect);
+                let mut y = rect.pos.y + 24.0;
+                for line in wrap(&status, ((rect.size.x - 32.0) / 7.2).max(12.0) as usize) {
+                    self.draw_label.color = vec4(0.82, 0.88, 0.96, 1.0);
+                    self.draw_label.draw_abs(cx, dvec2(rect.pos.x + 16.0, y), &line);
+                    y += 18.0;
+                }
+            }
+            let out = cx.end_turtle();
+            return out.size.y;
+        }
+
         let Some(splash) = self.surface(name) else {
             cx.walk_turtle(walk);
             return 0.0;
@@ -726,7 +782,7 @@ impl Shell {
     }
 
     fn draw_strip(&mut self, cx: &mut Cx2d, rect: Rect) {
-        self.draw_strip.color = if self.guard.is_some() { vec4(0.96, 0.62, 0.1, 1.0) } else { vec4(0.02, 0.027, 0.043, 1.0) };
+        self.draw_strip.color = vec4(0.02, 0.027, 0.043, 1.0);
         self.strip_rect = Rect { pos: rect.pos, size: dvec2(rect.size.x, self.strip_height) };
         self.draw_strip.draw_abs(cx, self.strip_rect);
 
@@ -734,21 +790,12 @@ impl Shell {
         for (on, text, color) in [
             (self.marks.mic, "MIC", vec4(1.0, 0.35, 0.35, 1.0)),
             (self.marks.loud, "LOUD", vec4(1.0, 0.75, 0.2, 1.0)),
-            (self.marks.test_taps, "TEST", vec4(1.0, 0.2, 1.0, 1.0)),
         ] {
             if on {
                 right_x -= 7.8 * text.len() as f64 + 8.0;
                 self.draw_mark.color = color;
                 self.draw_mark.draw_abs(cx, dvec2(right_x, rect.pos.y + 9.0), text);
             }
-        }
-
-        if self.guard.is_some() {
-            self.home_rect = Rect::default();
-            self.center_rect = Rect::default();
-            self.draw_label.color = vec4(0.0, 0.0, 0.0, 1.0);
-            self.draw_label.draw_abs(cx, rect.pos + dvec2(12.0, 9.0), "tb-shell   GUARD");
-            return;
         }
 
         // Left zone: `[ Home ]`
@@ -790,16 +837,17 @@ impl Shell {
             self.draw_guard_text.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
             y += 26.0;
         }
-        y += 8.0;
-        for line in wrap(&guard.who, ((w - 48.0) / 7.8) as usize) {
-            self.draw_guard_small.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
-            y += 18.0;
+        if !guard.who.is_empty() {
+            y += 8.0;
+            for line in wrap(&guard.who, ((w - 48.0) / 7.8) as usize) {
+                self.draw_guard_small.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
+                y += 18.0;
+            }
         }
         let bw = w - 48.0;
         let (yes_y, no_y) = (top + h - 200.0, top + h - 110.0);
-        let dim = if self.armed { 1.0 } else { 0.45 };
-        self.draw_yes.color = vec4(0.11 * dim, 0.13 * dim, 0.19 * dim, 1.0);
-        self.draw_no.color = self.draw_yes.color;
+        self.draw_yes.color = vec4(0.14, 0.24, 0.38, 1.0);
+        self.draw_no.color = vec4(0.11, 0.13, 0.19, 1.0);
         self.yes_rect = Rect { pos: dvec2(rect.pos.x + 24.0, yes_y), size: dvec2(bw, 72.0) };
         self.no_rect = Rect { pos: dvec2(rect.pos.x + 24.0, no_y), size: dvec2(bw, 72.0) };
         self.draw_yes.draw_abs(cx, self.yes_rect);
@@ -828,26 +876,28 @@ impl Shell {
     }
 
     pub fn remove(&mut self, cx: &mut Cx, name: &str) -> bool {
-        let Some(at) = self.surfaces.iter().position(|(n, _)| n == name) else { return false };
-        let (_, splash) = self.surfaces.remove(at);
-        self.measured_compact_h.remove(name);
-        splash.set_text(cx, "");
-        cx.widget_tree_mark_dirty(self.uid);
-        cx.redraw_all();
-        true
+        let removed_jit = self.jit.remove(name);
+        if let Some(at) = self.surfaces.iter().position(|(n, _)| n == name) {
+            let (_, splash) = self.surfaces.remove(at);
+            self.measured_compact_h.remove(name);
+            splash.set_text(cx, "");
+            cx.widget_tree_mark_dirty(self.uid);
+            cx.redraw_all();
+            return true;
+        }
+        if removed_jit {
+            self.measured_compact_h.remove(name);
+            cx.redraw_all();
+        }
+        removed_jit
     }
 
     pub fn set_guard(&mut self, cx: &mut Cx, guard: Option<GuardView>) {
         self.guard = guard;
-        self.armed = false;
         self.pressed = None;
         self.answer = None;
-        cx.stop_timer(self.arm_timer);
         self.guard_drawn_ms = None;
         self.raised_at = self.guard.as_ref().map(|_| std::time::Instant::now());
-        if self.guard.is_some() {
-            self.arm_timer = cx.start_timeout(0.5);
-        }
         cx.redraw_all();
     }
 
