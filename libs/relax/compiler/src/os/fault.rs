@@ -576,8 +576,17 @@ mod imp {
 
     /// The interrupted context's (pc, sp, fp, lr) (`uc`: a handler's third argument).
     pub(crate) unsafe fn regs(uc: *mut u8) -> (u64, u64, u64, u64) {
-        let gregs = uc.add(40) as *const u64;
-        (*gregs.add(16), *gregs.add(15), *gregs.add(10), 0)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gregs = uc.add(40) as *const u64;
+            (*gregs.add(16), *gregs.add(15), *gregs.add(10), 0)
+        }
+        // aarch64 `uc_mcontext` at +176: fault_address, x0..x30, sp, pc (x29 = fp, x30 = lr)
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mc = uc.add(176) as *const u64;
+            (*mc.add(33), *mc.add(32), *mc.add(30), *mc.add(31))
+        }
     }
 
     /// The fault's data address (`info`: a handler's second argument; 0 without one).
