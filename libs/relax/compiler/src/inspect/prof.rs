@@ -114,12 +114,12 @@ pub fn collect_opts(secs: f64, hz: u64, ev: Ev, wall: bool, want: &dyn Fn(&super
 }
 
 /// Stack samples of threads `tids` of another process, walked by its CFI (`vsnative pid=`).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn collect_foreign(tids: &[u64], secs: f64, hz: u64, ev: Ev, cfi: &super::cfi::Foreign, cancel: &dyn Fn() -> bool) -> (Vec<Sample>, u64, Vec<String>) {
     imp::collect_foreign(tids, secs, hz, ev, cfi, cancel)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     use super::{Run, Sample};
     use crate::inspect::cfi::Regs;
@@ -477,15 +477,15 @@ mod imp {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
+#[cfg(any(target_vendor = "apple", target_os = "android", all(target_os = "linux", target_arch = "aarch64")))]
 mod imp {
     use super::{Run, Sample};
 
-    /// On a CPU right now (macOS: the Mach run state; Android: /proc's `R`).
+    /// On a CPU right now (macOS: the Mach run state; Linux / Android: /proc's `R`).
     fn on_cpu(t: &crate::inspect::threads::Thread) -> bool {
         #[cfg(target_vendor = "apple")]
         { crate::inspect::threads::running(t) }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         { t.state == "running" }
     }
 

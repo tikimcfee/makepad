@@ -1621,8 +1621,11 @@ mod pause_imp {
     /// mostly sleeps between short bursts (a 5 ms sweep rarely sees it running): SAFE2's
     /// "0 threads held" under `makepad run`, the program ran on.
     fn holdable(t: &crate::inspect::threads::Thread) -> bool {
-        // x86_64: nanosleep 35, futex 202, clock_nanosleep 230
-        t.state == "running" || (t.state == "waiting" && t.syscall.is_some_and(|s| matches!(s.0, 35 | 202 | 230)))
+        #[cfg(target_arch = "x86_64")]
+        let wait_sys = t.syscall.is_some_and(|s| matches!(s.0, 35 | 202 | 230));
+        #[cfg(target_arch = "aarch64")]
+        let wait_sys = t.syscall.is_some_and(|s| matches!(s.0, 98 | 101 | 115));
+        t.state == "running" || (t.state == "waiting" && wait_sys)
     }
     pub fn resume() -> usize {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
