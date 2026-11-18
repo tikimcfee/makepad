@@ -1,42 +1,6 @@
-// CHAT: native GPU Markdown conversation view for the selected agent (`state.chat`).
-// Unlimited message length (`Markdown` + `TextFlow` + LaTeX math + code blocks + tables);
-// works solo or below pinned `Voice`.
-let ChatMd = Markdown{
-    width: Fill height: Fit
-    padding: 0
-    font_size: 15.0
-    font_color: #xeeeeee
-    paragraph_spacing: 8
-    pre_code_spacing: 6
-    heading_base_scale: 1.35
-    use_math_widget: true
-    draw_text +: { color: #xeeeeee }
-    text_style_normal +: { font_size: 15.0 }
-    text_style_italic +: { font_size: 15.0 }
-    text_style_bold +: { font_size: 15.0 }
-    text_style_bold_italic +: { font_size: 15.0 }
-    text_style_fixed +: { font_size: 13.5 }
-    code_layout +: { padding: Inset{left: 10 right: 10 top: 8 bottom: 8} }
-    quote_layout +: { padding: Inset{left: 10 right: 10 top: 6 bottom: 6} }
-    draw_block +: {
-        code_color: #x101520
-        quote_bg_color: #x151d2b
-        quote_fg_color: #x93c5fd
-        table_header_bg_color: #x232f46
-        table_border_color: #x334155
-        sep_color: #x2d3748
-    }
-}
-let ToolMd = ChatMd{
-    font_size: 13.5
-    font_color: #xb8c2d1
-    draw_text +: { color: #xb8c2d1 }
-    text_style_normal +: { font_size: 13.5 }
-    text_style_italic +: { font_size: 13.5 }
-    text_style_bold +: { font_size: 13.5 }
-    text_style_bold_italic +: { font_size: 13.5 }
-    text_style_fixed +: { font_size: 12.5 }
-}
+// CHAT: virtualized GPU Markdown conversation view for the selected agent (`state.chat`).
+// Uses native `PortalList`-backed `ChatFeed` (`O(viewport)` scrolling, fence-aware >2.2KB block
+// splitting, plain-prose `Label` fast path + rich `Markdown`, zero Splash `msgs` JSON copy).
 width: Fill height: Fill flow: Down padding: 12 spacing: 8
 main := View{
     width: Fill height: Fill flow: Down spacing: 8
@@ -45,8 +9,6 @@ main := View{
         let target_name = agent_name(state.agents ?? nil, state.target ?? nil)
         let st = if c == nil { "" } else { c.status ?? "" }
         let act = if c == nil { "" } else { c.activity ?? "" }
-        let msgs = if c == nil { [] } else { c.msgs ?? [] }
-        let hidden_before = if c == nil { 0 } else { c.hidden_before ?? 0 }
 
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -63,65 +25,12 @@ main := View{
             Small{text: st}
         }
 
-        if msgs.len() == 0 {
-            View{
-                width: Fill height: Fill flow: Down align: Align{y: 0.5}
-                Small{width: Fill text: "No messages yet."}
-            }
-        } else {
-            feed := ScrollYView{
-                width: Fill height: Fill flow: Down spacing: 8 scroll_bars +: {auto_tail: true}
-                if hidden_before > 0 {
-                    View{
-                        width: Fill height: Fit flow: Right spacing: 6
-                        PillBtn{
-                            width: Fill height: 36
-                            text: "Show earlier (" + show(hidden_before, " more)")
-                            on_click: || emit("more", {})
-                        }
-                        PillBtn{
-                            height: 36
-                            text: "Show all"
-                            on_click: || emit("all", {})
-                        }
-                    }
-                }
-                for m in msgs {
-                    let role = m.role ?? "say"
-                    let ts = m.ts ?? ""
-                    let hdr = (m.label ?? role) + (if ts == "" { "" } else { "  " + ts })
-                    let txt = m.text ?? ""
-                    if role == "you" {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 4
-                            margin: Inset{left: 22}
-                            padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
-                            new_batch: true show_bg: true
-                            draw_bg.color: #x1e2c42 draw_bg.border_radius: 15.0
-                            Small{text: hdr draw_text.color: #x7db3ff}
-                            ChatMd{body: txt}
-                        }
-                    } else if role == "tool" {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 3
-                            padding: Inset{top: 7 bottom: 7 left: 11 right: 11}
-                            new_batch: true show_bg: true
-                            draw_bg.color: #x151923 draw_bg.border_radius: 12.0
-                            Small{text: hdr draw_text.color: #x8b95a5}
-                            ToolMd{body: txt}
-                        }
-                    } else {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 4
-                            padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
-                            new_batch: true show_bg: true
-                            draw_bg.color: #x1c2230 draw_bg.border_radius: 15.0
-                            Small{text: hdr draw_text.color: #x3ddc84}
-                            ChatMd{body: txt}
-                        }
-                    }
-                }
-            }
+        feed := ChatFeed{
+            width: Fill height: Fill
+            store_key: "chat"
+            empty_text: "No messages yet."
+            on_more: || emit("more", {})
+            on_all: || emit("all", {})
         }
 
         if act != "" {
