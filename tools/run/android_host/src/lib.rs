@@ -19,6 +19,12 @@ mod logcat;
 #[cfg(target_os = "android")]
 mod socket;
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[no_mangle]
+pub extern "C" fn makepad_linux_tls_cell(cell_fn: extern "C" fn() -> *mut u64) {
+    relax_compiler::os::tls::register_tls_cell(cell_fn);
+}
+
 /// The APK's executable (libmakepad_exe.so, android_exe) calls this with its own arguments: Relax
 /// running itself again, which is what every build script is.
 #[no_mangle]

@@ -32,7 +32,10 @@ fn resolve_jit_bin() -> String {
         }
     }
     for cand in [
+        "/opt/tinybot/makepad-run/bin/makepad-run",
+        "/usr/local/bin/makepad-run",
         "/opt/tinybot/makepad-jit/bin/makepad-jit",
+        "/opt/tinybot/makepad-run/bin/makepad",
         "/opt/tinybot/makepad-jit/bin/makepad",
         "/usr/local/bin/makepad-jit",
     ] {
