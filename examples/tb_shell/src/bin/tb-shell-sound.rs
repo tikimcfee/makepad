@@ -153,8 +153,7 @@ fn strip_trailing_sentence<'a>(line: &'a str, suffix: &str) -> String {
     }
 }
 
-/// Raises `tb-shell`'s root GUARD via `tbui ask` with a 15-second timeout.
-/// Returns the exit code of `tbui ask` (`Some(0)` ONLY on a physical tap on `yes_label`).
+/// Raises a plain UI confirmation via `tbui confirm` with a 15-second timeout.
 fn ask_root_guard(
     cfg: &Config,
     question: &str,
@@ -163,35 +162,19 @@ fn ask_root_guard(
     slot: &Arc<Mutex<Option<u32>>>,
 ) -> CmdResult {
     let sock_env = format!("TB_SHELL_SOCK={}", cfg.sock_path);
-    if let Some(sudo) = sudo_prog() {
-        let args = [
-            "-n",
-            "env",
-            sock_env.as_str(),
-            "timeout",
-            "15",
-            cfg.tbui_bin.as_str(),
-            "ask",
-            question,
-            yes_label,
-            no_label,
-        ];
-        run_cmd(&sudo, &args, Duration::from_secs(17), Some(&sudo), Some(slot))
-    } else {
-        // Unprivileged host test mode (`TB_SUDO=none`).
-        let args = [
-            sock_env.as_str(),
-            "TBUI_ASK_GUARD=1",
-            "timeout",
-            "15",
-            cfg.tbui_bin.as_str(),
-            "ask",
-            question,
-            yes_label,
-            no_label,
-        ];
-        run_cmd("env", &args, Duration::from_secs(17), None, Some(slot))
-    }
+    let args = [
+        sock_env.as_str(),
+        "timeout",
+        "15",
+        cfg.tbui_bin.as_str(),
+        "confirm",
+        question,
+        "--yes",
+        yes_label,
+        "--no",
+        no_label,
+    ];
+    run_cmd("env", &args, Duration::from_secs(17), None, Some(slot))
 }
 
 /// Executes a `tb-sound` tone/sweep try and enforces all post-checks, guard prompts,

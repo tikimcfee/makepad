@@ -171,40 +171,6 @@ fn ask(args: &[String]) -> ! {
         die("ask QUESTION CHOICE...");
     }
     let (question, choices) = (words[0].clone(), words[1..].to_vec());
-    extern "C" {
-        fn geteuid() -> u32;
-    }
-    if unsafe { geteuid() } == 0 || std::env::var("TBUI_ASK_GUARD").map_or(false, |v| v == "1") {
-        if choices.len() != 2 {
-            die("a root ask is the guard: exactly two choices, yes then no");
-        }
-        let mut c = Client::connect();
-        c.send(&obj(vec![
-            ("op", "guard".into()),
-            ("text", question.as_str().into()),
-            ("yes", choices[0].as_str().into()),
-            ("no", choices[1].as_str().into()),
-        ]));
-        if timeout > 0 {
-            c.out.set_read_timeout(Some(Duration::from_secs(timeout))).ok();
-        }
-        match c.next() {
-            Some(reply) if reply.get("ok") == Some(&JsonValue::Bool(true)) => {
-                let choice = reply.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                println!("{choice}");
-                exit(if reply.get("answer").and_then(|v| v.as_str()) == Some("yes") { 0 } else { 1 })
-            }
-            Some(reply) => {
-                eprintln!("{}", reply.serialize_json());
-                exit(4)
-            }
-            None if timeout > 0 => exit(2),
-            None => {
-                eprintln!("tbui: the guard went away unanswered");
-                exit(3)
-            }
-        }
-    }
     let id = format!("ask-{}", std::process::id());
     if from.is_empty() {
         from = format!("asked by pid {}", std::os::unix::process::parent_id());
@@ -740,10 +706,57 @@ fn main() {
                 }
             }
         }
+        "jit" => {
+            let name = rest.first().unwrap_or_else(|| die("jit NAME PACKAGE [--dir DIR] [--src STORE] [--fps N] [--back]"));
+            let pkg = rest.get(1).unwrap_or_else(|| die("jit NAME PACKAGE [--dir DIR] [--src STORE] [--fps N] [--back]"));
+            let mut dir: Option<String> = None;
+            let mut src_store: Option<String> = None;
+            let mut fps: f64 = 24.0;
+            let mut front = true;
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--dir" => {
+                        let Some(v) = rest.get(i + 1) else { die("--dir needs a directory") };
+                        dir = Some(v.clone());
+                        i += 2;
+                    }
+                    "--src" => {
+                        let Some(v) = rest.get(i + 1) else { die("--src needs a store path") };
+                        src_store = Some(v.clone());
+                        i += 2;
+                    }
+                    "--fps" => {
+                        let Some(v) = rest.get(i + 1).and_then(|s| s.parse::<f64>().ok()) else { die("--fps needs a number") };
+                        fps = v;
+                        i += 2;
+                    }
+                    "--back" => {
+                        front = false;
+                        i += 1;
+                    }
+                    other => die(&format!("unknown jit flag: {other}")),
+                }
+            }
+            let mut fields = vec![
+                ("op", "jit".into()),
+                ("surface", name.as_str().into()),
+                ("package", pkg.as_str().into()),
+                ("fps", JsonValue::F64(fps)),
+                ("front", JsonValue::Bool(front)),
+            ];
+            if let Some(d) = &dir {
+                fields.push(("dir", d.as_str().into()));
+            }
+            if let Some(s) = &src_store {
+                fields.push(("src", s.as_str().into()));
+            }
+            report(&Client::connect().call(obj(fields)));
+        }
         "ask" => ask(rest),
-        "guard" => {
-            let text = rest.first().unwrap_or_else(|| die("guard TEXT [--yes LABEL] [--no LABEL]"));
-            let mut req = obj(vec![("op", "guard".into()), ("text", text.as_str().into())]);
+        "confirm" | "guard" => {
+            let text = rest.first().unwrap_or_else(|| die("confirm TEXT [--yes LABEL] [--no LABEL]"));
+            let mut req = obj(vec![("op", "confirm".into()), ("text", text.as_str().into())]);
             for (flag, key) in [("--yes", "yes"), ("--no", "no")] {
                 if let Some(i) = rest.iter().position(|a| a == flag) {
                     let v = rest.get(i + 1).unwrap_or_else(|| die("a label after the flag"));
@@ -764,11 +777,11 @@ fn main() {
                     }
                 }
                 None => {
-                    eprintln!("tbui: the guard went away unanswered");
+                    eprintln!("tbui: confirm went away unanswered");
                     exit(3)
                 }
             }
         }
-        _ => die("show | stage | note | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | guard"),
+        _ => die("show | jit | stage | note | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | confirm"),
     }
 }

@@ -21,9 +21,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 
-const MAX_CACHED_EVENTS: usize = 300;
-const MAX_SHOWN_MSGS: usize = 24;
+const DEFAULT_SHOWN_MSGS: usize = 120;
+const MORE_STEP_MSGS: usize = 200;
 const MAX_TARGETS: usize = 16;
+
+fn max_cached_events() -> usize {
+    env_opt("TB_CHAT_MAX_EVENTS")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn clean_text(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -232,7 +242,7 @@ fn parse_prompt(p: &JsonValue) -> Option<EvKind> {
     } else {
         ("You".to_string(), raw)
     };
-    Some(EvKind::Prompt { label, text: trunc_chars(body, 900) })
+    Some(EvKind::Prompt { label, text: clean_text(body) })
 }
 
 struct IngestOutcome {
@@ -303,7 +313,7 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
             if txt.is_empty() {
                 EvKind::Other
             } else {
-                EvKind::Say { text: trunc_chars(txt, 2400) }
+                EvKind::Say { text: clean_text(txt) }
             }
         }
         "tool" => {
@@ -313,7 +323,7 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
                 let st = t.get("result").and_then(|r| r.get("status")).and_then(|v| v.as_str()).unwrap_or("pending").to_string();
                 let raw_line = if detail.is_empty() { name.clone() } else { format!("{name}: {detail}") };
                 let line = trunc_chars(&raw_line, 120);
-                let text = trunc_chars(if detail.is_empty() { &name } else { detail }, 220);
+                let text = clean_text(if detail.is_empty() { &name } else { detail });
                 EvKind::Tool { name, st, line, text }
             } else {
                 EvKind::Other
@@ -325,7 +335,8 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
 
     if !c.by_id.contains_key(id) {
         c.order.push_back(id.to_string());
-        if c.order.len() > MAX_CACHED_EVENTS {
+        let cap = max_cached_events();
+        if cap > 0 && c.order.len() > cap {
             if let Some(old) = c.order.pop_front() {
                 c.by_id.remove(&old);
             }
@@ -335,7 +346,7 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
     IngestOutcome { dirty: true, need_full_reread: false }
 }
 
-fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool) -> JsonValue {
+fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_limit: usize) -> JsonValue {
     let mut msgs: Vec<JsonValue> = Vec::new();
     let mut last_say = String::new();
     let mut last_say_idx: isize = -1;
@@ -394,10 +405,14 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool) -> Jso
     if c.status != "busy" && c.status != "processing" && !activity.starts_with("running ") {
         activity.clear();
     }
-    if msgs.len() > MAX_SHOWN_MSGS {
-        let drop_n = msgs.len() - MAX_SHOWN_MSGS;
+    let total_msgs = msgs.len();
+    let hidden_before = if shown_limit > 0 && total_msgs > shown_limit {
+        let drop_n = total_msgs - shown_limit;
         msgs.drain(..drop_n);
-    }
+        drop_n
+    } else {
+        0
+    };
 
     let collapsed = collapse_ws(&last_say);
     let preview = if collapsed.is_empty() {
@@ -417,6 +432,8 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool) -> Jso
         ("tools", JsonValue::Bool(show_tools)),
         ("preview", preview.into()),
         ("activity", activity.into()),
+        ("total", JsonValue::U64(total_msgs as u64)),
+        ("hidden_before", JsonValue::U64(hidden_before as u64)),
         ("msgs", JsonValue::Array(msgs)),
     ])
 }
@@ -447,6 +464,7 @@ struct ChatState {
     agent_short: String,
     agent_host: String,
     show_tools: bool,
+    shown_limit: usize,
     chat_visible: bool,
     last_pushed: String,
     gen_counter: Arc<AtomicU64>,
@@ -467,6 +485,7 @@ impl ChatState {
             cache,
             target_id: default_id,
             show_tools: false,
+            shown_limit: DEFAULT_SHOWN_MSGS,
             chat_visible: false,
             last_pushed: String::new(),
             gen_counter: Arc::new(AtomicU64::new(0)),
@@ -504,6 +523,9 @@ impl ChatState {
             chosen = default_local;
         }
         let changed = chosen != self.target_id;
+        if changed {
+            self.shown_limit = DEFAULT_SHOWN_MSGS;
+        }
         self.target_id = chosen;
         if let Some((short, host)) = self.target_id.split_once('@') {
             self.agent_short = short.to_string();
@@ -586,16 +608,17 @@ impl ChatState {
                 self.cur_mut().reset_transcript();
             }
             let tid = self.target_id.clone();
-            let _ = self.run_ingest_cmd(&["logs", &tid, "--lines", "200", "--json"]);
+            let _ = self.run_ingest_cmd(&["logs", &tid, "--lines", "2000", "--json"]);
         }
     }
 
     fn push_if_changed(&mut self, writer: &ShellWriter, force: bool) -> Result<(), String> {
         let short = self.agent_short.clone();
         let tools = self.show_tools;
+        let limit = self.shown_limit;
         let val = {
             let c = self.cur_mut();
-            build_chat_value(c, &short, tools)
+            build_chat_value(c, &short, tools, limit)
         };
         let ser = val.serialize_json();
         if !force && ser == self.last_pushed {
@@ -702,7 +725,8 @@ fn main() {
         st.snapshot_fetch(true);
         let short = st.agent_short.clone();
         let tools = st.show_tools;
-        let val = build_chat_value(st.cur_mut(), &short, tools);
+        let limit = st.shown_limit;
+        let val = build_chat_value(st.cur_mut(), &short, tools, limit);
         if let Err(e) = set_key_sync("chat", val) {
             eprintln!("tb-shell-chat: {e}");
             std::process::exit(1);
@@ -827,6 +851,14 @@ fn main() {
                             }
                             "toggle_tools" => {
                                 st.show_tools = !st.show_tools;
+                                dirty = true;
+                            }
+                            "more" => {
+                                st.shown_limit = st.shown_limit.saturating_add(MORE_STEP_MSGS);
+                                dirty = true;
+                            }
+                            "all" => {
+                                st.shown_limit = 0;
                                 dirty = true;
                             }
                             _ => {}

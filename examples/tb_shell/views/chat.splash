@@ -1,12 +1,41 @@
-// CHAT: conversation view for the selected agent (`state.chat`).
-// Tappable top header jumps to `Agents` selector; works seamlessly solo or below pinned `Voice`.
-let MsgCard = RoundedView{
-    width: Fill height: Fit flow: Down spacing: 4
-    padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
-    new_batch: true show_bg: true
-    draw_bg.color: #x1c2230 draw_bg.border_radius: 15.0
-    who := Small{}
-    body := Label{width: Fill text: "" draw_text.text_style.font_size: 15.5 draw_text.color: #xeeeeee}
+// CHAT: native GPU Markdown conversation view for the selected agent (`state.chat`).
+// Unlimited message length (`Markdown` + `TextFlow` + LaTeX math + code blocks + tables);
+// works solo or below pinned `Voice`.
+let ChatMd = Markdown{
+    width: Fill height: Fit
+    padding: 0
+    font_size: 15.0
+    font_color: #xeeeeee
+    paragraph_spacing: 8
+    pre_code_spacing: 6
+    heading_base_scale: 1.35
+    use_math_widget: true
+    draw_text +: { color: #xeeeeee }
+    text_style_normal +: { font_size: 15.0 }
+    text_style_italic +: { font_size: 15.0 }
+    text_style_bold +: { font_size: 15.0 }
+    text_style_bold_italic +: { font_size: 15.0 }
+    text_style_fixed +: { font_size: 13.5 }
+    code_layout +: { padding: Inset{left: 10 right: 10 top: 8 bottom: 8} }
+    quote_layout +: { padding: Inset{left: 10 right: 10 top: 6 bottom: 6} }
+    draw_block +: {
+        code_color: #x101520
+        quote_bg_color: #x151d2b
+        quote_fg_color: #x93c5fd
+        table_header_bg_color: #x232f46
+        table_border_color: #x334155
+        sep_color: #x2d3748
+    }
+}
+let ToolMd = ChatMd{
+    font_size: 13.5
+    font_color: #xb8c2d1
+    draw_text +: { color: #xb8c2d1 }
+    text_style_normal +: { font_size: 13.5 }
+    text_style_italic +: { font_size: 13.5 }
+    text_style_bold +: { font_size: 13.5 }
+    text_style_bold_italic +: { font_size: 13.5 }
+    text_style_fixed +: { font_size: 12.5 }
 }
 width: Fill height: Fill flow: Down padding: 12 spacing: 8
 main := View{
@@ -17,6 +46,7 @@ main := View{
         let st = if c == nil { "" } else { c.status ?? "" }
         let act = if c == nil { "" } else { c.activity ?? "" }
         let msgs = if c == nil { [] } else { c.msgs ?? [] }
+        let hidden_before = if c == nil { 0 } else { c.hidden_before ?? 0 }
 
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -41,52 +71,71 @@ main := View{
         } else {
             feed := ScrollYView{
                 width: Fill height: Fill flow: Down spacing: 8 scroll_bars +: {auto_tail: true}
-                for m in msgs {
-                    let role = m.role ?? "say"
-                    if role == "you" {
-                        MsgCard{
-                            draw_bg.color: #x162235
-                            who.text: (m.label ?? "You") + "  " + (m.ts ?? "")
-                            who.draw_text.color: #x7fb3ff
-                            body.text: m.text ?? ""
-                            body.draw_text.text_style.font_size: 15
-                            body.draw_text.color: #xd6e2f0
+                if hidden_before > 0 {
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 6
+                        PillBtn{
+                            width: Fill height: 36
+                            text: "Show earlier (" + show(hidden_before, " more)")
+                            on_click: || emit("more", {})
                         }
-                    } else if role == "tool" {
-                        MsgCard{
-                            draw_bg.color: #x171b24
-                            who.text: (m.label ?? "Tool") + "  " + (m.ts ?? "")
-                            who.draw_text.color: #x7d8696
-                            body.text: m.text ?? ""
-                            body.draw_text.text_style.font_size: 12.5
-                            body.draw_text.color: #x9aa4b2
-                        }
-                    } else {
-                        MsgCard{
-                            draw_bg.color: #x1c2230
-                            who.text: (m.label ?? "Reply") + "  " + (m.ts ?? "")
-                            who.draw_text.color: #x3ddc84
-                            body.text: m.text ?? ""
+                        PillBtn{
+                            height: 36
+                            text: "Show all"
+                            on_click: || emit("all", {})
                         }
                     }
                 }
-                if act != "" {
-                    MsgCard{
-                        draw_bg.color: #x262116
-                        who.text: "Working"
-                        who.draw_text.color: #xf5b942
-                        body.text: act
-                        body.draw_text.text_style.font_size: 13.5
-                        body.draw_text.color: #xf5d98a
+                for m in msgs {
+                    let role = m.role ?? "say"
+                    let ts = m.ts ?? ""
+                    let hdr = (m.label ?? role) + (if ts == "" { "" } else { "  " + ts })
+                    let txt = m.text ?? ""
+                    if role == "you" {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 4
+                            margin: Inset{left: 22}
+                            padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
+                            new_batch: true show_bg: true
+                            draw_bg.color: #x1e2c42 draw_bg.border_radius: 15.0
+                            Small{text: hdr draw_text.color: #x7db3ff}
+                            ChatMd{body: txt}
+                        }
+                    } else if role == "tool" {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 3
+                            padding: Inset{top: 7 bottom: 7 left: 11 right: 11}
+                            new_batch: true show_bg: true
+                            draw_bg.color: #x151923 draw_bg.border_radius: 12.0
+                            Small{text: hdr draw_text.color: #x8b95a5}
+                            ToolMd{body: txt}
+                        }
+                    } else {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 4
+                            padding: Inset{top: 9 bottom: 9 left: 13 right: 13}
+                            new_batch: true show_bg: true
+                            draw_bg.color: #x1c2230 draw_bg.border_radius: 15.0
+                            Small{text: hdr draw_text.color: #x3ddc84}
+                            ChatMd{body: txt}
+                        }
                     }
                 }
             }
         }
 
+        if act != "" {
+            Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: act draw_text.color: #xf5b942}
+        }
+
         View{
             width: Fill height: Fit flow: Right spacing: 8
-            Big{width: Fill height: 46 text: "Refresh" on_click: || emit("refresh", {})}
-            Big{width: Fill height: 46 text: if c != nil && (c.tools ?? false) { "Tools: on" } else { "Tools: off" } on_click: || emit("toggle_tools", {})}
+            Big{height: 44 text: "Refresh" on_click: || emit("refresh", {})}
+            Big{
+                height: 44
+                text: if (if c == nil { false } else { c.tools ?? false }) { "Tools: on" } else { "Tools: off" }
+                on_click: || emit("toggle_tools", {})
+            }
         }
     }
 }
