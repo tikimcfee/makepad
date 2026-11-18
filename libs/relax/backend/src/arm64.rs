@@ -6165,9 +6165,9 @@ pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
 /// `mrs xN, <register holding the thread's slot array>` (N or-ed in). macOS: tpidrro_el0 (the
 /// pthread TSD base; its low 3 bits carry the cpu number, masked off after). Android: tpidr_el0,
 /// bionic's thread pointer = its TLS slot array (bionic libc/platform/bionic/tls_defines.h).
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 const MRS_SLOT_BASE: u32 = 0xD53B_D060;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 const MRS_SLOT_BASE: u32 = 0xD53B_D040;
 
 pub fn tsd_reader() -> Vec<u8> {

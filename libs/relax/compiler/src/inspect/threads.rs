@@ -149,10 +149,12 @@ pub fn capture(t: &Thread, raw: &mut Raw) -> Result<(), &'static str> {
     r
 }
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use imp::{stack_hi_of_self, walk_regs_with, Slot as HoldSlot};
+pub use imp::{stack_hi_of_self, walk_regs_with};
+#[cfg(target_os = "linux")]
+pub use imp::Slot as HoldSlot;
 
 /// Pause: holds thread `tid` in its handler until `release_hold` (Linux).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
     imp::hold(tid, imp::HOLD_PAUSE)
 }
@@ -160,31 +162,31 @@ pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
 /// Holds thread `tid` in its handler for good (a thread with a frame in code that never runs
 /// again: stale.rs `park_held`); a blocked thread is signalled too (it leaves the handler only at
 /// the run's end, `release_held_for_good`, when no code of the run runs any more). Linux.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn hold_for_good(tid: u64) -> Result<&'static HoldSlot, &'static str> {
     imp::hold(tid, imp::HOLD_FOREVER)
 }
 
 /// A pause's hold of a thread becomes a hold for good (no resume releases it: the run's end does).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn keep_held(s: &HoldSlot) {
     imp::keep(s)
 }
 
 /// The run's end, once its code is gone: every thread held for good leaves its handler (it faults
 /// out of that code at its next instruction there). Returns how many. Linux.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn release_held_for_good() -> usize {
     imp::release_forever()
 }
 
 /// Whether thread `tid` stands still in its handler now (held by a pause or for good). Linux.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn is_held(tid: u64) -> bool {
     imp::held(tid).is_some()
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 pub fn release_hold(s: &HoldSlot) {
     imp::release(s)
 }
@@ -671,8 +673,8 @@ mod imp {
     static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], mode: AtomicU32::new(0) } }; SLOTS];
     pub const HOLD_CAPTURE: u32 = 0;
     pub const HOLD_PAUSE: u32 = 1;
-    // a hold for good: Linux x86_64 only (`hold_for_good`, `keep_held`)
-    #[cfg(target_arch = "x86_64")]
+    // a hold for good: Linux (`hold_for_good`, `keep_held`)
+    #[cfg(target_os = "linux")]
     pub const HOLD_FOREVER: u32 = 2;
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
@@ -801,13 +803,13 @@ mod imp {
     }
 
     /// A held thread stays held for good.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_os = "linux")]
     pub fn keep(slot: &Slot) {
         slot.mode.store(HOLD_FOREVER, Relaxed);
     }
 
     /// Lets every thread held for good go (`release_held_for_good`).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_os = "linux")]
     pub fn release_forever() -> usize {
         let mut n = 0;
         for slot in HOLDS.iter().filter(|h| h.mode.load(Relaxed) == HOLD_FOREVER && h.state.load(Acquire) == 2) {
@@ -1146,9 +1148,9 @@ mod x64_walk {
     }
 }
 
-/// Android arm64: JIT code and host code both keep frame records (x29 = fp: [fp] = the caller's
+/// Linux and Android arm64: JIT code and host code keep frame records (x29 = fp: [fp] = the caller's
 /// fp, [fp+8] = the return address); a frame is kept while its return address is code.
-#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "android", target_os = "linux"), target_arch = "aarch64"))]
 mod arm64_walk {
     use super::{Raw, MAX_FRAMES};
 

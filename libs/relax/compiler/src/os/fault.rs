@@ -625,12 +625,21 @@ mod imp {
         unsafe {
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
-            let gregs = uc.add(40) as *mut u64;
+            #[cfg(target_arch = "x86_64")]
+            let (pc_reg, sp_reg, fp_reg, lr_val, a0_reg, a1_reg) = {
+                let gregs = uc.add(40) as *mut u64;
+                (gregs.add(16), gregs.add(15), gregs.add(10), 0u64, gregs.add(8), gregs.add(9))
+            };
+            #[cfg(target_arch = "aarch64")]
+            let (pc_reg, sp_reg, fp_reg, lr_val, a0_reg, a1_reg) = {
+                let mc = uc.add(176) as *mut u64;
+                (mc.add(33), mc.add(32), mc.add(30), *mc.add(31), mc.add(1), mc.add(2))
+            };
             if sig == SIGABRT {
-                super::note_abort(*gregs.add(16), *gregs.add(10));
+                super::note_abort(*pc_reg, *fp_reg);
                 let handled = super::program_abort(sig, info, uc);
                 if !crate::os::progsig::take_sent_on_abort() {
-                    report_abort(*gregs.add(16), *gregs.add(10));
+                    report_abort(*pc_reg, *fp_reg);
                 }
                 if handled {
                     return;
@@ -645,11 +654,11 @@ mod imp {
             }
             // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
-                let (pc, fp) = (*gregs.add(16), *gregs.add(10));
+                let (pc, fp) = (*pc_reg, *fp_reg);
                 eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
             }
-            let f = Fault { kind: kind(sig), sig, pc: *gregs.add(16), sp: *gregs.add(15), fp: *gregs.add(10), addr: *(info.add(16) as *const u64), lr: 0 };
+            let f = Fault { kind: kind(sig), sig, pc: *pc_reg, sp: *sp_reg, fp: *fp_reg, addr: *(info.add(16) as *const u64), lr: lr_val };
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &|| {}, chained, debug: &|| {} }) {
                 Action::Ignore | Action::Retry => {}
@@ -660,9 +669,9 @@ mod imp {
                 }
                 Action::Die => default_action(sig),
                 Action::Resume { pc, a0, a1 } => {
-                    *gregs.add(16) = pc;
-                    *gregs.add(8) = a0;
-                    *gregs.add(9) = a1;
+                    *pc_reg = pc;
+                    *a0_reg = a0;
+                    *a1_reg = a1;
                 }
             }
         }

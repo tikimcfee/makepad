@@ -35,7 +35,7 @@ mod unix {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     pub use super::unix::{get, key_create};
 
@@ -54,10 +54,7 @@ mod imp {
     /// Linux x86-64: the block pointer lives in a static-TLS cell of this (executable)
     /// runtime, at a fixed offset from the thread pointer that JIT code reads via fs.
     pub fn jit_offset(_key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
-        #[cfg(target_arch = "x86_64")]
         let reader = emit(&relax_backend::x64::fs_reader());
-        #[cfg(not(target_arch = "x86_64"))]
-        let reader: u64 = compile_error!("the JIT does not build for Linux on this CPU: its thread-local fast path has only the x86-64 (fs) reader on Linux");
         let fs_base: rt_fn_ty!(fn() -> u64) = unsafe { std::mem::transmute(reader as usize) };
         let cell = TLS_BLOCK.with(|c| c as *const std::cell::Cell<u64> as u64);
         let off = cell.wrapping_sub(fs_base()) as i64;
@@ -82,6 +79,76 @@ mod imp {
             let _ = cell;
             true
         }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod imp {
+    pub use super::unix::{get, key_create};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static EXTERNAL_CELL: AtomicUsize = AtomicUsize::new(0);
+
+    /// Registers a static-TLS cell getter owned by a small launcher executable when Relax runs
+    /// inside a dynamically loaded `cdylib` host (`libmakepad.so`).
+    pub fn register_tls_cell(cell_fn: extern "C" fn() -> *mut u64) {
+        EXTERNAL_CELL.store(cell_fn as usize, Ordering::Release);
+    }
+
+    thread_local! {
+        static TLS_BLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    #[inline]
+    fn cell_ptr() -> *mut u64 {
+        let ext = EXTERNAL_CELL.load(Ordering::Acquire);
+        if ext != 0 {
+            let f: extern "C" fn() -> *mut u64 = unsafe { std::mem::transmute(ext) };
+            f()
+        } else {
+            TLS_BLOCK.with(|c| c.as_ptr())
+        }
+    }
+
+    #[inline]
+    fn tp_base() -> u64 {
+        let tp: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack, preserves_flags));
+        }
+        tp & !7
+    }
+
+    pub fn set(key: u64, b: *mut u8) {
+        unsafe {
+            super::unix::pthread_setspecific(key as usize, b);
+            cell_ptr().write_volatile(b as u64);
+        }
+    }
+
+    /// Linux AArch64 (Variant I static TLS): the cell sits at a fixed positive 8-byte-aligned
+    /// offset above `tpidr_el0`, read by `arm64::tls_block_ip0` / `tsd_reader` as word slot `off/8`.
+    pub fn jit_offset(key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
+        let tp = tp_base();
+        let cell = cell_ptr() as u64;
+        let byte_off = cell.wrapping_sub(tp) as i64;
+        if byte_off <= 0 || (byte_off & 7) != 0 || byte_off > (1 << 20) {
+            panic!(
+                "thread-local fast path: AArch64 Linux cell {:#x} is not in static TLS above tpidr_el0 {:#x} (off {:#x})",
+                cell, tp, byte_off
+            );
+        }
+        let slot = (byte_off as u64) / 8;
+        let reader = emit(&relax_backend::arm64::tsd_reader());
+        let read: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(reader as usize) };
+        let old = get(key);
+        set(key, 0x5a5a_0000 as *mut u8);
+        let seen = read(slot);
+        set(key, old);
+        if seen != 0x5a5a_0000 {
+            panic!("thread-local fast path: AArch64 Linux slot {} (tp+{:#x}) reads {:#x}", slot, byte_off, seen);
+        }
+        slot
     }
 }
 
