@@ -4,6 +4,7 @@
 
 pub use makepad_widgets;
 
+mod chat_feed;
 mod io;
 mod jit_slot;
 mod library;
@@ -275,7 +276,9 @@ pub struct App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
+        chat_feed::script_mod(vm);
         makepad_widgets::widget_async::register_splash_isolate_mod(stream::isolate_mod);
+        makepad_widgets::widget_async::register_splash_isolate_mod(chat_feed::isolate_mod);
         crate::shell::script_mod(vm);
         self::script_mod(vm)
     }
@@ -2305,9 +2308,27 @@ impl App {
     }
 
     fn feed_inner(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef, keys: &[String]) {
+        let body = self.st.bodies.get(name).map(|s| s.as_str()).unwrap_or("");
+        let reads_dot_msgs = body.contains(".msgs");
+        let has_feed_widget = body.contains("ChatFeed") || body.contains("VirtualFeed");
         let vals = keys
             .iter()
-            .map(|k| (k.clone(), self.st.store.get(k).cloned().unwrap_or(JsonValue::Null)))
+            .map(|k| {
+                let strip_msgs = !reads_dot_msgs && (k == "chat" || has_feed_widget);
+                let v = match self.st.store.get(k) {
+                    Some(JsonValue::Object(m)) if strip_msgs && m.contains_key("msgs") => {
+                        let filtered = m
+                            .iter()
+                            .filter(|(mk, _)| mk.as_str() != "msgs")
+                            .map(|(mk, mv)| (mk.clone(), mv.clone()))
+                            .collect();
+                        JsonValue::Object(filtered)
+                    }
+                    Some(other) => other.clone(),
+                    None => JsonValue::Null,
+                };
+                (k.clone(), v)
+            })
             .collect();
         let text = JsonValue::Object(vals).serialize_json();
         let split = &mut self.st.split;
@@ -2367,8 +2388,23 @@ impl App {
             for (k, v) in top {
                 if *v == JsonValue::Null {
                     store.remove(k);
+                    chat_feed::remove_store(k);
                 } else {
-                    merge(store.entry(k.clone()).or_insert(JsonValue::Null), v);
+                    let feed_relevant = match v {
+                        JsonValue::Object(m) => {
+                            m.contains_key("msgs")
+                                || m.contains_key("items")
+                                || m.contains_key("hidden_before")
+                                || m.contains_key("agent")
+                        }
+                        JsonValue::Array(_) => true,
+                        _ => false,
+                    };
+                    let entry = store.entry(k.clone()).or_insert(JsonValue::Null);
+                    merge(entry, v);
+                    if feed_relevant {
+                        chat_feed::publish_store(k, entry);
+                    }
                 }
             }
         });
