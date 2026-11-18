@@ -12,7 +12,7 @@ let CoreTile = Squircle{
 let SurfCard = RoundedView{
     width: Fill height: 56 flow: Right spacing: 8
     padding: Inset{left: 14 right: 10} align: Align{y: 0.5}
-    new_batch: true show_bg: true
+    show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
 fn count_agent_surfaces(list) {

@@ -1,13 +1,13 @@
 let Squircle = RoundedView{
     width: Fill height: 72 flow: Right spacing: 14
     padding: Inset{left: 18 right: 18} align: Align{y: 0.5}
-    new_batch: true show_bg: true
+    show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 20.0
 }
 let CompactBar = RoundedView{
     width: Fill height: 56 flow: Right spacing: 10
     padding: Inset{left: 14 right: 14} align: Align{y: 0.5}
-    new_batch: true show_bg: true
+    show_bg: true
     draw_bg.color: #x18202e draw_bg.border_radius: 14.0
 }
 let Dot = RoundedView{width: 12 height: 12 show_bg: true draw_bg.border_radius: 6.0 draw_bg.color: #x666666}
