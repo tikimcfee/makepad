@@ -119,6 +119,7 @@ gl_functions! {
     glDrawBuffers(GLsizei, *const GLenum);
     glReadBuffer(GLenum);
     glBlitFramebuffer(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+    glInvalidateFramebuffer(GLenum, GLsizei, *const GLenum);
     glReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, *mut c_void);
     glClearBufferfv(GLenum, GLint, *const GLfloat);
     glClearBufferuiv(GLenum, GLint, *const GLuint);
