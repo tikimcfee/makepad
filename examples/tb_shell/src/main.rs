@@ -14,6 +14,9 @@ mod shell;
 mod split;
 mod stage;
 mod stream;
+mod termd_bridge;
+mod termd_view;
+mod termd_wire;
 
 use io::{Msg, Peer};
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
@@ -265,6 +268,7 @@ struct State {
     frame_budget_ms: f64,
     agent_shaders_on: bool,
     pending_watch_shown: Vec<(u64, String)>,
+    termd: Option<termd_bridge::TermdBridge>,
 }
 
 #[derive(Script, ScriptHook)]
@@ -277,8 +281,10 @@ impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
         chat_feed::script_mod(vm);
+        termd_view::script_mod(vm);
         makepad_widgets::widget_async::register_splash_isolate_mod(stream::isolate_mod);
         makepad_widgets::widget_async::register_splash_isolate_mod(chat_feed::isolate_mod);
+        makepad_widgets::widget_async::register_splash_isolate_mod(termd_view::isolate_mod);
         crate::shell::script_mod(vm);
         self::script_mod(vm)
     }
@@ -310,6 +316,7 @@ impl AppMain for App {
             } else {
                 self.drain_socket(cx);
             }
+            self.drain_termd_events(cx);
             if !self.st.panel_off {
                 let has_vis_jit = self.shell(cx).borrow::<Shell>().map_or(false, |sh| {
                     self.st.visible.iter().any(|n| sh.jit.contains(n))
@@ -605,6 +612,8 @@ impl App {
         self.read_loud(cx);
         self.update_strip_status(cx);
         self.arm_clock_timer(cx);
+        self.st.termd = Some(termd_bridge::TermdBridge::new(self.st.panel_off));
+        self.sync_termd_store(cx, false);
 
         let (prev_unclean, crashes_60s) = library::CrashGuard::check_on_start();
         let before = Self::surfaces_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
@@ -1040,6 +1049,9 @@ impl App {
         self.st.panel_wake_ticks = 0;
 
         if on {
+            if let Some(ref mut tb) = self.st.termd {
+                tb.set_panel_off(false);
+            }
             self.update_strip_status(cx);
             self.arm_clock_timer(cx);
             self.sync_visibility_and_lifecycle(cx);
@@ -1048,6 +1060,9 @@ impl App {
             self.st.panel_wake_ticks = 2;
             self.st.panel_wake_timer = cx.start_interval(0.18);
         } else {
+            if let Some(ref mut tb) = self.st.termd {
+                tb.set_panel_off(true);
+            }
             cx.stop_timer(self.st.clock_timer);
             let shell = self.shell(cx);
             let surfaces: Vec<(String, WidgetRef)> = shell.borrow::<Shell>().map_or(vec![], |sh| sh.surfaces.clone());
@@ -1206,6 +1221,12 @@ impl App {
         }
         if let Some(sh) = self.shell(cx).borrow::<Shell>() {
             sh.jit.sync_visibility(&self.st.visible, self.st.panel_off);
+        }
+        termd_view::sync_global_visibility(&self.st.visible, &self.st.bodies, self.st.panel_off);
+        if !self.st.panel_off && added.iter().any(|s| matches!(s.as_str(), "terminal" | "agents" | "home")) {
+            if let Some(ref tb) = self.st.termd {
+                tb.probe_disconnected();
+            }
         }
         self.sync_gpu_timer_for_visible(cx);
     }
@@ -1594,6 +1615,7 @@ impl App {
             }
             "lib" => self.lib_op(cx, req).map(Some),
             "reload" => self.reload_op(cx, req).map(Some),
+            "termd" => self.termd_socket_op(cx, req).map(Some),
             "jit" => {
                 let name = surface.ok_or("jit needs surface")?;
                 if !valid_name(name) {
@@ -2519,8 +2541,12 @@ impl App {
                         }
                     }
                     "emit" => {
+                        let name_str = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let name = args.get("name").cloned().unwrap_or(JsonValue::Null);
                         let data = args.get("data").cloned().unwrap_or(JsonValue::Null);
+                        if !name_str.is_empty() {
+                            self.handle_termd_ui_emit(cx, &name_str, &data);
+                        }
                         let ev = obj(vec![("ev", "emit".into()), ("surface", surface.as_str().into()), ("name", name), ("data", data)]);
                         self.to_surface_watchers(&surface, ev);
                     }
@@ -2528,5 +2554,60 @@ impl App {
                 }
             }
         }
+    }
+
+    fn sync_termd_store(&mut self, cx: &mut Cx, front_terminal: bool) {
+        let Some(ref mut tb) = self.st.termd else { return };
+        let val = tb.to_store_json();
+        if front_terminal && self.st.bodies.contains_key("terminal") {
+            let patch = obj(vec![
+                ("termd", val),
+                ("front", JsonValue::String("terminal".into())),
+            ]);
+            self.apply(cx, &patch, "termd");
+        } else {
+            let patch = obj(vec![("termd", val)]);
+            self.apply(cx, &patch, "termd");
+        }
+    }
+
+    fn drain_termd_events(&mut self, cx: &mut Cx) {
+        if self.st.panel_off {
+            return;
+        }
+        let outcome = self.st.termd.as_mut().map(|tb| tb.drain_events());
+        if let Some((changed, want_front)) = outcome {
+            if changed || want_front {
+                self.sync_termd_store(cx, want_front);
+            }
+        }
+    }
+
+    fn handle_termd_ui_emit(&mut self, cx: &mut Cx, name: &str, data: &JsonValue) {
+        let outcome = self
+            .st
+            .termd
+            .as_mut()
+            .map(|tb| tb.handle_ui_emit(name, data));
+        if let Some((handled, store_changed, want_front)) = outcome {
+            if handled {
+                if store_changed || want_front {
+                    self.sync_termd_store(cx, want_front);
+                } else if want_front && self.st.bodies.contains_key("terminal") {
+                    self.apply(cx, &obj(vec![("front", "terminal".into())]), "termd");
+                }
+            }
+        }
+    }
+
+    fn termd_socket_op(&mut self, cx: &mut Cx, req: &JsonValue) -> Result<JsonValue, String> {
+        let Some(ref mut tb) = self.st.termd else {
+            return Err("termd bridge not initialized".into());
+        };
+        let (reply, store_changed, want_front) = tb.handle_socket_op(req)?;
+        if store_changed || want_front {
+            self.sync_termd_store(cx, want_front);
+        }
+        Ok(reply)
     }
 }

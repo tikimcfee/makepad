@@ -28,6 +28,9 @@
 //!   tbui ask "QUESTION" CHOICE... [--from TEXT] [--timeout SECS]
 //!   tbui guard "TEXT" [--yes LABEL] [--no LABEL]
 
+#[path = "../termd_wire.rs"]
+mod termd_wire;
+
 use makepad_micro_serde::{DeJson, JsonValue, SerJson};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -570,6 +573,7 @@ fn main() {
         }
         "screen" => screen_cmd(rest),
         "stage" => stage_cmd(rest),
+        "termd" => termd_cmd(rest),
         "note" => {
             let mut text = String::new();
             let mut secs = 10.0f64;
@@ -782,6 +786,401 @@ fn main() {
                 }
             }
         }
-        _ => die("show | jit | stage | note | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | confirm"),
+        _ => die("show | jit | termd | stage | note | reload | screen | save | unsave | close | lib | set | push | get | watch | ask | confirm"),
+    }
+}
+
+fn try_shell_client() -> Option<Client> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let cand = if let Some(p) = var("TB_SHELL_SOCK") {
+        Some(p)
+    } else if let Some(dir) = var("XDG_RUNTIME_DIR") {
+        Some(format!("{dir}/tb-shell.sock"))
+    } else {
+        std::fs::read_dir("/run/user")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join("tb-shell.sock"))
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+    }?;
+    let out = UnixStream::connect(&cand).ok()?;
+    let _ = out.set_read_timeout(Some(Duration::from_secs(2)));
+    let lines = BufReader::new(out.try_clone().ok()?).lines();
+    Some(Client { out, lines })
+}
+
+fn resolve_active_target(
+    explicit_ns: Option<String>,
+    explicit_id: Option<String>,
+) -> (String, Option<String>) {
+    if explicit_ns.is_some() && explicit_id.is_some() {
+        return (explicit_ns.unwrap(), explicit_id);
+    }
+    if let Some(mut c) = try_shell_client() {
+        let rep = c.call(obj(vec![("op", "get".into()), ("keys", list("termd"))]));
+        if let Some(active) = rep
+            .get("state")
+            .and_then(|s| s.get("termd"))
+            .and_then(|t| t.get("active"))
+        {
+            let sh_ns = active.get("ns").and_then(|v| v.as_str()).unwrap_or("");
+            let sh_id = active.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            match (&explicit_ns, &explicit_id) {
+                (None, None) if !sh_id.is_empty() => {
+                    return (
+                        if sh_ns.is_empty() { "default".into() } else { sh_ns.into() },
+                        Some(sh_id.into()),
+                    );
+                }
+                (Some(ns), None) if ns == sh_ns && !sh_id.is_empty() => {
+                    return (ns.clone(), Some(sh_id.into()));
+                }
+                _ => {}
+            }
+        }
+    }
+    (explicit_ns.unwrap_or_else(|| "default".into()), explicit_id)
+}
+
+fn termd_cmd(args: &[String]) {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let rest = &args[args.len().min(1)..];
+    match sub {
+        "create" => {
+            let mut ns = "default".to_string();
+            let mut id: Option<String> = None;
+            let mut cwd: Option<String> = None;
+            let mut cmd: Option<String> = None;
+            let mut cols: u16 = 48;
+            let mut rows: u16 = 32;
+            let mut focus = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns = rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS"));
+                        i += 2;
+                    }
+                    "--id" => {
+                        id = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--id ID")));
+                        i += 2;
+                    }
+                    "--cwd" => {
+                        cwd = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--cwd DIR")));
+                        i += 2;
+                    }
+                    "--cmd" => {
+                        cmd = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--cmd CMD")));
+                        i += 2;
+                    }
+                    "--cols" => {
+                        cols = rest
+                            .get(i + 1)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or_else(|| die("--cols N"));
+                        i += 2;
+                    }
+                    "--rows" => {
+                        rows = rest
+                            .get(i + 1)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or_else(|| die("--rows N"));
+                        i += 2;
+                    }
+                    "--focus" => {
+                        focus = true;
+                        i += 1;
+                    }
+                    other => die(&format!("termd create: unknown flag {other}")),
+                }
+            }
+            match termd_wire::create_terminal(
+                &ns,
+                id.as_deref(),
+                cwd.as_deref(),
+                cmd.as_deref(),
+                cols,
+                rows,
+            ) {
+                Ok(rep) => {
+                    let created_id = rep
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(mut c) = try_shell_client() {
+                        let _ = c.call(obj(vec![
+                            ("op", "termd".into()),
+                            ("sub", "activated".into()),
+                            ("ns", ns.as_str().into()),
+                            ("id", created_id.as_str().into()),
+                            ("focus", JsonValue::Bool(focus)),
+                        ]));
+                    }
+                    report(&rep);
+                }
+                Err(e) => die(&format!("termd create: {e}")),
+            }
+        }
+        "paste" => {
+            let mut ns_opt: Option<String> = None;
+            let mut id_opt: Option<String> = None;
+            let mut enter = false;
+            let mut allow_unsafe = false;
+            let mut positional: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS")));
+                        i += 2;
+                    }
+                    "--id" => {
+                        id_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--id ID")));
+                        i += 2;
+                    }
+                    "--enter" => {
+                        enter = true;
+                        i += 1;
+                    }
+                    "--allow-unsafe" | "--force" => {
+                        allow_unsafe = true;
+                        i += 1;
+                    }
+                    "--" => {
+                        positional.extend_from_slice(&rest[i + 1..]);
+                        break;
+                    }
+                    a if a.starts_with('-') && a != "-" => {
+                        die(&format!("termd paste: unknown flag {a}"));
+                    }
+                    a => {
+                        positional.push(a.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            let text = if positional.is_empty() || (positional.len() == 1 && positional[0] == "-") {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .unwrap_or_else(|e| die(&format!("stdin: {e}")));
+                buf
+            } else {
+                positional.join(" ")
+            };
+            let (ns, resolved_id_opt) = resolve_active_target(ns_opt, id_opt);
+            match termd_wire::paste_terminal(
+                &ns,
+                resolved_id_opt.as_deref(),
+                &text,
+                enter,
+                allow_unsafe,
+            ) {
+                Ok((id, termd_wire::PasteOutcome::Written { written, entered })) => {
+                    report(&obj(vec![
+                        ("ok", JsonValue::Bool(true)),
+                        ("ns", ns.as_str().into()),
+                        ("id", id.as_str().into()),
+                        ("written", JsonValue::U64(written)),
+                        ("entered", JsonValue::Bool(entered)),
+                    ]));
+                }
+                Ok((id, termd_wire::PasteOutcome::UnsafePaste { lines, preview })) => {
+                    let mut staged = false;
+                    if let Some(mut c) = try_shell_client() {
+                        let rep = c.call(obj(vec![
+                            ("op", "termd".into()),
+                            ("sub", "stage_paste".into()),
+                            ("ns", ns.as_str().into()),
+                            ("id", id.as_str().into()),
+                            ("text", text.as_str().into()),
+                            ("enter", JsonValue::Bool(enter)),
+                        ]));
+                        staged = rep.get("ok") == Some(&JsonValue::Bool(true));
+                    }
+                    println!(
+                        "{}",
+                        obj(vec![
+                            ("ok", JsonValue::Bool(false)),
+                            ("code", "unsafe_paste".into()),
+                            ("staged", JsonValue::Bool(staged)),
+                            ("ns", ns.as_str().into()),
+                            ("id", id.as_str().into()),
+                            ("lines", JsonValue::U64(lines as u64)),
+                            ("preview", preview.as_str().into()),
+                        ])
+                        .serialize_json()
+                    );
+                    exit(2);
+                }
+                Err(e) => die(&format!("termd paste: {e}")),
+            }
+        }
+        "key" => {
+            let mut ns_opt: Option<String> = None;
+            let mut id_opt: Option<String> = None;
+            let mut ctrl = false;
+            let mut alt = false;
+            let mut shift = false;
+            let mut key_spec: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS")));
+                        i += 2;
+                    }
+                    "--id" => {
+                        id_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--id ID")));
+                        i += 2;
+                    }
+                    "--ctrl" => {
+                        ctrl = true;
+                        i += 1;
+                    }
+                    "--alt" => {
+                        alt = true;
+                        i += 1;
+                    }
+                    "--shift" => {
+                        shift = true;
+                        i += 1;
+                    }
+                    a if a.starts_with('-') => die(&format!("termd key: unknown flag {a}")),
+                    a => {
+                        key_spec = Some(a.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            let spec = key_spec.unwrap_or_else(|| {
+                die("termd key <KEY_SPEC> [--ctrl] [--alt] [--shift] [--ns NS] [--id ID]")
+            });
+            let (ns, resolved_id_opt) = resolve_active_target(ns_opt, id_opt);
+            match termd_wire::send_key_terminal(
+                &ns,
+                resolved_id_opt.as_deref(),
+                &spec,
+                ctrl,
+                alt,
+                shift,
+            ) {
+                Ok((id, written)) => {
+                    report(&obj(vec![
+                        ("ok", JsonValue::Bool(true)),
+                        ("ns", ns.as_str().into()),
+                        ("id", id.as_str().into()),
+                        ("key", spec.as_str().into()),
+                        ("written", JsonValue::U64(written)),
+                    ]));
+                }
+                Err(e) => die(&format!("termd key: {e}")),
+            }
+        }
+        "kill" => {
+            let mut ns_opt: Option<String> = None;
+            let mut id_opt: Option<String> = None;
+            let mut sig_opt: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS")));
+                        i += 2;
+                    }
+                    "--id" => {
+                        id_opt = Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--id ID")));
+                        i += 2;
+                    }
+                    "--signal" => {
+                        sig_opt =
+                            Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--signal SIG")));
+                        i += 2;
+                    }
+                    a if !a.starts_with('-') && id_opt.is_none() => {
+                        id_opt = Some(a.to_string());
+                        i += 1;
+                    }
+                    other => die(&format!("termd kill: unknown arg {other}")),
+                }
+            }
+            let (ns, resolved_id_opt) = resolve_active_target(ns_opt, id_opt);
+            match termd_wire::kill_terminal(&ns, resolved_id_opt.as_deref(), sig_opt.as_deref()) {
+                Ok(id) => {
+                    if let Some(mut c) = try_shell_client() {
+                        let _ = c.call(obj(vec![("op", "termd".into()), ("sub", "probe".into())]));
+                    }
+                    report(&obj(vec![
+                        ("ok", JsonValue::Bool(true)),
+                        ("ns", ns.as_str().into()),
+                        ("killed", id.as_str().into()),
+                    ]));
+                }
+                Err(e) => die(&format!("termd kill: {e}")),
+            }
+        }
+        "list" | "ls" => {
+            let mut ns_filter: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns_filter =
+                            Some(rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS")));
+                        i += 2;
+                    }
+                    other => die(&format!("termd list: unknown flag {other}")),
+                }
+            }
+            let namespaces: Vec<String> = match ns_filter {
+                Some(ns) => vec![ns],
+                None => vec!["default".into(), "agents".into()],
+            };
+            let mut out = Vec::new();
+            for ns in namespaces {
+                if let Ok(list) = termd_wire::list_terminals(&ns) {
+                    for mut item in list {
+                        if let JsonValue::Object(ref mut m) = item {
+                            m.insert("ns".into(), JsonValue::String(ns.clone()));
+                        }
+                        out.push(item);
+                    }
+                }
+            }
+            report(&obj(vec![
+                ("ok", JsonValue::Bool(true)),
+                ("terminals", JsonValue::Array(out)),
+            ]));
+        }
+        "focus" => {
+            let mut ns = "default".to_string();
+            let mut id_opt: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--ns" => {
+                        ns = rest.get(i + 1).cloned().unwrap_or_else(|| die("--ns NS"));
+                        i += 2;
+                    }
+                    a if !a.starts_with('-') => {
+                        id_opt = Some(a.to_string());
+                        i += 1;
+                    }
+                    other => die(&format!("termd focus: unknown flag {other}")),
+                }
+            }
+            let id = id_opt.unwrap_or_else(|| die("termd focus [--ns NS] <ID>"));
+            report(&Client::connect().call(obj(vec![
+                ("op", "termd".into()),
+                ("sub", "activated".into()),
+                ("ns", ns.as_str().into()),
+                ("id", id.as_str().into()),
+                ("focus", JsonValue::Bool(true)),
+            ])));
+        }
+        _ => die("termd <create|paste|key|kill|list|focus> ..."),
     }
 }

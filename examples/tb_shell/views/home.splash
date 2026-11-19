@@ -1,6 +1,6 @@
-// HOME: 4x2 core grid (`Agents`, `Voice`, `Chat`, `Battery`, `Sound`, `Display`, `Wi-Fi`,
-// `Stage`), quick `Power` button, saved `state.workspaces`, and live/saved agent surfaces
-// with one-tap `[+]` stack-add and `[x]` close.
+// HOME: 5x2 core grid (`Agents`, `Voice`, `Chat`, `Terminal`, `Battery`, `Sound`, `Display`,
+// `Wi-Fi`, `Stage`, `+ Shell`), quick `Power` button, saved `state.workspaces`, and live/saved
+// agent surfaces with one-tap `[+]` stack-add and `[x]` close.
 let CoreTile = Squircle{
     width: Fill height: 82 flow: Down spacing: 3
     padding: Inset{left: 14 right: 14 top: 8 bottom: 8}
@@ -32,6 +32,8 @@ main := ScrollYView{
         let snd = state.sound ?? nil
         let d = state.display ?? nil
         let w = state.wifi ?? nil
+        let td = state.termd ?? nil
+        let term_n = if td == nil { 0 } else { td.count ?? 0 }
         let stg = state.stage ?? nil
         let slots_n = if stg == nil { 1 } else { (stg.slots ?? []).len() }
         let surfs = state.surfaces ?? []
@@ -45,21 +47,27 @@ main := ScrollYView{
         }
         View{
             width: Fill height: Fit flow: Right spacing: 9
-            on_item_tap: |col| { if col == 0 { front("chat") } else { front("battery") } }
+            on_item_tap: |col| { if col == 0 { front("chat") } else { front("terminal") } }
             CoreTile{t.text: "Chat" s.text: if c == nil || (c.preview ?? "") == "" { "no replies yet" } else { c.preview ?? "" }}
+            CoreTile{t.text: "Terminal" s.text: "" + term_n + (if term_n == 1 { " live session" } else { " live sessions" })}
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 9
+            on_item_tap: |col| { if col == 0 { front("battery") } else { front("sound") } }
             CoreTile{t.text: "Battery" s.text: if b == nil { "reading..." } else { show(b.pct ?? nil, "%") + " · " + (b.state ?? "") }}
-        }
-        View{
-            width: Fill height: Fit flow: Right spacing: 9
-            on_item_tap: |col| { if col == 0 { front("sound") } else { front("display") } }
             CoreTile{t.text: "Sound" s.text: if snd == nil { "reading..." } else { show(snd.volume_db ?? nil, " dB") + " · " + (snd.speaker_state ?? "") }}
-            CoreTile{t.text: "Display" s.text: if d == nil { "reading..." } else { show(d.brightness ?? nil, "") + "/" + show(d.max ?? 255, "") + " · " + (d.panel ?? "on") }}
         }
         View{
             width: Fill height: Fit flow: Right spacing: 9
-            on_item_tap: |col| { if col == 0 { front("wifi") } else { front("stage") } }
+            on_item_tap: |col| { if col == 0 { front("display") } else { front("wifi") } }
+            CoreTile{t.text: "Display" s.text: if d == nil { "reading..." } else { show(d.brightness ?? nil, "") + "/" + show(d.max ?? 255, "") + " · " + (d.panel ?? "on") }}
             CoreTile{t.text: "Wi-Fi" s.text: if w == nil { "reading..." } else { (w.state ?? "off") + (if (w.ipv4 ?? nil) == nil { "" } else { " · " + w.ipv4 }) }}
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 9
+            on_item_tap: |col| { if col == 0 { front("stage") } else { emit("termd_create", {ns: "default", focus: true}) } }
             CoreTile{t.text: "Stage" s.text: "" + slots_n + (if slots_n == 1 { " active slot" } else { " active slots" })}
+            CoreTile{t.text: "+ New Shell" s.text: "start local terminal"}
         }
 
         if wks.len() > 0 {

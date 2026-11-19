@@ -9,8 +9,8 @@ let SectionHdr = RoundedView{
     draw_bg.color: #x151b26 draw_bg.border_radius: 12.0
 }
 let AgentCard = RoundedView{
-    width: Fill height: 60 flow: Right spacing: 10
-    padding: Inset{left: 14 right: 10} align: Align{y: 0.5}
+    width: Fill height: 60 flow: Right spacing: 7
+    padding: Inset{left: 12 right: 8} align: Align{y: 0.5}
     show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
@@ -78,7 +78,7 @@ main := View{
         let cur_target = state.target ?? nil
 
         if is_compact {
-            View{
+            compact_bar := View{
                 width: Fill height: 58 padding: Inset{left: 10 right: 10 top: 8 bottom: 8}
                 ScrollXView{
                     width: Fill height: 42 flow: Right spacing: 8 align: Align{y: 0.5}
@@ -99,6 +99,9 @@ main := View{
                 }
             }
         } else {
+            let td = state.termd ?? nil
+            let term_count = if td == nil { 0 } else { td.count ?? 0 }
+            let local_host = if td == nil { "local" } else { td.local_host ?? "local" }
             let collapsed = state.agents_collapsed ?? []
             let mut raw_hosts = []
             for a in list {
@@ -108,10 +111,49 @@ main := View{
                 }
             }
             let hosts = sort_items(raw_hosts, false)
-            let list_h = ((slot.height ?? 780.0) - 56.0)
+            let list_h = ((slot.height ?? 780.0) - 102.0)
             let safe_h = if list_h < 120.0 { 120.0 } else { list_h }
-            View{
-                width: Fill height: Fit flow: Down padding: 14 spacing: 10
+            full_box := View{
+                width: Fill height: Fit flow: Down padding: 14 spacing: 9
+                // Initiator bar: +Shell, +agy, +claude, Terms (N) ->
+                View{
+                    width: Fill height: 36 flow: Right spacing: 5
+                    on_item_tap: |col| {
+                        if col == 0 { emit("termd_create", {ns: "default", focus: true}) }
+                        if col == 1 { emit("termd_spawn_agent", {backend: "agy"}) }
+                        if col == 2 { emit("termd_spawn_agent", {backend: "claude"}) }
+                        if col == 3 { front("terminal") }
+                    }
+                    RoundedView{
+                        width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                        padding: Inset{left: 9 right: 9} show_bg: true
+                        draw_bg.color: #x1e3a5f draw_bg.border_radius: 10.0
+                        Label{draw_text.text_style.font_size: 12.5 draw_text.color: #x93c5fd text: "+Shell"}
+                    }
+                    RoundedView{
+                        width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                        padding: Inset{left: 9 right: 9} show_bg: true
+                        draw_bg.color: #x1e293b draw_bg.border_radius: 10.0
+                        Label{draw_text.text_style.font_size: 12.5 draw_text.color: #xe2e8f0 text: "+agy"}
+                    }
+                    RoundedView{
+                        width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                        padding: Inset{left: 9 right: 9} show_bg: true
+                        draw_bg.color: #x1e293b draw_bg.border_radius: 10.0
+                        Label{draw_text.text_style.font_size: 12.5 draw_text.color: #xe2e8f0 text: "+claude"}
+                    }
+                    RoundedView{
+                        width: Fill height: 36 align: Align{x: 0.5 y: 0.5}
+                        padding: Inset{left: 6 right: 6} show_bg: true
+                        draw_bg.color: #x182232 draw_bg.border_radius: 10.0
+                        Label{
+                            max_lines: 1 text_overflow: Ellipsis
+                            draw_text.text_style.font_size: 12.0
+                            draw_text.color: #x93c5fd
+                            text: "Terms (" + show(term_count, ") ->")
+                        }
+                    }
+                }
                 Small{text: "Agents · tap device to fold, agent to target"}
                 ScrollYView{
                     width: Fill height: safe_h flow: Down spacing: 8
@@ -151,9 +193,9 @@ main := View{
                                         text: host_name
                                     }
                                     if is_col && has_sel {
-                                        Dot{width: 8 height: 8 draw_bg.border_radius: 4.0 draw_bg.color: #x60a5fa}
+                                        sel_dot := Dot{width: 8 height: 8 draw_bg.border_radius: 4.0 draw_bg.color: #x60a5fa}
                                     }
-                                    Small{
+                                    cnt_lbl := Small{
                                         text: count_txt
                                         draw_text.color: #x8b95a5
                                     }
@@ -163,32 +205,53 @@ main := View{
                                 for a in list {
                                     if agent_host_name(a) == host_name {
                                         let aid = a.id ?? ""
+                                        let aname = a.name ?? aid
+                                        let asess = a.session ?? ""
                                         let sel = aid == cur_target
+                                        let is_local = host_name == local_host || host_name == "local"
                                         AgentCard{
                                             draw_bg.color: if sel { #x1f314a } else { #x1c2230 }
-                                            Dot{draw_bg.color: status_color(a.status ?? "")}
-                                            View{
-                                                width: Fill height: 48 align: Align{x: 0.0 y: 0.5}
-                                                padding: Inset{left: 4 right: 4}
-                                                on_item_tap: |i| set("target", aid)
-                                                Label{
-                                                    width: Fill
-                                                    draw_text.text_style.font_size: 15
-                                                    draw_text.color: #xeeeeee
-                                                    text: a.name ?? aid
+                                            on_item_tap: |col| {
+                                                if col <= 1 { set("target", aid) }
+                                                if is_local && col == 2 {
+                                                    emit("termd_focus_agent", {name: aname, session: asess})
                                                 }
-                                            }
-                                            RoundedView{
-                                                width: Fit height: 38 align: Align{x: 0.5 y: 0.5}
-                                                padding: Inset{left: 12 right: 12}
-                                                show_bg: true
-                                                draw_bg.color: #x222c3e draw_bg.border_radius: 10.0
-                                                on_item_tap: |i| {
+                                                if (is_local && col == 3) || (!is_local && col == 2) {
                                                     set("target", aid)
                                                     front("chat")
                                                 }
+                                            }
+                                            Dot{draw_bg.color: status_color(a.status ?? "")}
+                                            View{
+                                                width: Fill height: 48 align: Align{x: 0.0 y: 0.5}
+                                                padding: Inset{left: 2 right: 2}
                                                 Label{
-                                                    draw_text.text_style.font_size: 13
+                                                    width: Fill max_lines: 1 text_overflow: Ellipsis
+                                                    draw_text.text_style.font_size: 14.5
+                                                    draw_text.color: #xeeeeee
+                                                    text: aname
+                                                }
+                                            }
+                                            if is_local {
+                                                term_pill := RoundedView{
+                                                    width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                                                    padding: Inset{left: 9 right: 9}
+                                                    show_bg: true
+                                                    draw_bg.color: #x1c3147 draw_bg.border_radius: 10.0
+                                                    Label{
+                                                        draw_text.text_style.font_size: 12.5
+                                                        draw_text.color: #x93c5fd
+                                                        text: "Term ->"
+                                                    }
+                                                }
+                                            }
+                                            chat_pill := RoundedView{
+                                                width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                                                padding: Inset{left: 10 right: 10}
+                                                show_bg: true
+                                                draw_bg.color: #x222c3e draw_bg.border_radius: 10.0
+                                                Label{
+                                                    draw_text.text_style.font_size: 12.5
                                                     draw_text.color: #xeeeeee
                                                     text: "Chat ->"
                                                 }

@@ -1,0 +1,266 @@
+// TERMINAL: native 60fps GPU `TermdView` (`g3d-termd` Protocol 1.5) with session selector,
+// `+ Shell` initiator, `48c`/`80c` column zoom, 2-tap `Kill`, multiline paste confirm,
+// and a thumb-friendly 2-row Special-Key Strip (`new_batch: false` throughout).
+let BarPill = RoundedView{
+    width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+    padding: Inset{left: 10 right: 10}
+    show_bg: true
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 10.0
+}
+let KeyCap = RoundedView{
+    width: Fill height: 38 align: Align{x: 0.5 y: 0.5}
+    show_bg: true
+    draw_bg.color: #x1c2230 draw_bg.border_radius: 10.0
+    lbl := Label{
+        draw_text.text_style.font_size: 13.5
+        draw_text.color: #xe5e9f0
+        text: ""
+    }
+}
+let SessionRow = RoundedView{
+    width: Fill height: 40 flow: Right spacing: 8 align: Align{y: 0.5}
+    padding: Inset{left: 12 right: 12}
+    show_bg: true
+    draw_bg.color: #x18202e draw_bg.border_radius: 10.0
+}
+let EmptyActionCard = RoundedView{
+    width: Fill height: 54 align: Align{x: 0.5 y: 0.5}
+    padding: Inset{left: 14 right: 14}
+    show_bg: true
+    draw_bg.color: #x1e3352 draw_bg.border_radius: 12.0
+}
+fn active_label_for(terms, ns, id) {
+    if id == "" { return "No session" }
+    for t in terms ?? [] {
+        if (t.ns ?? "") == ns && (t.id ?? "") == id {
+            return t.label ?? (ns + ":" + id)
+        }
+    }
+    ns + ":" + id
+}
+width: Fill height: Fill flow: Down padding: Inset{left: 8 right: 8 top: 6 bottom: 8} spacing: 6
+main := View{
+    width: Fill height: Fill flow: Down spacing: 6
+    on_render: || {
+        let td = state.termd ?? nil
+        let terms = if td == nil { [] } else { td.terminals ?? [] }
+        let act = if td == nil { nil } else { td.active ?? nil }
+        let active_ns = if act == nil { "default" } else { act.ns ?? "default" }
+        let active_id = if act == nil { "" } else { act.id ?? "" }
+        let cols_mode = if td == nil { "48" } else { td.cols_mode ?? "48" }
+        let cols_n = if cols_mode == "80" { 80 } else { 48 }
+        let ctrl_on = if td == nil { false } else { td.ctrl_latched ?? false }
+        let kill_conf = if td == nil { "" } else { td.kill_confirm ?? "" }
+        let picker_open = if td == nil { false } else { td.picker_open ?? false }
+        let pp = if td == nil { nil } else { td.pending_paste ?? nil }
+        let err_msg = if td == nil { "" } else { td.last_error ?? "" }
+        let kill_armed = active_id != "" && kill_conf == (active_ns + ":" + active_id)
+        let sel_text = active_label_for(terms, active_ns, active_id) + (if terms.len() > 1 { "  v" } else { "" })
+
+        // 1. Top compact bar (38 px) — full-pill hit rects via parent `on_item_tap`
+        top_bar := View{
+            width: Fill height: 38 flow: Right spacing: 6 align: Align{y: 0.5}
+            on_item_tap: |col| {
+                if col == 0 && terms.len() > 1 { emit("termd_picker_toggle", {}) }
+                if col == 1 { emit("termd_create", {ns: "default", focus: true}) }
+                if col == 2 { emit("termd_cols_toggle", {}) }
+                if col == 3 {
+                    if kill_armed { emit("termd_kill_confirm", {}) } else { emit("termd_kill_arm", {}) }
+                }
+                if col == 4 { emit("termd_kill_cancel", {}) }
+            }
+            sel_pill := RoundedView{
+                width: Fill height: 36 align: Align{x: 0.0 y: 0.5}
+                padding: Inset{left: 10 right: 10}
+                show_bg: true
+                draw_bg.color: if picker_open { #x24344d } else { #x18202e }
+                draw_bg.border_radius: 10.0
+                Label{
+                    width: Fill max_lines: 1 text_overflow: Ellipsis
+                    draw_text.text_style.font_size: 13.5
+                    draw_text.color: #xe5e9f0
+                    text: sel_text
+                }
+            }
+            new_sh_pill := BarPill{
+                draw_bg.color: #x1e3a5f
+                Label{draw_text.text_style.font_size: 13 draw_text.color: #x93c5fd text: "+Shell"}
+            }
+            cols_pill := BarPill{
+                draw_bg.color: if cols_mode == "80" { #x284772 } else { #x1c2230 }
+                Label{draw_text.text_style.font_size: 13 draw_text.color: #xe5e9f0 text: cols_mode + "c"}
+            }
+            if active_id != "" {
+                if kill_armed {
+                    kill_yes := BarPill{
+                        draw_bg.color: #x7f1d1d
+                        Label{draw_text.text_style.font_size: 13 draw_text.color: #xfecaca text: "Confirm"}
+                    }
+                    kill_no := BarPill{
+                        Label{draw_text.text_style.font_size: 13 draw_text.color: #x9aa4b2 text: "x"}
+                    }
+                } else {
+                    kill_arm := BarPill{
+                        draw_bg.color: #x3a1d24
+                        Label{draw_text.text_style.font_size: 13 draw_text.color: #xfca5a5 text: "Kill"}
+                    }
+                }
+            }
+        }
+
+        // Optional inline session dropdown
+        if picker_open && terms.len() > 1 {
+            picker_box := RoundedView{
+                width: Fill height: Fit flow: Down spacing: 4 padding: 6
+                show_bg: true
+                draw_bg.color: #x111622 draw_bg.border_radius: 12.0
+                on_item_tap: |idx| {
+                    if idx >= 0 && idx < terms.len() {
+                        let chosen = terms[idx]
+                        emit("termd_select", {ns: chosen.ns ?? "default", id: chosen.id ?? ""})
+                    }
+                }
+                for t in terms {
+                    let tns = t.ns ?? "default"
+                    let tid = t.id ?? ""
+                    let is_cur = tns == active_ns && tid == active_id
+                    SessionRow{
+                        draw_bg.color: if is_cur { #x233858 } else { #x18202e }
+                        Dot{width: 8 height: 8 draw_bg.border_radius: 4.0 draw_bg.color: if is_cur { #x3ddc84 } else { #x64748b }}
+                        Label{
+                            width: Fill max_lines: 1 text_overflow: Ellipsis
+                            draw_text.text_style.font_size: 13.5
+                            draw_text.color: #xe5e9f0
+                            text: t.label ?? (tns + ":" + tid)
+                        }
+                        Small{text: show(t.cols ?? 48, "x") + show(t.rows ?? 24, "")}
+                    }
+                }
+            }
+        }
+
+        // Optional inline multiline unsafe_paste confirm bar
+        if pp != nil {
+            paste_bar := RoundedView{
+                width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
+                padding: Inset{left: 10 right: 8 top: 6 bottom: 6}
+                show_bg: true
+                draw_bg.color: #x332714 draw_bg.border_radius: 10.0
+                on_item_tap: |col| {
+                    if col == 1 { emit("termd_confirm_paste", {}) }
+                    if col == 2 { emit("termd_cancel_paste", {}) }
+                }
+                msg_box := View{
+                    width: Fill height: 32 align: Align{x: 0.0 y: 0.5}
+                    Label{
+                        width: Fill max_lines: 1 text_overflow: Ellipsis
+                        draw_text.text_style.font_size: 12.5
+                        draw_text.color: #xfde68a
+                        text: "Paste " + show(pp.lines ?? 2, " lines? ") + (pp.preview ?? "")
+                    }
+                }
+                paste_ok := BarPill{
+                    height: 32 draw_bg.color: #x1e4d35
+                    Label{draw_text.text_style.font_size: 12.5 draw_text.color: #xd1fae5 text: "Paste"}
+                }
+                paste_cancel := BarPill{
+                    height: 32
+                    Label{draw_text.text_style.font_size: 12.5 draw_text.color: #x9aa4b2 text: "Cancel"}
+                }
+            }
+        }
+
+        if err_msg != "" {
+            err_lbl := Small{width: Fill max_lines: 1 text_overflow: Ellipsis text: err_msg draw_text.color: #xff7a93}
+        }
+
+        // 2. Center terminal viewport or friendly empty-state initiator
+        if active_id != "" && (terms.len() > 0 || active_ns == "agents") {
+            term := TermdView{
+                width: Fill
+                height: Fill
+                ns: active_ns
+                term_id: active_id
+                cols_preset: cols_n
+                focused: true
+            }
+        } else {
+            empty_box := RoundedView{
+                width: Fill height: Fill flow: Down spacing: 12
+                padding: Inset{left: 18 right: 18 top: 28 bottom: 28}
+                align: Align{x: 0.5 y: 0.5}
+                show_bg: true
+                draw_bg.color: #x131722 draw_bg.border_radius: 12.0
+                on_item_tap: |row| {
+                    if row == 2 { emit("termd_create", {ns: "default", focus: true}) }
+                    if row == 3 { emit("termd_create", {ns: "default", cwd: "@workspace", focus: true}) }
+                }
+                Title{text: "Local Terminal"}
+                Small{text: "60fps GPU terminal · PTT voice + keys"}
+                EmptyActionCard{
+                    Label{
+                        draw_text.text_style.font_size: 15.5
+                        draw_text.color: #xe5e9f0
+                        text: "+ New Shell (Home)"
+                    }
+                }
+                EmptyActionCard{
+                    draw_bg.color: #x1a283d
+                    Label{
+                        draw_text.text_style.font_size: 15
+                        draw_text.color: #x93c5fd
+                        text: "+ Agent Workspace Shell"
+                    }
+                }
+            }
+        }
+
+        // 3. Thumb-friendly 2-row Special-Key Strip (`new_batch: false`)
+        key_strip := View{
+            width: Fill height: Fit flow: Down spacing: 5
+            row1 := View{
+                width: Fill height: 38 flow: Right spacing: 5
+                on_item_tap: |col| {
+                    if col == 0 { emit("termd_ctrl_toggle", {}) }
+                    if col == 1 { emit("termd_key", {key: "Escape"}) }
+                    if col == 2 { emit("termd_key", {key: "Tab"}) }
+                    if col == 3 { emit("termd_key", {key: "c", ctrl: true}) }
+                    if col == 4 { emit("termd_key", {key: "Backspace"}) }
+                }
+                KeyCap{
+                    draw_bg.color: if ctrl_on { #x284772 } else { #x1c2230 }
+                    lbl.text: "Ctrl"
+                    lbl.draw_text.color: if ctrl_on { #x93c5fd } else { #xe5e9f0 }
+                }
+                KeyCap{lbl.text: "Esc"}
+                KeyCap{lbl.text: "Tab"}
+                KeyCap{draw_bg.color: #x2d1e26 lbl.text: "^C" lbl.draw_text.color: #xfca5a5}
+                KeyCap{lbl.text: "Bksp"}
+            }
+            row2 := View{
+                width: Fill height: 40 flow: Right spacing: 5
+                on_item_tap: |col| {
+                    if col == 0 { emit("termd_key", {key: "ArrowLeft"}) }
+                    if col == 1 { emit("termd_key", {key: "ArrowDown"}) }
+                    if col == 2 { emit("termd_key", {key: "ArrowUp"}) }
+                    if col == 3 { emit("termd_key", {key: "ArrowRight"}) }
+                    if col == 4 { emit("termd_key", {key: "Enter"}) }
+                }
+                KeyCap{height: 40 lbl.text: "←"}
+                KeyCap{height: 40 lbl.text: "↓"}
+                KeyCap{height: 40 lbl.text: "↑"}
+                KeyCap{height: 40 lbl.text: "→"}
+                RoundedView{
+                    width: 84 height: 40 align: Align{x: 0.5 y: 0.5}
+                    show_bg: true
+                    draw_bg.color: #x1e4d35 draw_bg.border_radius: 10.0
+                    Label{
+                        draw_text.text_style.font_size: 14
+                        draw_text.color: #xd1fae5
+                        text: "Enter"
+                    }
+                }
+            }
+        }
+    }
+}
