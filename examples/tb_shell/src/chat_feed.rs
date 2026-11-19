@@ -220,14 +220,29 @@ fn needs_markdown(s: &str) -> bool {
     false
 }
 
-fn fence_marker(trimmed: &str) -> Option<&'static str> {
-    if trimmed.starts_with("```") {
-        Some("```")
-    } else if trimmed.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
+/// The run of 3+ backticks or tildes that opens a fence, as written (a fence opened with
+/// four closes with four).
+fn fence_marker(trimmed: &str) -> Option<&str> {
+    let c = *trimmed.as_bytes().first()?;
+    if c != b'`' && c != b'~' {
+        return None;
     }
+    let n = trimmed.bytes().take_while(|b| *b == c).count();
+    (n >= 3).then(|| &trimmed[..n])
+}
+
+/// Whether `trimmed` closes the fence `marker` opened: the same character, at least as many,
+/// nothing after them.
+fn closes_fence(trimmed: &str, marker: &str) -> bool {
+    let c = marker.as_bytes()[0];
+    let n = trimmed.bytes().take_while(|b| *b == c).count();
+    n >= marker.len() && trimmed[n..].trim().is_empty()
+}
+
+/// An ATX heading: 1 to 6 `#` and then a space or the line's end (`#123` is not one).
+fn is_heading(trimmed: &str) -> bool {
+    let n = trimmed.bytes().take_while(|b| *b == b'#').count();
+    (1..=6).contains(&n) && trimmed[n..].chars().next().map_or(true, char::is_whitespace)
 }
 
 /// Rows smaller than this are merged with the next block of the same message, so a reply of
@@ -249,7 +264,7 @@ fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
     let mut cur = String::new();
     // (marker, opening line) of the fence `cur` is inside, and the fence's indent: a fence
     // under a list item stands alone in its row, so its lines lose that indent.
-    let mut fence: Option<(&'static str, String)> = None;
+    let mut fence: Option<(String, String)> = None;
     let mut fence_indent = 0usize;
     let dedent = |line: &'_ str, n: usize| -> String {
         let spaces = line.bytes().take(n).take_while(|b| *b == b' ').count();
@@ -257,6 +272,9 @@ fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
     };
     let mut fence_lines = 0usize;
     let mut heading_pending = false;
+    // A wall of text passed `wall`: the row ends before the next line, unless that line
+    // continues something by indent (it would render as code at the start of a row).
+    let mut cut_pending = false;
 
     let flush = |cur: &mut String, blocks: &mut Vec<String>| {
         let t = cur.trim_matches(['\n', '\r']);
@@ -270,18 +288,18 @@ fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
         let trimmed = line.trim_start();
         if let Some((marker, open)) = fence.as_ref() {
             cur.push_str(&dedent(line, fence_indent));
-            if trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty() {
+            if closes_fence(trimmed, marker) {
                 fence = None;
                 flush(&mut cur, &mut blocks);
                 continue;
             }
             fence_lines += 1;
             if fence_lines >= CODE_ROW_LINES {
-                let (marker, open) = (*marker, open.clone());
+                let (marker, open) = (marker.clone(), open.clone());
                 if !cur.ends_with('\n') {
                     cur.push('\n');
                 }
-                cur.push_str(marker);
+                cur.push_str(&marker);
                 flush(&mut cur, &mut blocks);
                 cur.push_str(&open);
                 cur.push('\n');
@@ -294,7 +312,8 @@ fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
                 flush(&mut cur, &mut blocks);
             }
             heading_pending = false;
-            fence = Some((marker, trimmed.trim_end_matches(['\n', '\r']).to_string()));
+            cut_pending = false;
+            fence = Some((marker.to_string(), trimmed.trim_end_matches(['\n', '\r']).to_string()));
             fence_indent = line.len() - trimmed.len();
             fence_lines = 0;
             if !cur.is_empty() && !cur.ends_with('\n') {
@@ -307,18 +326,25 @@ fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
             // A blank line ends a block, unless a heading waits for its block.
             if !heading_pending {
                 flush(&mut cur, &mut blocks);
+                cut_pending = false;
             }
             continue;
         }
-        if trimmed.starts_with('#') && !heading_pending {
+        if cut_pending && !line.starts_with("    ") && !line.starts_with('\t') {
             flush(&mut cur, &mut blocks);
+            cut_pending = false;
+        }
+        let heading = is_heading(trimmed);
+        if heading && !heading_pending {
+            flush(&mut cur, &mut blocks);
+            cut_pending = false;
             heading_pending = true;
-        } else if !trimmed.starts_with('#') {
+        } else if !heading {
             heading_pending = false;
         }
         cur.push_str(line);
         if cur.len() >= wall && line.ends_with('\n') && !trimmed.starts_with('|') {
-            flush(&mut cur, &mut blocks);
+            cut_pending = true;
         }
     }
     flush(&mut cur, &mut blocks);
@@ -813,7 +839,7 @@ impl ScriptHook for ChatFeed {
                     }
                 }
                 self.has_inline_items = true;
-                self.rebuild_rows("", 0, &parsed, false);
+                self.rebuild_rows("", 0, &parsed);
             }
         }
     }
@@ -941,7 +967,7 @@ impl ChatFeed {
         };
         self.seen_store_ver = ver;
         let (agent, hidden_before, msgs) = Self::parse_json_value(&val);
-        self.rebuild_rows(&agent, hidden_before, &msgs, true)
+        self.rebuild_rows(&agent, hidden_before, &msgs)
     }
 
     fn rebuild_rows(
@@ -949,7 +975,6 @@ impl ChatFeed {
         agent: &str,
         hidden_before: usize,
         msgs: &[FeedMsg],
-        allow_splice: bool,
     ) -> bool {
         let split_target = self.split_bytes.max(600);
         let mut new_rows = Vec::with_capacity(msgs.len().saturating_add(8));
@@ -1028,7 +1053,7 @@ impl ChatFeed {
         let agent_changed = !self.agent_id.is_empty() && self.agent_id != agent;
         let old_has_bar = self.hidden_before > 0 && !self.rows.is_empty();
         let new_has_bar = hidden_before > 0 && !new_rows.is_empty();
-        let plan = if allow_splice && !agent_changed {
+        let plan = if !agent_changed {
             let old_keys: Vec<u64> = self.rows.iter().map(|r| r.key).collect();
             let new_keys: Vec<u64> = new_rows.iter().map(|r| r.key).collect();
             plan_splices(&old_keys, &new_keys, old_has_bar, new_has_bar)
@@ -1042,6 +1067,10 @@ impl ChatFeed {
         self.rows_fingerprint = fp;
         self.pending_range_sync = true;
         match plan {
+            // Two updates before one draw queue both plans. The first one's grown end has no
+            // op (set_item_range adds it at the draw), so an end op of the second can name ids
+            // past the list's range_end: splice_items clamps it, and set_item_range(0, total)
+            // then sets the count, with the rows there rebound by hash. Harmless.
             Some(ops) => self.pending_splices.extend(ops),
             None => {
                 self.pending_reset_tail = true;
