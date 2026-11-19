@@ -34,7 +34,16 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-app_main!(App);
+app_main!(
+    App,
+    font_assets: [
+        "makepad_widgets/resources/jetbrains_mono_variable.ttf",
+        "makepad_widgets/resources/fa-solid-900.ttf",
+        "makepad_widgets/resources/NotoColorEmoji.ttf",
+        INTER_FONT_ASSET,
+        MATH_VIEW_FONT_ASSET,
+    ]
+);
 
 const PRELUDE: &str = include_str!("prelude.splash");
 const BASE: &str = include_str!("../lib/base.splash");
