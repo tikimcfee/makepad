@@ -3,7 +3,7 @@
 let Card = RoundedView{
     width: Fill height: Fit flow: Down spacing: 2
     padding: Inset{top: 8 bottom: 8 left: 12 right: 12}
-    new_batch: true show_bg: true
+    show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
 let Chip = ButtonFlat{

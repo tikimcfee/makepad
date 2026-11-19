@@ -3,7 +3,7 @@
 let RowCard = RoundedView{
     width: Fill height: Fit flow: Right spacing: 6
     padding: Inset{left: 12 right: 8 top: 6 bottom: 6} align: Align{y: 0.5}
-    new_batch: true show_bg: true
+    show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 12.0
 }
 width: Fill height: Fill flow: Down padding: 12
