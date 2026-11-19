@@ -23,10 +23,13 @@ main := View{
         let resets = if w == nil { nil } else { w.resets ?? nil }
         let usb = if w == nil { nil } else { w.usb_ipv4 ?? nil }
         let ts = if w == nil { nil } else { w.tailscale ?? nil }
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
 
         if is_compact {
             View{
-                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                width: Fill height: Fit padding: Inset{left: sa_pad(10.0, cur_l) right: sa_pad(10.0, cur_r) top: 6.0 bottom: 6.0}
                 CompactBar{
                     Dot{draw_bg.color: status_color(st)}
                     Title{width: Fill draw_text.text_style.font_size: 15 text: "Wi-Fi: " + st + (if ip == nil { "" } else { " · " + ip })}
@@ -49,7 +52,7 @@ main := View{
             }
         } else {
             View{
-                width: Fill height: Fit flow: Down padding: 14 spacing: 10
+                width: Fill height: Fit flow: Down padding: Inset{left: sa_pad(14.0, cur_l) right: sa_pad(14.0, cur_r) top: 14.0 bottom: sa_pad(14.0, cur_b)} spacing: 10
                 View{
                     width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
                     Dot{draw_bg.color: status_color(st)}

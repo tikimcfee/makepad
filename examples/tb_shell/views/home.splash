@@ -22,10 +22,13 @@ fn count_agent_surfaces(list) {
     }
     n
 }
-width: Fill height: Fill flow: Down padding: 12
-main := ScrollYView{
-    width: Fill height: Fill flow: Down spacing: 9
+width: Fill height: Fill flow: Down padding: 0
+main := View{
+    width: Fill height: Fill flow: Down
     on_render: || {
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
         let b = state.battery ?? nil
         let v = state.voice ?? nil
         let c = state.chat ?? nil
@@ -38,6 +41,14 @@ main := ScrollYView{
         let slots_n = if stg == nil { 1 } else { (stg.slots ?? []).len() }
         let surfs = state.surfaces ?? []
         let wks = state.workspaces ?? []
+
+        View{
+            width: Fill height: Fill
+            padding: Inset{left: cur_l right: cur_r top: 0.0 bottom: cur_b}
+            ScrollYView{
+                width: Fill height: Fill flow: Down
+                padding: Inset{left: sa_inner(12.0, cur_l) right: sa_inner(12.0, cur_r) top: 12.0 bottom: sa_inner(12.0, cur_b)}
+                spacing: 9
 
         View{
             width: Fill height: Fit flow: Right spacing: 9
@@ -113,6 +124,8 @@ main := ScrollYView{
                 draw_bg.color: #x3a1d24 draw_bg.color_focus: #x3a1d24 draw_bg.color_hover: #x4d2630
                 draw_text.text_style.font_size: 13.5
                 on_click: || front("power")
+            }
+        }
             }
         }
     }

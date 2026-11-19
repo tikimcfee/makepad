@@ -17,10 +17,13 @@ main := View{
         let b = state.battery ?? nil
         let desk = if b == nil { nil } else { b.desk ?? nil }
         let desk_txt = if desk == "1" { "Desk 4.20V cap" } else if desk == "0" { "Portable" } else { show(desk, "") }
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
 
         if is_compact {
             View{
-                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                width: Fill height: Fit padding: Inset{left: sa_pad(10.0, cur_l) right: sa_pad(10.0, cur_r) top: 6.0 bottom: 6.0}
                 CompactBar{
                     Title{
                         width: Fill draw_text.text_style.font_size: 15
@@ -44,7 +47,7 @@ main := View{
             }
         } else {
             View{
-                width: Fill height: Fit flow: Down padding: 14 spacing: 9
+                width: Fill height: Fit flow: Down padding: Inset{left: sa_pad(14.0, cur_l) right: sa_pad(14.0, cur_r) top: 14.0 bottom: sa_pad(14.0, cur_b)} spacing: 9
                 if b == nil {
                     Small{text: "no reading yet"}
                 } else {

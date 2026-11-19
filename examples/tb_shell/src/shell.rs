@@ -78,6 +78,157 @@ pub struct Marks {
     pub loud: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum StripMode {
+    #[default]
+    Classic,
+    Split,
+    Below,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SafeArea {
+    pub active: bool,
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
+    pub strip_mode: StripMode,
+    pub strip_y: f64,
+    pub strip_h: f64,
+    pub strip_space_top: f64,
+    pub strip_space_bot: f64,
+    pub strip_pad_l: f64,
+    pub strip_pad_r: f64,
+    pub punch_x: f64,
+    pub punch_w: f64,
+    pub punch_h: f64,
+    pub corner_r: f64,
+}
+
+impl Default for SafeArea {
+    fn default() -> Self {
+        Self::classic(32.0)
+    }
+}
+
+impl SafeArea {
+    pub fn classic(strip_h: f64) -> Self {
+        let h = if strip_h > 0.0 { strip_h } else { 32.0 };
+        Self {
+            active: false,
+            top: h,
+            bottom: 0.0,
+            left: 0.0,
+            right: 0.0,
+            strip_mode: StripMode::Classic,
+            strip_y: 0.0,
+            strip_h: h,
+            strip_space_top: 0.0,
+            strip_space_bot: 0.0,
+            strip_pad_l: 6.0,
+            strip_pad_r: 10.0,
+            punch_x: 192.0,
+            punch_w: 0.0,
+            punch_h: 0.0,
+            corner_r: 0.0,
+        }
+    }
+
+    pub fn from_json(val: Option<&makepad_micro_serde::JsonValue>, fallback_strip_h: f64) -> Self {
+        use makepad_micro_serde::JsonValue;
+        let Some(JsonValue::Object(m)) = val else {
+            return Self::classic(fallback_strip_h);
+        };
+        let num = |k: &str| -> Option<f64> {
+            match m.get(k)? {
+                JsonValue::F64(f) if f.is_finite() => Some(*f),
+                JsonValue::I64(n) => Some(*n as f64),
+                JsonValue::U64(n) => Some(*n as f64),
+                JsonValue::String(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite()),
+                _ => None,
+            }
+        };
+
+        let raw_top = num("top").map(|v| v.max(0.0));
+        let bottom = num("bottom").unwrap_or(0.0).max(0.0);
+        let left = num("left").unwrap_or(0.0).max(0.0);
+        let right = num("right").unwrap_or(0.0).max(0.0);
+        let punch_x = num("punch_x").unwrap_or(192.0).max(0.0);
+        let punch_w = num("punch_w").unwrap_or(0.0).max(0.0);
+        let punch_h = num("punch_h").unwrap_or(0.0).max(0.0);
+        let corner_r = num("corner_r").unwrap_or(0.0).max(0.0);
+
+        let strip_mode = match m.get("strip_mode").and_then(|v| v.as_str()) {
+            Some("split") => StripMode::Split,
+            Some("below") => StripMode::Below,
+            Some(_) => StripMode::Classic,
+            None => {
+                if punch_w > 0.0 {
+                    StripMode::Split
+                } else {
+                    StripMode::Classic
+                }
+            }
+        };
+
+        let strip_space_top = num("strip_space_top").unwrap_or(0.0).max(0.0);
+        let strip_space_bot = num("strip_space_bot").unwrap_or(0.0).max(0.0);
+        let base_h = if fallback_strip_h > 0.0 { fallback_strip_h } else { 32.0 };
+        let default_h = match strip_mode {
+            StripMode::Split => {
+                if punch_h > 0.0 {
+                    punch_h
+                } else {
+                    72.0
+                }
+            }
+            StripMode::Below => 36.0,
+            StripMode::Classic => base_h,
+        };
+        let strip_h = num("strip_h").unwrap_or(default_h).clamp(24.0, 180.0);
+        let raw_strip_y = num("strip_y").map(|v| v.max(0.0));
+        let strip_y = match strip_mode {
+            StripMode::Below => match raw_strip_y {
+                Some(y) if y >= punch_h => y,
+                _ => punch_h + strip_space_top,
+            },
+            _ => raw_strip_y.unwrap_or(0.0),
+        };
+        let strip_pad_l = num("strip_pad_l")
+            .unwrap_or(if corner_r > 0.0 { 24.0 } else { 6.0 })
+            .max(0.0);
+        let strip_pad_r = num("strip_pad_r")
+            .unwrap_or(if corner_r > 0.0 { 24.0 } else { 10.0 })
+            .max(0.0);
+
+        let computed_top = strip_y + strip_h + strip_space_bot;
+        let top = match strip_mode {
+            StripMode::Split | StripMode::Below => computed_top.max(raw_top.unwrap_or(0.0)),
+            StripMode::Classic => raw_top.unwrap_or(computed_top).max(strip_h),
+        };
+
+        Self {
+            active: true,
+            top,
+            bottom,
+            left,
+            right,
+            strip_mode,
+            strip_y,
+            strip_h,
+            strip_space_top,
+            strip_space_bot,
+            strip_pad_l,
+            strip_pad_r,
+            punch_x,
+            punch_w,
+            punch_h,
+            corner_r,
+        }
+    }
+}
+
 /// UI actions initiated by strip taps/swipes or per-slot mini-headers.
 #[derive(Clone, Debug)]
 pub enum ShellAction {
@@ -132,12 +283,13 @@ pub struct Shell {
     #[live] draw_guard_text: DrawText,
     #[live] draw_guard_small: DrawText,
     #[live] top_list: DrawList2d,
-    #[live] strip_height: f64,
+    #[live] pub strip_height: f64,
     #[rust] area: Area,
     #[rust] pub surfaces: Vec<(String, WidgetRef)>,
     #[rust] pub jit: JitRegistry,
     #[rust] pub stage: Stage,
     #[rust] pub marks: Marks,
+    #[rust] pub safe_area: SafeArea,
     #[rust] pub status_right: String,
     #[rust] guard: Option<GuardView>,
     #[rust] pressed: Option<bool>,
@@ -147,6 +299,8 @@ pub struct Shell {
     #[rust] no_rect: Rect,
     #[rust] answer: Option<bool>,
     #[rust] strip_rect: Rect,
+    #[rust] bar_band_rect: Rect,
+    #[rust] punch_rect: Rect,
     #[rust] home_rect: Rect,
     #[rust] center_rect: Rect,
     #[rust] pub note: String,
@@ -277,9 +431,11 @@ impl Widget for Shell {
                         if dx.abs() >= 36.0 && dx.abs() > dy.abs() {
                             self.actions.push(ShellAction::CycleTask(if dx < 0.0 { 1 } else { -1 }));
                         } else if self.strip_rect.contains(p) && dx.abs() < 24.0 {
-                            if self.home_rect.contains(p) {
+                            if self.punch_rect.size.x > 0.0 && self.punch_rect.contains(p) {
+                                // Dead camera punch-out zone: ignore tap cleanly.
+                            } else if self.home_rect.contains(p) {
                                 self.actions.push(ShellAction::GoHome);
-                            } else {
+                            } else if self.bar_band_rect.contains(p) {
                                 self.actions.push(ShellAction::ToggleStageView);
                             }
                         }
@@ -397,12 +553,13 @@ impl Widget for Shell {
 
         cx.begin_turtle(walk, Layout::flow_down());
         let win_rect = cx.turtle().rect();
-        let stage_top = win_rect.pos.y + self.strip_height;
+        let top_clear = self.top_clearance();
+        let stage_top = win_rect.pos.y + top_clear;
         let stage_w = win_rect.size.x.max(1.0);
-        let stage_h = (win_rect.size.y - self.strip_height).max(1.0);
+        let stage_h = (win_rect.size.y - top_clear).max(1.0);
 
-        // Advance past the reserved top strip height, then open a clipped stage viewport.
-        cx.walk_turtle(Walk::fixed(stage_w, self.strip_height));
+        // Advance past the reserved top strip clearance, then open a clipped stage viewport.
+        cx.walk_turtle(Walk::fixed(stage_w, top_clear));
         cx.begin_turtle(
             Walk::fixed(stage_w, stage_h),
             Layout { clip_x: true, clip_y: true, ..Layout::flow_down() },
@@ -781,58 +938,345 @@ impl Shell {
         (col_r, mode_r, close_r)
     }
 
-    fn draw_strip(&mut self, cx: &mut Cx2d, rect: Rect) {
-        self.draw_strip.color = vec4(0.02, 0.027, 0.043, 1.0);
-        self.strip_rect = Rect { pos: rect.pos, size: dvec2(rect.size.x, self.strip_height) };
-        self.draw_strip.draw_abs(cx, self.strip_rect);
+    pub fn top_clearance(&self) -> f64 {
+        if self.safe_area.active {
+            self.safe_area.top.max(24.0)
+        } else {
+            self.strip_height.max(24.0)
+        }
+    }
 
-        let mut right_x = rect.pos.x + rect.size.x - 10.0;
-        for (on, text, color) in [
-            (self.marks.mic, "MIC", vec4(1.0, 0.35, 0.35, 1.0)),
-            (self.marks.loud, "LOUD", vec4(1.0, 0.75, 0.2, 1.0)),
+    pub fn set_safe_area(&mut self, cx: &mut Cx, next: SafeArea) -> bool {
+        if self.safe_area == next {
+            return false;
+        }
+        self.safe_area = next;
+        cx.redraw_all();
+        true
+    }
+
+    /// Draws `MIC` and `LOUD` truth marks right-aligned from `right_edge` leftward,
+    /// never crossing left of `min_x`, and returns the leftmost X reached.
+    fn draw_marks_right(&mut self, cx: &mut Cx2d, right_edge: f64, min_x: f64, cy: f64) -> f64 {
+        let mut cur_x = right_edge;
+        for (on, text, fg, bg) in [
+            (
+                self.marks.mic,
+                "MIC",
+                vec4(1.0, 0.40, 0.40, 1.0),
+                vec4(0.30, 0.08, 0.11, 1.0),
+            ),
+            (
+                self.marks.loud,
+                "LOUD",
+                vec4(1.0, 0.78, 0.22, 1.0),
+                vec4(0.27, 0.17, 0.05, 1.0),
+            ),
         ] {
-            if on {
-                right_x -= 7.8 * text.len() as f64 + 8.0;
-                self.draw_mark.color = color;
-                self.draw_mark.draw_abs(cx, dvec2(right_x, rect.pos.y + 9.0), text);
+            if !on {
+                continue;
+            }
+            let (tw, th) = measure_line(&self.draw_mark, cx, text);
+            let pill_w = (tw + 10.0).max(28.0);
+            let pill_h = (th + 6.0).clamp(18.0, 22.0);
+            if cur_x < right_edge {
+                cur_x -= 5.0;
+            }
+            let px = (cur_x - pill_w).max(min_x);
+            let pr = Rect {
+                pos: dvec2(px, cy - pill_h * 0.5),
+                size: dvec2(pill_w.min((cur_x - min_x).max(0.0)), pill_h),
+            };
+            if pr.size.x >= tw {
+                self.draw_pill.color = bg;
+                self.draw_pill.draw_abs(cx, pr);
+                self.draw_mark.color = fg;
+                self.draw_mark.draw_abs(
+                    cx,
+                    dvec2(pr.pos.x + (pr.size.x - tw) * 0.5, cy - th * 0.5),
+                    text,
+                );
+                cur_x = px;
             }
         }
+        cur_x
+    }
 
-        // Left zone: `[ Home ]`
-        self.home_rect = Rect { pos: rect.pos, size: dvec2(58.0, self.strip_height) };
-        self.draw_pill.color = vec4(0.09, 0.12, 0.18, 1.0);
-        self.draw_pill.draw_abs(cx, Rect { pos: dvec2(rect.pos.x + 6.0, rect.pos.y + 4.0), size: dvec2(48.0, self.strip_height - 8.0) });
-        self.draw_label.color = vec4(0.84, 0.89, 0.95, 1.0);
-        self.draw_label.draw_abs(cx, dvec2(rect.pos.x + 13.0, rect.pos.y + 9.0), "Home");
+    /// Draws passive `status_right` (`wifi · 94% · 22:41`) right-aligned to `right_edge`
+    /// within `avail_w`, gracefully dropping leading segments before truncating so the clock
+    /// and battery stay whole when horizontal space is tight. Returns leftmost X reached.
+    fn draw_status_right(&mut self, cx: &mut Cx2d, right_edge: f64, avail_w: f64, cy: f64) -> f64 {
+        if self.status_right.is_empty() || avail_w < 18.0 {
+            return right_edge;
+        }
+        let parts: Vec<&str> = self.status_right.split(" · ").collect();
+        let mut chosen: Option<(String, f64, f64)> = None;
+        for start in 0..parts.len() {
+            let cand = parts[start..].join(" · ");
+            let (w, h) = measure_line(&self.draw_sub, cx, &cand);
+            if w <= avail_w {
+                chosen = Some((cand, w, h));
+                break;
+            }
+        }
+        let (txt, tw, th) = chosen.unwrap_or_else(|| {
+            let last = parts.last().copied().unwrap_or(self.status_right.as_str());
+            fit_line_to_width(&self.draw_sub, cx, last, avail_w)
+        });
+        if txt.is_empty() || tw <= 0.0 {
+            return right_edge;
+        }
+        let x = (right_edge - tw).max(right_edge - avail_w);
+        self.draw_sub.color = vec4(0.58, 0.64, 0.73, 1.0);
+        self.draw_sub.draw_abs(cx, dvec2(x, cy - th * 0.5), &txt);
+        x
+    }
 
-        // Passive right status (`Wi-Fi · Bat% · HH:MM`)
-        if !self.status_right.is_empty() {
-            let sw = self.status_right.chars().count() as f64 * 5.9 + 8.0;
-            right_x -= sw;
-            self.draw_sub.color = vec4(0.56, 0.62, 0.70, 1.0);
-            self.draw_sub.draw_abs(cx, dvec2(right_x, rect.pos.y + 10.0), &self.status_right);
+    fn draw_strip(&mut self, cx: &mut Cx2d, rect: Rect) {
+        let top_clear = self.top_clearance();
+        self.draw_strip.color = vec4(0.02, 0.027, 0.043, 1.0);
+        self.strip_rect = Rect {
+            pos: rect.pos,
+            size: dvec2(rect.size.x, top_clear),
+        };
+        self.draw_strip.draw_abs(cx, self.strip_rect);
+
+        let (mode, bar_y, bar_h, space_top, pad_l, pad_r) = if self.safe_area.active {
+            let st = if self.safe_area.strip_mode == StripMode::Split {
+                self.safe_area.strip_space_top
+            } else {
+                0.0
+            };
+            (
+                self.safe_area.strip_mode,
+                rect.pos.y + self.safe_area.strip_y,
+                self.safe_area.strip_h,
+                st,
+                self.safe_area.strip_pad_l,
+                self.safe_area.strip_pad_r,
+            )
+        } else {
+            (
+                StripMode::Classic,
+                rect.pos.y,
+                self.strip_height,
+                0.0,
+                6.0,
+                10.0,
+            )
+        };
+
+        self.bar_band_rect = Rect {
+            pos: dvec2(rect.pos.x, bar_y),
+            size: dvec2(rect.size.x, bar_h),
+        };
+        let band_top = bar_y + space_top;
+        let band_h = (bar_h - space_top).max(20.0);
+
+        let focus = if self.stage.focus.is_empty() {
+            "-".to_string()
+        } else {
+            self.stage.focus.clone()
+        };
+        let extra = self.stage.extra_slot_count();
+
+        if mode == StripMode::Split && self.safe_area.punch_w > 0.0 {
+            let punch_l = (rect.pos.x + self.safe_area.punch_x - self.safe_area.punch_w * 0.5)
+                .clamp(rect.pos.x, rect.pos.x + rect.size.x);
+            let punch_r = (rect.pos.x + self.safe_area.punch_x + self.safe_area.punch_w * 0.5)
+                .clamp(punch_l, rect.pos.x + rect.size.x);
+            self.punch_rect = Rect {
+                pos: dvec2(punch_l, rect.pos.y),
+                size: dvec2(
+                    punch_r - punch_l,
+                    self.safe_area.punch_h.max((bar_y - rect.pos.y) + bar_h),
+                ),
+            };
+
+            // 1. Left flank: `[pad_l .. punch_l - 4]` (`Home` + `< focus >`, plus 2nd-row note if active)
+            let left_x = rect.pos.x + pad_l;
+            let left_end = (punch_l - 4.0).max(left_x);
+            let has_note_row = !self.note.is_empty() && band_h >= 46.0;
+            let left_cy = if has_note_row {
+                band_top + band_h * 0.36
+            } else {
+                band_top + band_h * 0.50
+            };
+
+            let (hw, hh) = measure_line(&self.draw_label, cx, "Home");
+            let pill_w = (hw + 14.0).clamp(42.0, 54.0).min((left_end - left_x).max(0.0));
+            let pill_h = 26.0_f64.min((band_h - 4.0).max(20.0));
+            let pill_rect = Rect {
+                pos: dvec2(left_x, left_cy - pill_h * 0.5),
+                size: dvec2(pill_w, pill_h),
+            };
+            if pill_w >= hw {
+                self.draw_pill.color = vec4(0.09, 0.12, 0.18, 1.0);
+                self.draw_pill.draw_abs(cx, pill_rect);
+                self.draw_label.color = vec4(0.84, 0.89, 0.95, 1.0);
+                self.draw_label.draw_abs(
+                    cx,
+                    dvec2(pill_rect.pos.x + (pill_w - hw) * 0.5, left_cy - hh * 0.5),
+                    "Home",
+                );
+            }
+            let home_hit_w = ((pill_rect.pos.x - rect.pos.x) + pill_w + 4.0).min(punch_l - rect.pos.x);
+            self.home_rect = Rect {
+                pos: dvec2(rect.pos.x, bar_y),
+                size: dvec2(home_hit_w.max(0.0), bar_h),
+            };
+
+            let focus_x = pill_rect.pos.x + pill_w + 6.0;
+            let focus_avail = (left_end - focus_x).max(0.0);
+            self.center_rect = Rect {
+                pos: dvec2(self.home_rect.pos.x + self.home_rect.size.x, bar_y),
+                size: dvec2(
+                    (punch_l - (self.home_rect.pos.x + self.home_rect.size.x)).max(0.0),
+                    bar_h,
+                ),
+            };
+
+            if focus_avail >= 16.0 {
+                let roomy = if extra > 0 {
+                    format!("< {focus} +{extra} >")
+                } else {
+                    format!("< {focus} >")
+                };
+                let tight = if extra > 0 {
+                    format!("<{focus}+{extra}>")
+                } else {
+                    format!("<{focus}>")
+                };
+                let mut candidates = Vec::with_capacity(3);
+                if !has_note_row && !self.note.is_empty() {
+                    candidates.push(format!("{tight} {}", self.note));
+                }
+                candidates.push(roomy);
+                candidates.push(tight.clone());
+
+                let mut picked: Option<(String, f64, f64)> = None;
+                for c in &candidates {
+                    let (w, h) = measure_line(&self.draw_label, cx, c);
+                    if w <= focus_avail {
+                        picked = Some((c.clone(), w, h));
+                        break;
+                    }
+                }
+                let (ftxt, fw, fh) = picked
+                    .unwrap_or_else(|| fit_line_to_width(&self.draw_label, cx, &tight, focus_avail));
+                if !ftxt.is_empty() && fw > 0.0 {
+                    self.draw_label.color = vec4(0.72, 0.78, 0.86, 1.0);
+                    self.draw_label
+                        .draw_abs(cx, dvec2(focus_x, left_cy - fh * 0.5), &ftxt);
+                }
+            }
+
+            if has_note_row {
+                let note_cy = band_top + band_h * 0.72;
+                let note_avail = (left_end - left_x).max(0.0);
+                let (ntxt, nw, nh) = fit_line_to_width(&self.draw_sub, cx, &self.note, note_avail);
+                if !ntxt.is_empty() && nw > 0.0 {
+                    self.draw_sub.color = vec4(0.95, 0.76, 0.35, 1.0);
+                    self.draw_sub
+                        .draw_abs(cx, dvec2(left_x, note_cy - nh * 0.5), &ntxt);
+                }
+            }
+
+            // 2. Right flank: `[punch_r + 4 .. W - pad_r]` (`MIC`/`LOUD` priority + `wifi · Bat% · HH:MM`)
+            let right_edge = (rect.pos.x + rect.size.x - pad_r).max(punch_r);
+            let right_start = (punch_r + 4.0).min(right_edge);
+            let right_avail = (right_edge - right_start).max(0.0);
+            let any_mark = self.marks.mic || self.marks.loud;
+            if any_mark && band_h >= 46.0 {
+                let mark_cy = band_top + band_h * 0.34;
+                let stat_cy = band_top + band_h * 0.69;
+                self.draw_marks_right(cx, right_edge, right_start, mark_cy);
+                self.draw_status_right(cx, right_edge, right_avail, stat_cy);
+            } else {
+                let cy = band_top + band_h * 0.50;
+                let marks_left = self.draw_marks_right(cx, right_edge, right_start, cy);
+                let stat_edge = if any_mark {
+                    (marks_left - 6.0).max(right_start)
+                } else {
+                    right_edge
+                };
+                let stat_avail = (stat_edge - right_start).max(0.0);
+                self.draw_status_right(cx, stat_edge, stat_avail, cy);
+            }
+            return;
         }
 
-        // Center zone: `‹ focus (+K) ›` + optional shell note
-        self.center_rect = Rect {
-            pos: dvec2(rect.pos.x + 58.0, rect.pos.y),
-            size: dvec2((right_x - (rect.pos.x + 58.0)).max(40.0), self.strip_height),
+        // Full-width strip (`Classic` or `Below` punch-out mode)
+        self.punch_rect = Rect::default();
+        let cy = band_top + band_h * 0.50;
+        let left_x = rect.pos.x + pad_l;
+        let right_edge = (rect.pos.x + rect.size.x - pad_r).max(left_x + 80.0);
+
+        let (hw, hh) = measure_line(&self.draw_label, cx, "Home");
+        let pill_w = (hw + 14.0).clamp(44.0, 54.0);
+        let pill_h = (band_h - 8.0).clamp(20.0, 28.0);
+        let pill_rect = Rect {
+            pos: dvec2(left_x, cy - pill_h * 0.5),
+            size: dvec2(pill_w, pill_h),
         };
-        let focus = if self.stage.focus.is_empty() { "-" } else { self.stage.focus.as_str() };
-        let extra = self.stage.extra_slot_count();
-        let stage_badge = if extra > 0 { format!("< {focus} +{extra} >") } else { format!("< {focus} >") };
-        let center_text = if self.note.is_empty() { stage_badge } else { format!("{stage_badge}  {}", self.note) };
-        let max_chars = ((self.center_rect.size.x - 10.0) / 6.3).max(6.0) as usize;
-        let clipped_text: String = center_text.chars().take(max_chars).collect();
-        self.draw_label.color = vec4(0.72, 0.78, 0.86, 1.0);
-        self.draw_label.draw_abs(cx, dvec2(self.center_rect.pos.x + 6.0, rect.pos.y + 9.0), &clipped_text);
+        self.draw_pill.color = vec4(0.09, 0.12, 0.18, 1.0);
+        self.draw_pill.draw_abs(cx, pill_rect);
+        self.draw_label.color = vec4(0.84, 0.89, 0.95, 1.0);
+        self.draw_label.draw_abs(
+            cx,
+            dvec2(pill_rect.pos.x + (pill_w - hw) * 0.5, cy - hh * 0.5),
+            "Home",
+        );
+        let home_hit_w = (pill_rect.pos.x - rect.pos.x) + pill_w + 4.0;
+        self.home_rect = Rect {
+            pos: dvec2(rect.pos.x, bar_y),
+            size: dvec2(home_hit_w, bar_h),
+        };
+
+        let focus_x = pill_rect.pos.x + pill_w + 6.0;
+        let any_mark = self.marks.mic || self.marks.loud;
+        let marks_left = self.draw_marks_right(cx, right_edge, focus_x + 36.0, cy);
+        let stat_edge = if any_mark {
+            (marks_left - 6.0).max(focus_x + 36.0)
+        } else {
+            right_edge
+        };
+        let stat_left = self.draw_status_right(cx, stat_edge, (stat_edge - (focus_x + 42.0)).max(0.0), cy);
+
+        let center_right = (stat_left - 6.0).max(focus_x);
+        self.center_rect = Rect {
+            pos: dvec2(self.home_rect.pos.x + self.home_rect.size.x, bar_y),
+            size: dvec2(
+                (center_right - (self.home_rect.pos.x + self.home_rect.size.x)).max(36.0),
+                bar_h,
+            ),
+        };
+
+        let stage_badge = if extra > 0 {
+            format!("< {focus} +{extra} >")
+        } else {
+            format!("< {focus} >")
+        };
+        let center_text = if self.note.is_empty() {
+            stage_badge
+        } else {
+            format!("{stage_badge}  {}", self.note)
+        };
+        let (clipped, cw, ch) =
+            fit_line_to_width(&self.draw_label, cx, &center_text, (center_right - focus_x).max(0.0));
+        if !clipped.is_empty() && cw > 0.0 {
+            self.draw_label.color = vec4(0.72, 0.78, 0.86, 1.0);
+            self.draw_label
+                .draw_abs(cx, dvec2(focus_x, cy - ch * 0.5), &clipped);
+        }
     }
 
     fn draw_guard(&mut self, cx: &mut Cx2d, rect: Rect, guard: &GuardView) {
-        let top = rect.pos.y + self.strip_height;
-        let (w, h) = (rect.size.x, rect.size.y - self.strip_height);
+        let top_clear = self.top_clearance();
+        let top = rect.pos.y + top_clear;
+        let (w, h) = (rect.size.x, (rect.size.y - top_clear).max(1.0));
         self.draw_veil.draw_abs(cx, Rect { pos: dvec2(rect.pos.x, top), size: dvec2(w, h) });
-        let mut y = top + 40.0;
+        let mut y = top + 36.0;
         for line in wrap(&guard.text, ((w - 48.0) / 9.5) as usize) {
             self.draw_guard_text.draw_abs(cx, dvec2(rect.pos.x + 24.0, y), &line);
             y += 26.0;
@@ -928,6 +1372,46 @@ impl WidgetNode for Shell {
             visit(LiveId::from_str(name), splash.clone());
         }
     }
+}
+
+fn measure_line(dt: &DrawText, cx: &mut Cx2d, text: &str) -> (f64, f64) {
+    if text.is_empty() {
+        return (0.0, 0.0);
+    }
+    let laid = dt.layout(cx, 0.0, 0.0, None, false, Align::default(), text);
+    let Some(row) = laid.rows.first() else {
+        return (0.0, 0.0);
+    };
+    let w = (row.width_in_lpxs * dt.font_scale) as f64;
+    let h = ((row.ascender_in_lpxs - row.descender_in_lpxs) * dt.font_scale) as f64;
+    (w, h)
+}
+
+fn fit_line_to_width(dt: &DrawText, cx: &mut Cx2d, text: &str, max_w: f64) -> (String, f64, f64) {
+    if text.is_empty() || max_w <= 4.0 {
+        return (String::new(), 0.0, 0.0);
+    }
+    let (w0, h0) = measure_line(dt, cx, text);
+    if w0 <= max_w {
+        return (text.to_string(), w0, h0);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best = (String::new(), 0.0, h0);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let mut cand: String = chars[..mid].iter().collect();
+        cand.push('…');
+        let (cw, ch) = measure_line(dt, cx, &cand);
+        if cw <= max_w {
+            best = (cand, cw, ch);
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {

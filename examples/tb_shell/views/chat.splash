@@ -1,14 +1,24 @@
 // CHAT: virtualized GPU Markdown conversation view for the selected agent (`state.chat`).
 // Uses native `PortalList`-backed `ChatFeed` (`O(viewport)` scrolling, fence-aware >2.2KB block
 // splitting, plain-prose `Label` fast path + rich `Markdown`, zero Splash `msgs` JSON copy).
-width: Fill height: Fill flow: Down padding: 12 spacing: 8
+width: Fill height: Fill flow: Down padding: 0 spacing: 0
 main := View{
-    width: Fill height: Fill flow: Down spacing: 8
+    width: Fill height: Fill flow: Down
     on_render: || {
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
+        let is_compact = (slot.mode ?? "full") == "compact"
+        let pad_b = if is_compact { 12.0 } else { sa_pad(12.0, cur_b) }
         let c = state.chat ?? nil
         let target_name = agent_name(state.agents ?? nil, state.target ?? nil)
         let st = if c == nil { "" } else { c.status ?? "" }
         let act = if c == nil { "" } else { c.activity ?? "" }
+
+        View{
+            width: Fill height: Fill flow: Down
+            padding: Inset{left: sa_pad(12.0, cur_l) right: sa_pad(12.0, cur_r) top: 12.0 bottom: pad_b}
+            spacing: 8
 
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -45,6 +55,7 @@ main := View{
                 text: if (if c == nil { false } else { c.tools ?? false }) { "Tools: on" } else { "Tools: off" }
                 on_click: || emit("toggle_tools", {})
             }
+        }
         }
     }
 }

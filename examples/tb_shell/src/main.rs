@@ -26,7 +26,7 @@ use makepad_widgets::makepad_platform::{
 };
 use makepad_widgets::splash_host::take_splash_host_requests;
 use makepad_widgets::*;
-use shell::{GuardView, Shell, ShellAction};
+use shell::{GuardView, SafeArea, Shell, ShellAction};
 use stage::{SlotMode, Stage, StageMode, StageSlot};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -149,6 +149,66 @@ impl Reads {
             Reads::Keys(keys) => keys.iter().any(|k| touched.contains(k)),
         }
     }
+
+    fn merge_from(&mut self, other: Reads) {
+        if matches!(self, Reads::All) {
+            return;
+        }
+        match other {
+            Reads::All => *self = Reads::All,
+            Reads::Keys(more) => {
+                if let Reads::Keys(cur) = self {
+                    for k in more {
+                        if !cur.iter().any(|x| x == &k) {
+                            cur.push(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extracts top-level `fn <ident>` / `let <ident>` definitions from `base.splash`
+/// whose bodies read `state.*`, so surfaces calling e.g. `sa_left()` / `sa_bottom()`
+/// automatically subscribe to `safe_area` / `safe_area_off` without adding unused keys
+/// to surfaces that do not call them.
+fn scan_base_state_defs(src: &str) -> Vec<(String, Reads)> {
+    let mut chunks: Vec<(String, String)> = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        let rest = trimmed
+            .strip_prefix("fn ")
+            .or_else(|| trimmed.strip_prefix("let "));
+        let started_top = line == trimmed && rest.is_some();
+        if started_top {
+            let ident: String = rest
+                .unwrap_or("")
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                chunks.push((ident, format!("{line}\n")));
+                continue;
+            }
+        }
+        if let Some((_, buf)) = chunks.last_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    chunks
+        .into_iter()
+        .filter_map(|(name, body)| {
+            let r = Reads::scan(&body);
+            match &r {
+                Reads::All => Some((name, r)),
+                Reads::Keys(k) if !k.is_empty() => Some((name, r)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn shader_text(body: &str) -> Option<String> {
@@ -475,6 +535,120 @@ impl App {
         lines_ahead(self.st.persist.base_and_lib_lines())
     }
 
+    fn scan_reads_for(&self, body: &str) -> Reads {
+        let mut r = Reads::scan(body);
+        for (def_name, def_reads) in scan_base_state_defs(&self.st.persist.sys_base_source) {
+            if library::ident_in(body, &def_name) {
+                r.merge_from(def_reads);
+            }
+        }
+        for (piece_name, piece_src) in &self.st.persist.pieces {
+            if library::ident_in(body, piece_name) {
+                r.merge_from(Reads::scan(piece_src));
+            }
+        }
+        r
+    }
+
+    fn sys_safe_area_path() -> String {
+        env("TB_SAFE_AREA_FILE").unwrap_or_else(|| "/userdata/tinybot/etc/safe-area.json".into())
+    }
+
+    fn user_safe_area_path() -> Option<String> {
+        if let Some(p) = env("TB_SAFE_AREA_USER_FILE") {
+            return Some(p);
+        }
+        if let Some(d) = env("TB_SHELL_DATA_DIR") {
+            return Some(format!("{d}/safe-area.json"));
+        }
+        if let Some(cfg) = env("XDG_CONFIG_HOME") {
+            return Some(format!("{cfg}/tb-shell/safe-area.json"));
+        }
+        env("HOME").map(|h| format!("{h}/.config/tb-shell/safe-area.json"))
+    }
+
+    fn read_json_object_file(path: &str) -> Option<JsonValue> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let val = JsonValue::deserialize_json(text.trim()).ok()?;
+        matches!(val, JsonValue::Object(_)).then_some(val)
+    }
+
+    fn read_sys_safe_area() -> Option<JsonValue> {
+        Self::read_json_object_file(&Self::sys_safe_area_path())
+    }
+
+    fn write_user_safe_area_file(val: &JsonValue) {
+        if matches!(env("TB_SAFE_AREA_NO_PERSIST").as_deref(), Some("1") | Some("true")) {
+            return;
+        }
+        if !matches!(val, JsonValue::Object(_)) {
+            return;
+        }
+        let Some(uf) = Self::user_safe_area_path() else { return };
+        if let Some(dir) = std::path::Path::new(&uf).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = format!("{uf}.tmp.{}", std::process::id());
+        if std::fs::write(&tmp, format!("{}\n", val.serialize_json())).is_ok() {
+            if std::fs::rename(&tmp, &uf).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    fn remove_user_safe_area_file() {
+        if matches!(env("TB_SAFE_AREA_NO_PERSIST").as_deref(), Some("1") | Some("true")) {
+            return;
+        }
+        if let Some(uf) = Self::user_safe_area_path() {
+            let _ = std::fs::remove_file(uf);
+        }
+    }
+
+    fn load_initial_safe_area(&mut self, cx: &mut Cx) {
+        let mut combined = JsonValue::Null;
+        let mut source_desc = Vec::new();
+        let sys_path = Self::sys_safe_area_path();
+        if let Some(sys_val) = Self::read_json_object_file(&sys_path) {
+            merge(&mut combined, &sys_val);
+            source_desc.push(sys_path);
+        }
+        if let Some(uf) = Self::user_safe_area_path() {
+            if let Some(user_val) = Self::read_json_object_file(&uf) {
+                merge(&mut combined, &user_val);
+                source_desc.push(uf);
+            }
+        }
+        if matches!(combined, JsonValue::Object(_)) {
+            log!("tb-shell: loaded safe-area from {}", source_desc.join(" + "));
+            self.st.store.insert("safe_area".into(), combined);
+            self.sync_safe_area_to_shell(cx);
+        }
+    }
+
+    fn current_top_clearance(&self, cx: &Cx) -> f64 {
+        self.shell(cx)
+            .borrow::<Shell>()
+            .map_or(32.0, |sh| sh.top_clearance())
+    }
+
+    fn sync_safe_area_to_shell(&mut self, cx: &mut Cx) {
+        let shell = self.shell(cx);
+        let fallback_h = shell.borrow::<Shell>().map_or(32.0, |sh| sh.strip_height);
+        let next = SafeArea::from_json(self.st.store.get("safe_area"), fallback_h);
+        let changed = shell
+            .borrow_mut::<Shell>()
+            .map_or(false, |mut sh| sh.set_safe_area(cx, next));
+        if changed {
+            self.st.slot_dims.clear();
+            self.st.slot_prelude_cache.clear();
+            if !self.st.panel_off {
+                self.sync_visible_slot_preludes(cx);
+            }
+            cx.redraw_all();
+        }
+    }
+
     fn is_watched_surface(&self, name: &str) -> bool {
         self.st.frame_budget_ms > 0.0
             && !self.st.views.contains(name)
@@ -621,6 +795,7 @@ impl App {
         self.read_loud(cx);
         self.update_strip_status(cx);
         self.arm_clock_timer(cx);
+        self.load_initial_safe_area(cx);
         self.st.termd = Some(termd_bridge::TermdBridge::new(self.st.panel_off));
         self.sync_termd_store(cx, false);
 
@@ -1119,7 +1294,8 @@ impl App {
             .find(|s| s.surface == name)
             .map(|s| (s.prelude_mode(stage_mode, total), s.pinned))
             .unwrap_or(("full", false));
-        let (w, h) = self.st.slot_dims.get(name).copied().unwrap_or((384.0, 822.0));
+        let default_h = (854.0 - self.current_top_clearance(cx)).max(120.0);
+        let (w, h) = self.st.slot_dims.get(name).copied().unwrap_or((384.0, default_h));
         let w_r = (w * 2.0).round() * 0.5;
         let h_r = (h * 2.0).round() * 0.5;
         let json = obj(vec![
@@ -2247,7 +2423,7 @@ impl App {
         self.st.bodies.insert(name.to_string(), body.to_string());
         self.st.persist.record_usage(body);
         self.write_surfaces_file();
-        self.st.reads.insert(name.to_string(), Reads::scan(body));
+        self.st.reads.insert(name.to_string(), self.scan_reads_for(body));
 
         if self.is_watched_surface(name) {
             let verify_redraws_left = if has_shader.is_some() { 3 } else { 0 };
@@ -2443,6 +2619,21 @@ impl App {
         let t = Instant::now();
         let shell = self.shell(cx);
         self.st.split.add_named("shell-lookup", t.elapsed());
+
+        if touched.iter().any(|k| k == "safe_area") {
+            let cleared = !self.st.store.contains_key("safe_area");
+            if cleared && by != "shell" {
+                Self::remove_user_safe_area_file();
+                if let Some(sys_sa) = Self::read_sys_safe_area() {
+                    self.st.store.insert("safe_area".into(), sys_sa);
+                }
+            } else if by != "shell" {
+                if let Some(cur) = self.st.store.get("safe_area") {
+                    Self::write_user_safe_area_file(cur);
+                }
+            }
+            self.sync_safe_area_to_shell(cx);
+        }
 
         if touched.iter().any(|k| k == "battery" || k == "wifi") && !self.st.panel_off {
             self.update_strip_status(cx);

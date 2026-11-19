@@ -1,9 +1,16 @@
 // POWER: opened by 1.0 s KEY_POWER hold or Home -> Power.
 // Uses a plain inline 2-tap UI confirmation for Restart and Power off.
-width: Fill height: Fill flow: Down padding: 20 spacing: 14 align: Align{y: 0.5}
+width: Fill height: Fill flow: Down padding: 0 spacing: 0 align: Align{y: 0.5}
 main := View{
-    width: Fill height: Fit flow: Down spacing: 12
+    width: Fill height: Fit flow: Down
     on_render: || {
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
+        View{
+            width: Fill height: Fit flow: Down
+            padding: Inset{left: sa_pad(20.0, cur_l) right: sa_pad(20.0, cur_r) top: 20.0 bottom: sa_pad(20.0, cur_b)}
+            spacing: 12
         let pending = state.power_confirm ?? ""
         Title{draw_text.text_style.font_size: 22 text: "Power"}
 
@@ -63,6 +70,7 @@ main := View{
                     front("home")
                 }
             }
+        }
         }
     }
 }

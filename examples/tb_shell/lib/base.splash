@@ -27,10 +27,19 @@ let MiniBtn = ButtonFlat{
     draw_text.text_style.font_size: 14
 }
 fn status_color(s) {
+    if s == "waiting" { return #xa855f7 }
     if s == "busy" || s == "processing" { return #xf5b942 }
     if s == "idle" || s == "online" { return #x3ddc84 }
     if s == "error" || s == "failed" { return #xff5a5a }
     #x666666
+}
+fn bus_term_id(id) {
+    if id == nil || id == "" { return "" }
+    let parts = ("" + id).split("@")
+    if parts.len() > 1 && parts[1] != "" {
+        return "bus-" + parts[0] + "--" + parts[1]
+    }
+    "bus-" + parts[0]
 }
 fn show(v, unit) { if v == nil { return "-" } "" + v + unit }
 fn agent_name(list, id) {
@@ -43,4 +52,36 @@ fn agent_host(id) {
     let parts = ("" + id).split("@")
     if parts.len() > 1 { return "@" + parts[1] }
     ""
+}
+fn sa_val(v) {
+    if v == nil { return 0.0 }
+    let f = v * 1.0
+    if f < 0.0 { return 0.0 }
+    f
+}
+fn sa_left() {
+    if state.safe_area_off ?? false { return 0.0 }
+    let sa = state.safe_area ?? nil
+    if sa == nil { return 0.0 }
+    sa_val(sa.left ?? nil)
+}
+fn sa_right() {
+    if state.safe_area_off ?? false { return 0.0 }
+    let sa = state.safe_area ?? nil
+    if sa == nil { return 0.0 }
+    sa_val(sa.right ?? nil)
+}
+fn sa_bottom() {
+    if state.safe_area_off ?? false { return 0.0 }
+    let sa = state.safe_area ?? nil
+    if sa == nil { return 0.0 }
+    sa_val(sa.bottom ?? nil)
+}
+fn sa_pad(base, inset) {
+    if inset > base { return inset }
+    base
+}
+fn sa_inner(base, inset) {
+    if base > inset { return base - inset }
+    0.0
 }

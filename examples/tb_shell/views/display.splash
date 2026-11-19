@@ -1,5 +1,5 @@
 // DISPLAY: backlight presets (`1..255`), `screen-timeout` (`30s/60s/2m/5m/Never`),
-// `/run/tinybot/display-state` path/fallback, and `Sleep now`.
+// `/run/tinybot/display-state` path/fallback, `Sleep now`, and live Safe Area readout/preview.
 let Cell = Squircle{
     width: Fill height: 78 flow: Down spacing: 3
     padding: Inset{left: 14 right: 14} align: Align{x: 0.0 y: 0.5}
@@ -27,10 +27,15 @@ main := View{
         let fb = if d == nil { false } else { d.fallback ?? false }
         let tmo = if d == nil { 60 } else { d.timeout ?? 60 }
         let last = if d == nil { "" } else { d.last ?? "" }
+        let sa = state.safe_area ?? nil
+        let sa_off = state.safe_area_off ?? false
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
 
         if is_compact {
             View{
-                width: Fill height: Fit padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                width: Fill height: Fit padding: Inset{left: sa_pad(10.0, cur_l) right: sa_pad(10.0, cur_r) top: 6.0 bottom: 6.0}
                 CompactBar{
                     Title{width: Fill draw_text.text_style.font_size: 15 text: "Bri " + show(cur, "") + "/" + show(max, "")}
                     MiniBtn{text: "-" on_click: || emit("step", {delta: -1})}
@@ -59,46 +64,172 @@ main := View{
                 Big{height: 40 text: "Sleep" draw_bg.color: #x212c40 draw_bg.color_focus: #x212c40 draw_bg.color_hover: #x2c3b54 on_click: || emit("sleep", {})}
             }
         } else {
-            let sc_h = ((slot.height ?? 780.0) - 20.0)
+            let sc_h = ((slot.height ?? 780.0) - 20.0 - cur_b)
             let safe_h = if sc_h < 140.0 { 140.0 } else { sc_h }
-            ScrollYView{
-                width: Fill height: safe_h flow: Down padding: 14 spacing: 9
-                Small{text: "Display backlight (1.." + show(max, ")") + (if path == nil { "" } else { "  ·  path: " + path })}
-                if fb {
-                    Small{width: Fill text: "Fallback display path active" draw_text.color: #xf5b942}
-                }
-                View{width: Fill height: Fit flow: Right spacing: 9
-                    Cell{k.text: "brightness" v.text: if cur == nil { "-" } else { show(cur, "") + " / " + show(max, "") }}
-                    Cell{k.text: "panel" v.text: show(panel, "")}
-                }
-                View{width: Fill height: Fit flow: Right spacing: 7
-                    Preset{text: "5" draw_bg.color: pick_bg(cur == 5) draw_bg.color_focus: pick_bg(cur == 5) draw_bg.color_hover: pick_bg(cur == 5) on_click: || emit("set", {level: 5})}
-                    Preset{text: "25" draw_bg.color: pick_bg(cur == 25) draw_bg.color_focus: pick_bg(cur == 25) draw_bg.color_hover: pick_bg(cur == 25) on_click: || emit("set", {level: 25})}
-                    Preset{text: "64" draw_bg.color: pick_bg(cur == 64) draw_bg.color_focus: pick_bg(cur == 64) draw_bg.color_hover: pick_bg(cur == 64) on_click: || emit("set", {level: 64})}
-                }
-                View{width: Fill height: Fit flow: Right spacing: 7
-                    Preset{text: "128" draw_bg.color: pick_bg(cur == 128) draw_bg.color_focus: pick_bg(cur == 128) draw_bg.color_hover: pick_bg(cur == 128) on_click: || emit("set", {level: 128})}
-                    Preset{text: "199" draw_bg.color: pick_bg(cur == 199) draw_bg.color_focus: pick_bg(cur == 199) draw_bg.color_hover: pick_bg(cur == 199) on_click: || emit("set", {level: 199})}
-                    Preset{text: "255" draw_bg.color: pick_bg(cur == 255) draw_bg.color_focus: pick_bg(cur == 255) draw_bg.color_hover: pick_bg(cur == 255) on_click: || emit("set", {level: 255})}
-                }
-                View{width: Fill height: Fit flow: Right spacing: 7
-                    Preset{text: "- step" on_click: || emit("step", {delta: -1})}
-                    Preset{text: "+ step" on_click: || emit("step", {delta: 1})}
-                }
-                Small{text: "Idle timeout"}
-                View{width: Fill height: Fit flow: Right spacing: 6
-                    Preset{height: 44 text: "30s" draw_bg.color: pick_bg(tmo == 30) draw_bg.color_focus: pick_bg(tmo == 30) draw_bg.color_hover: pick_bg(tmo == 30) on_click: || emit("timeout", {secs: 30})}
-                    Preset{height: 44 text: "60s" draw_bg.color: pick_bg(tmo == 60) draw_bg.color_focus: pick_bg(tmo == 60) draw_bg.color_hover: pick_bg(tmo == 60) on_click: || emit("timeout", {secs: 60})}
-                    Preset{height: 44 text: "2m" draw_bg.color: pick_bg(tmo == 120) draw_bg.color_focus: pick_bg(tmo == 120) draw_bg.color_hover: pick_bg(tmo == 120) on_click: || emit("timeout", {secs: 120})}
-                    Preset{height: 44 text: "5m" draw_bg.color: pick_bg(tmo == 300) draw_bg.color_focus: pick_bg(tmo == 300) draw_bg.color_hover: pick_bg(tmo == 300) on_click: || emit("timeout", {secs: 300})}
-                    Preset{height: 44 text: "Never" draw_bg.color: pick_bg(tmo == 0) draw_bg.color_focus: pick_bg(tmo == 0) draw_bg.color_hover: pick_bg(tmo == 0) on_click: || emit("timeout", {secs: 0})}
-                }
-                View{width: Fill height: Fit flow: Right spacing: 8
-                    Big{height: 48 text: "Sleep now" draw_bg.color: #x212c40 draw_bg.color_focus: #x212c40 draw_bg.color_hover: #x2c3b54 on_click: || emit("sleep", {})}
-                    Big{height: 48 text: "Refresh" on_click: || emit("refresh", {})}
-                }
-                if last != "" {
-                    Small{width: Fill text: last}
+            let raw_t = if sa == nil { nil } else { sa.top ?? nil }
+            let raw_b = if sa == nil { nil } else { sa.bottom ?? nil }
+            let raw_l = if sa == nil { nil } else { sa.left ?? nil }
+            let raw_r = if sa == nil { nil } else { sa.right ?? nil }
+            let has_sa = raw_t != nil || raw_b != nil || raw_l != nil || raw_r != nil
+            let strip_m = if sa == nil { "-" } else { sa.strip_mode ?? "-" }
+            let strip_y = if sa == nil { nil } else { sa.strip_y ?? nil }
+            let strip_h = if sa == nil { nil } else { sa.strip_h ?? nil }
+            let strip_pl = if sa == nil { nil } else { sa.strip_pad_l ?? nil }
+            let strip_pr = if sa == nil { nil } else { sa.strip_pad_r ?? nil }
+            let strip_st = if sa == nil { nil } else { sa.strip_space_top ?? nil }
+            let strip_sb = if sa == nil { nil } else { sa.strip_space_bot ?? nil }
+            let px = if sa == nil { nil } else { sa.punch_x ?? nil }
+            let pw = if sa == nil { nil } else { sa.punch_w ?? nil }
+            let ph = if sa == nil { nil } else { sa.punch_h ?? nil }
+            let cr = if sa == nil { nil } else { sa.corner_r ?? nil }
+            let preview_r = if cr == nil { 16.0 } else { sa_val(cr) }
+            let is_p0 = !sa_off && cur_b == 0.0 && cur_l == 0.0 && cur_r == 0.0
+            let is_p16 = !sa_off && cur_b == 16.0 && cur_l == 8.0 && cur_r == 8.0
+            let is_p28 = !sa_off && cur_b == 28.0 && cur_l == 16.0 && cur_r == 16.0
+            let is_p36 = !sa_off && cur_b == 36.0 && cur_l == 20.0 && cur_r == 20.0
+
+            View{
+                width: Fill height: Fit
+                padding: Inset{left: cur_l right: cur_r top: 0.0 bottom: cur_b}
+                ScrollYView{
+                    width: Fill height: safe_h flow: Down
+                    padding: Inset{left: sa_inner(14.0, cur_l) right: sa_inner(14.0, cur_r) top: 14.0 bottom: sa_inner(14.0, cur_b)}
+                    spacing: 9
+                    Small{text: "Display backlight (1.." + show(max, ")") + (if path == nil { "" } else { "  ·  path: " + path })}
+                    if fb {
+                        Small{width: Fill text: "Fallback display path active" draw_text.color: #xf5b942}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{k.text: "brightness" v.text: if cur == nil { "-" } else { show(cur, "") + " / " + show(max, "") }}
+                        Cell{k.text: "panel" v.text: show(panel, "")}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 7
+                        Preset{text: "5" draw_bg.color: pick_bg(cur == 5) draw_bg.color_focus: pick_bg(cur == 5) draw_bg.color_hover: pick_bg(cur == 5) on_click: || emit("set", {level: 5})}
+                        Preset{text: "25" draw_bg.color: pick_bg(cur == 25) draw_bg.color_focus: pick_bg(cur == 25) draw_bg.color_hover: pick_bg(cur == 25) on_click: || emit("set", {level: 25})}
+                        Preset{text: "64" draw_bg.color: pick_bg(cur == 64) draw_bg.color_focus: pick_bg(cur == 64) draw_bg.color_hover: pick_bg(cur == 64) on_click: || emit("set", {level: 64})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 7
+                        Preset{text: "128" draw_bg.color: pick_bg(cur == 128) draw_bg.color_focus: pick_bg(cur == 128) draw_bg.color_hover: pick_bg(cur == 128) on_click: || emit("set", {level: 128})}
+                        Preset{text: "199" draw_bg.color: pick_bg(cur == 199) draw_bg.color_focus: pick_bg(cur == 199) draw_bg.color_hover: pick_bg(cur == 199) on_click: || emit("set", {level: 199})}
+                        Preset{text: "255" draw_bg.color: pick_bg(cur == 255) draw_bg.color_focus: pick_bg(cur == 255) draw_bg.color_hover: pick_bg(cur == 255) on_click: || emit("set", {level: 255})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 7
+                        Preset{text: "- step" on_click: || emit("step", {delta: -1})}
+                        Preset{text: "+ step" on_click: || emit("step", {delta: 1})}
+                    }
+                    Small{text: "Idle timeout"}
+                    View{width: Fill height: Fit flow: Right spacing: 6
+                        Preset{height: 44 text: "30s" draw_bg.color: pick_bg(tmo == 30) draw_bg.color_focus: pick_bg(tmo == 30) draw_bg.color_hover: pick_bg(tmo == 30) on_click: || emit("timeout", {secs: 30})}
+                        Preset{height: 44 text: "60s" draw_bg.color: pick_bg(tmo == 60) draw_bg.color_focus: pick_bg(tmo == 60) draw_bg.color_hover: pick_bg(tmo == 60) on_click: || emit("timeout", {secs: 60})}
+                        Preset{height: 44 text: "2m" draw_bg.color: pick_bg(tmo == 120) draw_bg.color_focus: pick_bg(tmo == 120) draw_bg.color_hover: pick_bg(tmo == 120) on_click: || emit("timeout", {secs: 120})}
+                        Preset{height: 44 text: "5m" draw_bg.color: pick_bg(tmo == 300) draw_bg.color_focus: pick_bg(tmo == 300) draw_bg.color_hover: pick_bg(tmo == 300) on_click: || emit("timeout", {secs: 300})}
+                        Preset{height: 44 text: "Never" draw_bg.color: pick_bg(tmo == 0) draw_bg.color_focus: pick_bg(tmo == 0) draw_bg.color_hover: pick_bg(tmo == 0) on_click: || emit("timeout", {secs: 0})}
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 8
+                        Big{height: 48 text: "Sleep now" draw_bg.color: #x212c40 draw_bg.color_focus: #x212c40 draw_bg.color_hover: #x2c3b54 on_click: || emit("sleep", {})}
+                        Big{height: 48 text: "Refresh" on_click: || emit("refresh", {})}
+                    }
+
+                    // Safe Area readout & bottom/side padding toggle/preview
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                        padding: Inset{top: 6}
+                        Small{width: Fill text: "Safe Area"}
+                        Small{
+                            text: if sa_off { "bypassed (0 px)" } else if has_sa { "active" } else { "unset (0 px)" }
+                            draw_text.color: if sa_off { #xf5b942 } else if has_sa { #x3ddc84 } else { #x9aa4b2 }
+                        }
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{
+                            height: 66
+                            k.text: "top / bottom"
+                            v.draw_text.text_style.font_size: 16.5
+                            v.text: if has_sa { show(raw_t, "") + " / " + show(raw_b, " px") } else { "0 / 0 px" }
+                        }
+                        Cell{
+                            height: 66
+                            k.text: "left / right"
+                            v.draw_text.text_style.font_size: 16.5
+                            v.text: if has_sa { show(raw_l, "") + " / " + show(raw_r, " px") } else { "0 / 0 px" }
+                        }
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 9
+                        Cell{
+                            height: 66
+                            k.text: "strip (" + strip_m + ")"
+                            v.draw_text.text_style.font_size: 15
+                            v.text: if strip_y == nil { "-" } else { "y " + show(strip_y, "") + " · h " + show(strip_h, "") }
+                        }
+                        Cell{
+                            height: 66
+                            k.text: "punch / corner"
+                            v.draw_text.text_style.font_size: 15
+                            v.text: if pw == nil && cr == nil { "-" } else { show(pw, "") + "x" + show(ph, "") + " · r " + show(cr, "") }
+                        }
+                    }
+                    if strip_pl != nil || px != nil {
+                        Small{
+                            width: Fill
+                            text: "strip pad L/R " + show(strip_pl, "") + "/" + show(strip_pr, "") + " · space " + show(strip_st, "") + "/" + show(strip_sb, "") + " · punch x " + show(px, "")
+                        }
+                    }
+                    View{width: Fill height: Fit flow: Right spacing: 6
+                        Preset{
+                            height: 40 width: Fill
+                            text: if sa_off { "Padding: Off (enable)" } else { "Padding: On (bypass)" }
+                            draw_bg.color: if sa_off { #x4a3519 } else { #x1e4d35 }
+                            draw_bg.color_focus: if sa_off { #x4a3519 } else { #x1e4d35 }
+                            draw_bg.color_hover: if sa_off { #x5e4420 } else { #x276345 }
+                            on_click: || set("safe_area_off", !sa_off)
+                        }
+                    }
+                    Big{
+                        height: 46 text: "Calibrate Bounds"
+                        draw_bg.color: #x284772 draw_bg.color_focus: #x284772 draw_bg.color_hover: #x335a8f
+                        on_click: || emit("calibrate_bounds", {})
+                    }
+                    Small{text: "Quick bottom / side preview (px)"}
+                    View{width: Fill height: Fit flow: Right spacing: 6
+                        Preset{
+                            height: 40 text: "0/0"
+                            draw_bg.color: pick_bg(is_p0) draw_bg.color_focus: pick_bg(is_p0) draw_bg.color_hover: pick_bg(is_p0)
+                            on_click: || { set("safe_area_off", false); set("safe_area", {bottom: 0, left: 0, right: 0}) }
+                        }
+                        Preset{
+                            height: 40 text: "16/8"
+                            draw_bg.color: pick_bg(is_p16) draw_bg.color_focus: pick_bg(is_p16) draw_bg.color_hover: pick_bg(is_p16)
+                            on_click: || { set("safe_area_off", false); set("safe_area", {bottom: 16, left: 8, right: 8}) }
+                        }
+                        Preset{
+                            height: 40 text: "28/16"
+                            draw_bg.color: pick_bg(is_p28) draw_bg.color_focus: pick_bg(is_p28) draw_bg.color_hover: pick_bg(is_p28)
+                            on_click: || { set("safe_area_off", false); set("safe_area", {bottom: 28, left: 16, right: 16}) }
+                        }
+                        Preset{
+                            height: 40 text: "36/20"
+                            draw_bg.color: pick_bg(is_p36) draw_bg.color_focus: pick_bg(is_p36) draw_bg.color_hover: pick_bg(is_p36)
+                            on_click: || { set("safe_area_off", false); set("safe_area", {bottom: 36, left: 20, right: 20}) }
+                        }
+                    }
+                    RoundedView{
+                        width: Fill height: Fit
+                        padding: Inset{left: cur_l right: cur_r top: 6.0 bottom: cur_b}
+                        show_bg: true
+                        draw_bg.color: #x0d121c draw_bg.border_radius: preview_r
+                        RoundedView{
+                            width: Fill height: 34 align: Align{x: 0.5 y: 0.5}
+                            show_bg: true
+                            draw_bg.color: #x1f314a draw_bg.border_radius: 10.0
+                            Small{
+                                text: "Applied: L " + show(cur_l, "") + " · B " + show(cur_b, "") + " · R " + show(cur_r, "")
+                                draw_text.color: #xe2e8f0
+                            }
+                        }
+                    }
+                    if last != "" {
+                        Small{width: Fill text: last}
+                    }
                 }
             }
         }

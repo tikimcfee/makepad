@@ -6,15 +6,26 @@ let RowCard = RoundedView{
     show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 12.0
 }
-width: Fill height: Fill flow: Down padding: 12
-main := ScrollYView{
-    width: Fill height: Fill flow: Down spacing: 8
+width: Fill height: Fill flow: Down padding: 0
+main := View{
+    width: Fill height: Fill flow: Down
     on_render: || {
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
         let stg = (state.prev_stage ?? nil) ?? (state.stage ?? nil)
         let mode = if stg == nil { "stack" } else { stg.mode ?? "stack" }
         let slots = if stg == nil { [] } else { stg.slots ?? [] }
         let surfs = state.surfaces ?? []
         let wks = state.workspaces ?? []
+
+        View{
+            width: Fill height: Fill
+            padding: Inset{left: cur_l right: cur_r top: 0.0 bottom: cur_b}
+            ScrollYView{
+                width: Fill height: Fill flow: Down
+                padding: Inset{left: sa_inner(12.0, cur_l) right: sa_inner(12.0, cur_r) top: 12.0 bottom: sa_inner(12.0, cur_b)}
+                spacing: 8
 
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
@@ -74,6 +85,8 @@ main := ScrollYView{
                 PillBtn{height: 34 text: "Open" on_click: || front(sname)}
                 PillBtn{height: 34 text: "+Stack" on_click: || stage({sub: "add", surface: sname})}
                 PillBtn{height: 34 text: "Pin" on_click: || stage({sub: "pin", surface: sname, mode: "compact"})}
+            }
+        }
             }
         }
     }

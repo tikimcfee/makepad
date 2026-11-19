@@ -16,7 +16,11 @@ main := View{
         let txt = if v == nil { "" } else { v.text ?? "" }
         let st = if v == nil { "" } else { v.status ?? (if live { "Listening..." } else if n > 0 { "Sending..." } else { "Ready" }) }
         let target_lbl = agent_name(state.agents ?? nil, state.target ?? nil)
-        let full_raw_h = (slot.height ?? 780.0) - (if n > 0 { 156.0 } else { 100.0 })
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
+        let pad_b = if is_compact { 8.0 } else { sa_pad(14.0, cur_b) }
+        let full_raw_h = (slot.height ?? 780.0) - (if n > 0 { 156.0 } else { 100.0 }) - (pad_b - 14.0)
         let full_text_h = if full_raw_h < 110.0 { 110.0 } else { full_raw_h }
         let text_h = if is_compact { 98.0 } else { full_text_h }
 
@@ -24,7 +28,7 @@ main := View{
             width: Fill
             height: Fit
             flow: Down
-            padding: if is_compact { Inset{left: 10 right: 10 top: 6 bottom: 8} } else { Inset{left: 14 right: 14 top: 12 bottom: 14} }
+            padding: if is_compact { Inset{left: sa_pad(10.0, cur_l) right: sa_pad(10.0, cur_r) top: 6.0 bottom: 8.0} } else { Inset{left: sa_pad(14.0, cur_l) right: sa_pad(14.0, cur_r) top: 12.0 bottom: pad_b} }
             spacing: 8
 
             // 1. 60 px soft background visualizer + foreground target pill & status

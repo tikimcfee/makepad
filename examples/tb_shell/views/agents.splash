@@ -27,6 +27,16 @@ fn has_str(list, target) {
     }
     false
 }
+fn has_local_agent_term(terms, aname, asess) {
+    let want1 = "agent-" + aname
+    for t in terms ?? [] {
+        if (t.ns ?? "") == "agents" {
+            let tid = t.id ?? ""
+            if tid == want1 || (asess != "" && tid == asess) { return true }
+        }
+    }
+    false
+}
 fn toggle_host(collapsed, host) {
     let mut next = []
     let mut found = false
@@ -76,10 +86,13 @@ main := View{
         let raw_list = state.agents ?? []
         let list = sort_items(raw_list, true)
         let cur_target = state.target ?? nil
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
 
         if is_compact {
             compact_bar := View{
-                width: Fill height: 58 padding: Inset{left: 10 right: 10 top: 8 bottom: 8}
+                width: Fill height: 58 padding: Inset{left: sa_pad(10.0, cur_l) right: sa_pad(10.0, cur_r) top: 8.0 bottom: 8.0}
                 ScrollXView{
                     width: Fill height: 42 flow: Right spacing: 8 align: Align{y: 0.5}
                     for a in list {
@@ -100,6 +113,7 @@ main := View{
             }
         } else {
             let td = state.termd ?? nil
+            let terms = if td == nil { [] } else { td.terminals ?? [] }
             let term_count = if td == nil { 0 } else { td.count ?? 0 }
             let local_host = if td == nil { "local" } else { td.local_host ?? "local" }
             let collapsed = state.agents_collapsed ?? []
@@ -111,10 +125,13 @@ main := View{
                 }
             }
             let hosts = sort_items(raw_hosts, false)
-            let list_h = ((slot.height ?? 780.0) - 102.0)
+            let pad_l = sa_pad(14.0, cur_l)
+            let pad_r = sa_pad(14.0, cur_r)
+            let pad_b = if (slot.mode ?? "full") == "grid" { 14.0 } else { sa_pad(14.0, cur_b) }
+            let list_h = ((slot.height ?? 780.0) - (88.0 + pad_b))
             let safe_h = if list_h < 120.0 { 120.0 } else { list_h }
             full_box := View{
-                width: Fill height: Fit flow: Down padding: 14 spacing: 9
+                width: Fill height: Fit flow: Down padding: Inset{left: pad_l right: pad_r top: 14.0 bottom: pad_b} spacing: 9
                 // Initiator bar: +Shell, +agy, +claude, Terms (N) ->
                 View{
                     width: Fill height: 36 flow: Right spacing: 5
@@ -154,7 +171,7 @@ main := View{
                         }
                     }
                 }
-                Small{text: "Agents · tap device to fold, agent to target"}
+                Small{text: "Agents · tap device to fold, Term -> to open session"}
                 ScrollYView{
                     width: Fill height: safe_h flow: Down spacing: 8
                     if hosts.len() == 0 {
@@ -165,23 +182,25 @@ main := View{
                         let is_col = has_str(collapsed, host_name)
                         let mut total_n = 0
                         let mut busy_n = 0
+                        let mut wait_n = 0
                         let mut has_sel = false
                         for a in list {
                             if agent_host_name(a) == host_name {
                                 total_n = total_n + 1
                                 let st = a.status ?? ""
                                 if st == "busy" || st == "processing" { busy_n = busy_n + 1 }
+                                if st == "waiting" { wait_n = wait_n + 1 }
                                 if (a.id ?? "") == cur_target { has_sel = true }
                             }
                         }
-                        let count_txt = "" + total_n + (if busy_n > 0 { " · " + busy_n + " busy" } else { "" })
+                        let count_txt = "" + total_n + (if wait_n > 0 { " · " + wait_n + " waiting" } else { "" }) + (if busy_n > 0 { " · " + busy_n + " busy" } else { "" })
                         View{
                             width: Fill height: Fit flow: Down spacing: 6
                             View{
                                 width: Fill height: Fit
                                 on_item_tap: |i| set("agents_collapsed", toggle_host(state.agents_collapsed ?? [], host_name))
                                 SectionHdr{
-                                    draw_bg.color: if is_col && has_sel { #x19283d } else { #x151b26 }
+                                    draw_bg.color: if wait_n > 0 { #x241936 } else { if is_col && has_sel { #x19283d } else { #x151b26 } }
                                     Small{
                                         text: if is_col { ">" } else { "v" }
                                         draw_text.color: #x9aa4b2
@@ -197,7 +216,7 @@ main := View{
                                     }
                                     cnt_lbl := Small{
                                         text: count_txt
-                                        draw_text.color: #x8b95a5
+                                        draw_text.color: if wait_n > 0 { #xd8b4fe } else { #x8b95a5 }
                                     }
                                 }
                             }
@@ -207,42 +226,63 @@ main := View{
                                         let aid = a.id ?? ""
                                         let aname = a.name ?? aid
                                         let asess = a.session ?? ""
+                                        let ast = a.status ?? ""
+                                        let adetail = a.detail ?? ""
+                                        let is_wait = ast == "waiting"
                                         let sel = aid == cur_target
                                         let is_local = host_name == local_host || host_name == "local"
+                                        let native_local = is_local && has_local_agent_term(terms, aname, asess)
+                                        let bid = bus_term_id(aid)
                                         AgentCard{
-                                            draw_bg.color: if sel { #x1f314a } else { #x1c2230 }
+                                            draw_bg.color: if is_wait { #x261a38 } else { if sel { #x1f314a } else { #x1c2230 } }
                                             on_item_tap: |col| {
                                                 if col <= 1 { set("target", aid) }
-                                                if is_local && col == 2 {
-                                                    emit("termd_focus_agent", {name: aname, session: asess})
+                                                if col == 2 {
+                                                    if native_local {
+                                                        emit("termd_focus_agent", {name: aname, session: asess})
+                                                    } else if bid != "" {
+                                                        emit("termd_create", {
+                                                            ns: "default",
+                                                            id: bid,
+                                                            cmd: "exec /usr/local/bin/tb-agent-term " + aid + " " + bid,
+                                                            focus: true,
+                                                        })
+                                                    }
                                                 }
-                                                if (is_local && col == 3) || (!is_local && col == 2) {
+                                                if col == 3 {
                                                     set("target", aid)
                                                     front("chat")
                                                 }
                                             }
-                                            Dot{draw_bg.color: status_color(a.status ?? "")}
+                                            Dot{draw_bg.color: status_color(ast)}
                                             View{
-                                                width: Fill height: 48 align: Align{x: 0.0 y: 0.5}
+                                                width: Fill height: 48 flow: Down spacing: 2 align: Align{x: 0.0 y: 0.5}
                                                 padding: Inset{left: 2 right: 2}
-                                                Label{
+                                                name_lbl := Label{
                                                     width: Fill max_lines: 1 text_overflow: Ellipsis
                                                     draw_text.text_style.font_size: 14.5
                                                     draw_text.color: #xeeeeee
                                                     text: aname
                                                 }
-                                            }
-                                            if is_local {
-                                                term_pill := RoundedView{
-                                                    width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
-                                                    padding: Inset{left: 9 right: 9}
-                                                    show_bg: true
-                                                    draw_bg.color: #x1c3147 draw_bg.border_radius: 10.0
-                                                    Label{
-                                                        draw_text.text_style.font_size: 12.5
-                                                        draw_text.color: #x93c5fd
-                                                        text: "Term ->"
+                                                if is_wait && adetail != "" {
+                                                    wait_lbl := Label{
+                                                        width: Fill max_lines: 1 text_overflow: Ellipsis
+                                                        draw_text.text_style.font_size: 11.5
+                                                        draw_text.color: #xd8b4fe
+                                                        text: adetail
                                                     }
+                                                }
+                                            }
+                                            term_pill := RoundedView{
+                                                width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
+                                                padding: Inset{left: 9 right: 9}
+                                                show_bg: true
+                                                draw_bg.color: if is_wait { #x581c87 } else { #x1c3147 }
+                                                draw_bg.border_radius: 10.0
+                                                Label{
+                                                    draw_text.text_style.font_size: 12.5
+                                                    draw_text.color: if is_wait { #xf3e8ff } else { #x93c5fd }
+                                                    text: if is_wait { "Prompt ->" } else { "Term ->" }
                                                 }
                                             }
                                             chat_pill := RoundedView{

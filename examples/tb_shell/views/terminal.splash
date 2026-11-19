@@ -38,10 +38,29 @@ fn active_label_for(terms, ns, id) {
     }
     ns + ":" + id
 }
-width: Fill height: Fill flow: Down padding: Inset{left: 8 right: 8 top: 6 bottom: 8} spacing: 6
+fn find_bus_agent(bt, agents, ns, id) {
+    if ns != "default" || id == "" { return nil }
+    let bp = ("" + id).split("bus-")
+    if bp.len() < 2 || bp[0] != "" { return nil }
+    if bt != nil && (bt.term_id ?? "") == id {
+        return bt
+    }
+    for a in agents ?? [] {
+        if bus_term_id(a.id ?? "") == id {
+            return a
+        }
+    }
+    nil
+}
+width: Fill height: Fill flow: Down padding: 0 spacing: 0
 main := View{
-    width: Fill height: Fill flow: Down spacing: 6
+    width: Fill height: Fill flow: Down
     on_render: || {
+        let cur_l = sa_left()
+        let cur_r = sa_right()
+        let cur_b = sa_bottom()
+        let is_compact = (slot.mode ?? "full") == "compact"
+        let pad_b = if is_compact { 8.0 } else { sa_pad(8.0, cur_b) }
         let td = state.termd ?? nil
         let terms = if td == nil { [] } else { td.terminals ?? [] }
         let act = if td == nil { nil } else { td.active ?? nil }
@@ -54,8 +73,19 @@ main := View{
         let picker_open = if td == nil { false } else { td.picker_open ?? false }
         let pp = if td == nil { nil } else { td.pending_paste ?? nil }
         let err_msg = if td == nil { "" } else { td.last_error ?? "" }
+        let ba = find_bus_agent(state.bus_term ?? nil, state.agents ?? [], active_ns, active_id)
+        let ba_waiting = ba != nil && (ba.status ?? "") == "waiting"
+        let ba_detail = if ba == nil { "" } else {
+            let d = ba.detail ?? ""
+            if d != "" { d } else { ba.tool ?? "Permission requested" }
+        }
         let kill_armed = active_id != "" && kill_conf == (active_ns + ":" + active_id)
         let sel_text = active_label_for(terms, active_ns, active_id) + (if terms.len() > 1 { "  v" } else { "" })
+
+        View{
+            width: Fill height: Fill flow: Down
+            padding: Inset{left: sa_pad(8.0, cur_l) right: sa_pad(8.0, cur_r) top: 6.0 bottom: pad_b}
+            spacing: 6
 
         // 1. Top compact bar (38 px) — full-pill hit rects via parent `on_item_tap`
         top_bar := View{
@@ -134,6 +164,42 @@ main := View{
                             text: t.label ?? (tns + ":" + tid)
                         }
                         Small{text: show(t.cols ?? 48, "x") + show(t.rows ?? 24, "")}
+                    }
+                }
+            }
+        }
+
+        // Optional inline permission response bar when viewing a `waiting` bus-mirrored agent
+        if ba_waiting {
+            wait_bar := RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6
+                padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                show_bg: true
+                draw_bg.color: #x26173d draw_bg.border_radius: 11.0
+                wait_msg := Label{
+                    width: Fill max_lines: 1 text_overflow: Ellipsis
+                    draw_text.text_style.font_size: 12.5
+                    draw_text.color: #xf3e8ff
+                    text: "Prompt · " + ba_detail
+                }
+                wait_btns := View{
+                    width: Fill height: 34 flow: Right spacing: 6
+                    on_item_tap: |col| {
+                        if col == 0 { emit("termd_key", {key: "y", alt: true}) }
+                        if col == 1 { emit("termd_key", {key: "a", alt: true}) }
+                        if col == 2 { emit("termd_key", {key: "n", alt: true}) }
+                    }
+                    allow_btn := KeyCap{
+                        height: 34 draw_bg.color: #x1e4d35
+                        lbl.text: "Allow" lbl.draw_text.color: #xd1fae5
+                    }
+                    always_btn := KeyCap{
+                        height: 34 draw_bg.color: #x24426e
+                        lbl.text: "Always" lbl.draw_text.color: #xdbeafe
+                    }
+                    deny_btn := KeyCap{
+                        height: 34 draw_bg.color: #x4c1d24
+                        lbl.text: "Deny" lbl.draw_text.color: #xfca5a5
                     }
                 }
             }
@@ -261,6 +327,7 @@ main := View{
                     }
                 }
             }
+        }
         }
     }
 }
