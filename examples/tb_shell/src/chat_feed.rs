@@ -1,18 +1,21 @@
 //! Virtualized `PortalList`-backed feed widget (`ChatFeed` / `VirtualFeed`) for `tb-shell`.
 //!
-//! Solves three scroll bottlenecks on mobile TBDR GPUs (PowerVR GE8320):
+//! Solves the scroll bottlenecks on mobile TBDR GPUs (PowerVR GE8320):
 //! 1. **Viewport Virtualization (`O(viewport)`):** Wraps Makepad's `PortalList` (`auto_tail`,
-//!    `keep_end_on_resize`, `keep_nearby_items`, `reuse_items`) so only the 2–4 visible rows
-//!    intersecting the viewport run layout/draw on a scroll frame, whether the feed holds 18
-//!    or 1,000+ messages.
-//! 2. **Fence-Aware Block Splitting (`> split_bytes`):** Messages exceeding `split_bytes`
-//!    (default `2200` B) are split once (cached by 64-bit content hash) at top-level Markdown
-//!    block boundaries (or clean ~45-line fenced code continuations) into seamless `Single` /
-//!    `Top` / `Mid` / `Bot` `RoundedYView` slices (all `new_batch: false`, batching into a
-//!    single instanced `DrawQuad` draw call).
-//! 3. **Plain-Text Fast Path + Hash-Gated Binding:** Chunks with no Markdown syntax route to
+//!    `keep_end_on_resize`, `keep_nearby_items`, `reuse_items`) so only the rows intersecting
+//!    the viewport run layout/draw on a scroll frame, whether the feed holds 18 or 1,000+
+//!    messages; rows leaving the screen are recycled by template.
+//! 2. **One row per Markdown block:** each message is split once (cached by content hash) at
+//!    its top-level blocks (paragraphs, lists, tables, quotes, fenced code; small neighbours
+//!    merged) into seamless `Single` / `Top` / `Mid` / `Bot` `RoundedYView` slices (all
+//!    `new_batch: false`), so a row's layout cost is one block's, however long the message.
+//! 3. **Rows keep their place:** every row has a key (its message's event id and its block
+//!    index). An update is diffed by key into `PortalList::splice_items` edits, so when older
+//!    messages leave the front of the window or new ones arrive at the end, the rows on screen
+//!    keep their ids, widgets and measured heights: nothing under the reader jumps.
+//! 4. **Plain-Text Fast Path + Hash-Gated Binding:** Rows with no Markdown syntax route to
 //!    single-walk `Label` templates (0 `pulldown-cmark` parses, 1 `TurtleWalk`), Markdown
-//!    chunks route to `Markdown{ use_math_widget: false }`, and `existed` rows skip `set_text`
+//!    rows route to `Markdown{ use_math_widget: false }`, and `existed` rows skip `set_text`
 //!    completely whenever their 64-bit row hash already matches `applied_hashes`.
 //!
 //! Data sources:
@@ -125,6 +128,8 @@ impl SlicePos {
 
 #[derive(Clone)]
 struct FeedMsg {
+    /// The message's identity across updates: its event id, else a hash of what it says.
+    id: String,
     role: RoleKind,
     hdr: String,
     text: String,
@@ -133,6 +138,8 @@ struct FeedMsg {
 
 #[derive(Clone)]
 struct FlatRow {
+    /// The row's identity across updates (its message's id and its place in the message).
+    key: u64,
     role: RoleKind,
     pos: SlicePos,
     is_md: bool,
@@ -223,113 +230,169 @@ fn fence_marker(trimmed: &str) -> Option<&'static str> {
     }
 }
 
-/// Splits `text` exceeding `target_bytes` cleanly at top-level Markdown block boundaries
-/// (blank lines / headings outside code fences and tables), or splits giant fenced code
-/// blocks cleanly at ~45-line newline boundaries while preserving the language tag.
-fn split_markdown_blocks(text: &str, target_bytes: usize) -> Vec<(String, bool)> {
-    let target = target_bytes.max(600);
-    if text.len() <= target {
-        let md = needs_markdown(text);
-        return vec![(text.to_string(), md)];
-    }
+/// Rows smaller than this are merged with the next block of the same message, so a reply of
+/// many one-line paragraphs isn't one row per line (each row costs a card and a widget).
+const MERGE_BELOW_BYTES: usize = 360;
+/// A fenced code block longer than this many lines continues in the next row.
+const CODE_ROW_LINES: usize = 40;
 
-    let mut chunks: Vec<String> = Vec::new();
-    let mut cur = String::with_capacity(target + 512);
-    let mut active_fence: Option<(&'static str, String)> = None;
+/// Splits a message into its rows: one per top-level Markdown block (a paragraph, a list, a
+/// table, a quote, a fenced code block; a heading stays with the block after it), small
+/// neighbours merged up to `MERGE_BELOW_BYTES`. The list then recycles and lays out what is
+/// on screen block by block, whatever the message's length: a row's cost is bounded by its
+/// block, not by the message. Only a block with no boundary of its own is cut further: code
+/// every `CODE_ROW_LINES` lines (the fence reopened with its language), and a wall of text
+/// at a line end once it passes `wall_bytes`.
+fn split_message_rows(text: &str, wall_bytes: usize) -> Vec<(String, bool)> {
+    let wall = wall_bytes.max(600);
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // (marker, opening line) of the fence `cur` is inside, and the fence's indent: a fence
+    // under a list item stands alone in its row, so its lines lose that indent.
+    let mut fence: Option<(&'static str, String)> = None;
+    let mut fence_indent = 0usize;
+    let dedent = |line: &'_ str, n: usize| -> String {
+        let spaces = line.bytes().take(n).take_while(|b| *b == b' ').count();
+        line[spaces..].to_string()
+    };
     let mut fence_lines = 0usize;
-    let mut in_table = false;
+    let mut heading_pending = false;
+
+    let flush = |cur: &mut String, blocks: &mut Vec<String>| {
+        let t = cur.trim_matches(['\n', '\r']);
+        if !t.trim().is_empty() {
+            blocks.push(t.to_string());
+        }
+        cur.clear();
+    };
 
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
-
-        // Heading boundary outside fences starts a fresh slice once `cur` is substantial.
-        if active_fence.is_none()
-            && !in_table
-            && trimmed.starts_with('#')
-            && cur.len() >= target * 2 / 3
-            && !cur.trim().is_empty()
-        {
-            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-            cur.clear();
-        }
-
-        if let Some((marker, _)) = active_fence.as_ref() {
+        if let Some((marker, open)) = fence.as_ref() {
+            cur.push_str(&dedent(line, fence_indent));
             if trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty() {
-                cur.push_str(line);
-                active_fence = None;
-                fence_lines = 0;
-                if cur.len() >= target {
-                    chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-                    cur.clear();
-                }
+                fence = None;
+                flush(&mut cur, &mut blocks);
                 continue;
             }
-            cur.push_str(line);
             fence_lines += 1;
-            // Giant single code block: split cleanly every ~45 lines once past `target`.
-            if cur.len() >= target && fence_lines >= 40 {
-                let (m, open_header) = active_fence.as_ref().unwrap().clone();
+            if fence_lines >= CODE_ROW_LINES {
+                let (marker, open) = (*marker, open.clone());
                 if !cur.ends_with('\n') {
                     cur.push('\n');
                 }
-                cur.push_str(m);
-                chunks.push(cur.clone());
-                cur.clear();
-                cur.push_str(&open_header);
-                if !cur.ends_with('\n') {
-                    cur.push('\n');
-                }
+                cur.push_str(marker);
+                flush(&mut cur, &mut blocks);
+                cur.push_str(&open);
+                cur.push('\n');
                 fence_lines = 0;
             }
             continue;
         }
-
-        if let Some(m) = fence_marker(trimmed) {
-            let header = trimmed.trim_end_matches(['\n', '\r']).to_string();
-            active_fence = Some((m, header));
+        if let Some(marker) = fence_marker(trimmed) {
+            if !heading_pending {
+                flush(&mut cur, &mut blocks);
+            }
+            heading_pending = false;
+            fence = Some((marker, trimmed.trim_end_matches(['\n', '\r']).to_string()));
+            fence_indent = line.len() - trimmed.len();
             fence_lines = 0;
-            in_table = false;
-            cur.push_str(line);
+            if !cur.is_empty() && !cur.ends_with('\n') {
+                cur.push('\n');
+            }
+            cur.push_str(trimmed);
             continue;
         }
-
-        let looks_table = trimmed.starts_with('|');
-        if in_table && !looks_table {
-            in_table = false;
-            if cur.len() >= target && !cur.trim().is_empty() {
-                chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-                cur.clear();
+        if trimmed.trim().is_empty() {
+            // A blank line ends a block, unless a heading waits for its block.
+            if !heading_pending {
+                flush(&mut cur, &mut blocks);
             }
-        } else if looks_table {
-            in_table = true;
+            continue;
         }
-
+        if trimmed.starts_with('#') && !heading_pending {
+            flush(&mut cur, &mut blocks);
+            heading_pending = true;
+        } else if !trimmed.starts_with('#') {
+            heading_pending = false;
+        }
         cur.push_str(line);
-
-        let is_blank = trimmed.trim().is_empty();
-        if !in_table && is_blank && cur.len() >= target && !cur.trim().is_empty() {
-            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-            cur.clear();
-        } else if !in_table && cur.len() >= target * 2 && !cur.trim().is_empty() {
-            // Unbroken wall of single-newline lines without blank separators.
-            chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-            cur.clear();
+        if cur.len() >= wall && line.ends_with('\n') && !trimmed.starts_with('|') {
+            flush(&mut cur, &mut blocks);
         }
     }
-
-    if !cur.trim().is_empty() {
-        chunks.push(cur.trim_end_matches(['\n', '\r']).to_string());
-    }
-    if chunks.is_empty() {
+    flush(&mut cur, &mut blocks);
+    if blocks.is_empty() {
         return vec![(String::new(), false)];
     }
-    chunks
-        .into_iter()
+
+    // Merge small neighbours; a fenced block's lines stay whole, so merging joins at block
+    // edges only, with the blank line Markdown needs between them.
+    let mut rows: Vec<String> = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        match rows.last_mut() {
+            Some(last) if last.len() + b.len() < MERGE_BELOW_BYTES => {
+                last.push_str("\n\n");
+                last.push_str(&b);
+            }
+            _ => rows.push(b),
+        }
+    }
+    rows.into_iter()
         .map(|s| {
             let md = needs_markdown(&s);
             (s, md)
         })
         .collect()
+}
+
+/// The list edits that turn the rows `old` into `new` (each a row key), as
+/// `PortalList::splice_items` takes them, applied in order: `(at, removed, added)` in list
+/// ids, the history bar (`old_bar`/`new_bar`) at id 0. Rows after an edit keep their widget
+/// and measured height under their new id, so the rows on screen stay where they are when
+/// older ones leave the front or newer ones arrive at the end. A grown end is left to
+/// `set_item_range` (it follows the end when the list was tailing). `None`: nothing in
+/// common, start over.
+fn plan_splices(old: &[u64], new: &[u64], old_bar: bool, new_bar: bool) -> Option<Vec<(usize, usize, usize)>> {
+    if old.is_empty() || new.is_empty() {
+        return None;
+    }
+    let mut ops = Vec::new();
+    match (old_bar, new_bar) {
+        (true, false) => ops.push((0, 1, 0)),
+        (false, true) => ops.push((0, 0, 1)),
+        _ => {}
+    }
+    let off = usize::from(new_bar);
+    let (mut a, mut b) = (0usize, 0usize);
+    if old[0] != new[0] {
+        if let Some(j) = old.iter().position(|k| *k == new[0]) {
+            ops.push((off, j, 0)); // older rows left the front
+            a = j;
+        } else if let Some(j) = new.iter().position(|k| *k == old[0]) {
+            ops.push((off, 0, j)); // earlier rows came in at the front
+            b = j;
+        } else {
+            return None;
+        }
+    }
+    let (oa, nb) = (&old[a..], &new[b..]);
+    let p = oa.iter().zip(nb).take_while(|(x, y)| x == y).count();
+    let max_s = oa.len().min(nb.len()) - p;
+    let s = oa.iter().rev().zip(nb.iter().rev()).take(max_s).take_while(|(x, y)| x == y).count();
+    let removed = oa.len() - p - s;
+    let added = nb.len() - p - s;
+    let at = off + b + p;
+    if s == 0 {
+        // The end changed: the ids both sides have are rebound in place; extra old rows go,
+        // extra new ones come with the range.
+        if removed > added {
+            ops.push((at + added, removed - added, 0));
+        }
+    } else if removed > 0 || added > 0 {
+        ops.push((at, removed, added));
+    }
+    Some(ops)
 }
 
 script_mod! {
@@ -641,8 +704,9 @@ pub struct ChatFeed {
     pending_range_sync: bool,
     #[rust]
     pending_reset_tail: bool,
+    /// List edits (`plan_splices`) the next draw applies before it sets the range.
     #[rust]
-    pending_prepend_splice: Option<(usize, usize, usize)>,
+    pending_splices: Vec<(usize, usize, usize)>,
 
     /// Per-message split cache: `msg_hash -> Rc<Vec<(String, bool)>>` so untouched messages
     /// are never re-scanned or re-split when new messages arrive.
@@ -730,7 +794,9 @@ impl ScriptHook for ChatFeed {
                         let text = get_str(vm, live_id!(text))
                             .or_else(|| get_str(vm, live_id!(body)))
                             .unwrap_or_default();
+                        let id = get_str(vm, live_id!(id)).unwrap_or_default();
                         parsed.push(FeedMsg {
+                            id,
                             role: RoleKind::from_str(&role_s),
                             hdr,
                             text,
@@ -738,6 +804,7 @@ impl ScriptHook for ChatFeed {
                         });
                     } else if let Some(s) = vm.cast_to_owned_string(elem, "") {
                         parsed.push(FeedMsg {
+                            id: String::new(),
                             role: RoleKind::Say,
                             hdr: String::new(),
                             text: s,
@@ -819,6 +886,7 @@ impl ChatFeed {
         for (idx, item) in arr.iter().enumerate() {
             match item {
                 JsonValue::String(s) => out.push(FeedMsg {
+                    id: String::new(),
                     role: RoleKind::Say,
                     hdr: String::new(),
                     text: s.clone(),
@@ -845,7 +913,9 @@ impl ChatFeed {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     out.push(FeedMsg {
+                        id,
                         role: RoleKind::from_str(role_s),
                         hdr,
                         text,
@@ -887,17 +957,27 @@ impl ChatFeed {
         let mut fp = fnv1a(agent.as_bytes(), FNV_INIT);
         fp = fnv1a(&hidden_before.to_le_bytes(), fp);
         fp = fnv1a(&split_target.to_le_bytes(), fp);
+        // A message without an id is known by what it says, and by how many times the same
+        // words came before it.
+        let mut seen_content: HashMap<u64, u32> = HashMap::new();
 
         for m in msgs {
             let mut mh = fnv1a(&[m.role.tag()], FNV_INIT);
             mh = fnv1a(m.text.as_bytes(), mh);
             mh = fnv1a(&split_target.to_le_bytes(), mh);
             used_msg_hashes.push(mh);
+            let msg_key = if m.id.is_empty() {
+                let n = seen_content.entry(mh).or_insert(0);
+                *n += 1;
+                fnv1a(&n.to_le_bytes(), fnv1a(m.hdr.as_bytes(), mh))
+            } else {
+                fnv1a(m.id.as_bytes(), 0x9e3779b97f4a7c15)
+            };
 
             let slices = if let Some(cached) = self.split_cache.get(&mh) {
                 Rc::clone(cached)
             } else {
-                let built = Rc::new(split_markdown_blocks(&m.text, split_target));
+                let built = Rc::new(split_message_rows(&m.text, split_target));
                 self.split_cache.insert(mh, Rc::clone(&built));
                 built
             };
@@ -924,6 +1004,7 @@ impl ChatFeed {
                 fp = fnv1a(&rh.to_le_bytes(), fp);
 
                 new_rows.push(FlatRow {
+                    key: fnv1a(&(i as u64).to_le_bytes(), msg_key),
                     role: m.role,
                     pos,
                     is_md: *is_md,
@@ -945,49 +1026,27 @@ impl ChatFeed {
         }
 
         let agent_changed = !self.agent_id.is_empty() && self.agent_id != agent;
-        let was_empty = self.rows.is_empty();
         let old_has_bar = self.hidden_before > 0 && !self.rows.is_empty();
         let new_has_bar = hidden_before > 0 && !new_rows.is_empty();
-
-        // Detect clean top-prepend ("Show earlier" / "Show all"): the tail matches `self.rows`.
-        let mut prepend_splice = None;
-        if allow_splice
-            && !agent_changed
-            && !was_empty
-            && new_rows.len() > self.rows.len()
-        {
-            let added = new_rows.len() - self.rows.len();
-            let tail_matches = self
-                .rows
-                .iter()
-                .zip(&new_rows[added..])
-                .all(|(a, b)| a.hash == b.hash);
-            if tail_matches {
-                match (old_has_bar, new_has_bar) {
-                    (true, true) => prepend_splice = Some((1, 0, added)),
-                    (true, false) => prepend_splice = Some((0, 1, added)),
-                    (false, false) => prepend_splice = Some((0, 0, added)),
-                    (false, true) => prepend_splice = Some((0, 0, added + 1)),
-                }
-            }
-        }
-
-        let session_replaced = !was_empty
-            && !new_rows.is_empty()
-            && prepend_splice.is_none()
-            && new_rows.len() < self.rows.len()
-            && self.rows[0].hash != new_rows[0].hash;
+        let plan = if allow_splice && !agent_changed {
+            let old_keys: Vec<u64> = self.rows.iter().map(|r| r.key).collect();
+            let new_keys: Vec<u64> = new_rows.iter().map(|r| r.key).collect();
+            plan_splices(&old_keys, &new_keys, old_has_bar, new_has_bar)
+        } else {
+            None
+        };
 
         self.agent_id = agent.to_string();
         self.hidden_before = hidden_before;
         self.rows = new_rows;
         self.rows_fingerprint = fp;
         self.pending_range_sync = true;
-        if agent_changed || was_empty || session_replaced {
-            self.pending_reset_tail = true;
-            self.pending_prepend_splice = None;
-        } else if prepend_splice.is_some() {
-            self.pending_prepend_splice = prepend_splice;
+        match plan {
+            Some(ops) => self.pending_splices.extend(ops),
+            None => {
+                self.pending_reset_tail = true;
+                self.pending_splices.clear();
+            }
         }
         true
     }
@@ -1008,13 +1067,16 @@ impl ChatFeed {
             self.pending_range_sync = false;
             if self.pending_reset_tail {
                 self.pending_reset_tail = false;
-                self.pending_prepend_splice = None;
+                self.pending_splices.clear();
                 list.set_tail_range(true);
                 list.set_item_range(cx, 0, total);
-            } else if let Some((at, removed, added)) = self.pending_prepend_splice.take() {
-                list.splice_items(cx, at, removed, added);
-                list.set_item_range(cx, 0, total);
+                // Also when the count happens to be the same (another agent's chat): the range
+                // didn't change, so set_item_range moved nothing.
+                list.set_first_id_and_scroll(total.saturating_sub(1), 0.0);
             } else {
+                for (at, removed, added) in self.pending_splices.drain(..) {
+                    list.splice_items(cx, at, removed, added);
+                }
                 list.set_item_range(cx, 0, total);
             }
         } else {
@@ -1192,7 +1254,6 @@ impl Widget for ChatFeed {
         }
         if self.pending_reset_tail {
             self.list.as_portal_list().stop_scrolling();
-            self.list.as_portal_list().set_first_id_and_scroll(0, 0.0);
         }
         while self.list.draw_walk(cx, scope, walk).is_step() {
             let list_ref = self.list.clone();

@@ -1,6 +1,7 @@
 // CHAT: virtualized GPU Markdown conversation view for the selected agent (`state.chat`).
-// Uses native `PortalList`-backed `ChatFeed` (`O(viewport)` scrolling, fence-aware >2.2KB block
-// splitting, plain-prose `Label` fast path + rich `Markdown`, zero Splash `msgs` JSON copy).
+// Uses native `PortalList`-backed `ChatFeed` (`O(viewport)` scrolling, one recycled row per
+// Markdown block, rows keyed by event id so updates never shift them, plain-prose `Label` fast
+// path + rich `Markdown`, zero Splash `msgs` JSON copy).
 width: Fill height: Fill flow: Down padding: 0 spacing: 0
 main := View{
     width: Fill height: Fill flow: Down

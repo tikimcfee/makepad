@@ -18,12 +18,43 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const DEFAULT_SHOWN_MSGS: usize = 120;
 const MORE_STEP_MSGS: usize = 200;
 const MAX_TARGETS: usize = 16;
+/// How long after a local follower ended it starts again (ms), by how many times in a row
+/// it ended without a line.
+const FOLLOW_RESTART_DELAYS: [u64; 5] = [250, 1000, 2000, 5000, 10000];
+/// A local follower silent this long when the target's status changes is started again
+/// (the agent may have begun a new session, whose transcript it isn't reading).
+const FOLLOW_STALE: Duration = Duration::from_millis(1500);
+/// Remote: a status event asks for a fetch this soon (a burst of events is one fetch), and
+/// once more a little later, for lines the agent writes after its hook fired.
+const REMOTE_FETCH_SOON: Duration = Duration::from_millis(400);
+const REMOTE_FETCH_TRAIL: Duration = Duration::from_millis(2000);
+/// Remote fetches start at least this far apart (each one runs `agent logs` over the bus).
+const REMOTE_FETCH_MIN_GAP: Duration = Duration::from_millis(1200);
+/// Remote, `chat` in front and the target busy: how often recent events are fetched.
+const REMOTE_POLL: Duration = Duration::from_millis(2500);
+const REMOTE_RECENT_LINES: &str = "30";
+
+/// `TB_CHAT_DEBUG=1`: one stderr line per follower start/end and per remote fetch, so the
+/// journal shows when the feed was refreshed and why.
+fn debug_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_opt("TB_CHAT_DEBUG").is_some_and(|v| v != "0"))
+}
+
+macro_rules! dbg_log {
+    ($($t:tt)*) => {
+        if debug_on() {
+            eprintln!("tb-shell-chat: {}", format!($($t)*));
+        }
+    };
+}
 
 fn max_cached_events() -> usize {
     env_opt("TB_CHAT_MAX_EVENTS")
@@ -248,15 +279,22 @@ fn parse_prompt(p: &JsonValue) -> Option<EvKind> {
 struct IngestOutcome {
     dirty: bool,
     need_full_reread: bool,
+    /// For an event line: whether its id was already cached (a fetch that knew none of the
+    /// events it got may have missed some between them and the cache).
+    event_known: Option<bool>,
+}
+
+impl IngestOutcome {
+    const NONE: IngestOutcome = IngestOutcome { dirty: false, need_full_reread: false, event_known: None };
 }
 
 fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
     let trimmed = line.trim_start();
     if !trimmed.starts_with('{') {
-        return IngestOutcome { dirty: false, need_full_reread: false };
+        return IngestOutcome::NONE;
     }
     let Ok(ev_obj) = JsonValue::deserialize_json(trimmed) else {
-        return IngestOutcome { dirty: false, need_full_reread: false };
+        return IngestOutcome::NONE;
     };
     let ty = ev_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if ty == "session" {
@@ -281,13 +319,13 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
                 dirty = true;
             }
         }
-        return IngestOutcome { dirty, need_full_reread: need_full };
+        return IngestOutcome { dirty, need_full_reread: need_full, event_known: None };
     }
     if ty != "event" {
-        return IngestOutcome { dirty: false, need_full_reread: false };
+        return IngestOutcome::NONE;
     }
     let Some(id) = ev_obj.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
-        return IngestOutcome { dirty: false, need_full_reread: false };
+        return IngestOutcome::NONE;
     };
     let provisional = json_bool(ev_obj.get("provisional"));
     if !provisional {
@@ -333,7 +371,8 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
         _ => EvKind::Other,
     };
 
-    if !c.by_id.contains_key(id) {
+    let known = c.by_id.contains_key(id);
+    if !known {
         c.order.push_back(id.to_string());
         let cap = max_cached_events();
         if cap > 0 && c.order.len() > cap {
@@ -343,7 +382,7 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
         }
     }
     c.by_id.insert(id.to_string(), CompactEvent { abandoned, provisional, ts, kind });
-    IngestOutcome { dirty: true, need_full_reread: false }
+    IngestOutcome { dirty: true, need_full_reread: false, event_known: Some(known) }
 }
 
 fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_limit: usize) -> JsonValue {
@@ -361,6 +400,7 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_
         match &ev.kind {
             EvKind::Prompt { label, text } => {
                 msgs.push(obj(vec![
+                    ("id", id.as_str().into()),
                     ("role", "you".into()),
                     ("label", label.clone().into()),
                     ("ts", ev.ts.clone().into()),
@@ -370,6 +410,7 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_
             }
             EvKind::Say { text } => {
                 msgs.push(obj(vec![
+                    ("id", id.as_str().into()),
                     ("role", "say".into()),
                     ("label", agent_short.into()),
                     ("ts", ev.ts.clone().into()),
@@ -382,6 +423,7 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_
             EvKind::Tool { name, st, line, text } => {
                 if show_tools {
                     msgs.push(obj(vec![
+                        ("id", id.as_str().into()),
                         ("role", "tool".into()),
                         ("label", format!("{name} ({st})").into()),
                         ("ts", ev.ts.clone().into()),
@@ -470,6 +512,17 @@ struct ChatState {
     gen_counter: Arc<AtomicU64>,
     follower: Option<ChildFollower>,
     remote_ev: Option<ChildFollower>,
+    /// Local: when the follower last sent a line, and how many times in a row it was started
+    /// again without one; when the next start is due.
+    follow_line_at: Instant,
+    follow_restarts: u32,
+    restart_at: Option<Instant>,
+    /// Remote: when the next fetch of recent events is due (after a status event), and the
+    /// next poll while the target is busy.
+    fetch_at: Option<Instant>,
+    trail_at: Option<Instant>,
+    poll_at: Option<Instant>,
+    last_fetch_at: Option<Instant>,
 }
 
 impl ChatState {
@@ -491,6 +544,13 @@ impl ChatState {
             gen_counter: Arc::new(AtomicU64::new(0)),
             follower: None,
             remote_ev: None,
+            follow_line_at: Instant::now(),
+            follow_restarts: 0,
+            restart_at: None,
+            fetch_at: None,
+            trail_at: None,
+            poll_at: None,
+            last_fetch_at: None,
         }
     }
 
@@ -549,7 +609,9 @@ impl ChatState {
         changed
     }
 
-    fn run_ingest_cmd(&mut self, args: &[&str]) -> (bool, bool) {
+    /// Runs `agent ARGS` and ingests its JSON lines: (exit ok, a full re-read is needed,
+    /// events seen, events among them already cached).
+    fn run_ingest_cmd(&mut self, args: &[&str]) -> (bool, bool, usize, usize) {
         let Ok(mut child) = Command::new(&self.agent_bin)
             .args(args)
             .stdin(Stdio::null())
@@ -557,19 +619,99 @@ impl ChatState {
             .stderr(Stdio::null())
             .spawn()
         else {
-            return (false, false);
+            return (false, false, 0, 0);
         };
         let mut need_full = false;
+        let (mut seen, mut known) = (0usize, 0usize);
         if let Some(out) = child.stdout.take() {
             let c = self.cur_mut();
             for line in BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
                 let r = ingest_line(c, &line);
                 need_full |= r.need_full_reread;
+                if let Some(k) = r.event_known {
+                    seen += 1;
+                    known += usize::from(k);
+                }
             }
         }
         let ok = child.wait().map_or(false, |s| s.success());
-        (ok, need_full)
+        (ok, need_full, seen, known)
+    }
+
+    fn is_busy(&self) -> bool {
+        self.cache.get(&self.target_id).is_some_and(|c| matches!(c.status.as_str(), "busy" | "processing"))
+    }
+
+    /// A remote target's newest events: a short window first; when none of it overlaps what
+    /// is cached (more happened since the last fetch than the window holds), the long one.
+    fn remote_fetch_recent(&mut self) {
+        let tid = self.target_id.clone();
+        let had_any = !self.cur_mut().order.is_empty();
+        let t = Instant::now();
+        self.last_fetch_at = Some(t);
+        let (_, _, seen, known) = self.run_ingest_cmd(&["logs", &tid, "--lines", REMOTE_RECENT_LINES, "--json"]);
+        dbg_log!("fetched {tid}: {seen} events, {known} known, {} ms", t.elapsed().as_millis());
+        if had_any && seen > 0 && known == 0 {
+            let _ = self.run_ingest_cmd(&["logs", &tid, "--lines", "2000", "--json"]);
+            dbg_log!("no overlap: fetched {tid} long");
+        }
+    }
+
+    /// A remote target reported something while `chat` is in front: fetch its recent events
+    /// soon (an earlier fetch already asked for stands, so a burst is one fetch), and once more
+    /// a while after the last report.
+    fn remote_activity(&mut self) {
+        if !self.chat_visible || self.is_local() {
+            return;
+        }
+        let now = Instant::now();
+        let mut at = now + REMOTE_FETCH_SOON;
+        if let Some(last) = self.last_fetch_at {
+            at = at.max(last + REMOTE_FETCH_MIN_GAP);
+        }
+        self.fetch_at = Some(self.fetch_at.map_or(at, |f| f.min(at)));
+        self.trail_at = Some(now + REMOTE_FETCH_TRAIL);
+    }
+
+    /// The next time the loop has to wake up on its own, if any.
+    fn next_deadline(&self) -> Option<Instant> {
+        [self.restart_at, self.fetch_at, self.trail_at, self.poll_at].into_iter().flatten().min()
+    }
+
+    /// Runs what is due; returns whether the cache may have changed.
+    fn run_timers(&mut self, tx: &Sender<ChatMsg>) -> bool {
+        let now = Instant::now();
+        let mut dirty = false;
+        if self.restart_at.is_some_and(|t| t <= now) {
+            self.restart_at = None;
+            if self.chat_visible && self.is_local() {
+                self.start_stream(false, tx);
+            }
+        }
+        if self.fetch_at.is_some_and(|t| t <= now) || self.trail_at.is_some_and(|t| t <= now) {
+            if self.fetch_at.is_some_and(|t| t <= now) {
+                self.fetch_at = None;
+            } else {
+                self.trail_at = None;
+            }
+            if !self.is_local() {
+                self.remote_fetch_recent();
+                dirty = true;
+            }
+        }
+        if self.poll_at.is_some_and(|t| t <= now) {
+            self.poll_at = None;
+            if self.chat_visible && !self.is_local() {
+                let recent = self.last_fetch_at.is_some_and(|t| t.elapsed() < REMOTE_FETCH_MIN_GAP);
+                if self.is_busy() && !recent {
+                    self.remote_fetch_recent();
+                    dirty = true;
+                }
+                self.poll_at = Some(Instant::now() + REMOTE_POLL);
+            }
+        }
+        dirty
     }
 
     fn snapshot_fetch(&mut self, force_full: bool) {
@@ -593,7 +735,7 @@ impl ChatState {
             };
             let _ = unchanged;
             let short = self.agent_short.clone();
-            let (ok, need_full) = if last_at >= 0 {
+            let (ok, need_full, _, _) = if last_at >= 0 {
                 let from_str = last_at.to_string();
                 self.run_ingest_cmd(&["transcript", &short, "--from", &from_str])
             } else {
@@ -608,7 +750,11 @@ impl ChatState {
                 self.cur_mut().reset_transcript();
             }
             let tid = self.target_id.clone();
-            let _ = self.run_ingest_cmd(&["logs", &tid, "--lines", "2000", "--json"]);
+            if force_full || self.cur_mut().order.is_empty() {
+                let _ = self.run_ingest_cmd(&["logs", &tid, "--lines", "2000", "--json"]);
+            } else {
+                self.remote_fetch_recent();
+            }
         }
     }
 
@@ -629,19 +775,48 @@ impl ChatState {
         Ok(())
     }
 
+    /// Stops the followers and every timer: nothing runs while `chat` is hidden.
     fn stop_streams(&mut self) {
         self.gen_counter.fetch_add(1, Ordering::SeqCst);
         self.follower = None;
         self.remote_ev = None;
+        self.restart_at = None;
+        self.fetch_at = None;
+        self.trail_at = None;
+        self.poll_at = None;
     }
 
     fn sync_streams(&mut self, force_full: bool, tx: &Sender<ChatMsg>) {
         self.stop_streams();
+        self.follow_restarts = 0;
         if !self.chat_visible {
             return;
         }
-        let gen_id = self.gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.start_stream(force_full, tx);
+    }
+
+    /// The local follower ended while `chat` is in front (its transcript was replaced or
+    /// rewritten, or the agent is gone): it starts again, sooner the first times.
+    fn follower_ended(&mut self) {
+        self.follower = None;
+        if !(self.chat_visible && self.is_local()) {
+            return;
+        }
+        let delay = FOLLOW_RESTART_DELAYS[(self.follow_restarts as usize).min(FOLLOW_RESTART_DELAYS.len() - 1)];
+        dbg_log!("follower ended; starting again in {delay} ms");
+        self.follow_restarts = self.follow_restarts.saturating_add(1);
+        self.restart_at = Some(Instant::now() + Duration::from_millis(delay));
+    }
+
+    /// Starts the follower (local) or the bus events plus the busy poll (remote).
+    fn start_stream(&mut self, force_full: bool, tx: &Sender<ChatMsg>) {
+        self.gen_counter.fetch_add(1, Ordering::SeqCst);
+        self.follower = None;
+        self.remote_ev = None;
+        let gen_id = self.gen_counter.load(Ordering::SeqCst);
+        dbg_log!("stream for {} ({}, full: {force_full})", self.target_id, if self.is_local() { "follow" } else { "remote" });
         if self.is_local() {
+            self.follow_line_at = Instant::now();
             let last_at = {
                 let c = self.cur_mut();
                 if force_full {
@@ -682,9 +857,12 @@ impl ChatState {
                     });
                 }
                 self.follower = Some(ChildFollower { pid });
+            } else {
+                self.follower_ended();
             }
         } else {
             self.snapshot_fetch(force_full);
+            self.poll_at = Some(Instant::now() + REMOTE_POLL);
             let mut cmd = Command::new(&self.agent_bin);
             cmd.args(["events", "--all-hosts", "--json", "-q"])
                 .stdin(Stdio::null())
@@ -773,17 +951,43 @@ fn main() {
         st.sync_streams(false, &tx);
     }
 
-    while let Ok(msg) = rx.recv() {
-        let mut dirty = false;
+    let mut quit = false;
+    while !quit {
+        // Waits for the next message, or for the next timer (only while `chat` is in front).
+        let first = match st.next_deadline() {
+            Some(due) => match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            },
+        };
+        let mut dirty = st.run_timers(&tx);
+        // Everything already queued is handled before one push: a follower catching up on a
+        // long transcript sends thousands of lines, and each push copies the whole `chat`.
+        let mut batch: Vec<ChatMsg> = first.into_iter().collect();
+        while batch.len() < 4096 {
+            match rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
+        for msg in batch {
         match msg {
             ChatMsg::SocketClosed => {
                 st.stop_streams();
+                quit = true;
                 break;
             }
             ChatMsg::FollowerLine { gen_id, line } => {
                 if gen_id != st.gen_counter.load(Ordering::Relaxed) {
                     continue;
                 }
+                st.follow_line_at = Instant::now();
+                st.follow_restarts = 0;
                 let out = ingest_line(st.cur_mut(), &line);
                 if out.need_full_reread {
                     st.sync_streams(true, &tx);
@@ -791,8 +995,13 @@ fn main() {
                 dirty |= out.dirty;
             }
             ChatMsg::FollowerEof { gen_id, used_from, saw_any } => {
-                if gen_id == st.gen_counter.load(Ordering::Relaxed) && used_from && !saw_any && st.chat_visible && st.is_local() {
-                    st.sync_streams(true, &tx);
+                if gen_id == st.gen_counter.load(Ordering::Relaxed) {
+                    if used_from && !saw_any {
+                        // `--from` named no line of this transcript: read it whole next time,
+                        // merging by id, so what is shown stays up meanwhile.
+                        st.cur_mut().last_at = -1;
+                    }
+                    st.follower_ended();
                 }
             }
             ChatMsg::RemoteEvLine { gen_id, line } => {
@@ -810,11 +1019,11 @@ fn main() {
                                 c.status = ns.to_string();
                                 dirty = true;
                             }
-                            if matches!(ns, "idle" | "waiting" | "error") {
-                                st.snapshot_fetch(false);
-                                dirty = true;
-                            }
                         }
+                        // Every report of the target (a prompt taken, a tool run, a turn
+                        // ended) means its transcript may have grown: fetch soon, and again
+                        // after the last report, for lines written after the hook fired.
+                        st.remote_activity();
                     }
                 }
             }
@@ -875,8 +1084,17 @@ fn main() {
                                         if ns != prev {
                                             st.cur_mut().status = ns.clone();
                                             dirty = true;
-                                            if !st.chat_visible && matches!(ns.as_str(), "idle" | "waiting" | "error") {
-                                                st.snapshot_fetch(false);
+                                            if !st.chat_visible {
+                                                if matches!(ns.as_str(), "idle" | "waiting" | "error") {
+                                                    st.snapshot_fetch(false);
+                                                }
+                                            } else if !st.is_local() {
+                                                st.remote_activity();
+                                            } else if st.follow_line_at.elapsed() > FOLLOW_STALE {
+                                                // A quiet follower may be reading a transcript the
+                                                // agent left (a new session): start it again; its
+                                                // session line tells a new transcript.
+                                                st.start_stream(false, &tx);
                                             }
                                         }
                                         break;
@@ -900,7 +1118,8 @@ fn main() {
                 }
             }
         }
-        if dirty {
+        }
+        if dirty && !quit {
             if let Err(e) = st.push_if_changed(&writer, false) {
                 eprintln!("tb-shell-chat: {e}");
                 st.stop_streams();
