@@ -9,8 +9,8 @@ let SectionHdr = RoundedView{
     draw_bg.color: #x151b26 draw_bg.border_radius: 12.0
 }
 let AgentCard = RoundedView{
-    width: Fill height: 60 flow: Right spacing: 7
-    padding: Inset{left: 12 right: 8} align: Align{y: 0.5}
+    width: Fill height: Fit flow: Down spacing: 8
+    padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
     show_bg: true
     draw_bg.color: #x1c2230 draw_bg.border_radius: 14.0
 }
@@ -132,7 +132,7 @@ main := View{
             let safe_h = if list_h < 120.0 { 120.0 } else { list_h }
             full_box := View{
                 width: Fill height: Fit flow: Down padding: Inset{left: pad_l right: pad_r top: 14.0 bottom: pad_b} spacing: 9
-                // Initiator bar: +Shell, +agy, +claude, Terms (N) ->
+                // Initiator bar: +Shell, +agy, +claude, Terms (N)
                 View{
                     width: Fill height: 36 flow: Right spacing: 5
                     on_item_tap: |col| {
@@ -167,11 +167,11 @@ main := View{
                             max_lines: 1 text_overflow: Ellipsis
                             draw_text.text_style.font_size: 12.0
                             draw_text.color: #x93c5fd
-                            text: "Terms (" + show(term_count, ") ->")
+                            text: "Terms (" + show(term_count, ")")
                         }
                     }
                 }
-                Small{text: "Agents · tap device to fold, Term -> to open session"}
+                Small{text: "Agents · tap device to fold, Term to open session"}
                 ScrollYView{
                     width: Fill height: safe_h flow: Down spacing: 8
                     if hosts.len() == 0 {
@@ -233,67 +233,71 @@ main := View{
                                         let is_local = host_name == local_host || host_name == "local"
                                         let native_local = is_local && has_local_agent_term(terms, aname, asess)
                                         let bid = bus_term_id(aid)
+                                        let aback = a.backend ?? ""
+                                        let sub_txt = if is_wait && adetail != "" { adetail } else if aback != "" && ast != "" { aback + " · " + ast } else if aback != "" { aback } else { ast }
+                                        let sub_col = if is_wait && adetail != "" { #xd8b4fe } else { #x9aa4b2 }
                                         AgentCard{
                                             draw_bg.color: if is_wait { #x261a38 } else { if sel { #x1f314a } else { #x1c2230 } }
-                                            on_item_tap: |col| {
-                                                if col <= 1 { set("target", aid) }
-                                                if col == 2 {
-                                                    if native_local {
-                                                        emit("termd_focus_agent", {name: aname, session: asess})
-                                                    } else if bid != "" {
-                                                        emit("termd_create", {
-                                                            ns: "default",
-                                                            id: bid,
-                                                            cmd: "exec /usr/local/bin/tb-agent-term " + aid + " " + bid,
-                                                            focus: true,
-                                                        })
-                                                    }
-                                                }
-                                                if col == 3 {
-                                                    set("target", aid)
-                                                    front("chat")
-                                                }
-                                            }
-                                            Dot{draw_bg.color: status_color(ast)}
                                             View{
-                                                width: Fill height: 48 flow: Down spacing: 2 align: Align{x: 0.0 y: 0.5}
-                                                padding: Inset{left: 2 right: 2}
-                                                name_lbl := Label{
-                                                    width: Fill max_lines: 1 text_overflow: Ellipsis
-                                                    draw_text.text_style.font_size: 14.5
-                                                    draw_text.color: #xeeeeee
-                                                    text: aname
-                                                }
-                                                if is_wait && adetail != "" {
-                                                    wait_lbl := Label{
+                                                width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                                                on_item_tap: |i| set("target", aid)
+                                                Dot{draw_bg.color: status_color(ast)}
+                                                View{
+                                                    width: Fill height: Fit flow: Down spacing: 2
+                                                    name_lbl := Label{
+                                                        width: Fill
+                                                        draw_text.text_style.font_size: 15.5
+                                                        draw_text.color: #xeeeeee
+                                                        text: aname
+                                                    }
+                                                    sub_lbl := Label{
                                                         width: Fill max_lines: 1 text_overflow: Ellipsis
-                                                        draw_text.text_style.font_size: 11.5
-                                                        draw_text.color: #xd8b4fe
-                                                        text: adetail
+                                                        draw_text.text_style.font_size: 12.0
+                                                        draw_text.color: sub_col
+                                                        text: sub_txt
                                                     }
                                                 }
                                             }
-                                            term_pill := RoundedView{
-                                                width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
-                                                padding: Inset{left: 9 right: 9}
-                                                show_bg: true
-                                                draw_bg.color: if is_wait { #x581c87 } else { #x1c3147 }
-                                                draw_bg.border_radius: 10.0
-                                                Label{
-                                                    draw_text.text_style.font_size: 12.5
-                                                    draw_text.color: if is_wait { #xf3e8ff } else { #x93c5fd }
-                                                    text: if is_wait { "Prompt ->" } else { "Term ->" }
+                                            View{
+                                                width: Fill height: 34 flow: Right spacing: 8
+                                                on_item_tap: |col| {
+                                                    if col == 0 {
+                                                        if native_local {
+                                                            emit("termd_focus_agent", {name: aname, session: asess})
+                                                        } else if bid != "" {
+                                                            emit("termd_create", {
+                                                                ns: "default",
+                                                                id: bid,
+                                                                cmd: "exec /usr/local/bin/tb-agent-term " + aid + " " + bid,
+                                                                focus: true,
+                                                            })
+                                                        }
+                                                    }
+                                                    if col == 1 {
+                                                        set("target", aid)
+                                                        front("chat")
+                                                    }
                                                 }
-                                            }
-                                            chat_pill := RoundedView{
-                                                width: Fit height: 36 align: Align{x: 0.5 y: 0.5}
-                                                padding: Inset{left: 10 right: 10}
-                                                show_bg: true
-                                                draw_bg.color: #x222c3e draw_bg.border_radius: 10.0
-                                                Label{
-                                                    draw_text.text_style.font_size: 12.5
-                                                    draw_text.color: #xeeeeee
-                                                    text: "Chat ->"
+                                                term_pill := RoundedView{
+                                                    width: Fill height: 34 align: Align{x: 0.5 y: 0.5}
+                                                    show_bg: true
+                                                    draw_bg.color: if is_wait { #x581c87 } else { #x1c3147 }
+                                                    draw_bg.border_radius: 10.0
+                                                    Label{
+                                                        draw_text.text_style.font_size: 13.0
+                                                        draw_text.color: if is_wait { #xf3e8ff } else { #x93c5fd }
+                                                        text: if is_wait { "Prompt" } else { "Term" }
+                                                    }
+                                                }
+                                                chat_pill := RoundedView{
+                                                    width: Fill height: 34 align: Align{x: 0.5 y: 0.5}
+                                                    show_bg: true
+                                                    draw_bg.color: #x222c3e draw_bg.border_radius: 10.0
+                                                    Label{
+                                                        draw_text.text_style.font_size: 13.0
+                                                        draw_text.color: #xeeeeee
+                                                        text: "Chat"
+                                                    }
                                                 }
                                             }
                                         }
