@@ -96,6 +96,16 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// An ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) as Unix seconds.
+fn ts_epoch(ts: Option<&str>) -> Option<i64> {
+    let s = ts?;
+    if s.len() < 20 || !s.ends_with('Z') || s.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    let n = |a: usize, b: usize| s.get(a..b).and_then(|v| v.parse::<i64>().ok());
+    Some(days_from_civil(n(0, 4)?, n(5, 7)?, n(8, 10)?) * 86_400 + n(11, 13)? * 3600 + n(14, 16)? * 60 + n(17, 19)?)
+}
+
 /// Formats an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) as local `HH:MM`.
 fn fmt_hhmm(ts: Option<&str>) -> String {
     let Some(s) = ts else { return String::new() };
@@ -186,6 +196,9 @@ struct CompactEvent {
     abandoned: bool,
     provisional: bool,
     ts: String,
+    /// The event's time, Unix seconds (0 when unknown): speech skips replies older than
+    /// when it started watching the target.
+    epoch: i64,
     kind: EvKind,
 }
 
@@ -343,6 +356,7 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
 
     let abandoned = json_bool(ev_obj.get("abandoned"));
     let ts = fmt_hhmm(ev_obj.get("ts").and_then(|v| v.as_str()));
+    let epoch = ts_epoch(ev_obj.get("ts").and_then(|v| v.as_str())).unwrap_or(0);
     let kind_str = ev_obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let kind = match kind_str {
         "prompt" => ev_obj.get("prompt").and_then(parse_prompt).unwrap_or(EvKind::Other),
@@ -381,11 +395,11 @@ fn ingest_line(c: &mut TargetCache, line: &str) -> IngestOutcome {
             }
         }
     }
-    c.by_id.insert(id.to_string(), CompactEvent { abandoned, provisional, ts, kind });
+    c.by_id.insert(id.to_string(), CompactEvent { abandoned, provisional, ts, epoch, kind });
     IngestOutcome { dirty: true, need_full_reread: false, event_known: Some(known) }
 }
 
-fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_limit: usize) -> JsonValue {
+fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_limit: usize, speak: &Speak) -> JsonValue {
     let mut msgs: Vec<JsonValue> = Vec::new();
     let mut last_say = String::new();
     let mut last_say_idx: isize = -1;
@@ -477,7 +491,149 @@ fn build_chat_value(c: &TargetCache, agent_short: &str, show_tools: bool, shown_
         ("total", JsonValue::U64(total_msgs as u64)),
         ("hidden_before", JsonValue::U64(hidden_before as u64)),
         ("msgs", JsonValue::Array(msgs)),
+        ("speak", speak.mode.name().into()),
+        ("pick", speak.pick_value(c)),
     ])
+}
+
+/// The ids of the messages `build_chat_value` shows, in order (what `on_item_tap`'s index
+/// counts).
+fn shown_ids(c: &TargetCache, show_tools: bool, shown_limit: usize) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in c.order.iter() {
+        let Some(ev) = c.by_id.get(id) else { continue };
+        if ev.abandoned {
+            continue;
+        }
+        match &ev.kind {
+            EvKind::Prompt { .. } | EvKind::Say { .. } => ids.push(id.clone()),
+            EvKind::Tool { .. } if show_tools => ids.push(id.clone()),
+            _ => {}
+        }
+    }
+    if shown_limit > 0 && ids.len() > shown_limit {
+        let drop_n = ids.len() - shown_limit;
+        ids.drain(..drop_n);
+    }
+    ids
+}
+
+/// The newest finished agent reply (a `say` that is not a streaming partial).
+fn latest_say(c: &TargetCache) -> Option<(String, i64, String)> {
+    for id in c.order.iter().rev() {
+        let Some(ev) = c.by_id.get(id) else { continue };
+        if ev.abandoned || ev.provisional {
+            continue;
+        }
+        if let EvKind::Say { text } = &ev.kind {
+            return Some((id.clone(), ev.epoch, text.clone()));
+        }
+    }
+    None
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SpeakMode {
+    Off,
+    /// New replies are spoken while `chat` is shown.
+    Auto,
+    /// New replies are spoken whether `chat` is shown or not (the target is followed while
+    /// hidden too).
+    Always,
+}
+
+impl SpeakMode {
+    fn name(self) -> &'static str {
+        match self {
+            SpeakMode::Off => "off",
+            SpeakMode::Auto => "auto",
+            SpeakMode::Always => "always",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        match s.trim() {
+            "auto" => SpeakMode::Auto,
+            "always" => SpeakMode::Always,
+            _ => SpeakMode::Off,
+        }
+    }
+}
+
+/// Spoken replies: `tb-say` (as root through `sudo -n`, for the voice key) reads the text on
+/// stdin, has monolith1 speak it and plays it; a new say or `tb-say --stop` ends the one before.
+struct Speak {
+    mode: SpeakMode,
+    /// The reply picked by a tap (its id), spoken by "Speak" instead of the newest.
+    pick: Option<String>,
+    /// Per target: the newest reply already accounted for, and when watching began (replies
+    /// older than that are never spoken on their own).
+    heard: HashMap<String, String>,
+    since: HashMap<String, i64>,
+}
+
+impl Speak {
+    fn conf_path() -> Option<PathBuf> {
+        env_opt("HOME").map(|h| PathBuf::from(h).join(".config/tb-shell/chat-speak"))
+    }
+    fn load() -> Self {
+        let mode = Self::conf_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map_or(SpeakMode::Off, |s| SpeakMode::parse(&s));
+        Self { mode, pick: None, heard: HashMap::new(), since: HashMap::new() }
+    }
+    fn set_mode(&mut self, m: SpeakMode) {
+        self.mode = m;
+        if let Some(p) = Self::conf_path() {
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let _ = std::fs::write(p, format!("{}\n", m.name()));
+        }
+    }
+    fn pick_value(&self, c: &TargetCache) -> JsonValue {
+        let Some(id) = &self.pick else { return JsonValue::Null };
+        let Some(ev) = c.by_id.get(id) else { return JsonValue::Null };
+        let EvKind::Say { text } = &ev.kind else { return JsonValue::Null };
+        obj(vec![
+            ("id", id.as_str().into()),
+            ("ts", ev.ts.clone().into()),
+            ("preview", trunc_chars(&collapse_ws(text), 18).into()),
+        ])
+    }
+}
+
+fn say_bin() -> String {
+    env_opt("TB_SAY").unwrap_or_else(|| "/usr/local/sbin/tb-say".to_string())
+}
+
+/// Runs `sudo -n tb-say [--stop]` in the background, the text on its stdin.
+fn run_say(text: Option<&str>) {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("-n").arg(say_bin());
+    if text.is_none() {
+        cmd.arg("--stop");
+    }
+    cmd.stdin(if text.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        eprintln!("tb-shell-chat: could not run {}", say_bin());
+        return;
+    };
+    let input = child.stdin.take();
+    let text = text.map(str::to_string);
+    dbg_log!("say: {} chars", text.as_deref().map_or(0, |t| t.chars().count()));
+    let _ = std::thread::Builder::new().name("tb-chat-say".into()).spawn(move || {
+        if let (Some(mut w), Some(t)) = (input, text) {
+            use std::io::Write;
+            let _ = w.write_all(t.as_bytes());
+        }
+        let _ = child.wait();
+    });
 }
 
 enum ChatMsg {
@@ -508,6 +664,7 @@ struct ChatState {
     show_tools: bool,
     shown_limit: usize,
     chat_visible: bool,
+    speak: Speak,
     last_pushed: String,
     gen_counter: Arc<AtomicU64>,
     follower: Option<ChildFollower>,
@@ -540,6 +697,7 @@ impl ChatState {
             show_tools: false,
             shown_limit: DEFAULT_SHOWN_MSGS,
             chat_visible: false,
+            speak: Speak::load(),
             last_pushed: String::new(),
             gen_counter: Arc::new(AtomicU64::new(0)),
             follower: None,
@@ -556,6 +714,60 @@ impl ChatState {
 
     fn is_local(&self) -> bool {
         self.agent_host == self.me_host
+    }
+
+    /// Whether the target is followed live: `chat` is shown, or replies are spoken always.
+    fn live(&self) -> bool {
+        self.chat_visible || self.speak.mode == SpeakMode::Always
+    }
+
+    /// Speaks the target's newest finished reply when it is new (not yet heard, not older
+    /// than when watching began) and the turn has ended; otherwise only notes it as heard.
+    fn speak_new_reply(&mut self) {
+        let tid = self.target_id.clone();
+        let since = *self.speak.since.entry(tid.clone()).or_insert_with(now_epoch);
+        if self.is_busy() {
+            return;
+        }
+        let Some((id, epoch, text)) = latest_say(self.cur_mut()) else { return };
+        if self.speak.heard.get(&tid) == Some(&id) {
+            return;
+        }
+        self.speak.heard.insert(tid, id);
+        // 30 s of slack for clocks between hosts; older replies are history, not news
+        let fresh = epoch == 0 || epoch + 30 >= since;
+        let on = match self.speak.mode {
+            SpeakMode::Off => false,
+            SpeakMode::Auto => self.chat_visible,
+            SpeakMode::Always => true,
+        };
+        if on && fresh {
+            run_say(Some(&text));
+        }
+    }
+
+    /// A tap on the message at `idx` (as shown): a reply is picked (tapped again: unpicked).
+    fn pick_index(&mut self, idx: usize) {
+        let tools = self.show_tools;
+        let limit = self.shown_limit;
+        let id = shown_ids(self.cur_mut(), tools, limit).get(idx).cloned();
+        let is_say = id.as_ref().is_some_and(|i| matches!(self.cur_mut().by_id.get(i).map(|e| &e.kind), Some(EvKind::Say { .. })));
+        self.speak.pick = if is_say && self.speak.pick != id { id } else { None };
+    }
+
+    /// "Speak": the picked reply, else the newest one.
+    fn speak_now(&mut self) {
+        let pick = self.speak.pick.take();
+        let c = self.cur_mut();
+        let text = pick
+            .and_then(|id| match c.by_id.get(&id).map(|e| &e.kind) {
+                Some(EvKind::Say { text }) => Some(text.clone()),
+                _ => None,
+            })
+            .or_else(|| latest_say(c).map(|(_, _, t)| t));
+        if let Some(t) = text {
+            run_say(Some(&t));
+        }
     }
 
     fn cur_mut(&mut self) -> &mut TargetCache {
@@ -662,7 +874,7 @@ impl ChatState {
     /// soon (an earlier fetch already asked for stands, so a burst is one fetch), and once more
     /// a while after the last report.
     fn remote_activity(&mut self) {
-        if !self.chat_visible || self.is_local() {
+        if !self.live() || self.is_local() {
             return;
         }
         let now = Instant::now();
@@ -685,7 +897,7 @@ impl ChatState {
         let mut dirty = false;
         if self.restart_at.is_some_and(|t| t <= now) {
             self.restart_at = None;
-            if self.chat_visible && self.is_local() {
+            if self.live() && self.is_local() {
                 self.start_stream(false, tx);
             }
         }
@@ -702,7 +914,7 @@ impl ChatState {
         }
         if self.poll_at.is_some_and(|t| t <= now) {
             self.poll_at = None;
-            if self.chat_visible && !self.is_local() {
+            if self.live() && !self.is_local() {
                 let recent = self.last_fetch_at.is_some_and(|t| t.elapsed() < REMOTE_FETCH_MIN_GAP);
                 if self.is_busy() && !recent {
                     self.remote_fetch_recent();
@@ -762,10 +974,8 @@ impl ChatState {
         let short = self.agent_short.clone();
         let tools = self.show_tools;
         let limit = self.shown_limit;
-        let val = {
-            let c = self.cur_mut();
-            build_chat_value(c, &short, tools, limit)
-        };
+        self.cur_mut();
+        let val = build_chat_value(&self.cache[&self.target_id], &short, tools, limit, &self.speak);
         let ser = val.serialize_json();
         if !force && ser == self.last_pushed {
             return Ok(());
@@ -789,7 +999,7 @@ impl ChatState {
     fn sync_streams(&mut self, force_full: bool, tx: &Sender<ChatMsg>) {
         self.stop_streams();
         self.follow_restarts = 0;
-        if !self.chat_visible {
+        if !self.live() {
             return;
         }
         self.start_stream(force_full, tx);
@@ -799,13 +1009,41 @@ impl ChatState {
     /// rewritten, or the agent is gone): it starts again, sooner the first times.
     fn follower_ended(&mut self) {
         self.follower = None;
-        if !(self.chat_visible && self.is_local()) {
+        if !(self.live() && self.is_local()) {
             return;
         }
         let delay = FOLLOW_RESTART_DELAYS[(self.follow_restarts as usize).min(FOLLOW_RESTART_DELAYS.len() - 1)];
         dbg_log!("follower ended; starting again in {delay} ms");
         self.follow_restarts = self.follow_restarts.saturating_add(1);
         self.restart_at = Some(Instant::now() + Duration::from_millis(delay));
+    }
+
+    /// The bus's status events (every host), for the target's status: remote targets fetch on
+    /// them; local ones learn at once that a turn ended (spoken replies wait for that).
+    fn spawn_events(&mut self, gen_id: u64, tx: &Sender<ChatMsg>) {
+        let mut cmd = Command::new(&self.agent_bin);
+        cmd.args(["events", "--all-hosts", "--json", "-q"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = cmd.spawn() {
+            let pid = child.id();
+            if let Some(out) = child.stdout.take() {
+                let tx = tx.clone();
+                let gen_ref = self.gen_counter.clone();
+                let _ = std::thread::Builder::new().name("tb-chat-events".into()).spawn(move || {
+                    for line in BufReader::new(out).lines() {
+                        if gen_ref.load(Ordering::Relaxed) != gen_id {
+                            break;
+                        }
+                        let Ok(line) = line else { break };
+                        let _ = tx.send(ChatMsg::RemoteEvLine { gen_id, line });
+                    }
+                    let _ = child.wait();
+                });
+            }
+            self.remote_ev = Some(ChildFollower { pid });
+        }
     }
 
     /// Starts the follower (local) or the bus events plus the busy poll (remote).
@@ -860,32 +1098,11 @@ impl ChatState {
             } else {
                 self.follower_ended();
             }
+            self.spawn_events(gen_id, tx);
         } else {
             self.snapshot_fetch(force_full);
             self.poll_at = Some(Instant::now() + REMOTE_POLL);
-            let mut cmd = Command::new(&self.agent_bin);
-            cmd.args(["events", "--all-hosts", "--json", "-q"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            if let Ok(mut child) = cmd.spawn() {
-                let pid = child.id();
-                if let Some(out) = child.stdout.take() {
-                    let tx = tx.clone();
-                    let gen_ref = self.gen_counter.clone();
-                    let _ = std::thread::Builder::new().name("tb-chat-events".into()).spawn(move || {
-                        for line in BufReader::new(out).lines() {
-                            if gen_ref.load(Ordering::Relaxed) != gen_id {
-                                break;
-                            }
-                            let Ok(line) = line else { break };
-                            let _ = tx.send(ChatMsg::RemoteEvLine { gen_id, line });
-                        }
-                        let _ = child.wait();
-                    });
-                }
-                self.remote_ev = Some(ChildFollower { pid });
-            }
+            self.spawn_events(gen_id, tx);
         }
     }
 }
@@ -904,7 +1121,8 @@ fn main() {
         let short = st.agent_short.clone();
         let tools = st.show_tools;
         let limit = st.shown_limit;
-        let val = build_chat_value(st.cur_mut(), &short, tools, limit);
+        st.cur_mut();
+        let val = build_chat_value(&st.cache[&st.target_id], &short, tools, limit, &st.speak);
         if let Err(e) = set_key_sync("chat", val) {
             eprintln!("tb-shell-chat: {e}");
             std::process::exit(1);
@@ -947,9 +1165,11 @@ fn main() {
         });
     }
 
-    if st.chat_visible {
+    if st.live() {
         st.sync_streams(false, &tx);
     }
+    // what is there at start is history: noted as heard, not spoken
+    st.speak_new_reply();
 
     let mut quit = false;
     while !quit {
@@ -1038,7 +1258,9 @@ fn main() {
                     }
                     "hidden" if surf == "chat" => {
                         st.chat_visible = false;
-                        st.stop_streams();
+                        if !st.live() {
+                            st.stop_streams();
+                        }
                     }
                     "shown" if surf == "home" && !st.chat_visible => {
                         st.snapshot_fetch(false);
@@ -1070,6 +1292,35 @@ fn main() {
                                 st.shown_limit = 0;
                                 dirty = true;
                             }
+                            "pick" => {
+                                let i = json_i64(ev.get("data").and_then(|d| d.get("i")));
+                                if let Some(i) = i.filter(|&i| i >= 0) {
+                                    st.pick_index(i as usize);
+                                    dirty = true;
+                                }
+                            }
+                            "speak" => {
+                                st.speak_now();
+                                dirty = true;
+                            }
+                            "speak_stop" => run_say(None),
+                            "speak_mode" => {
+                                let next = match st.speak.mode {
+                                    SpeakMode::Off => SpeakMode::Auto,
+                                    SpeakMode::Auto => SpeakMode::Always,
+                                    SpeakMode::Always => SpeakMode::Off,
+                                };
+                                st.speak.set_mode(next);
+                                // replies before the switch are not news
+                                let tid = st.target_id.clone();
+                                st.speak.since.insert(tid, now_epoch());
+                                if st.live() && st.follower.is_none() && st.remote_ev.is_none() {
+                                    st.sync_streams(false, &tx);
+                                } else if !st.live() {
+                                    st.stop_streams();
+                                }
+                                dirty = true;
+                            }
                             _ => {}
                         }
                     }
@@ -1084,7 +1335,7 @@ fn main() {
                                         if ns != prev {
                                             st.cur_mut().status = ns.clone();
                                             dirty = true;
-                                            if !st.chat_visible {
+                                            if !st.live() {
                                                 if matches!(ns.as_str(), "idle" | "waiting" | "error") {
                                                     st.snapshot_fetch(false);
                                                 }
@@ -1104,7 +1355,8 @@ fn main() {
                             if let Some(t) = patch.get("target") {
                                 if st.set_target(t.as_str(), None) {
                                     dirty = true;
-                                    if st.chat_visible {
+                                    st.speak.pick = None;
+                                    if st.live() {
                                         st.sync_streams(false, &tx);
                                     } else {
                                         st.stop_streams();
@@ -1120,6 +1372,7 @@ fn main() {
         }
         }
         if dirty && !quit {
+            st.speak_new_reply();
             if let Err(e) = st.push_if_changed(&writer, false) {
                 eprintln!("tb-shell-chat: {e}");
                 st.stop_streams();
