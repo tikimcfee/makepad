@@ -4,7 +4,8 @@
 //!   - Parses JSON lines one at a time and retains only compact pre-truncated fields
 //!     (at most 300 events per target, <= 16 targets).
 //!   - Runs `agent transcript <short> --follow` (or `agent events` for remote targets) ONLY
-//!     while `chat` is in front; stops child followers immediately on `hidden`.
+//!     while `chat` is in front (or always, when replies are spoken always: then started
+//!     again every HIDDEN_REARM while hidden); stops child followers on `hidden` otherwise.
 //!   - Refreshes `state.chat` (`preview` for `Home`) on start, when `target` or target's
 //!     `agents` status changes, and when `home` is `shown`.
 
@@ -40,6 +41,12 @@ const REMOTE_FETCH_MIN_GAP: Duration = Duration::from_millis(1200);
 /// Remote, `chat` in front and the target busy: how often recent events are fetched.
 const REMOTE_POLL: Duration = Duration::from_millis(2500);
 const REMOTE_RECENT_LINES: &str = "30";
+/// `chat` hidden (or the panel off) with replies spoken always: the bus events stream is the
+/// only news of the target, and `agent events` goes quiet without exiting when its bus
+/// connection closes. So the stream is started again this often (a fresh events child and
+/// one fetch of the recent events), and at once when the events child ends.
+const HIDDEN_REARM: Duration = Duration::from_secs(60);
+const EVENTS_RESTART_DELAY: Duration = Duration::from_secs(2);
 
 /// `TB_CHAT_DEBUG=1`: one stderr line per follower start/end and per remote fetch, so the
 /// journal shows when the feed was refreshed and why.
@@ -646,6 +653,7 @@ enum ChatMsg {
     FollowerLine { gen_id: u64, line: String },
     FollowerEof { gen_id: u64, used_from: bool, saw_any: bool },
     RemoteEvLine { gen_id: u64, line: String },
+    RemoteEvEof { gen_id: u64 },
 }
 
 struct ChildFollower {
@@ -683,6 +691,8 @@ struct ChatState {
     fetch_at: Option<Instant>,
     trail_at: Option<Instant>,
     poll_at: Option<Instant>,
+    /// Hidden + always: when the stream is started again (HIDDEN_REARM, EVENTS_RESTART_DELAY).
+    rearm_at: Option<Instant>,
     last_fetch_at: Option<Instant>,
 }
 
@@ -712,6 +722,7 @@ impl ChatState {
             fetch_at: None,
             trail_at: None,
             poll_at: None,
+            rearm_at: None,
             last_fetch_at: None,
         }
     }
@@ -892,13 +903,21 @@ impl ChatState {
 
     /// The next time the loop has to wake up on its own, if any.
     fn next_deadline(&self) -> Option<Instant> {
-        [self.restart_at, self.fetch_at, self.trail_at, self.poll_at].into_iter().flatten().min()
+        [self.restart_at, self.fetch_at, self.trail_at, self.poll_at, self.rearm_at].into_iter().flatten().min()
     }
 
     /// Runs what is due; returns whether the cache may have changed.
     fn run_timers(&mut self, tx: &Sender<ChatMsg>) -> bool {
         let now = Instant::now();
         let mut dirty = false;
+        if self.rearm_at.is_some_and(|t| t <= now) {
+            self.rearm_at = None;
+            if self.live() {
+                dbg_log!("rearm: stream started again (hidden: {})", !self.chat_visible);
+                self.start_stream(false, tx);
+                dirty = true;
+            }
+        }
         if self.restart_at.is_some_and(|t| t <= now) {
             self.restart_at = None;
             if self.live() && self.is_local() {
@@ -998,6 +1017,7 @@ impl ChatState {
         self.fetch_at = None;
         self.trail_at = None;
         self.poll_at = None;
+        self.rearm_at = None;
     }
 
     fn sync_streams(&mut self, force_full: bool, tx: &Sender<ChatMsg>) {
@@ -1044,6 +1064,9 @@ impl ChatState {
                         let _ = tx.send(ChatMsg::RemoteEvLine { gen_id, line });
                     }
                     let _ = child.wait();
+                    if gen_ref.load(Ordering::Relaxed) == gen_id {
+                        let _ = tx.send(ChatMsg::RemoteEvEof { gen_id });
+                    }
                 });
             }
             self.remote_ev = Some(ChildFollower { pid });
@@ -1057,6 +1080,7 @@ impl ChatState {
         self.remote_ev = None;
         let gen_id = self.gen_counter.load(Ordering::SeqCst);
         dbg_log!("stream for {} ({}, full: {force_full})", self.target_id, if self.is_local() { "follow" } else { "remote" });
+        self.rearm_at = if self.chat_visible { None } else { Some(Instant::now() + HIDDEN_REARM) };
         if self.is_local() {
             self.follow_line_at = Instant::now();
             let last_at = {
@@ -1251,6 +1275,16 @@ fn main() {
                     }
                 }
             }
+            ChatMsg::RemoteEvEof { gen_id } => {
+                if gen_id == st.gen_counter.load(Ordering::Relaxed) {
+                    dbg_log!("events stream ended; starting again soon");
+                    st.remote_ev = None;
+                    if st.live() {
+                        let at = Instant::now() + EVENTS_RESTART_DELAY;
+                        st.rearm_at = Some(st.rearm_at.map_or(at, |r| r.min(at)));
+                    }
+                }
+            }
             ChatMsg::Socket(ev) => {
                 let kind = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
                 let surf = ev.get("surface").and_then(|v| v.as_str()).unwrap_or("");
@@ -1264,6 +1298,8 @@ fn main() {
                         st.chat_visible = false;
                         if !st.live() {
                             st.stop_streams();
+                        } else {
+                            st.rearm_at = Some(Instant::now() + HIDDEN_REARM);
                         }
                     }
                     "shown" if surf == "home" && !st.chat_visible => {
