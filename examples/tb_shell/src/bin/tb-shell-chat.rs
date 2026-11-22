@@ -610,12 +610,16 @@ fn say_bin() -> String {
     env_opt("TB_SAY").unwrap_or_else(|| "/usr/local/sbin/tb-say".to_string())
 }
 
-/// Runs `sudo -n tb-say [--stop]` in the background, the text on its stdin.
-fn run_say(text: Option<&str>) {
+/// Runs `sudo -n tb-say [--stop | full]` in the background, the text on its stdin. `full`:
+/// the whole reply (asked for by hand); without it monolith1 caps a long one ("The rest is on
+/// screen.").
+fn run_say(text: Option<&str>, full: bool) {
     let mut cmd = Command::new("sudo");
     cmd.arg("-n").arg(say_bin());
     if text.is_none() {
         cmd.arg("--stop");
+    } else if full {
+        cmd.arg("full");
     }
     cmd.stdin(if text.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())
@@ -742,7 +746,7 @@ impl ChatState {
             SpeakMode::Always => true,
         };
         if on && fresh {
-            run_say(Some(&text));
+            run_say(Some(&text), false);
         }
     }
 
@@ -766,7 +770,7 @@ impl ChatState {
             })
             .or_else(|| latest_say(c).map(|(_, _, t)| t));
         if let Some(t) = text {
-            run_say(Some(&t));
+            run_say(Some(&t), true);
         }
     }
 
@@ -1303,7 +1307,7 @@ fn main() {
                                 st.speak_now();
                                 dirty = true;
                             }
-                            "speak_stop" => run_say(None),
+                            "speak_stop" => run_say(None, false),
                             "speak_mode" => {
                                 let next = match st.speak.mode {
                                     SpeakMode::Off => SpeakMode::Auto,
