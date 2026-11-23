@@ -105,7 +105,6 @@ let GlassCard = GaussRoundedView{
     draw_bg.border_alpha: 0.08
     draw_bg.border_width: 0.5
     draw_bg.inner_shadow_alpha: 0.0
-    draw_bg.noise_strength: 0.0
     draw_bg.fallback_color: #x0d1626
     draw_bg.shadow_color: #x00000055
 }

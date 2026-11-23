@@ -228,8 +228,9 @@ impl StreamView {
         if !moving {
             self.energy = self.energy_target;
         }
-        self.draw_bg.energy = if self.glow { self.energy } else { -1.0 };
-        self.draw_bg.draw_vars.set_instance_on_area(cx, live_id!(energy), &[self.draw_bg.energy]);
+        let e = if self.glow { self.energy } else { -1.0 };
+        self.draw_bg.energy = e;
+        self.draw_bg.draw_vars.set_instance_on_area(cx, live_id!(energy), &[e]);
         if moving {
             self.energy_frame = cx.new_next_frame();
         } else {

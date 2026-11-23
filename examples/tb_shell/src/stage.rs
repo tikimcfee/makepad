@@ -652,12 +652,15 @@ impl Stage {
         self.layers.iter_mut().find(|l| l.surface == name)
     }
 
-    /// Floats `layer`'s surface: takes it out of the slots and replaces any layer it had,
-    /// keeping that one's runtime shown state.
+    /// Floats `layer`'s surface: takes it out of the slots and replaces any layer it had.
+    /// A layer with `when` shows by the store (the caller re-evaluates it); one without keeps
+    /// the shown state it had.
     pub fn float(&mut self, mut layer: StageLayer, fallback_home: bool) {
         let name = layer.surface.clone();
         if let Some(old) = self.layer(&name) {
-            layer.shown = if layer.when.is_empty() && old.when.is_empty() { old.shown } else { layer.shown || old.shown };
+            if layer.when.is_empty() && old.when.is_empty() {
+                layer.shown = old.shown;
+            }
             layer.leaving = old.leaving;
         }
         self.layers.retain(|l| l.surface != name);

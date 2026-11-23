@@ -2211,10 +2211,21 @@ impl App {
             "next" => self.cycle_task(cx, 1, by),
             "prev" => self.cycle_task(cx, -1, by),
             "float" => {
-                let layer = StageLayer::from_json(req).ok_or("stage float needs surface")?;
+                let mut layer = StageLayer::from_json(req).ok_or("stage float needs surface")?;
                 check_exists(&layer.surface, &self.st.bodies)?;
                 let name = layer.surface.clone();
                 self.st.layer_hide_at.remove(&name);
+                // shown by the store as it is now, not by whatever the old spec had
+                let was_shown = self.st.stage.layer(&name).map_or(false, |l| l.shown);
+                if !layer.when.is_empty() {
+                    let holds = layer.when_holds(&self.st.store);
+                    layer.shown = holds;
+                    if was_shown && !holds {
+                        layer.shown = true;
+                        layer.leaving = false;
+                        self.st.layer_hide_at.insert(name.clone(), Instant::now());
+                    }
+                }
                 self.st.stage.float(layer, self.st.bodies.contains_key("home"));
                 self.commit_stage(cx, by);
                 self.eval_layers(cx, None);
