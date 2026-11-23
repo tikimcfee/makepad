@@ -459,6 +459,56 @@ fn stage_cmd(args: &[String]) {
             ])
         }
         "next" | "prev" => obj(vec![("op", "stage".into()), ("sub", sub.into())]),
+        "float" => {
+            const USAGE: &str = "stage float NAME [--z N] [--place top|center|bottom] [--inset L,T,R,B] [--width fill|PX|N%] \
+[--max-h PX|N%] [--hit card|all|none] [--when PATH,PATH] [--hold MS] [--motion slide|slide-top|slide-bottom|none]";
+            let mut m = HashMap::new();
+            m.insert("op".to_string(), JsonValue::from("stage"));
+            m.insert("sub".to_string(), JsonValue::from("float"));
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                let key = match a.as_str() {
+                    "--z" => "z",
+                    "--place" => "place",
+                    "--inset" => "inset",
+                    "--width" => "width",
+                    "--max-h" => "max_h",
+                    "--hit" => "hit",
+                    "--when" => "when",
+                    "--hold" => "hold_ms",
+                    "--motion" => "motion",
+                    s if !s.starts_with('-') && !m.contains_key("surface") => {
+                        m.insert("surface".to_string(), JsonValue::from(s));
+                        continue;
+                    }
+                    _ => die(USAGE),
+                };
+                let v = it.next().unwrap_or_else(|| die(USAGE));
+                m.insert(key.to_string(), JsonValue::from(v.as_str()));
+            }
+            if !m.contains_key("surface") {
+                die(USAGE);
+            }
+            JsonValue::Object(m)
+        }
+        "unfloat" => {
+            let name = rest.first().unwrap_or_else(|| die("stage unfloat NAME"));
+            obj(vec![("op", "stage".into()), ("sub", "unfloat".into()), ("surface", name.as_str().into())])
+        }
+        "layer" => {
+            let (Some(name), Some(act)) = (rest.first(), rest.get(1)) else { die("stage layer NAME show|hide") };
+            let show = match act.as_str() {
+                "show" => true,
+                "hide" => false,
+                _ => die("stage layer NAME show|hide"),
+            };
+            obj(vec![
+                ("op", "stage".into()),
+                ("sub", "layer".into()),
+                ("surface", name.as_str().into()),
+                ("show", JsonValue::Bool(show)),
+            ])
+        }
         "save" => {
             let name = rest.iter().find(|a| !a.starts_with('-')).unwrap_or_else(|| die("stage save NAME [--title TITLE]"));
             let mut req = obj(vec![("op", "stage".into()), ("sub", "save".into()), ("name", name.as_str().into())]);
@@ -474,7 +524,7 @@ fn stage_cmd(args: &[String]) {
             let name = rest.first().unwrap_or_else(|| die(&format!("stage {sub} NAME")));
             obj(vec![("op", "stage".into()), ("sub", sub.into()), ("name", name.as_str().into())])
         }
-        _ => die("stage [stack|grid|deck|add|rm|pin|unpin|solo|focus|next|prev|save|open|unsave] ..."),
+        _ => die("stage [stack|grid|deck|add|rm|pin|unpin|solo|focus|next|prev|float|unfloat|layer|save|open|unsave] ..."),
     };
     report(&Client::connect().call(req));
 }

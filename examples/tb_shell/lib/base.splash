@@ -85,3 +85,27 @@ fn sa_inner(base, inset) {
     if base > inset { return base - inset }
     0.0
 }
+// A floating layer's card (`stage float`): frosted glass over whatever the stage shows
+// underneath, sampled only inside the card. The navy tint keeps 15 px text legible over
+// Chat; `fallback_color` is the whole look under MAKEPAD_NO_GAUSS=1 (and before the first
+// capture), so it must read well on its own. A visible radius of 22 is corner_radius 11.
+let GlassCard = GaussRoundedView{
+    width: Fill height: Fit flow: Down
+    padding: 12 spacing: 8
+    draw_bg.corner_radius: 11.0
+    draw_bg.blur_level: 3.5
+    draw_bg.edge_blur_level: 3.5
+    draw_bg.lensing_effect: 0.0
+    draw_bg.lensing_strength: 0.0
+    draw_bg.lensing_width: 0.0
+    draw_bg.tint_color: #x0d1626
+    draw_bg.tint_alpha: 0.5
+    draw_bg.rim_alpha: 0.12
+    draw_bg.border_color: #xffffff
+    draw_bg.border_alpha: 0.08
+    draw_bg.border_width: 0.5
+    draw_bg.inner_shadow_alpha: 0.0
+    draw_bg.noise_strength: 0.0
+    draw_bg.fallback_color: #x0d1626
+    draw_bg.shadow_color: #x00000055
+}

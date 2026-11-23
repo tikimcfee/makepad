@@ -411,6 +411,18 @@ impl StorePersistence {
         atomic_write(&self.workspaces_dir, &format!("{name}.json"), &text)
     }
 
+    /// The floating layers (`stage float`) outlive a restart: one file beside the workspaces.
+    pub fn save_layers(&self, layers: &JsonValue) -> Result<(), String> {
+        let dir = self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir);
+        atomic_write(dir, "layers.json", &(layers.serialize_json() + "\n"))
+    }
+
+    pub fn load_layers(&self) -> Option<JsonValue> {
+        let dir = self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir);
+        let text = std::fs::read_to_string(dir.join("layers.json")).ok()?;
+        JsonValue::deserialize_json(text.trim()).ok()
+    }
+
     pub fn unsave_workspace(&self, name: &str) -> Result<bool, String> {
         let path = self.workspaces_dir.join(format!("{name}.json"));
         let existed = path.exists();

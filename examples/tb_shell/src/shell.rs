@@ -4,7 +4,7 @@
 //! and the root `GUARD` drawn in the final overlay tier gating all input.
 
 use crate::jit_slot::JitRegistry;
-use crate::stage::{SlotMode, Stage, StageMode};
+use crate::stage::{self, Hit, Place, SlideFrom, SlotMode, Stage, StageMode};
 use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::*;
 use std::collections::HashMap;
@@ -258,6 +258,13 @@ struct DeckTabHit {
     close_rect: Rect,
 }
 
+/// A floating layer's touch target this frame: its drawn card (or the whole stage for `Hit::All`).
+#[derive(Clone)]
+struct LayerHit {
+    surface: String,
+    rect: Rect,
+}
+
 #[derive(Clone)]
 enum DragOrigin {
     Strip(Vec2d),
@@ -316,6 +323,15 @@ pub struct Shell {
     #[rust] pub last_draw_ms: Vec<(String, f64)>,
     /// `(surface_name, slot_w, slot_h)` from the latest draw frame.
     #[rust] pub last_slot_sizes: Vec<(String, f64, f64)>,
+    /// Floating layers: touch targets in draw order (ascending z), each one's own overlay
+    /// draw list (so its order over the body and the other layers is its z), its entry
+    /// progress `t` (0 hidden .. 1 in place) and its card height from the last frame.
+    #[rust] layer_hits: Vec<LayerHit>,
+    #[rust] layer_lists: HashMap<String, DrawList2d>,
+    #[rust] layer_t: HashMap<String, f64>,
+    #[rust] layer_card_h: HashMap<String, f64>,
+    #[rust] layer_frame: NextFrame,
+    #[rust] layer_frame_at: Option<std::time::Instant>,
 }
 
 fn is_input(event: &Event) -> bool {
@@ -351,6 +367,9 @@ fn event_abs(event: &Event) -> Option<Vec2d> {
 
 impl Widget for Shell {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.layer_frame.is_event(event).is_some() {
+            self.step_layers(cx);
+        }
         if self.guard.is_some() {
             let (down, _, up) = pointer_down_move_up(event);
             let button_at = |p: Vec2d| {
@@ -379,6 +398,9 @@ impl Widget for Shell {
                     self.drag_origin = Some(DragOrigin::Strip(p));
                     self.active_body_surface = None;
                     chrome_consumed = true;
+                } else if let Some(surface) = self.layer_at(p) {
+                    // A floating layer's card takes the touch; outside it the stage gets it.
+                    self.active_body_surface = Some(surface);
                 } else if let Some(th) = self.deck_hits.iter().find(|t| t.tab_rect.contains(p)).cloned() {
                     if th.close_rect.size.x > 0.0 && th.close_rect.contains(p) {
                         self.actions.push(ShellAction::RemoveSlot(th.surface));
@@ -484,10 +506,12 @@ impl Widget for Shell {
             {
                 self.active_body_surface.clone()
             } else {
-                self.slot_hits
-                    .iter()
-                    .find(|h| h.body_rect.size.y > 0.0 && h.body_rect.contains(abs))
-                    .map(|h| h.surface.clone())
+                self.layer_at(abs).or_else(|| {
+                    self.slot_hits
+                        .iter()
+                        .find(|h| h.body_rect.size.y > 0.0 && h.body_rect.contains(abs))
+                        .map(|h| h.surface.clone())
+                })
             }
         } else {
             Some(self.stage.focus.clone())
@@ -504,10 +528,11 @@ impl Widget for Shell {
         if let Some(ref target) = target_surface {
             if let Some(inst) = self.jit.slots.get(target) {
                 let body_pos = self
-                    .slot_hits
+                    .layer_hits
                     .iter()
                     .find(|h| &h.surface == target)
-                    .map(|h| h.body_rect.pos)
+                    .map(|h| h.rect.pos)
+                    .or_else(|| self.slot_hits.iter().find(|h| &h.surface == target).map(|h| h.body_rect.pos))
                     .unwrap_or_default();
                 let (down, mv, up) = pointer_down_move_up(event);
                 if let Some(p) = down {
@@ -548,6 +573,7 @@ impl Widget for Shell {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.slot_hits.clear();
         self.deck_hits.clear();
+        self.layer_hits.clear();
         self.last_draw_ms.clear();
         self.last_slot_sizes.clear();
 
@@ -575,6 +601,10 @@ impl Widget for Shell {
 
         cx.end_turtle();
 
+        // Floating layers over the stage body, in z order, under the strip and the guard.
+        let stage_rect = Rect { pos: dvec2(win_rect.pos.x, stage_top), size: dvec2(stage_w, stage_h) };
+        self.draw_layers(cx, scope, stage_rect, win_rect.size.y);
+
         self.top_list.begin_overlay_last(cx);
         if let Some(guard) = self.guard.clone() {
             self.draw_guard(cx, win_rect, &guard);
@@ -592,6 +622,119 @@ impl Widget for Shell {
 }
 
 impl Shell {
+    /// The surface of the topmost shown layer that takes a touch at `p`.
+    fn layer_at(&self, p: Vec2d) -> Option<String> {
+        self.layer_hits.iter().rev().find(|h| h.rect.contains(p)).map(|h| h.surface.clone())
+    }
+
+    /// Draws every shown (or leaving) layer in its own overlay, lowest z first, placed in the
+    /// stage viewport and slid by its entry progress. The card is moved by relayout, not a
+    /// transform, so a glass card samples the scene at its real position all the way in.
+    fn draw_layers(&mut self, cx: &mut Cx2d, scope: &mut Scope, stage_rect: Rect, win_h: f64) {
+        let layers: Vec<_> = self.stage.layers.iter().filter(|l| l.drawn()).cloned().collect();
+        let motion_on = stage::motion_enabled();
+        self.layer_t.retain(|n, _| layers.iter().any(|l| &l.surface == n));
+        let mut animating = false;
+        for l in layers {
+            let target = if l.shown { 1.0 } else { 0.0 };
+            let instant = !motion_on || l.motion.from == SlideFrom::None;
+            let t = *self.layer_t.entry(l.surface.clone()).or_insert(if instant { target } else { 0.0 });
+            let t = if instant { target } else { t };
+            self.layer_t.insert(l.surface.clone(), t);
+            if (t - target).abs() > 1e-6 {
+                animating = true;
+            }
+            if t <= 0.0 && !l.shown {
+                continue;
+            }
+
+            let [il, it, ir, ib] = l.inset;
+            let avail_w = (stage_rect.size.x - il - ir).max(40.0);
+            let w = l.width.resolve(avail_w).clamp(40.0, avail_w);
+            let x = stage_rect.pos.x + il + (avail_w - w) * 0.5;
+            let max_h = l.max_h.resolve(win_h).min(stage_rect.size.y - it - ib).max(40.0);
+            let card_h = self.layer_card_h.get(&l.surface).copied().unwrap_or(max_h).min(max_h);
+            let stage_bot = stage_rect.pos.y + stage_rect.size.y;
+            let base_y = match l.place {
+                Place::Top => stage_rect.pos.y + it,
+                Place::Center => stage_rect.pos.y + (stage_rect.size.y - card_h) * 0.5,
+                Place::Bottom => stage_bot - ib - card_h,
+            };
+            // ease-out cubic in, ease-in cubic out: one curve over t
+            let p = 1.0 - (1.0 - t).powi(3);
+            let y = match l.motion.from {
+                SlideFrom::Top => base_y - (1.0 - p) * (card_h + (base_y - stage_rect.pos.y)),
+                SlideFrom::Bottom => base_y + (1.0 - p) * (stage_bot - base_y),
+                SlideFrom::None => base_y,
+            };
+
+            let mut list = self.layer_lists.remove(&l.surface).unwrap_or_else(|| DrawList2d::new(cx));
+            list.begin_overlay_reuse(cx);
+            // clipped to the stage viewport: the card comes out from under the strip
+            cx.begin_turtle(
+                Walk { abs_pos: Some(stage_rect.pos), ..Walk::fixed(stage_rect.size.x, stage_rect.size.y) },
+                Layout { clip_x: true, clip_y: true, ..Layout::flow_down() },
+            );
+            let walk = Walk {
+                abs_pos: Some(dvec2(x, y)),
+                width: Size::Fixed(w),
+                height: Size::Fit { min: None, max: Some(FitBound::Abs(max_h)) },
+                ..Walk::default()
+            };
+            let used_h = self.draw_clipped_slot_body(cx, scope, &l.surface, walk);
+            cx.end_turtle();
+            list.end(cx);
+            self.layer_lists.insert(l.surface.clone(), list);
+
+            if used_h > 1.0 {
+                let prev = self.layer_card_h.insert(l.surface.clone(), used_h);
+                if prev.map_or(true, |h| (h - used_h).abs() > 1.0) && l.place != Place::Top {
+                    // Center / Bottom place by the card's height: lay out again with the new one.
+                    cx.redraw_all();
+                }
+            }
+            self.last_slot_sizes.push((l.surface.clone(), w, max_h));
+            if l.shown {
+                let rect = match l.hit {
+                    Hit::Card => Rect { pos: dvec2(x, y.max(stage_rect.pos.y)), size: dvec2(w, (y + used_h - y.max(stage_rect.pos.y)).max(0.0)) },
+                    Hit::All => stage_rect,
+                    Hit::None => Rect::default(),
+                };
+                if rect.size.x > 0.0 && rect.size.y > 0.0 {
+                    self.layer_hits.push(LayerHit { surface: l.surface.clone(), rect });
+                }
+            }
+        }
+        if animating && self.layer_frame_at.is_none() {
+            self.layer_frame_at = Some(std::time::Instant::now());
+            self.layer_frame = cx.new_next_frame();
+        }
+    }
+
+    /// Advances each layer's entry progress towards shown (1) or hidden (0) by the time since
+    /// the last frame, and asks for another frame only while one is still moving.
+    fn step_layers(&mut self, cx: &mut Cx) {
+        let now = std::time::Instant::now();
+        let dt_ms = self.layer_frame_at.map_or(0.0, |at| now.duration_since(at).as_secs_f64() * 1000.0);
+        let mut moving = false;
+        for l in &self.stage.layers {
+            let Some(t) = self.layer_t.get_mut(&l.surface) else { continue };
+            let (target, ms) = if l.shown { (1.0, l.motion.in_ms) } else { (0.0, l.motion.out_ms) };
+            let step = if ms == 0 { 1.0 } else { dt_ms / ms as f64 };
+            *t = if target > *t { (*t + step).min(1.0) } else { (*t - step).max(0.0) };
+            if (*t - target).abs() > 1e-6 {
+                moving = true;
+            }
+        }
+        if moving {
+            self.layer_frame_at = Some(now);
+            self.layer_frame = cx.new_next_frame();
+        } else {
+            self.layer_frame_at = None;
+        }
+        cx.redraw_all();
+    }
+
     fn draw_deck(&mut self, cx: &mut Cx2d, scope: &mut Scope, origin: Vec2d, w: f64, h: f64) {
         self.max_stage_scroll = 0.0;
         self.stage_scroll_y = 0.0;

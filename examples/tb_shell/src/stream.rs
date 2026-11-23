@@ -61,6 +61,10 @@ script_mod! {
         color_bg: #x0b0e14
         color_track: #x1c2230
         color_bar: #x5fd4ff
+        // glow: a soft radial wash from the bottom centre, as bright as the energy, cool to warm
+        // uniforms, not instances: the GE8320's 64 varying components are nearly spent
+        color_glow: uniform(#x2f7fd0)
+        color_warm: uniform(#x8a6cf0)
         soft: 0.0
         border_radius: 0.0
         pick: fn(i) {
@@ -100,7 +104,18 @@ script_mod! {
                 let from_bot = 1.0 - self.pos.y
                 let wave = (1.0 - smoothstep(h - 0.35, h + 0.08, from_bot)) * (0.45 + 0.55 * (1.0 - from_bot))
                 let rib = 0.82 + 0.18 * smoothstep(0.08, 0.35, fract(cell))
-                let col = mix(self.color_bg, self.color_bar, clamp(wave * rib, 0.0, 1.0))
+                let mut bg = self.color_bg
+                let mut lift = 1.0
+                if self.energy > -0.5 {
+                    // the level's envelope (Rust, attack 30 ms / release 250 ms), never draw_pass.time
+                    let e = clamp(self.energy, 0.0, 1.0)
+                    let d = (self.pos - vec2(0.5, 1.1)) * vec2(1.0, 1.6)
+                    let falloff = 1.0 - smoothstep(0.0, 1.0, length(d))
+                    let glow_col = mix(self.color_glow, self.color_warm, e * e)
+                    bg = mix(self.color_bg, glow_col, clamp((0.15 + 0.85 * e) * falloff, 0.0, 1.0))
+                    lift = 0.6 + 0.4 * e
+                }
+                let col = mix(bg, self.color_bar, clamp(wave * rib * lift, 0.0, 1.0))
                 if self.border_radius > 0.5 {
                     sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, self.border_radius)
                     sdf.fill(col)
@@ -132,6 +147,8 @@ pub struct DrawStreamBars {
     #[live] meter: f32,
     #[live] soft: f32,
     #[live] border_radius: f32,
+    /// The glow's envelope 0..1; -1 = no glow (one instance float: the varying budget).
+    #[live] energy: f32,
     #[live] v0: Vec4f, #[live] v1: Vec4f, #[live] v2: Vec4f, #[live] v3: Vec4f,
     #[live] v4: Vec4f, #[live] v5: Vec4f, #[live] v6: Vec4f, #[live] v7: Vec4f,
 }
@@ -182,7 +199,44 @@ pub struct StreamView {
     #[live] stream: ArcStringMut,
     /// One value drawn as a horizontal meter (a level), not as bars.
     #[live] meter: bool,
+    /// `soft` mode: the background glows with this stream's level (its first value), through
+    /// an attack/release envelope, under the wave.
+    #[live] energy_stream: ArcStringMut,
+    #[live] glow: bool,
     #[rust] seen: u64,
+    #[rust] seen_energy: u64,
+    #[rust] energy: f32,
+    #[rust] energy_target: f32,
+    #[rust] energy_at: Option<std::time::Instant>,
+    #[rust] energy_frame: NextFrame,
+}
+
+const ATTACK_MS: f32 = 30.0;
+const RELEASE_MS: f32 = 250.0;
+
+impl StreamView {
+    /// Moves the envelope towards the level by the time since its last step; returns
+    /// whether it is still moving (then it asks for another frame, else none: at rest a
+    /// silent mic means no wake-ups).
+    fn step_energy(&mut self, cx: &mut Cx) -> bool {
+        let now = std::time::Instant::now();
+        let dt = self.energy_at.map_or(16.0, |at| now.duration_since(at).as_secs_f32() * 1000.0).min(100.0);
+        self.energy_at = Some(now);
+        let tau = if self.energy_target > self.energy { ATTACK_MS } else { RELEASE_MS };
+        self.energy += (self.energy_target - self.energy) * (1.0 - (-dt / tau).exp());
+        let moving = (self.energy - self.energy_target).abs() > 0.004;
+        if !moving {
+            self.energy = self.energy_target;
+        }
+        self.draw_bg.energy = if self.glow { self.energy } else { -1.0 };
+        self.draw_bg.draw_vars.set_instance_on_area(cx, live_id!(energy), &[self.draw_bg.energy]);
+        if moving {
+            self.energy_frame = cx.new_next_frame();
+        } else {
+            self.energy_at = None;
+        }
+        moving
+    }
 }
 
 impl Widget for StreamView {
@@ -194,6 +248,18 @@ impl Widget for StreamView {
                 self.draw_bg.set_values(&values, ring);
                 self.draw_bg.write_in_place(cx);
             }
+            if self.glow && !self.energy_stream.as_ref().is_empty() {
+                if let Some((version, values, _)) = current(self.energy_stream.as_ref(), self.seen_energy) {
+                    self.seen_energy = version;
+                    self.energy_target = values.last().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    if self.energy_at.is_none() {
+                        self.step_energy(cx);
+                    }
+                }
+            }
+        }
+        if self.energy_frame.is_event(event).is_some() {
+            self.step_energy(cx);
         }
     }
 
@@ -203,6 +269,7 @@ impl Widget for StreamView {
             self.draw_bg.set_values(&values, ring);
         }
         self.draw_bg.meter = if self.meter { 1.0 } else { 0.0 };
+        self.draw_bg.energy = if self.glow { self.energy } else { -1.0 };
         self.draw_bg.draw_walk(cx, walk);
         DrawStep::done()
     }

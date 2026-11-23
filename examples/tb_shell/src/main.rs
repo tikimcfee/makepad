@@ -27,7 +27,7 @@ use makepad_widgets::makepad_platform::{
 use makepad_widgets::splash_host::take_splash_host_requests;
 use makepad_widgets::*;
 use shell::{GuardView, SafeArea, Shell, ShellAction};
-use stage::{SlotMode, Stage, StageMode, StageSlot};
+use stage::{SlotMode, Stage, StageLayer, StageMode, StageSlot};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -329,6 +329,12 @@ struct State {
     clock_timer: Timer,
     panel_wake_timer: Timer,
     panel_wake_ticks: u8,
+    /// Floating layers: when each shown one hides (`when` false + `hold_ms`), and when each
+    /// hidden one has finished animating out; one timer for the earliest.
+    layer_hide_at: HashMap<String, Instant>,
+    layer_gone_at: HashMap<String, Instant>,
+    layer_timer: Timer,
+    layers_saved: String,
     mic_unreadable: bool,
     persist: library::StorePersistence,
     surfaces_json: String,
@@ -411,6 +417,9 @@ impl AppMain for App {
         }
         if self.st.note_timer.is_event(event).is_some() {
             self.clear_note(cx);
+        }
+        if self.st.layer_timer.is_event(event).is_some() {
+            self.layer_deadlines(cx);
         }
         if self.st.clock_timer.is_event(event).is_some() {
             if !self.st.panel_off {
@@ -822,6 +831,7 @@ impl App {
         }
         self.sync_surfaces_key(cx);
         self.sync_workspaces_key(cx);
+        self.load_layers(cx);
     }
 
     fn load_views(&mut self, cx: &mut Cx) {
@@ -1286,14 +1296,17 @@ impl App {
     fn feed_slot_for(&mut self, cx: &mut Cx, name: &str, splash: &WidgetRef) -> bool {
         let total = self.st.stage.slots.len();
         let stage_mode = self.st.stage.mode;
-        let (mode_str, pinned) = self
-            .st
-            .stage
-            .slots
-            .iter()
-            .find(|s| s.surface == name)
-            .map(|s| (s.prelude_mode(stage_mode, total), s.pinned))
-            .unwrap_or(("full", false));
+        let (mode_str, pinned) = if self.st.stage.is_floated(name) {
+            ("float", false)
+        } else {
+            self.st
+                .stage
+                .slots
+                .iter()
+                .find(|s| s.surface == name)
+                .map(|s| (s.prelude_mode(stage_mode, total), s.pinned))
+                .unwrap_or(("full", false))
+        };
         let default_h = (854.0 - self.current_top_clearance(cx)).max(120.0);
         let (w, h) = self.st.slot_dims.get(name).copied().unwrap_or((384.0, default_h));
         let w_r = (w * 2.0).round() * 0.5;
@@ -1419,7 +1432,9 @@ impl App {
     fn commit_stage(&mut self, cx: &mut Cx, by: &str) {
         let bodies_ref = &self.st.bodies;
         self.st.stage.slots.retain(|s| bodies_ref.contains_key(&s.surface));
+        self.st.stage.layers.retain(|l| bodies_ref.contains_key(&l.surface));
         self.st.stage.ensure_valid_focus(self.st.bodies.contains_key("home"));
+        self.save_layers();
 
         let focus = self.st.stage.focus.clone();
         let prev_focus = self.st.store.get("front").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1871,6 +1886,149 @@ impl App {
         }
     }
 
+    /// A stage given without `layers` (an older workspace, `stage set` from a client that
+    /// knows only slots) keeps the layers floating now, and their surfaces stay out of its slots.
+    fn keep_layers_unless_given(&self, given: &JsonValue, parsed: &mut Stage) {
+        if given.get("layers").is_none() {
+            parsed.layers = self.st.stage.layers.clone();
+            let layers = &parsed.layers;
+            parsed.slots.retain(|s| !layers.iter().any(|l| l.surface == s.surface));
+            parsed.ensure_valid_focus(self.st.bodies.contains_key("home"));
+        }
+    }
+
+    fn save_layers(&mut self) {
+        let json = JsonValue::Array(self.st.stage.layers.iter().map(StageLayer::to_json).collect()).serialize_json();
+        if json == self.st.layers_saved {
+            return;
+        }
+        let val = JsonValue::deserialize_json(&json).unwrap_or(JsonValue::Array(vec![]));
+        match self.st.persist.save_layers(&val) {
+            Ok(()) => self.st.layers_saved = json,
+            Err(e) => error!("tb-shell: saving layers: {e}"),
+        }
+    }
+
+    fn load_layers(&mut self, cx: &mut Cx) {
+        let Some(JsonValue::Array(items)) = self.st.persist.load_layers() else { return };
+        let home = self.st.bodies.contains_key("home");
+        for item in &items {
+            if let Some(layer) = StageLayer::from_json(item) {
+                if self.st.bodies.contains_key(&layer.surface) {
+                    self.st.stage.float(layer, home);
+                } else {
+                    log!("tb-shell: layer {} left out: no such surface", item.get("surface").and_then(|s| s.as_str()).unwrap_or("?"));
+                }
+            }
+        }
+        self.st.layers_saved = JsonValue::Array(items).serialize_json();
+        if !self.st.stage.layers.is_empty() {
+            log!("tb-shell: {} floating layer(s) restored", self.st.stage.layers.len());
+            self.commit_stage(cx, "shell");
+            self.eval_layers(cx, None);
+        }
+    }
+
+    /// Re-reads `when` for the layers that read one of `touched` (all, if `None`): a layer
+    /// whose `when` holds shows at once; one whose `when` stopped holding hides `hold_ms` later.
+    fn eval_layers(&mut self, cx: &mut Cx, touched: Option<&[String]>) {
+        let now = Instant::now();
+        let mut show = Vec::new();
+        for l in &self.st.stage.layers {
+            if l.when.is_empty() || touched.map_or(false, |t| !l.when_reads_any(t)) {
+                continue;
+            }
+            if l.when_holds(&self.st.store) {
+                self.st.layer_hide_at.remove(&l.surface);
+                if !l.shown {
+                    show.push(l.surface.clone());
+                }
+            } else if l.shown && !self.st.layer_hide_at.contains_key(&l.surface) {
+                self.st.layer_hide_at.insert(l.surface.clone(), now + Duration::from_millis(l.hold_ms as u64));
+            }
+        }
+        let mut changed = false;
+        for name in show {
+            changed |= self.set_layer_shown(&name, true);
+        }
+        // A hold of 0 hides now rather than on the next timer.
+        changed |= self.layer_due(now);
+        if changed {
+            self.push_layers(cx);
+        }
+        self.arm_layer_timer(cx);
+    }
+
+    /// Shows or hides one layer's runtime state; hiding leaves it drawn while it animates out.
+    fn set_layer_shown(&mut self, name: &str, show: bool) -> bool {
+        let Some(l) = self.st.stage.layer_mut(name) else { return false };
+        if l.shown == show {
+            return false;
+        }
+        l.shown = show;
+        if show {
+            l.leaving = false;
+            self.st.layer_gone_at.remove(name);
+        } else {
+            let out_ms = if stage::motion_enabled() && l.motion.from != stage::SlideFrom::None { l.motion.out_ms } else { 0 };
+            if out_ms > 0 {
+                l.leaving = true;
+                // a frame or two past the animation, so its last frame is drawn before the surface goes
+                self.st.layer_gone_at.insert(name.to_string(), Instant::now() + Duration::from_millis(out_ms as u64 + 40));
+            } else {
+                l.leaving = false;
+            }
+        }
+        true
+    }
+
+    /// Applies the hides and the ends of exit animations that are due by `now`.
+    fn layer_due(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        let hides: Vec<String> = self.st.layer_hide_at.iter().filter(|(_, at)| **at <= now).map(|(n, _)| n.clone()).collect();
+        for name in hides {
+            self.st.layer_hide_at.remove(&name);
+            changed |= self.set_layer_shown(&name, false);
+        }
+        let gone: Vec<String> = self.st.layer_gone_at.iter().filter(|(_, at)| **at <= now).map(|(n, _)| n.clone()).collect();
+        for name in gone {
+            self.st.layer_gone_at.remove(&name);
+            if let Some(l) = self.st.stage.layer_mut(&name) {
+                if l.leaving {
+                    l.leaving = false;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn layer_deadlines(&mut self, cx: &mut Cx) {
+        if self.layer_due(Instant::now()) {
+            self.push_layers(cx);
+        }
+        self.arm_layer_timer(cx);
+    }
+
+    fn arm_layer_timer(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.st.layer_timer);
+        let now = Instant::now();
+        if let Some(next) = self.st.layer_hide_at.values().chain(self.st.layer_gone_at.values()).min() {
+            let secs = next.saturating_duration_since(now).as_secs_f64().max(0.005);
+            self.st.layer_timer = cx.start_timeout(secs);
+        }
+    }
+
+    /// Hands the layers' runtime state to the shell and redraws (no store write: `stage`
+    /// in the store carries no runtime state).
+    fn push_layers(&mut self, cx: &mut Cx) {
+        if let Some(mut sh) = self.shell(cx).borrow_mut::<Shell>() {
+            sh.stage = self.st.stage.clone();
+        }
+        self.sync_visibility_and_lifecycle(cx);
+        cx.redraw_all();
+    }
+
     fn stage_op(&mut self, cx: &mut Cx, req: &JsonValue, by: &str) -> Result<JsonValue, String> {
         let sub = req.get("sub").and_then(|v| v.as_str()).unwrap_or("get");
         if sub == "get" {
@@ -1887,6 +2045,16 @@ impl App {
             }
         };
 
+        // A floated surface has no slot: slot ops on it change nothing and say so (tb-voiced
+        // still pins and unpins Voice for each take; with Voice floated its layer shows instead).
+        if matches!(sub, "add" | "pin" | "unpin" | "solo" | "focus") {
+            if let Some(name) = req.get("surface").and_then(|v| v.as_str()) {
+                if self.st.stage.is_floated(name) {
+                    return Ok(obj(vec![("stage", self.st.stage.to_json()), ("floated", JsonValue::Bool(true))]));
+                }
+            }
+        }
+
         if self.st.stage.focus == "stage" && matches!(sub, "add" | "rm" | "pin" | "unpin" | "solo") {
             if let Some(prev) = self.st.prev_stage_before_switcher.take() {
                 self.st.stage = prev;
@@ -1897,12 +2065,14 @@ impl App {
             "stack" | "grid" | "deck" | "set" => {
                 if sub == "set" {
                     if let Some(st_obj) = req.get("stage") {
-                        let parsed = Stage::from_json(st_obj).ok_or("invalid stage json")?;
+                        let mut parsed = Stage::from_json(st_obj).ok_or("invalid stage json")?;
                         for s in &parsed.slots {
                             check_exists(&s.surface, &self.st.bodies)?;
                         }
+                        self.keep_layers_unless_given(st_obj, &mut parsed);
                         self.st.stage = parsed;
                         self.commit_stage(cx, by);
+                        self.eval_layers(cx, None);
                         return Ok(obj(vec![("stage", self.st.stage.to_json())]));
                     }
                 }
@@ -1911,7 +2081,7 @@ impl App {
                 for item in specs {
                     let slot = StageSlot::from_json(item).ok_or("invalid slot spec")?;
                     check_exists(&slot.surface, &self.st.bodies)?;
-                    if !slots.iter().any(|x: &StageSlot| x.surface == slot.surface) {
+                    if !slots.iter().any(|x: &StageSlot| x.surface == slot.surface) && !self.st.stage.is_floated(&slot.surface) {
                         slots.push(slot);
                     }
                 }
@@ -2040,6 +2210,36 @@ impl App {
             }
             "next" => self.cycle_task(cx, 1, by),
             "prev" => self.cycle_task(cx, -1, by),
+            "float" => {
+                let layer = StageLayer::from_json(req).ok_or("stage float needs surface")?;
+                check_exists(&layer.surface, &self.st.bodies)?;
+                let name = layer.surface.clone();
+                self.st.layer_hide_at.remove(&name);
+                self.st.stage.float(layer, self.st.bodies.contains_key("home"));
+                self.commit_stage(cx, by);
+                self.eval_layers(cx, None);
+            }
+            "unfloat" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage unfloat needs surface")?;
+                if self.st.stage.unfloat(name) {
+                    self.st.layer_hide_at.remove(name);
+                    self.st.layer_gone_at.remove(name);
+                    self.commit_stage(cx, by);
+                    self.arm_layer_timer(cx);
+                }
+            }
+            "layer" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage layer needs surface")?;
+                if !self.st.stage.is_floated(name) {
+                    return Err(format!("{name} is not floated (stage float {name} first)"));
+                }
+                let show = req.get("show") != Some(&JsonValue::Bool(false));
+                self.st.layer_hide_at.remove(name);
+                if self.set_layer_shown(name, show) {
+                    self.push_layers(cx);
+                }
+                self.arm_layer_timer(cx);
+            }
             "save" => {
                 let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage save needs name")?;
                 if !valid_name(name) {
@@ -2054,6 +2254,7 @@ impl App {
                 let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage open needs name")?;
                 let saved = self.st.persist.load_workspace(name).ok_or_else(|| format!("no workspace {name}"))?;
                 let mut parsed = Stage::from_json(&saved).ok_or("corrupt workspace json")?;
+                self.keep_layers_unless_given(&saved, &mut parsed);
                 parsed.slots.retain(|s| self.st.bodies.contains_key(&s.surface));
                 if parsed.slots.is_empty() {
                     return Err(format!("workspace {name} has no active surfaces"));
@@ -2061,6 +2262,7 @@ impl App {
                 parsed.ensure_valid_focus(false);
                 self.st.stage = parsed;
                 self.commit_stage(cx, by);
+                self.eval_layers(cx, None);
             }
             "unsave" => {
                 let name = req.get("name").and_then(|v| v.as_str()).ok_or("stage unsave needs name")?;
@@ -2649,6 +2851,10 @@ impl App {
             }
             self.sync_visibility_and_lifecycle(cx);
             cx.redraw_all();
+        }
+
+        if self.st.stage.layers.iter().any(|l| l.when_reads_any(&touched)) {
+            self.eval_layers(cx, Some(&touched));
         }
 
         if !self.st.panel_off {

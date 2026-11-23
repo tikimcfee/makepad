@@ -1,4 +1,8 @@
-// VOICE: pinned top-band & full view.
+// VOICE: floating card (`slot.mode == "float"`, `stage float voice`), pinned top-band & full view.
+// float: one GlassCard (frosted only inside the card, Chat stays sharp and scrollable below):
+//    the 56 px visualizer (the wave over a glow that follows the level), the transcript at
+//    17 px with no background of its own (the glass shows), capped so the card stays within
+//    slot.height, and Don't send / Send now at 48 px while the send is pending.
 // 1. 60 px soft visualizer header (`flow: Overlay`): `mic` wave + `level` meter behind
 //    the tappable `"to: <agent>"` selector pill and live status.
 // 2. Underneath: `ScrollYView` (`auto_tail: true`, no char limit; ~4-5 lines `height: 98`
@@ -9,6 +13,7 @@ width: Fill height: Fit flow: Down
 main := View{
     width: Fill height: Fit flow: Down
     on_render: || {
+        let is_float = (slot.mode ?? "full") == "float"
         let is_compact = (slot.mode ?? "full") == "compact"
         let v = state.voice ?? nil
         let live = if v == nil { false } else { v.live ?? false }
@@ -23,7 +28,87 @@ main := View{
         let full_raw_h = (slot.height ?? 780.0) - (if n > 0 { 156.0 } else { 100.0 }) - (pad_b - 14.0)
         let full_text_h = if full_raw_h < 110.0 { 110.0 } else { full_raw_h }
         let text_h = if is_compact { 98.0 } else { full_text_h }
+        // float: card padding 24, visualizer 56, two gaps 16, transcript padding 8, buttons 56
+        let float_raw_h = (slot.height ?? 600.0) - 104.0 - (if n > 0 { 56.0 } else { 0.0 })
+        let float_text_h = if float_raw_h < 60.0 { 60.0 } else { float_raw_h }
 
+        if is_float {
+            GlassCard{
+                // 1. visualizer: the wave over a glow that follows the level; pill and status on it
+                View{
+                    width: Fill height: 56 flow: Overlay
+                    StreamView{
+                        stream: "mic" energy_stream: "level" glow: true
+                        width: Fill height: 56
+                        draw_bg.soft: 1.0 draw_bg.border_radius: 14.0
+                        draw_bg.color_bg: #x0a1220
+                        draw_bg.color_bar: if live { #x5aa8ff } else { #x2a4a70 }
+                    }
+                    View{
+                        width: Fill height: 56 flow: Right align: Align{y: 0.5}
+                        padding: Inset{left: 8 right: 12} spacing: 8
+                        ButtonFlat{
+                            width: Fit height: 30 margin: 0
+                            padding: Inset{left: 12 right: 12 top: 0 bottom: 0}
+                            draw_bg.color: #x1a283dcc draw_bg.color_focus: #x1a283dcc draw_bg.color_hover: #x243652
+                            draw_bg.border_radius: 15.0
+                            draw_text.text_style.font_size: 12.5
+                            text: "to: " + target_lbl
+                            on_click: || front("agents")
+                        }
+                        View{width: Fill height: 1}
+                        Small{
+                            text: st
+                            draw_text.color: if live { #x3ddc84 } else if n > 0 { #xf5b942 } else { #x9aa4b2 }
+                        }
+                    }
+                }
+
+                // 2. transcript: no background (the glass shows), grows with the words up to the cap
+                ScrollYView{
+                    width: Fill height: Fit{max: FitBound.Abs(float_text_h)} flow: Down
+                    padding: Inset{left: 4 right: 4 top: 4 bottom: 4}
+                    scroll_bars +: {auto_tail: true}
+                    if txt == "" {
+                        Small{
+                            width: Fill
+                            text: "Hold side PTT key to speak"
+                            draw_text.color: #x8b95a5
+                        }
+                    } else {
+                        Label{
+                            width: Fill
+                            text: txt
+                            draw_text.text_style.font_size: 17
+                            draw_text.color: if live || n > 0 { #xf2f5f9 } else { #xa8b2c0 }
+                        }
+                    }
+                }
+
+                // 3. Don't send (N) / Send now, while the send is pending
+                if n > 0 {
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 10
+                        Big{
+                            height: 48 width: Fill margin: 0
+                            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+                            draw_bg.color: #x6a2631 draw_bg.color_focus: #x6a2631 draw_bg.color_hover: #x803040
+                            draw_bg.border_radius: 16.0
+                            text: "Don't send (" + show(n, ")")
+                            on_click: || set("voice_cancel", v.id ?? "")
+                        }
+                        Big{
+                            height: 48 width: Fill margin: 0
+                            padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+                            draw_bg.color: #x22593d draw_bg.color_focus: #x22593d draw_bg.color_hover: #x2b6f4c
+                            draw_bg.border_radius: 16.0
+                            text: "Send now"
+                            on_click: || set("voice_send", v.id ?? "")
+                        }
+                    }
+                }
+            }
+        } else {
         View{
             width: Fill
             height: Fit
@@ -113,6 +198,7 @@ main := View{
                     }
                 }
             }
+        }
         }
     }
 }
