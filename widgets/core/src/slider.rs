@@ -2967,7 +2967,8 @@ pub struct Slider {
 
 impl ScriptHook for Slider {
     fn on_after_new(&mut self, vm: &mut ScriptVm) {
-        self.set_internal(self.default);
+        // a slider that mirrors state starts at that state, not at its default
+        self.set_internal(if self.value.is_nan() { self.default } else { self.value });
         vm.with_cx_mut(|cx| {
             self.update_text_input(cx);
         });
@@ -3052,8 +3053,10 @@ impl Slider {
 
     fn set_internal(&mut self, external: f64) -> bool {
         let old = self.relative_value;
-        self.relative_value =
-            taper_to_travel(self.taper, external, self.min, self.max, self.default, self.step);
+        // A value outside min..max (a default of 0 on a -70..-15 range, a bound that moved under
+        // it) would put the cap past the track's end, off the slider.
+        let travel = taper_to_travel(self.taper, external, self.min, self.max, self.default, self.step);
+        self.relative_value = if travel.is_nan() { 0.0 } else { travel.clamp(0.0, 1.0) };
         old != self.relative_value
     }
 
