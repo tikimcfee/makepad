@@ -5,8 +5,13 @@
 //!   - `inotify` on `$XDG_RUNTIME_DIR/tinybot/volume-bridge.last` and `/run/tinybot/speaker-state`
 //!
 //! Safety & harm rules:
-//!   - Everyday volume runs through `wpctl` (`tb-volume-bridge` owns the sink->hardware path
-//!     and raises the root guard when crossing `-30 dB`).
+//!   - ONE VOLUME SCALE (2026-11-24): the volume is `tb-sound`'s own number in dB (the stream's
+//!     total, floor..top). `vol_db` / `vol_up` / `vol_down` store it with
+//!     `tb-sound --volume ... --no-sound` and play the chime into the speaker service, which plays
+//!     exactly what was stored. PipeWire's 0..1 volume is not in the path (the bridge pins it at 1.0).
+//!   - The speaker's hardware guard is `tb-speakerd`'s current guard; `guard_ma {ma}` and
+//!     `guard_mode {mode}` set it through `tb-sound --guard` (whole mA; above the nominal ceiling
+//!     `tb-sound` answers exit 4 and a device tap on `tbui confirm` is the "are you sure?").
 //!   - Direct tone/sweep tries run `/usr/local/sbin/tb-sound` on a worker thread so `All off`
 //!     (`emit("stop")`) is never blocked and immediately stops an active try and runs
 //!     `/usr/local/sbin/tb-audio-off`.
@@ -41,7 +46,8 @@ struct Config {
     sock_path: String,
     sound_bin: String,
     audio_off_bin: String,
-    wpctl_bin: String,
+    pw_play_bin: String,
+    chime_path: String,
     tbui_bin: String,
     speaker_state_path: String,
     volume_bridge_dir: Option<String>,
@@ -61,7 +67,8 @@ impl Config {
             sock_path,
             sound_bin: env_or("TB_SOUND_BIN", "/usr/local/sbin/tb-sound"),
             audio_off_bin: env_or("TB_AUDIO_OFF_BIN", "/usr/local/sbin/tb-audio-off"),
-            wpctl_bin: env_or("TB_WPCTL_BIN", "wpctl"),
+            pw_play_bin: env_or("TB_PW_PLAY_BIN", "pw-play"),
+            chime_path: env_or("TB_CHIME", "/usr/share/tinybot/sounds/plink.wav"),
             tbui_bin: env_or("TB_TBUI_BIN", &default_tbui),
             speaker_state_path: env_or("TB_SPEAKER_STATE", "/run/tinybot/speaker-state"),
             volume_bridge_dir,
@@ -120,6 +127,20 @@ fn read_fast_state(cfg: &Config) -> (f64, f64, Vec<(&'static str, JsonValue)>) {
         ("bytes_dropped", opt_str(spk_kv.get("bytes_dropped"))),
         ("underruns", opt_str(spk_kv.get("underruns"))),
         ("lock_holder", opt_str(spk_kv.get("lock_holder"))),
+        ("duck_db", opt_str(spk_kv.get("duck_db"))),
+        // the speaker guard: its settings (from tb-sound, so they show while idle too) and,
+        // from the speaker service, what it measures and does while a stream plays
+        ("amp_ma_max", opt_str(vol_kv.get("guard_amp_ma_max").or(spk_kv.get("amp_ma_max")))),
+        ("guard_mode", opt_str(vol_kv.get("guard_mode").or(spk_kv.get("guard_mode")))),
+        ("guard_nominal_max_ma", opt_str(vol_kv.get("guard_nominal_max_ma"))),
+        ("guard_min_ma", opt_str(vol_kv.get("guard_min_ma"))),
+        ("guard_hard_max_ma", opt_str(vol_kv.get("guard_hard_max_ma"))),
+        ("monitor_only", opt_str(spk_kv.get("monitor_only"))),
+        ("backdown_db", opt_str(spk_kv.get("backdown_db"))),
+        ("guard_status", opt_str(spk_kv.get("guard_status"))),
+        ("amp_ma", opt_str(spk_kv.get("amp_ma"))),
+        ("amp_ma_max_two_sided", opt_str(spk_kv.get("amp_ma_max_two_sided"))),
+        ("battery_ma", opt_str(spk_kv.get("battery_ma"))),
     ];
     (floor_db, top_db, fields)
 }
@@ -309,11 +330,45 @@ fn execute_sound_try(
     let _ = tx.send(Ev::DelayedRefresh);
 }
 
-fn schedule_delayed_refresh(tx: Sender<Ev>, delay: Duration) {
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        let _ = tx.send(Ev::DelayedRefresh);
-    });
+/// Stores `args` (a `--volume ... --no-sound` call) and, if it was stored, plays the chime into
+/// the speaker service, which plays it at exactly the stored volume. Returns the tool's sentence.
+fn set_volume_and_chime(cfg: &Config, args: &[&str]) -> String {
+    let res = run_root_tool(&cfg.sound_bin, args, Duration::from_secs(5), None);
+    if res.code == Some(0) {
+        if let Ok(mut child) = std::process::Command::new(&cfg.pw_play_bin)
+            .args(["--target", "tinybot-speaker", &cfg.chime_path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            let _ = std::thread::Builder::new().name("tb-sound-chime".into()).spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    res.summary_line()
+}
+
+/// `tb-sound --guard ma N`; above the nominal ceiling tb-sound answers exit 4 and the person is
+/// asked on the device ("are you sure?") before it is stored with `--confirm`. On a thread of its
+/// own: the question waits up to 15 s.
+fn set_guard_ma(cfg: Config, writer: ShellWriter, ma: i64, tx: Sender<Ev>) {
+    let ma_s = ma.to_string();
+    let res = run_root_tool(&cfg.sound_bin, &["--guard", "ma", &ma_s], Duration::from_secs(5), None);
+    let mut last = res.summary_line();
+    if res.code == Some(4) {
+        let slot = Arc::new(Mutex::new(None));
+        let q = format!("Speaker guard {ma} mA is above the nominal ceiling: the speaker may be driven past its rating. Are you sure?");
+        let ans = ask_root_guard(&cfg, &q, "Yes, store it", "No", &slot);
+        if ans.code == Some(0) {
+            let res2 = run_root_tool(&cfg.sound_bin, &["--guard", "ma", &ma_s, "--confirm"], Duration::from_secs(5), None);
+            last = res2.summary_line();
+        } else {
+            last = format!("Speaker guard left as it was ({ma} mA not stored)");
+        }
+    }
+    let _ = writer.patch_key("sound", obj(vec![("last", last.into())]));
+    let _ = tx.send(Ev::DelayedRefresh);
 }
 
 fn json_f64(v: Option<&JsonValue>) -> Option<f64> {
@@ -458,48 +513,54 @@ fn main() {
                                     (floor_db, top_db) = v;
                                 }
                             }
-                            "vol_down" => {
-                                let res = run_cmd(
-                                    &cfg.wpctl_bin,
-                                    &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "0.075-"],
-                                    Duration::from_secs(5),
-                                    None,
-                                    None,
-                                );
-                                if res.code != Some(0) {
-                                    let _ = writer.patch_key("sound", obj(vec![("last", format!("wpctl: {}", res.summary_line()).into())]));
+                            "vol_down" | "vol_up" => {
+                                let dir = if name == "vol_up" { "up" } else { "down" };
+                                let last = set_volume_and_chime(&cfg, &["--volume", dir, "--no-sound"]);
+                                last_fast_json.clear();
+                                if let Ok(v) = publish_fast(&writer, &cfg, vec![("last", last.into())], None) {
+                                    (floor_db, top_db) = v;
                                 }
-                                schedule_delayed_refresh(tx.clone(), Duration::from_millis(500));
-                            }
-                            "vol_up" => {
-                                let res = run_cmd(
-                                    &cfg.wpctl_bin,
-                                    &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "0.075+"],
-                                    Duration::from_secs(5),
-                                    None,
-                                    None,
-                                );
-                                if res.code != Some(0) {
-                                    let _ = writer.patch_key("sound", obj(vec![("last", format!("wpctl: {}", res.summary_line()).into())]));
-                                }
-                                schedule_delayed_refresh(tx.clone(), Duration::from_millis(500));
                             }
                             "vol_db" => {
-                                if let Some(db) = json_f64(data.and_then(|d| d.get("db"))) {
-                                    let span = (top_db - floor_db).max(1.0);
-                                    let norm = ((db - floor_db) / span).clamp(0.0, 1.0);
-                                    let val = format!("{norm:.3}");
-                                    let res = run_cmd(
-                                        &cfg.wpctl_bin,
-                                        &["set-volume", "@DEFAULT_AUDIO_SINK@", &val],
-                                        Duration::from_secs(5),
-                                        None,
-                                        None,
-                                    );
-                                    if res.code != Some(0) {
-                                        let _ = writer.patch_key("sound", obj(vec![("last", format!("wpctl: {}", res.summary_line()).into())]));
+                                if let Some(db) = json_f64(data.and_then(|d| d.get("db"))).filter(|d| d.is_finite()) {
+                                    // the exact dB, kept inside the scale here too (tb-sound clamps as well)
+                                    let db = db.clamp(floor_db.min(top_db), top_db.max(floor_db));
+                                    let val = format!("{db:.1}");
+                                    let last = set_volume_and_chime(&cfg, &["--volume", "set", &val, "--no-sound"]);
+                                    last_fast_json.clear();
+                                    if let Ok(v) = publish_fast(&writer, &cfg, vec![("last", last.into())], None) {
+                                        (floor_db, top_db) = v;
                                     }
-                                    schedule_delayed_refresh(tx.clone(), Duration::from_millis(500));
+                                }
+                            }
+                            "guard_ma" => {
+                                // whole mA only: a number with a fraction is refused, not rounded
+                                let ma = data.and_then(|d| d.get("ma")).and_then(|v| match v {
+                                    JsonValue::String(s) => s.trim().parse::<i64>().ok(),
+                                    other => json_f64(Some(other)).filter(|f| f.fract() == 0.0).map(|f| f as i64),
+                                });
+                                match ma {
+                                    Some(ma) => {
+                                        let (cfg_c, writer_c, tx_c) = (cfg.clone(), writer.clone(), tx.clone());
+                                        let _ = std::thread::Builder::new()
+                                            .name("tb-sound-guard".into())
+                                            .spawn(move || set_guard_ma(cfg_c, writer_c, ma, tx_c));
+                                    }
+                                    None => {
+                                        let _ = writer.patch_key("sound", obj(vec![("last", "REFUSED: the guard takes whole mA".into())]));
+                                    }
+                                }
+                            }
+                            "guard_mode" => {
+                                let mode = data.and_then(|d| d.get("mode")).and_then(|v| v.as_str()).unwrap_or("");
+                                if mode == "enforce" || mode == "monitor" {
+                                    let res = run_root_tool(&cfg.sound_bin, &["--guard", mode], Duration::from_secs(5), None);
+                                    last_fast_json.clear();
+                                    if let Ok(v) = publish_fast(&writer, &cfg, vec![("last", res.summary_line().into())], None) {
+                                        (floor_db, top_db) = v;
+                                    }
+                                } else {
+                                    let _ = writer.patch_key("sound", obj(vec![("last", "REFUSED: the guard mode is enforce or monitor".into())]));
                                 }
                             }
                             "stop" => {
