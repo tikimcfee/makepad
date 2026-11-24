@@ -500,7 +500,9 @@ impl Widget for Shell {
                     if let Some(t) = event_time(event) {
                         let ms = (t - *last_t) * 1000.0;
                         if ms >= 4.0 {
-                            *vel = 0.6 * ((p.y - *last_y) / ms) + 0.4 * *vel;
+                            let v = (p.y - *last_y) / ms;
+                            // the first measure counts in full: a short flick has only a move or two
+                            *vel = if *vel == 0.0 { v } else { 0.6 * v + 0.4 * *vel };
                             *last_y = p.y;
                             *last_t = t;
                         }
