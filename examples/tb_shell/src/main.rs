@@ -1501,6 +1501,13 @@ impl App {
         }
         for act in actions {
             match act {
+                ShellAction::ShowLayer(name, show) => {
+                    self.st.layer_hide_at.remove(&name);
+                    if self.set_layer_shown(&name, show) {
+                        self.push_layers(cx);
+                    }
+                    self.arm_layer_timer(cx);
+                }
                 ShellAction::GoHome => {
                     self.clear_note(cx);
                     if self.st.bodies.contains_key("home") {
@@ -2961,11 +2968,21 @@ impl App {
                         let name_str = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let name = args.get("name").cloned().unwrap_or(JsonValue::Null);
                         let data = args.get("data").cloned().unwrap_or(JsonValue::Null);
-                        if !name_str.is_empty() {
-                            self.handle_termd_ui_emit(cx, &name_str, &data);
-                        }
-                        let ev = obj(vec![("ev", "emit".into()), ("surface", surface.as_str().into()), ("name", name), ("data", data)]);
-                        self.to_surface_watchers(&surface, ev);
+                        // emit_to(): a control on one surface (the shade) drives another's handler
+                        // (sound, display), which sees the event as its own surface's, plus "from".
+                        let to = args.get("to").and_then(|v| v.as_str())
+                            .filter(|t| !t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                            .map(|t| t.to_string());
+                        let Some(to) = to else {
+                            if !name_str.is_empty() {
+                                self.handle_termd_ui_emit(cx, &name_str, &data);
+                            }
+                            let ev = obj(vec![("ev", "emit".into()), ("surface", surface.as_str().into()), ("name", name), ("data", data)]);
+                            self.to_surface_watchers(&surface, ev);
+                            continue;
+                        };
+                        let ev = obj(vec![("ev", "emit".into()), ("surface", to.as_str().into()), ("from", surface.as_str().into()), ("name", name), ("data", data)]);
+                        self.to_surface_watchers(&to, ev);
                     }
                     other => log!("tb-shell: surface {surface} asked for {other}: refused"),
                 }

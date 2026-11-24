@@ -461,7 +461,8 @@ fn stage_cmd(args: &[String]) {
         "next" | "prev" => obj(vec![("op", "stage".into()), ("sub", sub.into())]),
         "float" => {
             const USAGE: &str = "stage float NAME [--z N] [--place top|center|bottom] [--inset L,T,R,B] [--width fill|PX|N%] \
-[--max-h PX|N%] [--hit card|all|none] [--when PATH,PATH] [--hold MS] [--motion slide|slide-top|slide-bottom|none]";
+[--max-h PX|N%] [--hit card|all|none] [--when PATH,PATH] [--hold MS] [--motion slide|slide-top|slide-bottom|none] \
+[--pull top] [--dismiss outside]";
             let mut m = HashMap::new();
             m.insert("op".to_string(), JsonValue::from("stage"));
             m.insert("sub".to_string(), JsonValue::from("float"));
@@ -477,6 +478,8 @@ fn stage_cmd(args: &[String]) {
                     "--when" => "when",
                     "--hold" => "hold_ms",
                     "--motion" => "motion",
+                    "--pull" => "pull",
+                    "--dismiss" => "dismiss",
                     s if !s.starts_with('-') && !m.contains_key("surface") => {
                         m.insert("surface".to_string(), JsonValue::from(s));
                         continue;

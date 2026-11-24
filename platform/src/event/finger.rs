@@ -1085,6 +1085,13 @@ impl CxFingers {
             || self.captures.iter().any(|v| v.digit_id == digit_id && v.owner)
     }
 
+    /// Whether ANY finger's drag is claimed by a widget or owned by a scroller right now: a
+    /// container that watches drags through its children (a drawer's swipe-to-close) leaves
+    /// them alone while it is.
+    pub fn any_drag_claimed(&self) -> bool {
+        !self.drag_claims.is_empty() || self.captures.iter().any(|v| v.owner)
+    }
+
     /// Whether a widget claimed `digit_id`'s drag (see [`Cx::claim_finger_drag`]), not counting
     /// a scroller that owns its gesture.
     pub fn is_drag_claimed_by_widget(&self, digit_id: DigitId) -> bool {

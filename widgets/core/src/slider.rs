@@ -2824,6 +2824,15 @@ pub struct Slider {
     step: f64,
     #[live]
     default: f64,
+    /// The value to show, for a slider that mirrors outside state (Splash:
+    /// `value: state.x`). Applied on every apply while no finger is on the
+    /// slider; NaN (the default) leaves the slider owning its value, as
+    /// before. After a release the old value is not re-applied for a moment,
+    /// so state that has not caught up yet cannot snap the cap back.
+    #[live(f64::NAN)]
+    value: f64,
+    #[rust]
+    commit_hold: Option<(f64, std::time::Instant)>,
 
     /// Fraction of the value range one scroll-wheel notch moves while the
     /// pointer hovers this slider. 0.0 (the default) disables wheel input.
@@ -2971,6 +2980,22 @@ impl ScriptHook for Slider {
         _scope: &mut Scope,
         _value: ScriptValue,
     ) {
+        if !apply.is_animate() && !self.value.is_nan() && self.dragging.is_none() {
+            let v = self.value;
+            let held = match self.commit_hold {
+                Some((stale, at)) => v == stale && at.elapsed().as_millis() < 1500,
+                None => false,
+            };
+            if !held {
+                self.commit_hold = None;
+                if self.set_internal(v) {
+                    vm.with_cx_mut(|cx| {
+                        self.update_text_input(cx);
+                        self.draw_bg.redraw(cx);
+                    });
+                }
+            }
+        }
         if !self.backdrop {
             return;
         }
@@ -3014,6 +3039,9 @@ impl Slider {
 
     fn emit_end_slide(&mut self, cx: &mut Cx, uid: WidgetUid) {
         let value = self.to_external();
+        if !self.value.is_nan() {
+            self.commit_hold = Some((self.value, std::time::Instant::now()));
+        }
         cx.widget_action(uid, SliderAction::EndSlide(value));
         cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_commit.clone(), &[ScriptValue::from_f64(value)]);
     }

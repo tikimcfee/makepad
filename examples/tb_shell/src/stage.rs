@@ -358,6 +358,12 @@ pub struct StageLayer {
     /// Stays up this long after `when` turns false.
     pub hold_ms: u32,
     pub motion: Motion,
+    /// `"pull": "top"`: a drag down from the status strip brings it out under the finger
+    /// (the shade). It starts hidden; a swipe up on it puts it away.
+    pub pull: bool,
+    /// `"dismiss": "outside"`: a press outside the card while it is up hides it, and that
+    /// press goes no further.
+    pub dismiss_outside: bool,
     /// Runtime, not saved: shown now (the shell animates towards it).
     pub shown: bool,
     /// Runtime, not saved: hidden but still animating out, so its surface is still drawn.
@@ -387,15 +393,19 @@ impl StageLayer {
             Some(JsonValue::String(s)) => s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             _ => Vec::new(),
         };
+        let pull = matches!(v.get("pull"), Some(JsonValue::String(s)) if s == "top") || v.get("pull") == Some(&JsonValue::Bool(true));
+        let dismiss_outside = matches!(v.get("dismiss"), Some(JsonValue::String(s)) if s == "outside");
         Some(Self {
             surface,
+            pull,
+            dismiss_outside,
             z: json_num(v.get("z")).unwrap_or(0.0).clamp(-1000.0, 1000.0) as i32,
             place,
             inset,
             width: Extent::from_json(v.get("width")).unwrap_or(Extent::Fill),
             max_h: Extent::from_json(v.get("max_h")).unwrap_or(Extent::Frac(0.48)),
             hit: v.get("hit").and_then(|h| h.as_str()).map(Hit::from_str).unwrap_or(Hit::Card),
-            shown: when.is_empty(),
+            shown: when.is_empty() && !pull,
             when,
             hold_ms: json_num(v.get("hold_ms")).unwrap_or(0.0).clamp(0.0, 60_000.0) as u32,
             motion: Motion::from_json(v.get("motion"), place),
@@ -415,6 +425,12 @@ impl StageLayer {
         m.insert("when".to_string(), JsonValue::Array(self.when.iter().map(|s| JsonValue::String(s.clone())).collect()));
         m.insert("hold_ms".to_string(), JsonValue::F64(self.hold_ms as f64));
         m.insert("motion".to_string(), self.motion.to_json());
+        if self.pull {
+            m.insert("pull".to_string(), JsonValue::String("top".into()));
+        }
+        if self.dismiss_outside {
+            m.insert("dismiss".to_string(), JsonValue::String("outside".into()));
+        }
         JsonValue::Object(m)
     }
 

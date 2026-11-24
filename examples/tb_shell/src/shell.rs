@@ -239,6 +239,8 @@ pub enum ShellAction {
     ToggleHeader(String),
     CycleSlotMode(String),
     RemoveSlot(String),
+    /// A floated layer shown or hidden by a gesture (the shade's pull, swipe up, a press outside).
+    ShowLayer(String, bool),
 }
 
 #[derive(Clone)]
@@ -268,6 +270,12 @@ struct LayerHit {
 #[derive(Clone)]
 enum DragOrigin {
     Strip(Vec2d),
+    /// A finger holding a pull layer (the shade): `start_d` is how far out the card was when
+    /// the finger took it (0 from the strip, its whole travel on a swipe up), `vel` the
+    /// smoothed speed in points/ms, down positive.
+    Pull { surface: String, start_y: f64, start_d: f64, opened: bool, last_y: f64, last_at: std::time::Instant, vel: f64 },
+    /// A press that closed a layer from outside it: its moves and its lift go nowhere.
+    Swallow,
     Header { surface: String, start: Vec2d, start_scroll: f64, dragged: bool },
 }
 
@@ -332,7 +340,20 @@ pub struct Shell {
     #[rust] layer_card_h: HashMap<String, f64>,
     #[rust] layer_frame: NextFrame,
     #[rust] layer_frame_at: Option<std::time::Instant>,
+    /// A pull layer held by a finger: how far out its card is (points), which replaces its
+    /// animated progress until the finger lifts; and each layer's full travel from the last frame.
+    #[rust] layer_drag: HashMap<String, f64>,
+    #[rust] layer_travel: HashMap<String, f64>,
+    /// Where the press now routed to a layer's body went down (a swipe up there closes a shade).
+    #[rust] body_down: Option<Vec2d>,
 }
+
+/// Pull layers: a drag down from the strip starts one past this many points.
+const PULL_SLOP: f64 = 12.0;
+/// A swipe up on an open shade takes it past this many points (and only if no widget in it took the drag).
+const SWIPE_UP_SLOP: f64 = 20.0;
+/// On release, faster than this (points/ms) decides by direction; slower, by how far out it is.
+const FLICK_VEL: f64 = 0.5;
 
 fn is_input(event: &Event) -> bool {
     !matches!(event, Event::Signal | Event::Timer(_) | Event::NextFrame(_) | Event::Startup | Event::Draw(_))
@@ -394,13 +415,21 @@ impl Widget for Shell {
             let mut chrome_consumed = false;
 
             if let Some(p) = down {
+                self.body_down = None;
                 if self.strip_rect.contains(p) {
                     self.drag_origin = Some(DragOrigin::Strip(p));
+                    self.active_body_surface = None;
+                    chrome_consumed = true;
+                } else if let Some(name) = self.dismiss_target(p) {
+                    // A press outside a layer that closes on one: it closes, and the press goes no further.
+                    self.actions.push(ShellAction::ShowLayer(name, false));
+                    self.drag_origin = Some(DragOrigin::Swallow);
                     self.active_body_surface = None;
                     chrome_consumed = true;
                 } else if let Some(surface) = self.layer_at(p) {
                     // A floating layer's card takes the touch; outside it the stage gets it.
                     self.active_body_surface = Some(surface);
+                    self.body_down = Some(p);
                 } else if let Some(th) = self.deck_hits.iter().find(|t| t.tab_rect.contains(p)).cloned() {
                     if th.close_rect.size.x > 0.0 && th.close_rect.contains(p) {
                         self.actions.push(ShellAction::RemoveSlot(th.surface));
@@ -440,8 +469,59 @@ impl Widget for Shell {
                         }
                     }
                     chrome_consumed = true;
-                } else if matches!(self.drag_origin, Some(DragOrigin::Strip(_))) {
+                } else if let Some(DragOrigin::Strip(start)) = self.drag_origin {
+                    let (dx, dy) = (p.x - start.x, p.y - start.y);
+                    if dy > PULL_SLOP && dy > dx.abs() {
+                        if let Some(name) = self.stage.layers.iter().rev().find(|l| l.pull && !l.shown).map(|l| l.surface.clone()) {
+                            self.actions.push(ShellAction::ShowLayer(name.clone(), true));
+                            self.drag_origin = Some(DragOrigin::Pull {
+                                surface: name.clone(), start_y: start.y, start_d: 0.0, opened: false,
+                                last_y: p.y, last_at: std::time::Instant::now(), vel: 0.0,
+                            });
+                            self.layer_drag.insert(name, dy.max(0.0));
+                            cx.redraw_all();
+                        }
+                    }
                     chrome_consumed = true;
+                } else if let Some(DragOrigin::Pull { ref surface, start_y, start_d, ref mut last_y, ref mut last_at, ref mut vel, .. }) = self.drag_origin {
+                    let travel = self.layer_travel.get(surface).copied().unwrap_or(400.0);
+                    let d = (start_d + p.y - start_y).clamp(0.0, travel);
+                    let now = std::time::Instant::now();
+                    let ms = now.duration_since(*last_at).as_secs_f64() * 1000.0;
+                    if ms > 0.5 {
+                        *vel = 0.6 * ((p.y - *last_y) / ms) + 0.4 * *vel;
+                        *last_y = p.y;
+                        *last_at = now;
+                    }
+                    self.layer_drag.insert(surface.clone(), d);
+                    cx.redraw_all();
+                    chrome_consumed = true;
+                } else if matches!(self.drag_origin, Some(DragOrigin::Swallow)) {
+                    chrome_consumed = true;
+                } else if self.drag_origin.is_none() {
+                    // A swipe up on an open shade puts it away, unless something in it (a slider,
+                    // a scroller) took the drag: the finger then carries the card back up.
+                    if let (Some(name), Some(start)) = (self.active_body_surface.clone(), self.body_down) {
+                        let (dx, dy) = (p.x - start.x, p.y - start.y);
+                        let open_pull = self.stage.layer(&name).map_or(false, |l| l.pull && l.shown);
+                        if open_pull && dy < -SWIPE_UP_SLOP && dy.abs() > 1.5 * dx.abs() && !cx.fingers.any_drag_claimed() {
+                            if let Event::TouchUpdate(e) = event {
+                                for t in &e.touches {
+                                    cx.release_touch_captures(t.uid);
+                                }
+                            }
+                            let travel = self.layer_travel.get(&name).copied().unwrap_or(400.0);
+                            self.layer_drag.insert(name.clone(), (travel + dy).clamp(0.0, travel));
+                            self.drag_origin = Some(DragOrigin::Pull {
+                                surface: name, start_y: start.y, start_d: travel, opened: true,
+                                last_y: p.y, last_at: std::time::Instant::now(), vel: 0.0,
+                            });
+                            self.active_body_surface = None;
+                            self.body_down = None;
+                            cx.redraw_all();
+                            chrome_consumed = true;
+                        }
+                    }
                 }
             }
 
@@ -461,6 +541,28 @@ impl Widget for Shell {
                                 self.actions.push(ShellAction::ToggleStageView);
                             }
                         }
+                        chrome_consumed = true;
+                    }
+                    Some(DragOrigin::Pull { surface, opened, vel, .. }) => {
+                        let travel = self.layer_travel.get(&surface).copied().unwrap_or(400.0).max(1.0);
+                        let d = self.layer_drag.remove(&surface).unwrap_or(0.0);
+                        let out = (d / travel).clamp(0.0, 1.0);
+                        // a flick decides by its direction; otherwise how far out it is, past a
+                        // third to open, or still two thirds out to stay open
+                        let open = if vel > FLICK_VEL {
+                            true
+                        } else if vel < -FLICK_VEL {
+                            false
+                        } else {
+                            out > if opened { 0.65 } else { 0.35 }
+                        };
+                        // the animation goes on from where the finger left it (p = 1 - (1 - t)^3)
+                        self.layer_t.insert(surface.clone(), 1.0 - (1.0 - out).cbrt());
+                        self.actions.push(ShellAction::ShowLayer(surface, open));
+                        cx.redraw_all();
+                        chrome_consumed = true;
+                    }
+                    Some(DragOrigin::Swallow) => {
                         chrome_consumed = true;
                     }
                     Some(DragOrigin::Header { surface, dragged, .. }) => {
@@ -622,6 +724,13 @@ impl Widget for Shell {
 }
 
 impl Shell {
+    /// A shown, `dismiss: outside` layer that a press at `p` (not on its card) should close.
+    fn dismiss_target(&self, p: Vec2d) -> Option<String> {
+        let l = self.stage.layers.iter().rev().find(|l| l.dismiss_outside && l.shown)?;
+        let on_card = self.layer_hits.iter().any(|h| h.surface == l.surface && h.rect.contains(p));
+        if on_card { None } else { Some(l.surface.clone()) }
+    }
+
     /// The surface of the topmost shown layer that takes a touch at `p`.
     fn layer_at(&self, p: Vec2d) -> Option<String> {
         self.layer_hits.iter().rev().find(|h| h.rect.contains(p)).map(|h| h.surface.clone())
@@ -631,20 +740,21 @@ impl Shell {
     /// stage viewport and slid by its entry progress. The card is moved by relayout, not a
     /// transform, so a glass card samples the scene at its real position all the way in.
     fn draw_layers(&mut self, cx: &mut Cx2d, scope: &mut Scope, stage_rect: Rect, win_h: f64) {
-        let layers: Vec<_> = self.stage.layers.iter().filter(|l| l.drawn()).cloned().collect();
+        let layers: Vec<_> = self.stage.layers.iter().filter(|l| l.drawn() || self.layer_drag.contains_key(&l.surface)).cloned().collect();
         let motion_on = stage::motion_enabled();
         self.layer_t.retain(|n, _| layers.iter().any(|l| &l.surface == n));
         let mut animating = false;
         for l in layers {
+            let held = self.layer_drag.get(&l.surface).copied();
             let target = if l.shown { 1.0 } else { 0.0 };
             let instant = !motion_on || l.motion.from == SlideFrom::None;
             let t = *self.layer_t.entry(l.surface.clone()).or_insert(if instant { target } else { 0.0 });
             let t = if instant { target } else { t };
             self.layer_t.insert(l.surface.clone(), t);
-            if (t - target).abs() > 1e-6 {
+            if held.is_none() && (t - target).abs() > 1e-6 {
                 animating = true;
             }
-            if t <= 0.0 && !l.shown {
+            if held.is_none() && t <= 0.0 && !l.shown {
                 continue;
             }
 
@@ -662,11 +772,19 @@ impl Shell {
             };
             // ease-out cubic in, ease-in cubic out: one curve over t
             let p = 1.0 - (1.0 - t).powi(3);
-            let y = match l.motion.from {
+            let travel = match l.motion.from {
+                SlideFrom::Bottom => stage_bot - base_y,
+                _ => card_h + (base_y - stage_rect.pos.y),
+            };
+            self.layer_travel.insert(l.surface.clone(), travel.max(1.0));
+            let y = if let Some(d) = held {
+                // under the finger: the card's bottom edge follows it, point for point
+                base_y - (travel - d.clamp(0.0, travel))
+            } else { match l.motion.from {
                 SlideFrom::Top => base_y - (1.0 - p) * (card_h + (base_y - stage_rect.pos.y)),
                 SlideFrom::Bottom => base_y + (1.0 - p) * (stage_bot - base_y),
                 SlideFrom::None => base_y,
-            };
+            } };
 
             let mut list = self.layer_lists.remove(&l.surface).unwrap_or_else(|| DrawList2d::new(cx));
             list.begin_overlay_reuse(cx);
@@ -718,6 +836,9 @@ impl Shell {
         let dt_ms = self.layer_frame_at.map_or(0.0, |at| now.duration_since(at).as_secs_f64() * 1000.0);
         let mut moving = false;
         for l in &self.stage.layers {
+            if self.layer_drag.contains_key(&l.surface) {
+                continue;
+            }
             let Some(t) = self.layer_t.get_mut(&l.surface) else { continue };
             let (target, ms) = if l.shown { (1.0, l.motion.in_ms) } else { (0.0, l.motion.out_ms) };
             let step = if ms == 0 { 1.0 } else { dt_ms / ms as f64 };
