@@ -346,6 +346,8 @@ pub struct Shell {
     #[rust] layer_travel: HashMap<String, f64>,
     /// Where the press now routed to a layer's body went down (a swipe up there closes a shade).
     #[rust] body_down: Option<Vec2d>,
+    /// The event time of the last press: a pull taken over mid-gesture starts at its average speed.
+    #[rust] down_t: f64,
 }
 
 /// Pull layers: a drag down from the strip starts one past this many points.
@@ -372,6 +374,11 @@ fn pointer_down_move_up(event: &Event) -> (Option<Vec2d>, Option<Vec2d>, Option<
         }
         _ => (None, None, None),
     }
+}
+
+/// Points per ms over `secs`, or 0 when the time is too short to tell.
+fn avg_speed(dy: f64, secs: f64) -> f64 {
+    if secs > 0.004 { dy / (secs * 1000.0) } else { 0.0 }
 }
 
 /// The event's own clock (seconds), for a drag's speed: arrival times bunch up when frames are slow.
@@ -427,6 +434,7 @@ impl Widget for Shell {
 
             if let Some(p) = down {
                 self.body_down = None;
+                self.down_t = event_time(event).unwrap_or(0.0);
                 if self.strip_rect.contains(p) {
                     self.drag_origin = Some(DragOrigin::Strip(p));
                     self.active_body_surface = None;
@@ -485,9 +493,10 @@ impl Widget for Shell {
                     if dy > PULL_SLOP && dy > dx.abs() {
                         if let Some(name) = self.stage.layers.iter().rev().find(|l| l.pull && !l.shown).map(|l| l.surface.clone()) {
                             self.actions.push(ShellAction::ShowLayer(name.clone(), true));
+                            let t = event_time(event).unwrap_or(0.0);
                             self.drag_origin = Some(DragOrigin::Pull {
                                 surface: name.clone(), start_y: start.y, start_d: 0.0, opened: false,
-                                last_y: p.y, last_t: event_time(event).unwrap_or(0.0), vel: 0.0,
+                                last_y: p.y, last_t: t, vel: avg_speed(dy, t - self.down_t),
                             });
                             self.layer_drag.insert(name, dy.max(0.0));
                             cx.redraw_all();
@@ -526,9 +535,10 @@ impl Widget for Shell {
                             }
                             let travel = self.layer_travel.get(&name).copied().unwrap_or(400.0);
                             self.layer_drag.insert(name.clone(), (travel + dy).clamp(0.0, travel));
+                            let t = event_time(event).unwrap_or(0.0);
                             self.drag_origin = Some(DragOrigin::Pull {
                                 surface: name, start_y: start.y, start_d: travel, opened: true,
-                                last_y: p.y, last_t: event_time(event).unwrap_or(0.0), vel: 0.0,
+                                last_y: p.y, last_t: t, vel: avg_speed(dy, t - self.down_t),
                             });
                             self.active_body_surface = None;
                             self.body_down = None;
