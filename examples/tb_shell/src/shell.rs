@@ -273,7 +273,7 @@ enum DragOrigin {
     /// A finger holding a pull layer (the shade): `start_d` is how far out the card was when
     /// the finger took it (0 from the strip, its whole travel on a swipe up), `vel` the
     /// smoothed speed in points/ms, down positive.
-    Pull { surface: String, start_y: f64, start_d: f64, opened: bool, last_y: f64, last_at: std::time::Instant, vel: f64 },
+    Pull { surface: String, start_y: f64, start_d: f64, opened: bool, last_y: f64, last_t: f64, vel: f64 },
     /// A press that closed a layer from outside it: its moves and its lift go nowhere.
     Swallow,
     Header { surface: String, start: Vec2d, start_scroll: f64, dragged: bool },
@@ -371,6 +371,17 @@ fn pointer_down_move_up(event: &Event) -> (Option<Vec2d>, Option<Vec2d>, Option<
             (start, mv, stop)
         }
         _ => (None, None, None),
+    }
+}
+
+/// The event's own clock (seconds), for a drag's speed: arrival times bunch up when frames are slow.
+fn event_time(event: &Event) -> Option<f64> {
+    match event {
+        Event::MouseDown(e) => Some(e.time),
+        Event::MouseMove(e) => Some(e.time),
+        Event::MouseUp(e) => Some(e.time),
+        Event::TouchUpdate(e) => Some(e.time),
+        _ => None,
     }
 }
 
@@ -476,22 +487,23 @@ impl Widget for Shell {
                             self.actions.push(ShellAction::ShowLayer(name.clone(), true));
                             self.drag_origin = Some(DragOrigin::Pull {
                                 surface: name.clone(), start_y: start.y, start_d: 0.0, opened: false,
-                                last_y: p.y, last_at: std::time::Instant::now(), vel: 0.0,
+                                last_y: p.y, last_t: event_time(event).unwrap_or(0.0), vel: 0.0,
                             });
                             self.layer_drag.insert(name, dy.max(0.0));
                             cx.redraw_all();
                         }
                     }
                     chrome_consumed = true;
-                } else if let Some(DragOrigin::Pull { ref surface, start_y, start_d, ref mut last_y, ref mut last_at, ref mut vel, .. }) = self.drag_origin {
+                } else if let Some(DragOrigin::Pull { ref surface, start_y, start_d, ref mut last_y, ref mut last_t, ref mut vel, .. }) = self.drag_origin {
                     let travel = self.layer_travel.get(surface).copied().unwrap_or(400.0);
                     let d = (start_d + p.y - start_y).clamp(0.0, travel);
-                    let now = std::time::Instant::now();
-                    let ms = now.duration_since(*last_at).as_secs_f64() * 1000.0;
-                    if ms > 0.5 {
-                        *vel = 0.6 * ((p.y - *last_y) / ms) + 0.4 * *vel;
-                        *last_y = p.y;
-                        *last_at = now;
+                    if let Some(t) = event_time(event) {
+                        let ms = (t - *last_t) * 1000.0;
+                        if ms >= 4.0 {
+                            *vel = 0.6 * ((p.y - *last_y) / ms) + 0.4 * *vel;
+                            *last_y = p.y;
+                            *last_t = t;
+                        }
                     }
                     self.layer_drag.insert(surface.clone(), d);
                     cx.redraw_all();
@@ -514,7 +526,7 @@ impl Widget for Shell {
                             self.layer_drag.insert(name.clone(), (travel + dy).clamp(0.0, travel));
                             self.drag_origin = Some(DragOrigin::Pull {
                                 surface: name, start_y: start.y, start_d: travel, opened: true,
-                                last_y: p.y, last_at: std::time::Instant::now(), vel: 0.0,
+                                last_y: p.y, last_t: event_time(event).unwrap_or(0.0), vel: 0.0,
                             });
                             self.active_body_surface = None;
                             self.body_down = None;
@@ -543,7 +555,9 @@ impl Widget for Shell {
                         }
                         chrome_consumed = true;
                     }
-                    Some(DragOrigin::Pull { surface, opened, vel, .. }) => {
+                    Some(DragOrigin::Pull { surface, opened, vel, last_t, .. }) => {
+                        // a finger that stopped before it lifted is not a flick
+                        let vel = if event_time(event).map_or(false, |t| t - last_t > 0.1) { 0.0 } else { vel };
                         let travel = self.layer_travel.get(&surface).copied().unwrap_or(400.0).max(1.0);
                         let d = self.layer_drag.remove(&surface).unwrap_or(0.0);
                         let out = (d / travel).clamp(0.0, 1.0);
