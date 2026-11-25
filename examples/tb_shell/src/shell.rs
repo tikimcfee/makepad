@@ -1288,7 +1288,7 @@ impl Shell {
     }
 
     /// The stack's names, in slot order, `·` between, the focused one drawn brighter; names
-    /// shortened to 4 characters when the full ones do not fit. False (nothing drawn) for a
+    /// shortened to 4, then 3 characters when the full ones do not fit. False (nothing drawn) for a
     /// single slot or when even the short form does not fit.
     fn draw_stack_names(&mut self, cx: &mut Cx2d, x: f64, cy: f64, avail: f64) -> bool {
         let names: Vec<String> = self.stage.slots.iter().map(|s| s.surface.clone()).collect();
@@ -1296,8 +1296,9 @@ impl Shell {
             return false;
         }
         let focus = self.stage.focus.clone();
-        for short in [false, true] {
-            let shown: Vec<String> = names.iter().map(|n| if short { n.chars().take(4).collect() } else { n.clone() }).collect();
+        for keep in [usize::MAX, 4, 3] {
+            let short = keep != usize::MAX;
+            let shown: Vec<String> = names.iter().map(|n| n.chars().take(keep).collect()).collect();
             let sep = if short { "·" } else { " · " };
             let text = shown.join(sep);
             let (w, h) = measure_line(&self.draw_label, cx, &text);
