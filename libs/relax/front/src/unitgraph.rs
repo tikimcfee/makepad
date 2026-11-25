@@ -2179,7 +2179,11 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
             match (shared_content(shared, &path, false, follow), crate::vfs::identity(&path)) {
                 (Some(c), _) => key.push_str(&format!("f c{:032x} {}\n", c, path)),
                 (None, Some(id)) => key.push_str(&format!("f {} {}\n", id, path)),
-                (None, None) => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path), follow), path)),
+                // an overlaid input (RELAX_OVERLAY) keeps its original's mtime: key it by what is read
+                (None, None) => match crate::vfs::overlay_digest_for(&path) {
+                    Some(ov) => key.push_str(&format!("f o{:016x} {}\n", ov, path)),
+                    None => key.push_str(&format!("f {} {}\n", newest_mtime(std::path::Path::new(&path), follow), path)),
+                },
             }
         } else if let Some(v) = rest.strip_prefix("rerun-if-env-changed=") {
             any = true;
@@ -2195,7 +2199,10 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
         match (shared_content(shared, pkg_dir, true, follow), crate::vfs::identity(pkg_dir)) {
             (Some(c), _) => key.push_str(&format!("p c{:032x} {}\n", c, pkg_dir)),
             (None, Some(id)) => key.push_str(&format!("p {} {}\n", id, pkg_dir)),
-            (None, None) => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir), follow), pkg_dir)),
+            (None, None) => match crate::vfs::overlay_digest_for(pkg_dir) {
+                Some(ov) => key.push_str(&format!("p o{:016x} {}\n", ov, pkg_dir)),
+                None => key.push_str(&format!("p {} {}\n", newest_mtime_pkg(std::path::Path::new(pkg_dir), follow), pkg_dir)),
+            },
         }
     }
     Some(key)

@@ -409,7 +409,15 @@ fn run_ended(code: i32, json: bool, args: &[String], start: Instant) -> i32 {
         crate::hot_failure::restart_failed(&format!("the replacement test harness ended before it started (exit {code})"));
         crate::hot_failure::pump();
     }
-    let code = crate::hot_failure::verdict(code).code();
+    let mut code = crate::hot_failure::verdict(code).code();
+    // RELAX_OVERLAY: a run that never read a file it was told to read in place of another proved
+    // nothing about that file (a mutant that landed in no unit), so it does not pass
+    if code == 0 && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
+        if let Err(e) = crate::vfs::check_overlay_used() {
+            eprintln!("relax: {e}");
+            code = 2;
+        }
+    }
     crate::tui::exit_code(code);
     if let Some(exit) = EXIT_SUMMARY.get() {
         // atexit runs after application TLS destructors. Do not quiesce earlier:
@@ -4720,6 +4728,27 @@ fn finish_run(why: &'static str, code: Option<i32>) {
         }
         if now >= deadline { break; }
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // a program that exits itself (std::process::exit) passes no verdict: the overlay's check runs here
+    if code.is_none()
+        && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none()
+        && ERRORS_SEEN.load(Ordering::Relaxed) == 0
+        && RUN_PANIC.get().is_none()
+    {
+        if let Err(e) = crate::vfs::check_overlay_used() {
+            eprintln!("relax: {e}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            #[cfg(unix)]
+            {
+                extern "C" {
+                    fn _exit(status: i32) -> !;
+                }
+                unsafe {
+                    _exit(2);
+                }
+            }
+        }
     }
 }
 

@@ -214,7 +214,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         cmd.env("RELAX_CACHE_DIR", work.join("cache"));
         cmd.env("RELAX_READ_LOG", &log);
         crate::progenv::scrub_run_facts(&mut cmd);
-        cmd.env_remove("RELAX_CHECK_TARGET");
+        // the collection reads the tree as it is on disk, never a run's overlay of it
+        cmd.env_remove("RELAX_CHECK_TARGET").env_remove("RELAX_OVERLAY").env_remove("RELAX_OVERLAY_USED");
         cmd.env("RELAX_OFFLINE", "1").envs(crate::progenv::host_env().offline.iter().copied());
         if let Some(t) = &opts.target {
             cmd.env("RELAX_CHECK_TARGET", t);

@@ -623,6 +623,185 @@ pub fn set_edits(dir: Option<std::path::PathBuf>) {
     *WHITEOUTS.write().unwrap() = None;
 }
 
+// ---- the overlay (RELAX_OVERLAY=<file> of lines `<path>\t<replacement>`): a disk file whose
+// bytes are read in place of another disk file's, the tree left untouched (mutation testing reads
+// a mutant without writing it). Content only: probes and listings stay the disk's. An overlaid
+// path has no stat (file_stat None), so a cache that recorded the original's stat hashes it.
+static OVERLAY_ANY: AtomicBool = AtomicBool::new(false);
+static OVERLAY: RwLock<BTreeMap<String, (std::path::PathBuf, Arc<AtomicBool>)>> = RwLock::new(BTreeMap::new());
+static OVERLAY_ENTRIES: RwLock<Vec<(String, Arc<AtomicBool>)>> = RwLock::new(Vec::new());
+
+fn note_overlay_used(key: &str) {
+    if let Ok(path) = std::env::var("RELAX_OVERLAY_USED") {
+        if !path.is_empty() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{key}");
+            }
+        }
+    }
+}
+
+/// The file read in place of `path`, when one is overlaid on it.
+fn overlaid(path: &str) -> Option<std::path::PathBuf> {
+    if !OVERLAY_ANY.load(Ordering::Acquire) {
+        return None;
+    }
+    let key = if std::path::Path::new(path).is_absolute() {
+        normalize_path(path)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        normalize_path(&cwd.join(path).to_string_lossy())
+    } else {
+        normalize_path(path)
+    };
+    let m = OVERLAY.read().unwrap();
+    let (repl, used) = m.get(&key)?;
+    if !used.swap(true, Ordering::Relaxed) {
+        note_overlay_used(&key);
+    }
+    Some(repl.clone())
+}
+
+/// FNV-1a digest of any active `RELAX_OVERLAY` entries matching `path` or a file inside
+/// `path/`. `None` when no overlay touches `path`.
+pub fn overlay_digest_for(path: &str) -> Option<u64> {
+    if !OVERLAY_ANY.load(Ordering::Acquire) {
+        return None;
+    }
+    let norm = if std::path::Path::new(path).is_absolute() {
+        normalize_path(path)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        normalize_path(&cwd.join(path).to_string_lossy())
+    } else {
+        normalize_path(path)
+    };
+    let canon = std::fs::canonicalize(path).ok().map(|p| normalize_path(&p.to_string_lossy()));
+    let m = OVERLAY.read().unwrap();
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut matched = false;
+    for (k, (repl, used)) in m.iter() {
+        let exact = k == &norm || canon.as_ref().is_some_and(|c| k == c);
+        let hit = exact
+            || k.strip_prefix(&norm).is_some_and(|r| r.starts_with('/'))
+            || canon.as_ref().is_some_and(|c| k.strip_prefix(c).is_some_and(|r| r.starts_with('/')));
+        if hit {
+            if exact && !used.swap(true, Ordering::Relaxed) {
+                note_overlay_used(k);
+            }
+            matched = true;
+            for &b in k.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            if let Ok(bytes) = std::fs::read(repl) {
+                for &b in &bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+    }
+    matched.then_some(h)
+}
+
+/// FNV-1a digest across all active `RELAX_OVERLAY` entries, or `None` when no overlay is set.
+pub fn overlay_any_digest() -> Option<u64> {
+    if !OVERLAY_ANY.load(Ordering::Acquire) {
+        return None;
+    }
+    let m = OVERLAY.read().unwrap();
+    if m.is_empty() {
+        return None;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (k, (repl, _)) in m.iter() {
+        for &b in k.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        if let Ok(bytes) = std::fs::read(repl) {
+            for &b in &bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    Some(h)
+}
+
+/// Marks overlay keys recorded by a child build script as used in this process.
+pub fn mark_overlay_used(lines: &str) {
+    if !OVERLAY_ANY.load(Ordering::Acquire) {
+        return;
+    }
+    let m = OVERLAY.read().unwrap();
+    for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some((_, used)) = m.get(line) {
+            if !used.swap(true, Ordering::Relaxed) {
+                note_overlay_used(line);
+            }
+        }
+    }
+}
+
+/// Verifies that every entry in `RELAX_OVERLAY` was read at least once during the run.
+pub fn check_overlay_used() -> Result<(), String> {
+    if !OVERLAY_ANY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let entries = OVERLAY_ENTRIES.read().unwrap();
+    for (path, used) in entries.iter() {
+        if !used.load(Ordering::Relaxed) {
+            return Err(format!("RELAX_OVERLAY: {path}: overlaid target was never read"));
+        }
+    }
+    Ok(())
+}
+
+/// Replaces the overlay: each (path, replacement) reads the replacement's bytes for the path.
+pub fn set_overlay(pairs: Vec<(String, std::path::PathBuf)>) {
+    // process state: built in the kept heap
+    let _k = crate::zone_alloc::kept();
+    let mut m = OVERLAY.write().unwrap();
+    let mut entries = OVERLAY_ENTRIES.write().unwrap();
+    m.clear();
+    entries.clear();
+    for (p, r) in pairs {
+        let used = Arc::new(AtomicBool::new(false));
+        if let Ok(canon) = std::fs::canonicalize(&p) {
+            m.insert(normalize_path(&canon.to_string_lossy()), (r.clone(), used.clone()));
+        }
+        m.insert(normalize_path(&p), (r, used.clone()));
+        entries.push((p, used));
+    }
+    OVERLAY_ANY.store(!m.is_empty(), Ordering::Release);
+}
+
+/// The overlay from RELAX_OVERLAY (the loader calls this at start, next to RELAX_VFS).
+pub fn overlay_from_env() -> Result<(), String> {
+    let Some(list) = std::env::var_os("RELAX_OVERLAY").filter(|p| !p.is_empty()) else { return Ok(()) };
+    let text = std::fs::read_to_string(&list).map_err(|e| format!("RELAX_OVERLAY {}: {e}", list.to_string_lossy()))?;
+    let mut pairs = Vec::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let (path, with) = line.split_once('\t').ok_or_else(|| format!("RELAX_OVERLAY: bad line {line}"))?;
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(format!("RELAX_OVERLAY: {path}: target path must be absolute"));
+        }
+        if !is_file(path) {
+            return Err(format!("RELAX_OVERLAY: {path}: target is not an existing file"));
+        }
+        // a replacement that is missing would read as the file being gone: say so instead, and
+        // canonicalize so child processes that change working directory still open it
+        let with_canon = std::fs::canonicalize(with).map_err(|_| format!("RELAX_OVERLAY: {with}: no such file"))?;
+        if !with_canon.is_file() {
+            return Err(format!("RELAX_OVERLAY: {with}: no such file"));
+        }
+        pairs.push((path.to_string(), with_canon));
+    }
+    set_overlay(pairs);
+    Ok(())
+}
+
 impl Mount {
     fn file(&self, rel: &str) -> Option<&Entry> {
         self.files.binary_search_by(|e| e.path.as_str().cmp(rel)).ok().map(|i| &self.files[i])
@@ -849,6 +1028,9 @@ fn read_uncached(path: &std::path::Path, entry: Option<&ReadEntry>) -> io::Resul
 }
 
 fn read_uncached_inner(path: &std::path::Path, entry: Option<&ReadEntry>) -> io::Result<Vec<u8>> {
+    if let Some(o) = overlaid(&path.to_string_lossy()) {
+        return read_disk(&o, entry);
+    }
     if !ANY.load(Ordering::Acquire) {
         return read_disk(path, entry);
     }
@@ -907,6 +1089,9 @@ pub fn metadata(path: impl AsRef<std::path::Path>) -> io::Result<Metadata> {
 
 fn metadata_inner(path: &std::path::Path) -> io::Result<Metadata> {
     let s = path.to_string_lossy();
+    if let Some(o) = overlaid(&s) {
+        return metadata(o);
+    }
     if let Some(p) = folder_path(&s) { return disk_metadata(&p); }
     if whiteout(&s) { return Err(not_found(&s)); }
     if let Some((mount, rel)) = ANY.load(Ordering::Acquire).then(|| find(&s)).flatten() {
@@ -1173,9 +1358,10 @@ pub struct FileStat {
 pub const STAT_RACY_NS: u64 = 2_000_000_000;
 
 /// The stat of an on-disk path (None: virtual (a mounted store or an edits overlay, a folder
-/// mount: its content names it), missing).
+/// mount: its content names it), overlaid (RELAX_OVERLAY: its stat is the original's, not what is
+/// read), missing).
 pub fn file_stat(path: &str) -> Option<FileStat> {
-    if is_virtual(path) {
+    if is_virtual(path) || overlaid(path).is_some() {
         return None;
     }
     disk_stat(path)
@@ -1219,6 +1405,9 @@ fn disk_stat(path: &str) -> Option<FileStat> {
 /// When the file last changed (a git file: never, None; the caller treats it as unchanged).
 pub fn modified(path: impl AsRef<std::path::Path>) -> Option<std::time::SystemTime> {
     let path = path.as_ref();
+    if let Some(o) = overlaid(&path.to_string_lossy()) {
+        return std::fs::metadata(o).and_then(|m| m.modified()).ok();
+    }
     if let Some(p) = folder_path(&path.to_string_lossy()) {
         return std::fs::metadata(p).and_then(|m| m.modified()).ok();
     }
@@ -1240,9 +1429,13 @@ pub fn identity(path: &str) -> Option<String> {
     if whiteout(path) || edited_file(path).is_some() || std_view(path).is_some() {
         return None;
     }
-    Some(match m.store.range {
+    let base = match m.store.range {
         Some((offset, len)) => format!("{}@{offset}+{len}@{}", m.store.path.display(), store::hex(&m.commit)),
         None => format!("{}@{}", m.store.path.display(), store::hex(&m.commit)),
+    };
+    Some(match overlay_digest_for(path) {
+        Some(d) => format!("{base}#overlay:{d:016x}"),
+        None => base,
     })
 }
 
@@ -1321,6 +1514,7 @@ pub fn mount_from_env() -> Result<(), String> {
     // process state: built in the kept heap
     let _k = crate::zone_alloc::kept();
     record_from_env()?;
+    overlay_from_env()?;
     if let Some(d) = std::env::var_os("RELAX_EDITS").filter(|d| !d.is_empty()) {
         set_edits(Some(d.into()));
     }
@@ -1914,6 +2108,38 @@ mod tests {
     /// The mounts' outermost root and the edits folder are process state: the tests that set
     /// them run one at a time.
     static EDITS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RELAX_OVERLAY: an overlaid file reads as its replacement through every read, has no stat
+    /// (a cache hashes what is read), and leaves the disk as it was; an entry nothing read fails
+    /// the run's check, naming it; an empty overlay reads the disk again.
+    #[test]
+    fn an_overlaid_file_reads_as_its_replacement_and_an_unread_entry_is_named() {
+        let dir = std::env::temp_dir().join(format!("relax-vfs-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, other, mutant) = (dir.join("value.rs"), dir.join("other.rs"), dir.join("mutant.rs"));
+        std::fs::write(&file, b"pub const V: u32 = 1;\n").unwrap();
+        std::fs::write(&other, b"untouched").unwrap();
+        std::fs::write(&mutant, b"pub const V: u32 = 2;\n").unwrap();
+        let (f, o) = (file.to_string_lossy().into_owned(), other.to_string_lossy().into_owned());
+        set_overlay(vec![(f.clone(), mutant.clone()), (o.clone(), mutant.clone())]);
+        assert_eq!(read(&file).unwrap(), b"pub const V: u32 = 2;\n");
+        assert_eq!(read_to_string(&file).unwrap(), "pub const V: u32 = 2;\n");
+        assert_eq!(metadata(&file).unwrap().len, 22);
+        assert!(file_stat(&f).is_none(), "an overlaid file has no stat of its own");
+        assert!(file_stat(&dir.join("mutant.rs").to_string_lossy()).is_some(), "the replacement keeps its stat");
+        assert!(overlay_digest_for(&f).is_some() && overlay_digest_for(&dir.to_string_lossy()).is_some());
+        assert!(overlay_digest_for(&dir.join("absent.rs").to_string_lossy()).is_none());
+        let unread = check_overlay_used().unwrap_err();
+        assert!(unread.contains(&o) && unread.contains("never read"), "{unread}");
+        assert_eq!(read(&other).unwrap(), b"pub const V: u32 = 2;\n");
+        check_overlay_used().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"pub const V: u32 = 1;\n", "the disk is never written");
+        set_overlay(Vec::new());
+        assert_eq!(read(&file).unwrap(), b"pub const V: u32 = 1;\n");
+        assert!(file_stat(&f).is_some() && overlay_digest_for(&f).is_none() && overlay_any_digest().is_none());
+        check_overlay_used().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A held landing's files read as they were before it: changed, removed (still there) and
     /// added (not there yet) alike, through every read; the live watch reads them as they are; a
