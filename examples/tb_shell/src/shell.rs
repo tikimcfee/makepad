@@ -1463,8 +1463,11 @@ impl Shell {
             // 1. Left flank: `[pad_l .. punch_l - 4]` (`Home` + `< focus >`, plus 2nd-row note if active)
             let left_x = rect.pos.x + pad_l;
             let left_end = (punch_l - 4.0).max(left_x);
-            let has_note_row = !self.note.is_empty() && band_h >= 46.0;
-            let left_cy = if has_note_row {
+            // A stack's names get their own row under Home (Ivan, 2026-11-24: long names ran
+            // behind the camera beside it); a note then sits beside Home instead of below.
+            let names_row = self.stage.slots.len() > 1 && band_h >= 46.0;
+            let has_note_row = !names_row && !self.note.is_empty() && band_h >= 46.0;
+            let left_cy = if has_note_row || names_row {
                 band_top + band_h * 0.36
             } else {
                 band_top + band_h * 0.50
@@ -1488,9 +1491,11 @@ impl Shell {
                 );
             }
             let home_hit_w = ((pill_rect.pos.x - rect.pos.x) + pill_w + 4.0).min(punch_l - rect.pos.x);
+            // with the names row, Home takes only the upper row (a tap on the names opens the switcher)
+            let home_hit_h = if names_row { (band_top + band_h * 0.54 - bar_y).max(pill_h) } else { bar_h };
             self.home_rect = Rect {
                 pos: dvec2(rect.pos.x, bar_y),
-                size: dvec2(home_hit_w.max(0.0), bar_h),
+                size: dvec2(home_hit_w.max(0.0), home_hit_h),
             };
 
             let focus_x = pill_rect.pos.x + pill_w + 6.0;
@@ -1503,9 +1508,30 @@ impl Shell {
                 ),
             };
 
-            let names_drawn = focus_avail >= 16.0
-                && (has_note_row || self.note.is_empty())
-                && self.draw_stack_names(cx, focus_x, left_cy, focus_avail);
+            if names_row {
+                if !self.note.is_empty() && focus_avail >= 16.0 {
+                    let (ntxt, nw, nh) = fit_line_to_width(&self.draw_sub, cx, &self.note, focus_avail);
+                    if !ntxt.is_empty() && nw > 0.0 {
+                        self.draw_sub.color = vec4(0.95, 0.76, 0.35, 1.0);
+                        self.draw_sub.draw_abs(cx, dvec2(focus_x, left_cy - nh * 0.5), &ntxt);
+                    }
+                }
+                let names_cy = band_top + band_h * 0.74;
+                let names_avail = (left_end - left_x).max(0.0);
+                if !self.draw_stack_names(cx, left_x + 2.0, names_cy, (names_avail - 2.0).max(0.0)) {
+                    // even 3 letters each do not fit: as much as fits, cut short
+                    let short: Vec<String> = self.stage.slots.iter().map(|s| s.surface.chars().take(3).collect()).collect();
+                    let (t, tw, th) = fit_line_to_width(&self.draw_label, cx, &short.join("·"), (names_avail - 2.0).max(0.0));
+                    if !t.is_empty() && tw > 0.0 {
+                        self.draw_label.color = vec4(0.72, 0.78, 0.86, 1.0);
+                        self.draw_label.draw_abs(cx, dvec2(left_x + 2.0, names_cy - th * 0.5), &t);
+                    }
+                }
+            }
+            let names_drawn = names_row
+                || (focus_avail >= 16.0
+                    && (has_note_row || self.note.is_empty())
+                    && self.draw_stack_names(cx, focus_x, left_cy, focus_avail));
             if focus_avail >= 16.0 && !names_drawn {
                 let roomy = if extra > 0 {
                     format!("< {focus} +{extra} >")
