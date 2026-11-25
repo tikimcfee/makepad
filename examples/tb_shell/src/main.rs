@@ -831,6 +831,7 @@ impl App {
         }
         self.sync_surfaces_key(cx);
         self.sync_workspaces_key(cx);
+        self.st.stage.headers = self.st.persist.load_headers();
         self.load_layers(cx);
     }
 
@@ -1311,11 +1312,17 @@ impl App {
         let (w, h) = self.st.slot_dims.get(name).copied().unwrap_or((384.0, default_h));
         let w_r = (w * 2.0).round() * 0.5;
         let h_r = (h * 2.0).round() * 0.5;
+        // where it sits: views pad for the screen's bottom edge only when they touch it
+        let (index, count, top, bottom) = self.st.stage.slot_position(name);
         let json = obj(vec![
             ("mode", mode_str.into()),
             ("pinned", JsonValue::Bool(pinned)),
             ("width", JsonValue::F64(w_r)),
             ("height", JsonValue::F64(h_r)),
+            ("index", JsonValue::U64(index as u64)),
+            ("count", JsonValue::U64(count as u64)),
+            ("top", JsonValue::Bool(top)),
+            ("bottom", JsonValue::Bool(bottom)),
         ])
         .serialize_json();
         if self.st.slot_prelude_cache.get(name) == Some(&json) {
@@ -1465,6 +1472,10 @@ impl App {
         self.st.store.insert("front".into(), JsonValue::String(focus.clone()));
 
         self.sync_visibility_and_lifecycle(cx);
+        // a slot's place (index, top, bottom) can change with its size unchanged
+        if !self.st.panel_off {
+            self.sync_visible_slot_preludes(cx);
+        }
 
         // Notify store readers of `stage` / `front`
         let touched = vec!["stage".to_string(), "prev_stage".to_string(), "front".to_string()];
@@ -1521,7 +1532,17 @@ impl App {
                         self.commit_stage(cx, "shell");
                     }
                 }
-                ShellAction::ToggleStageView => {
+                // the strip's grid button or a tap on its names: the floated `switcher` card when
+                // there is one (a tap again, or a press outside it, puts it away), else stage.splash
+                ShellAction::ToggleSwitcher if self.st.stage.is_floated("switcher") => {
+                    let open = self.st.stage.layer("switcher").map_or(false, |l| l.shown && !l.leaving);
+                    self.st.layer_hide_at.remove("switcher");
+                    if self.set_layer_shown("switcher", !open) {
+                        self.push_layers(cx);
+                    }
+                    self.arm_layer_timer(cx);
+                }
+                ShellAction::ToggleSwitcher => {
                     if self.st.bodies.contains_key("stage") {
                         if self.st.stage.focus == "stage" {
                             if let Some(prev) = self.st.prev_stage_before_switcher.take() {
@@ -2076,6 +2097,9 @@ impl App {
                         for s in &parsed.slots {
                             check_exists(&s.surface, &self.st.bodies)?;
                         }
+                        if st_obj.get("headers").is_none() {
+                            parsed.headers = self.st.stage.headers;
+                        }
                         self.keep_layers_unless_given(st_obj, &mut parsed);
                         self.st.stage = parsed;
                         self.commit_stage(cx, by);
@@ -2097,6 +2121,9 @@ impl App {
                 }
                 self.st.stage.mode = StageMode::from_str(sub);
                 self.st.stage.slots = slots;
+                if let Some(JsonValue::Bool(h)) = req.get("headers") {
+                    self.st.stage.headers = *h;
+                }
                 if let Some(f) = req.get("focus").and_then(|v| v.as_str()).filter(|f| self.st.stage.slots.iter().any(|s| s.surface == *f)) {
                     self.st.stage.focus = f.to_string();
                 } else {
@@ -2215,6 +2242,69 @@ impl App {
                     self.commit_stage(cx, by);
                 }
             }
+            // In place, for the switcher: put a surface into slot N (a swap if it is in another
+            // slot), add one at N, move one to N, or change one's size; each is one commit.
+            "replace" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage replace needs surface")?;
+                let index = stage::json_num(req.get("index")).ok_or("stage replace needs index")?;
+                check_exists(name, &self.st.bodies)?;
+                self.st.stage.replace_at(index.max(0.0) as usize, name)?;
+                self.commit_stage(cx, by);
+            }
+            "insert" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage insert needs surface")?;
+                check_exists(name, &self.st.bodies)?;
+                let index = stage::json_num(req.get("index")).map_or(usize::MAX, |i| i.max(0.0) as usize);
+                let mut slot = StageSlot::fill(name);
+                slot.mode = req.get("mode").and_then(|v| v.as_str()).map(SlotMode::from_str).unwrap_or(SlotMode::Fill);
+                slot.px = stage::json_num(req.get("px")).map(|p| p.clamp(36.0, 720.0));
+                if slot.px.is_some() && slot.mode == SlotMode::Fill {
+                    slot.mode = SlotMode::Compact;
+                }
+                slot.weight = stage::json_num(req.get("weight")).unwrap_or(1.0).clamp(0.1, 20.0);
+                slot.pinned = req.get("pinned") == Some(&JsonValue::Bool(true));
+                self.st.stage.slots.retain(|s| s.surface != "stage");
+                if self.st.stage.mode == StageMode::Deck && req.get("keep_mode") != Some(&JsonValue::Bool(true)) {
+                    self.st.stage.mode = StageMode::Stack;
+                }
+                self.st.stage.insert_at(index, slot)?;
+                self.commit_stage(cx, by);
+            }
+            "move" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage move needs surface")?;
+                let index = stage::json_num(req.get("index")).ok_or("stage move needs index")?;
+                self.st.stage.move_to(name, index.max(0.0) as usize)?;
+                self.commit_stage(cx, by);
+            }
+            "resize" => {
+                let name = req.get("surface").and_then(|v| v.as_str()).ok_or("stage resize needs surface")?;
+                let slot = self.st.stage.slots.iter_mut().find(|s| s.surface == name).ok_or_else(|| format!("{name} has no slot"))?;
+                if let Some(m) = req.get("mode").and_then(|v| v.as_str()) {
+                    slot.mode = SlotMode::from_str(m);
+                    if slot.mode == SlotMode::Fill {
+                        slot.px = None;
+                    }
+                }
+                if let Some(px) = stage::json_num(req.get("px")) {
+                    slot.px = Some(px.clamp(36.0, 720.0));
+                    if slot.mode == SlotMode::Fill {
+                        slot.mode = SlotMode::Compact;
+                    }
+                }
+                if let Some(w) = stage::json_num(req.get("weight")) {
+                    slot.weight = w.clamp(0.1, 20.0);
+                }
+                self.commit_stage(cx, by);
+            }
+            "headers" => {
+                let on = match req.get("on") {
+                    Some(JsonValue::Bool(b)) => *b,
+                    _ => !self.st.stage.headers,
+                };
+                self.st.stage.headers = on;
+                self.st.persist.save_headers(on);
+                self.commit_stage(cx, by);
+            }
             "next" => self.cycle_task(cx, 1, by),
             "prev" => self.cycle_task(cx, -1, by),
             "float" => {
@@ -2273,6 +2363,9 @@ impl App {
                 let saved = self.st.persist.load_workspace(name).ok_or_else(|| format!("no workspace {name}"))?;
                 let mut parsed = Stage::from_json(&saved).ok_or("corrupt workspace json")?;
                 self.keep_layers_unless_given(&saved, &mut parsed);
+                if saved.get("headers").is_none() {
+                    parsed.headers = self.st.stage.headers;
+                }
                 parsed.slots.retain(|s| self.st.bodies.contains_key(&s.surface));
                 if parsed.slots.is_empty() {
                     return Err(format!("workspace {name} has no active surfaces"));

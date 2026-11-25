@@ -459,6 +459,50 @@ fn stage_cmd(args: &[String]) {
             ])
         }
         "next" | "prev" => obj(vec![("op", "stage".into()), ("sub", sub.into())]),
+        "headers" => {
+            let mut m = HashMap::new();
+            m.insert("op".to_string(), JsonValue::from("stage"));
+            m.insert("sub".to_string(), JsonValue::from("headers"));
+            match rest.first().map(String::as_str) {
+                Some("on") => { m.insert("on".to_string(), JsonValue::Bool(true)); }
+                Some("off") => { m.insert("on".to_string(), JsonValue::Bool(false)); }
+                None | Some("toggle") => {}
+                _ => die("stage headers [on|off|toggle]"),
+            }
+            JsonValue::Object(m)
+        }
+        "replace" | "insert" | "move" | "resize" => {
+            const USAGE: &str = "stage replace INDEX NAME | stage insert INDEX NAME [--mode compact|fill|header] [--px N] [--weight W] \
+| stage move NAME INDEX | stage resize NAME [--mode compact|fill|header] [--px N] [--weight W]";
+            let mut m = HashMap::new();
+            m.insert("op".to_string(), JsonValue::from("stage"));
+            m.insert("sub".to_string(), JsonValue::from(sub));
+            let mut pos: Vec<&String> = Vec::new();
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--mode" => { m.insert("mode".to_string(), JsonValue::from(it.next().unwrap_or_else(|| die(USAGE)).as_str())); }
+                    "--px" | "--weight" => {
+                        let v: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| die(USAGE));
+                        m.insert(a[2..].to_string(), JsonValue::F64(v));
+                    }
+                    s if !s.starts_with('-') => pos.push(a),
+                    _ => die(USAGE),
+                }
+            }
+            let (idx, name) = match (sub, pos.as_slice()) {
+                ("replace" | "insert", [i, n]) => (Some(*i), *n),
+                ("move", [n, i]) => (Some(*i), *n),
+                ("resize", [n]) => (None, *n),
+                _ => die(USAGE),
+            };
+            if let Some(i) = idx {
+                let i: u64 = i.parse().unwrap_or_else(|_| die(USAGE));
+                m.insert("index".to_string(), JsonValue::U64(i));
+            }
+            m.insert("surface".to_string(), JsonValue::from(name.as_str()));
+            JsonValue::Object(m)
+        }
         "float" => {
             const USAGE: &str = "stage float NAME [--z N] [--place top|center|bottom] [--inset L,T,R,B] [--width fill|PX|N%] \
 [--max-h PX|N%] [--hit card|all|none] [--when PATH,PATH] [--hold MS] [--motion slide|slide-top|slide-bottom|none] \

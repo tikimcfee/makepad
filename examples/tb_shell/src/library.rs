@@ -417,6 +417,17 @@ impl StorePersistence {
         atomic_write(dir, "layers.json", &(layers.serialize_json() + "\n"))
     }
 
+    /// `stage headers on|off`, kept across restarts (absent: off).
+    pub fn save_headers(&self, on: bool) {
+        let dir = self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir);
+        let _ = atomic_write(dir, "stage-headers", if on { "on\n" } else { "off\n" });
+    }
+
+    pub fn load_headers(&self) -> bool {
+        let dir = self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir);
+        std::fs::read_to_string(dir.join("stage-headers")).map_or(false, |t| t.trim() == "on")
+    }
+
     pub fn load_layers(&self) -> Option<JsonValue> {
         let dir = self.workspaces_dir.parent().unwrap_or(&self.workspaces_dir);
         let text = std::fs::read_to_string(dir.join("layers.json")).ok()?;

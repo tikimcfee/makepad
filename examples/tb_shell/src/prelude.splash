@@ -1,5 +1,5 @@
 let state = "{}".parse_json()
-let slot = "{\"mode\":\"full\",\"pinned\":false,\"width\":384.0,\"height\":822.0}".parse_json()
+let slot = "{\"mode\":\"full\",\"pinned\":false,\"width\":384.0,\"height\":822.0,\"index\":0,\"count\":1,\"top\":true,\"bottom\":true}".parse_json()
 fn emit(name, data) { host.request("emit", {name: name, data: data}, nil) }
 fn emit_to(surface, name, data) { host.request("emit", {to: surface, name: name, data: data}, nil) }
 fn as_num(x) { if x == nil { return nil } x.to_number() }

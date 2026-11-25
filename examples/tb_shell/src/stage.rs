@@ -493,6 +493,9 @@ pub struct Stage {
     pub slots: Vec<StageSlot>,
     /// Floating surfaces above the stage body, kept in ascending `z` (draw order).
     pub layers: Vec<StageLayer>,
+    /// Per-slot mini-headers (name and collapse/mode/close) in stack and grid. Off by default
+    /// since tb-shell 39: slots sit flush and the strip names the stack.
+    pub headers: bool,
 }
 
 impl Default for Stage {
@@ -502,6 +505,7 @@ impl Default for Stage {
             focus: String::new(),
             slots: Vec::new(),
             layers: Vec::new(),
+            headers: false,
         }
     }
 }
@@ -515,6 +519,7 @@ impl Stage {
         if !self.layers.is_empty() {
             m.insert("layers".to_string(), JsonValue::Array(self.layers.iter().map(StageLayer::to_json).collect()));
         }
+        m.insert("headers".to_string(), JsonValue::Bool(self.headers));
         JsonValue::Object(m)
     }
 
@@ -548,7 +553,79 @@ impl Stage {
             .filter(|f| slots.iter().any(|s| s.surface == *f))
             .map(str::to_string)
             .unwrap_or_else(|| slots.iter().find(|s| !s.pinned).or(slots.first()).unwrap().surface.clone());
-        Some(Self { mode, focus, slots, layers })
+        let headers = v.get("headers") == Some(&JsonValue::Bool(true));
+        Some(Self { mode, focus, slots, layers, headers })
+    }
+
+    /// Where `name`'s slot sits: `(index, count, top, bottom)`, `top`/`bottom` meaning its
+    /// body touches the stage's top/bottom edge as laid out (a surface with no slot: alone).
+    pub fn slot_position(&self, name: &str) -> (usize, usize, bool, bool) {
+        if let Some(l) = self.layer(name) {
+            return (0, 1, l.place == Place::Top, l.place == Place::Bottom);
+        }
+        let count = self.slots.len();
+        let Some(idx) = self.slots.iter().position(|s| s.surface == name) else { return (0, 1, true, true) };
+        match self.mode {
+            StageMode::Deck => (idx, count, true, true),
+            StageMode::Grid if count > 1 => {
+                let shown: Vec<&StageSlot> = self.slots.iter().filter(|s| s.mode != SlotMode::Header).collect();
+                let Some(gi) = shown.iter().position(|s| s.surface == name) else { return (idx, count, false, false) };
+                let rows = (shown.len() + 1) / 2;
+                (idx, count, !self.headers && gi < 2, gi / 2 + 1 == rows)
+            }
+            _ => {
+                // with headers, a header sits above every body; without, collapsed slots take no room
+                let bodies: Vec<usize> = (0..count).filter(|&i| self.slots[i].mode != SlotMode::Header).collect();
+                let first = !self.headers && bodies.first() == Some(&idx);
+                let last = if self.headers { idx + 1 == count } else { bodies.last() == Some(&idx) };
+                (idx, count, first, last && self.slots[idx].mode != SlotMode::Header)
+            }
+        }
+    }
+
+    /// Puts `name` into slot `index`, keeping that slot's mode, size and pin. If `name` is in
+    /// another slot already, the two swap places (each keeping its slot's mode and size).
+    pub fn replace_at(&mut self, index: usize, name: &str) -> Result<(), String> {
+        if index >= self.slots.len() {
+            return Err(format!("no slot {index} (the stage has {})", self.slots.len()));
+        }
+        if self.is_floated(name) {
+            return Err(format!("{name} is floated (stage unfloat {name} first)"));
+        }
+        let old = self.slots[index].surface.clone();
+        if old == name {
+            return Ok(());
+        }
+        if let Some(j) = self.slots.iter().position(|s| s.surface == name) {
+            self.slots[j].surface = old.clone();
+        }
+        self.slots[index].surface = name.to_string();
+        if self.focus == old || self.focus.is_empty() {
+            self.focus = name.to_string();
+        }
+        Ok(())
+    }
+
+    /// Adds `slot` at `index` (clamped; past the end appends). A surface already in the stage
+    /// moves there instead, taking the given mode and size.
+    pub fn insert_at(&mut self, index: usize, slot: StageSlot) -> Result<(), String> {
+        if self.is_floated(&slot.surface) {
+            return Err(format!("{} is floated (stage unfloat {} first)", slot.surface, slot.surface));
+        }
+        self.slots.retain(|s| s.surface != slot.surface);
+        let at = index.min(self.slots.len());
+        self.focus = slot.surface.clone();
+        self.slots.insert(at, slot);
+        Ok(())
+    }
+
+    /// Moves `name`'s slot to `index` (clamped), keeping its mode and size.
+    pub fn move_to(&mut self, name: &str, index: usize) -> Result<(), String> {
+        let Some(from) = self.slots.iter().position(|s| s.surface == name) else { return Err(format!("{name} has no slot")) };
+        let slot = self.slots.remove(from);
+        let at = index.min(self.slots.len());
+        self.slots.insert(at, slot);
+        Ok(())
     }
 
     /// Surfaces actively drawn right now (empty when `panel_off`, excludes `Header`-collapsed

@@ -4,7 +4,7 @@
 //! and the root `GUARD` drawn in the final overlay tier gating all input.
 
 use crate::jit_slot::JitRegistry;
-use crate::stage::{self, Hit, Place, SlideFrom, SlotMode, Stage, StageMode};
+use crate::stage::{self, Hit, Place, SlideFrom, SlotMode, Stage, StageMode, StageSlot};
 use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::*;
 use std::collections::HashMap;
@@ -233,7 +233,8 @@ impl SafeArea {
 #[derive(Clone, Debug)]
 pub enum ShellAction {
     GoHome,
-    ToggleStageView,
+    /// The strip's grid button / names: the floated `switcher` layer, else the stage view.
+    ToggleSwitcher,
     CycleTask(i32),
     FocusSlot(String),
     ToggleHeader(String),
@@ -318,6 +319,7 @@ pub struct Shell {
     #[rust] punch_rect: Rect,
     #[rust] home_rect: Rect,
     #[rust] center_rect: Rect,
+    #[rust] switcher_rect: Rect,
     #[rust] pub note: String,
     #[rust] actions: Vec<ShellAction>,
     #[rust] slot_hits: Vec<SlotHit>,
@@ -561,8 +563,8 @@ impl Widget for Shell {
                                 // Dead camera punch-out zone: ignore tap cleanly.
                             } else if self.home_rect.contains(p) {
                                 self.actions.push(ShellAction::GoHome);
-                            } else if self.bar_band_rect.contains(p) {
-                                self.actions.push(ShellAction::ToggleStageView);
+                            } else if self.switcher_rect.contains(p) || self.bar_band_rect.contains(p) {
+                                self.actions.push(ShellAction::ToggleSwitcher);
                             }
                         }
                         chrome_consumed = true;
@@ -962,10 +964,13 @@ impl Shell {
         }
 
         // Precompute header + compact/fixed heights so Fill slots share remaining viewport cleanly.
+        // Without headers (the default) slots sit flush and a collapsed one takes no room.
+        let headers = self.stage.headers;
+        let hdr_of = |s: &StageSlot| if !headers { 0.0 } else if s.mode == SlotMode::Header { 26.0 } else { 22.0 };
         let mut fixed_sum = 0.0;
         let mut fill_weight_sum = 0.0;
         for s in &slots {
-            let hdr_h = if s.mode == SlotMode::Header { 26.0 } else { 22.0 };
+            let hdr_h = hdr_of(s);
             fixed_sum += hdr_h;
             match s.mode {
                 SlotMode::Header => {}
@@ -983,7 +988,7 @@ impl Shell {
         // Estimate total content height for outer stage scroll clamping.
         let mut est_total = 0.0;
         for s in &slots {
-            est_total += if s.mode == SlotMode::Header { 26.0 } else { 22.0 };
+            est_total += hdr_of(s);
             match s.mode {
                 SlotMode::Header => {}
                 SlotMode::Compact => {
@@ -1007,10 +1012,15 @@ impl Shell {
         let has_fill = fill_weight_sum > 0.0;
 
         for s in &slots {
-            let hdr_h = if s.mode == SlotMode::Header { 26.0 } else { 22.0 };
+            let hdr_h = hdr_of(s);
             let hdr_rect = Rect { pos: dvec2(origin.x, cur_y), size: dvec2(w, hdr_h) };
-            let (btn_collapse, btn_mode, btn_close) = self.draw_slot_header(cx, hdr_rect, s);
-            cx.walk_turtle(Walk::fixed(w, hdr_h));
+            let (btn_collapse, btn_mode, btn_close) = if hdr_h > 0.0 {
+                let b = self.draw_slot_header(cx, hdr_rect, s);
+                cx.walk_turtle(Walk::fixed(w, hdr_h));
+                b
+            } else {
+                (Rect::default(), Rect::default(), Rect::default())
+            };
             cur_y += hdr_h;
 
             match s.mode {
@@ -1116,10 +1126,15 @@ impl Shell {
                 let cell_y = origin.y - self.stage_scroll_y + r as f64 * (row_h + gap);
 
                 cx.begin_turtle(Walk::fixed(cell_w, row_h), Layout::flow_down());
-                let hdr_h = 20.0;
+                let hdr_h = if self.stage.headers { 20.0 } else { 0.0 };
                 let hdr_rect = Rect { pos: dvec2(cell_x, cell_y), size: dvec2(cell_w, hdr_h) };
-                let (btn_collapse, btn_mode, btn_close) = self.draw_slot_header(cx, hdr_rect, s);
-                cx.walk_turtle(Walk::fixed(cell_w, hdr_h));
+                let (btn_collapse, btn_mode, btn_close) = if hdr_h > 0.0 {
+                    let b = self.draw_slot_header(cx, hdr_rect, s);
+                    cx.walk_turtle(Walk::fixed(cell_w, hdr_h));
+                    b
+                } else {
+                    (Rect::default(), Rect::default(), Rect::default())
+                };
 
                 let body_h = (row_h - hdr_h).max(40.0);
                 self.draw_clipped_slot_body(cx, scope, &s.surface, Walk::fixed(cell_w, body_h));
@@ -1247,6 +1262,67 @@ impl Shell {
 
     /// Draws `MIC` and `LOUD` truth marks right-aligned from `right_edge` leftward,
     /// never crossing left of `min_x`, and returns the leftmost X reached.
+    /// The strip's switcher button (a 2x2 grid) ending at `right_edge`; returns where the rest
+    /// of the right flank must end. Its hit area is the bar's full height.
+    fn draw_switcher_btn(&mut self, cx: &mut Cx2d, right_edge: f64, min_x: f64, bar_y: f64, bar_h: f64, cy: f64) -> f64 {
+        let (bw, bh) = (24.0, 20.0_f64.min((bar_h - 4.0).max(12.0)));
+        let x = right_edge - bw;
+        if x < min_x {
+            self.switcher_rect = Rect::default();
+            return right_edge;
+        }
+        let open = self.stage.layer("switcher").map_or(false, |l| l.shown && !l.leaving);
+        self.draw_pill.color = if open { vec4(0.16, 0.28, 0.45, 1.0) } else { vec4(0.09, 0.12, 0.18, 1.0) };
+        self.draw_pill.draw_abs(cx, Rect { pos: dvec2(x, cy - bh * 0.5), size: dvec2(bw, bh) });
+        let (cw, ch, gap) = (6.0, (bh - 9.0) * 0.5, 2.0);
+        let x0 = x + (bw - (cw * 2.0 + gap)) * 0.5;
+        let y0 = cy - (ch * 2.0 + gap) * 0.5;
+        self.draw_pill.color = vec4(0.72, 0.78, 0.86, 1.0);
+        for (i, j) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            self.draw_pill.draw_abs(cx, Rect { pos: dvec2(x0 + i * (cw + gap), y0 + j * (ch + gap)), size: dvec2(cw, ch) });
+        }
+        // a finger-sized target: 12 px either side, the bar's whole height
+        let hit_l = (x - 12.0).max(min_x);
+        self.switcher_rect = Rect { pos: dvec2(hit_l, bar_y), size: dvec2(right_edge + 12.0 - hit_l, bar_h) };
+        x - 6.0
+    }
+
+    /// The stack's names, in slot order, `·` between, the focused one drawn brighter; names
+    /// shortened to 4 characters when the full ones do not fit. False (nothing drawn) for a
+    /// single slot or when even the short form does not fit.
+    fn draw_stack_names(&mut self, cx: &mut Cx2d, x: f64, cy: f64, avail: f64) -> bool {
+        let names: Vec<String> = self.stage.slots.iter().map(|s| s.surface.clone()).collect();
+        if names.len() < 2 {
+            return false;
+        }
+        let focus = self.stage.focus.clone();
+        for short in [false, true] {
+            let shown: Vec<String> = names.iter().map(|n| if short { n.chars().take(4).collect() } else { n.clone() }).collect();
+            let sep = if short { "·" } else { " · " };
+            let text = shown.join(sep);
+            let (w, h) = measure_line(&self.draw_label, cx, &text);
+            if w > avail {
+                continue;
+            }
+            self.draw_label.color = vec4(0.55, 0.60, 0.68, 1.0);
+            self.draw_label.draw_abs(cx, dvec2(x, cy - h * 0.5), &text);
+            if let Some(fi) = names.iter().position(|n| *n == focus) {
+                // the offset of the focused name: (all up to and with it) less (it alone), so a
+                // trailing space in the separator is counted
+                let before: String = shown[..fi].iter().map(|n| format!("{n}{sep}")).collect();
+                let bw = if before.is_empty() {
+                    0.0
+                } else {
+                    measure_line(&self.draw_label, cx, &format!("{before}{}", shown[fi])).0 - measure_line(&self.draw_label, cx, &shown[fi]).0
+                };
+                self.draw_label.color = vec4(0.95, 0.97, 1.0, 1.0);
+                self.draw_label.draw_abs(cx, dvec2(x + bw, cy - h * 0.5), &shown[fi]);
+            }
+            return true;
+        }
+        false
+    }
+
     fn draw_marks_right(&mut self, cx: &mut Cx2d, right_edge: f64, min_x: f64, cy: f64) -> f64 {
         let mut cur_x = right_edge;
         for (on, text, fg, bg) in [
@@ -1426,7 +1502,10 @@ impl Shell {
                 ),
             };
 
-            if focus_avail >= 16.0 {
+            let names_drawn = focus_avail >= 16.0
+                && (has_note_row || self.note.is_empty())
+                && self.draw_stack_names(cx, focus_x, left_cy, focus_avail);
+            if focus_avail >= 16.0 && !names_drawn {
                 let roomy = if extra > 0 {
                     format!("< {focus} +{extra} >")
                 } else {
@@ -1474,6 +1553,7 @@ impl Shell {
 
             // 2. Right flank: `[punch_r + 4 .. W - pad_r]` (`MIC`/`LOUD` priority + `wifi · Bat% · HH:MM`)
             let right_edge = (rect.pos.x + rect.size.x - pad_r).max(punch_r);
+            let right_edge = self.draw_switcher_btn(cx, right_edge, punch_r + 4.0, bar_y, bar_h, band_top + band_h * 0.5);
             let right_start = (punch_r + 4.0).min(right_edge);
             let right_avail = (right_edge - right_start).max(0.0);
             let any_mark = self.marks.mic || self.marks.loud;
@@ -1501,6 +1581,7 @@ impl Shell {
         let cy = band_top + band_h * 0.50;
         let left_x = rect.pos.x + pad_l;
         let right_edge = (rect.pos.x + rect.size.x - pad_r).max(left_x + 80.0);
+        let right_edge = self.draw_switcher_btn(cx, right_edge, left_x + 120.0, bar_y, bar_h, cy);
 
         let (hw, hh) = measure_line(&self.draw_label, cx, "Home");
         let pill_w = (hw + 14.0).clamp(44.0, 54.0);
@@ -1542,6 +1623,9 @@ impl Shell {
             ),
         };
 
+        if self.note.is_empty() && self.draw_stack_names(cx, focus_x, cy, (center_right - focus_x).max(0.0)) {
+            return;
+        }
         let stage_badge = if extra > 0 {
             format!("< {focus} +{extra} >")
         } else {
