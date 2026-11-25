@@ -1447,8 +1447,10 @@ crate::makepad_math::impl_gpu_pod!(DrawCallUniforms,
 impl DrawCallUniforms {
     /// A call's block: its zbias comes with its paint order; `premultiplied` from how it blends.
     pub fn for_call(mapping: &CxDrawShaderMapping, options: &CxDrawShaderOptions) -> Self {
-        // The declared rule every backend applies: only a BGRA8-declared shader blends.
-        let over = options.alpha_blend && mapping.color_format.blends() && mapping.blend_op == DrawShaderBlendOp::Over;
+        // The declared rule every backend applies: a BGRA8-declared shader blends over, and so
+        // does one that declares `blend_op: @Over`.
+        let over = options.alpha_blend
+            && ((mapping.color_format.blends() && mapping.blend_op == DrawShaderBlendOp::Over) || mapping.blend_op == DrawShaderBlendOp::DeclaredOver);
         Self { premultiplied: if over { 1.0 } else { 0.0 }, ..Self::default() }
     }
 

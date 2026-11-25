@@ -1506,10 +1506,10 @@ impl Cx {
                 storage_push_size: mapping.storage_push_size,
                 color_formats: [pipeline_color_format(mapping.color_format), 0, 0, 0],
                 blend: (match mapping.blend_op {
-                    DrawShaderBlendOp::Over => 0,
+                    DrawShaderBlendOp::Over | DrawShaderBlendOp::DeclaredOver => 0,
                     DrawShaderBlendOp::Max => pipeline_blend::MAX,
                     DrawShaderBlendOp::Add => pipeline_blend::ADD,
-                }) | (if mapping.color_format.blends() || mapping.blend_op == DrawShaderBlendOp::Add { 0 } else { pipeline_blend::RAW }),
+                }) | (if mapping.color_format.blends() || matches!(mapping.blend_op, DrawShaderBlendOp::Add | DrawShaderBlendOp::DeclaredOver) { 0 } else { pipeline_blend::RAW }),
                 flags: if mapping.precise_math { pipeline_flags::PRECISE } else { 0 },
                 outputs: mapping.fragment_outputs as u32,
                 shader: index as u32,

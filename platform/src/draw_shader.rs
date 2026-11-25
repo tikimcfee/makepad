@@ -885,8 +885,8 @@ pub enum DrawShaderColorFormat {
 
 impl DrawShaderColorFormat {
     /// Whether this format blends with Over/Max: only default BGRA8 does.
-    /// Other declared formats write raw unless `blend_op: @Add`, which opts
-    /// into blending wherever the target supports it. Every op still needs
+    /// Other declared formats write raw unless `blend_op: @Add` or
+    /// `blend_op: @Over`, which opt into blending wherever the target supports it. Every op still needs
     /// `alpha_blend` (`Draw::BLEND`) enabled on the draw call.
     pub fn blends(self) -> bool {
         self == Self::Bgra8Unorm
@@ -894,8 +894,8 @@ impl DrawShaderColorFormat {
 }
 
 /// How a blending pipeline combines a fragment with the target. Declared in
-/// the shader DSL as `blend_op: @Max` or `blend_op: @Add`; the default is
-/// premultiplied over. Add also enables blending for float-declared shaders,
+/// the shader DSL as `blend_op: @Max`, `blend_op: @Add` or `blend_op: @Over`; the default is
+/// premultiplied over. Add and a declared Over also enable blending for float-declared shaders,
 /// where supported; an unsupported target fails the pipeline.
 /// Baked into the shader's pipelines on every backend (a per-shader
 /// property, like `color_format`); blending still requires `alpha_blend`
@@ -911,6 +911,10 @@ pub enum DrawShaderBlendOp {
     Max,
     /// Per-channel `src + dst`, alpha included (ONE/ONE/ADD).
     Add,
+    /// Premultiplied source-over, as `Over`, declared (`blend_op: @Over`): like Add, the
+    /// declaration enables blending for a float-declared shader (an HDR scene target in
+    /// `@Rgba16F`), on the formats each backend blends (BGRA8, RGBA8, RGBA16F).
+    DeclaredOver,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -1273,6 +1277,7 @@ impl CxDrawShaderMapping {
         let blend_op = match heap.value(source.as_object(), id!(blend_op).into(), NoTrap).as_id() {
             Some(id) if id == id!(Max) => DrawShaderBlendOp::Max,
             Some(id) if id == id!(Add) => DrawShaderBlendOp::Add,
+            Some(id) if id == id!(Over) => DrawShaderBlendOp::DeclaredOver,
             _ => DrawShaderBlendOp::Over,
         };
         let fragment_outputs = desc.io().iter().fold(0u8, |mask, io| match io.kind().fragment_output() {

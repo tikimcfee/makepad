@@ -375,7 +375,9 @@ pub(super) fn create(dev: &Device, sid: u32, id: Id, incarnation: Arc<crate::fon
         blend_max: desc.blend & pipeline_blend::MAX != 0,
         blend_add: desc.blend & pipeline_blend::ADD != 0,
         name: name.to_owned(),
-        can_blend: (declared == MTLPixelFormat::BGRA8Unorm || desc.blend & pipeline_blend::ADD != 0) && !raw,
+        // Over blends BGRA8, RGBA8 and RGBA16Float targets, as Vulkan's and D3D11's pipelines do;
+        // the frame builder marks every other shader RAW unless it declares a blend_op
+        can_blend: (blendable(declared) || desc.blend & pipeline_blend::ADD != 0) && !raw,
         discards: source.contains("discard_fragment"),
         // RGBA8 is format zero, so the output mask determines the attachment span.
         declared: desc.color_formats.iter().copied().take((u32::BITS - desc.outputs.leading_zeros()) as usize).filter_map(mtl_format).collect(),

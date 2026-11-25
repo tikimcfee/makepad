@@ -701,7 +701,7 @@ impl Cx {
                     index_width: geometry.index_width as u32,
                     depth_write: draw_call.options.depth_write,
                     depth_test_greater: draw_call.options.depth_test_greater,
-                    alpha_blend: draw_call.options.alpha_blend && (sh.mapping.color_format.blends() || sh.mapping.blend_op == DrawShaderBlendOp::Add),
+                    alpha_blend: draw_call.options.alpha_blend && (sh.mapping.color_format.blends() || matches!(sh.mapping.blend_op, DrawShaderBlendOp::Add | DrawShaderBlendOp::DeclaredOver)),
                     blend_max: sh.mapping.blend_op == DrawShaderBlendOp::Max,
                     blend_add: sh.mapping.blend_op == DrawShaderBlendOp::Add,
                     backface_culling: draw_call.options.backface_culling,
