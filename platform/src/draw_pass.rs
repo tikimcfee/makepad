@@ -272,6 +272,8 @@ pub struct ScriptDrawPass {
     pub dont_clear: bool,
     #[live]
     pub keep_camera_matrix: bool,
+    #[live]
+    pub reverse_z: bool,
 }
 
 impl std::ops::Deref for ScriptDrawPass {
@@ -293,6 +295,7 @@ impl ScriptHook for ScriptDrawPass {
         vm.host.cx_mut().passes[self.handle.draw_pass_id()].dont_clear = self.dont_clear;
         vm.host.cx_mut().passes[self.handle.draw_pass_id()].keep_camera_matrix =
             self.keep_camera_matrix;
+        vm.host.cx_mut().passes[self.handle.draw_pass_id()].reverse_z = self.reverse_z;
     }
 }
 
@@ -445,6 +448,15 @@ impl DrawPass {
     /// begun, instead of the 2D ortho matrix of its size.
     pub fn set_keep_camera_matrix(&self, cx: &mut Cx, keep: bool) {
         cx.passes[self.draw_pass_id()].keep_camera_matrix = keep;
+    }
+
+    /// This pass keeps a reversed-Z depth buffer: near is 1.0 and far 0.0, so every draw's
+    /// depth comparison turns around (less-equal becomes greater-equal, `depth_test_greater`
+    /// becomes less). Pair it with a projection that maps near to 1.0 and a depth clear of 0.0
+    /// (`DrawPassClearDepth::ClearWith(0.0)`). Reverse-Z keeps float depth's precision where
+    /// it is spent, far from the camera.
+    pub fn set_reverse_z(&self, cx: &mut Cx, reverse_z: bool) {
+        cx.passes[self.draw_pass_id()].reverse_z = reverse_z;
     }
 
     /// The camera every draw in this pass sees: `view` and `projection`
@@ -895,6 +907,8 @@ pub struct CxDrawPass {
     /// The colour targets are scratch (see `DrawPass::set_color_scratch`).
     pub color_scratch: bool,
     pub keep_camera_matrix: bool,
+    /// The depth buffer is reversed-Z (`DrawPass::set_reverse_z`).
+    pub reverse_z: bool,
     pub depth_init: f64,
     pub clear_color: Vec4f,
     pub dpi_factor: Option<f64>,
@@ -1122,6 +1136,7 @@ impl Default for CxDrawPass {
             debug: false,
             dont_clear: false,
             keep_camera_matrix: false,
+            reverse_z: false,
             debug_name: String::new(),
             zbias_step: 0.001,
             sploded: None,

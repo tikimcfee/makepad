@@ -75,7 +75,7 @@ pub(super) struct DrawJob {
     /// Some(bits) = blended with the pipeline_blend operation
     pub blend: Option<u32>,
     pub depth_write: bool,
-    pub depth_greater: bool,
+    pub depth_compare: DepthCompare,
     pub cull: bool,
     /// (view, scissor) per draw call: the draw's scissor, in a partial repaint cut to each damaged
     /// rect it touches, or once per view of the pass clipped to that view's rect
@@ -605,7 +605,7 @@ impl GlBackend {
             s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now);
         }
         Ok(Some(DrawJob { program, vb, ib, index_u32, index: d.index, blocks, buffers, textures, twins, pick: pick_words, instances, stride,
-            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, depth_greater: d.flags & Draw::DEPTH_GREATER != 0, cull: d.flags & Draw::CULL != 0, scissors, pass_block, draw_buffers }))
+            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, depth_compare: Draw::depth_compare(d.flags), cull: d.flags & Draw::CULL != 0, scissors, pass_block, draw_buffers }))
     }
 }
 
@@ -616,7 +616,7 @@ struct Bound {
     draw_buffers: Option<u32>,
     blend: Option<Option<u32>>,
     depth_write: Option<bool>,
-    depth_greater: Option<bool>,
+    depth_compare: Option<DepthCompare>,
     cull: Option<bool>,
     /// the view whose rect the viewport is (`PassJob::views`), None: the pass's viewport
     view: Option<usize>,
@@ -787,9 +787,14 @@ impl Renderer {
                 }
                 bound.blend = Some(d.blend);
             }
-            if bound.depth_greater != Some(d.depth_greater) {
-                (gl.glDepthFunc)(if d.depth_greater { sys::GREATER } else { sys::LEQUAL });
-                bound.depth_greater = Some(d.depth_greater);
+            if bound.depth_compare != Some(d.depth_compare) {
+                (gl.glDepthFunc)(match d.depth_compare {
+                    DepthCompare::LessEqual => sys::LEQUAL,
+                    DepthCompare::Greater => sys::GREATER,
+                    DepthCompare::GreaterEqual => sys::GEQUAL,
+                    DepthCompare::Less => sys::LESS,
+                });
+                bound.depth_compare = Some(d.depth_compare);
             }
             if bound.depth_write != Some(d.depth_write) {
                 (gl.glDepthMask)(d.depth_write as u8);

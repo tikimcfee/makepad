@@ -1104,7 +1104,7 @@ impl D3d11 {
             state.fail("blend_op: @Add could not create a D3D11 blend state".into());
             return Ok(None);
         }
-        let depth_state = if depth.is_none() { 0 } else { (if d.flags & Draw::DEPTH_WRITE != 0 { 1 } else { 2 }) + if d.flags & Draw::DEPTH_GREATER != 0 { 2 } else { 0 } };
+        let depth_state = if depth.is_none() { 0 } else { (if d.flags & Draw::DEPTH_WRITE != 0 { 1 } else { 2 }) + 2 * Draw::depth_compare(d.flags) as usize };
         let cull = if d.flags & Draw::CULL != 0 { 1 } else { 0 };
         let draw_scissor = (!d.scissor.iter().any(|n| n.is_nan())).then_some(d.scissor);
         let scissor = if d.scissor.iter().any(|n| n.is_nan()) || pass.view_rects.len != 0 {

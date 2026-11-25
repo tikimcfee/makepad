@@ -163,8 +163,9 @@ pub fn dxgi(format: u32) -> Option<Fmt> {
 /// Fixed-function states, made once per device.
 pub struct States {
     pub raster: [ID3D11RasterizerState; 2],
-    /// No test; LessEqual with/without writes; Greater with/without writes.
-    pub depth: [ID3D11DepthStencilState; 5],
+    /// No test, then with/without writes for each `DepthCompare` in its order
+    /// (`1 + 2 * compare + (no write)`): LessEqual, Greater, GreaterEqual, Less.
+    pub depth: [ID3D11DepthStencilState; 9],
     /// blend states by (per-attachment mode bits, operation): made on first use
     pub blend: Mutex<HashMap<u32, ID3D11BlendState>>,
 }
@@ -287,6 +288,10 @@ impl Device {
                     depth(true, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_COMPARISON_LESS_EQUAL)?,
                     depth(true, D3D11_DEPTH_WRITE_MASK_ALL, D3D11_COMPARISON_GREATER)?,
                     depth(true, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_COMPARISON_GREATER)?,
+                    depth(true, D3D11_DEPTH_WRITE_MASK_ALL, D3D11_COMPARISON_GREATER_EQUAL)?,
+                    depth(true, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_COMPARISON_GREATER_EQUAL)?,
+                    depth(true, D3D11_DEPTH_WRITE_MASK_ALL, D3D11_COMPARISON_LESS)?,
+                    depth(true, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_COMPARISON_LESS)?,
                 ],
                 blend: Mutex::new(HashMap::new()),
             };

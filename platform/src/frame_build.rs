@@ -2411,6 +2411,9 @@ impl Cx {
         if call.options.depth_test_greater {
             flags |= Draw::DEPTH_GREATER;
         }
+        if self.passes[pass_id].reverse_z {
+            flags |= Draw::REVERSE_Z;
+        }
         if call.options.backface_culling {
             flags |= Draw::CULL;
         }

@@ -1636,12 +1636,8 @@ impl Metal {
                 }
             }
             if depth.is_some() {
-                let state = match (d.flags & Draw::DEPTH_GREATER != 0, d.flags & Draw::DEPTH_WRITE != 0) {
-                    (false, true) => self.dev.depth_write.as_id(),
-                    (false, false) => self.dev.depth_no_write.as_id(),
-                    (true, true) => self.dev.depth_greater_write.as_id(),
-                    (true, false) => self.dev.depth_greater_no_write.as_id(),
-                };
+                let write = (d.flags & Draw::DEPTH_WRITE != 0) as usize;
+                let state = self.dev.depth_states[Draw::depth_compare(d.flags) as usize * 2 + write].as_id();
                 if enc.depth_state != state {
                     enc.depth_state = state;
                     unsafe {

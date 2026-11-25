@@ -327,8 +327,8 @@ struct VariantKey { colors: [u32; 4], depth: u32, flags: u32, views: u8, samples
 
 impl VariantKey {
     fn new(program: &Program, pass: PassKey, flags: u32) -> Self {
-        let mut flags = flags & (Draw::BLEND | Draw::CULL | Draw::DEPTH_WRITE | Draw::WIREFRAME | Draw::DEPTH_GREATER);
-        if pass.depth == ABSENT { flags &= !(Draw::DEPTH_WRITE | Draw::DEPTH_GREATER); } // no depth attachment: the bit changes nothing
+        let mut flags = flags & (Draw::BLEND | Draw::CULL | Draw::DEPTH_WRITE | Draw::WIREFRAME | Draw::DEPTH_GREATER | Draw::REVERSE_Z);
+        if pass.depth == ABSENT { flags &= !(Draw::DEPTH_WRITE | Draw::DEPTH_GREATER | Draw::REVERSE_Z); } // no depth attachment: the bits change nothing
         if program.desc.blend & pipeline_blend::RAW != 0 { flags &= !Draw::BLEND; } // a raw write never blends: neither does the bit
         Self { colors: pass.colors, depth: pass.depth, flags, views: pass.views, samples: pass.samples.max(1) }
     }
@@ -554,7 +554,12 @@ fn create_variant(program: Arc<Program>, pass: &RenderPass, flags: u32) -> Resul
     }
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
     let depth = vk::PipelineDepthStencilStateCreateInfo::default().depth_test_enable(pass.key.depth != ABSENT)
-        .depth_write_enable(pass.key.depth != ABSENT && flags & Draw::DEPTH_WRITE != 0).depth_compare_op(if flags & Draw::DEPTH_GREATER != 0 { vk::CompareOp::GREATER } else { vk::CompareOp::LESS_OR_EQUAL });
+        .depth_write_enable(pass.key.depth != ABSENT && flags & Draw::DEPTH_WRITE != 0).depth_compare_op(match Draw::depth_compare(flags) {
+            DepthCompare::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+            DepthCompare::Greater => vk::CompareOp::GREATER,
+            DepthCompare::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+            DepthCompare::Less => vk::CompareOp::LESS,
+        });
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let info = vk::GraphicsPipelineCreateInfo::default().stages(&stages).vertex_input_state(&vertex).input_assembly_state(&assembly)

@@ -1437,6 +1437,34 @@ impl Draw {
     pub const INPUT_TRANSPARENT: u32 = 32;
     /// Strict greater-than depth comparison (otherwise less-equal).
     pub const DEPTH_GREATER: u32 = 64;
+    /// The draw's pass keeps a reversed-Z depth buffer (near is 1.0, far 0.0, cleared to 0.0):
+    /// each comparison turns around, less-equal to greater-equal and DEPTH_GREATER's
+    /// greater to less (`DrawPass::set_reverse_z`).
+    pub const REVERSE_Z: u32 = 128;
+
+    /// The depth comparison `flags` ask for (DEPTH_GREATER, REVERSE_Z).
+    pub fn depth_compare(flags: u32) -> DepthCompare {
+        match (flags & Self::DEPTH_GREATER != 0, flags & Self::REVERSE_Z != 0) {
+            (false, false) => DepthCompare::LessEqual,
+            (true, false) => DepthCompare::Greater,
+            (false, true) => DepthCompare::GreaterEqual,
+            (true, true) => DepthCompare::Less,
+        }
+    }
+}
+
+/// A draw's depth comparison (`Draw::depth_compare`): a fragment passes when its depth compares
+/// so against the stored one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DepthCompare {
+    LessEqual = 0,
+    Greater = 1,
+    GreaterEqual = 2,
+    Less = 3,
+}
+
+impl DepthCompare {
+    pub const ALL: [DepthCompare; 4] = [DepthCompare::LessEqual, DepthCompare::Greater, DepthCompare::GreaterEqual, DepthCompare::Less];
 }
 
 unsafe impl Plain for Draw {}
