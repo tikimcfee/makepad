@@ -118,6 +118,11 @@ pub struct DeckSharedState {
     pub pos_anchor_at: Instant,
     pub pos_rate: f64,
     pub has_stream_pos: bool,
+    /// the local head's heard position and speed (lgtm_head), and when they came: while fresh
+    /// they are the tape's truth, so the reels follow the speaker within a frame
+    pub head_pos_ms: f64,
+    pub head_rate: f64,
+    pub head_at: Option<Instant>,
     pub last_stream_at: Instant,
 
     // Live audio levels (0..1)
@@ -183,6 +188,9 @@ impl Default for DeckSharedState {
             pos_rate: 1.0,
             has_stream_pos: false,
             last_stream_at: now,
+            head_pos_ms: 0.0,
+            head_rate: 0.0,
+            head_at: None,
             level_orig: 0.0,
             level_new: 0.0,
             voice_id: "kokoro".to_string(),
@@ -275,8 +283,15 @@ impl DeckSharedState {
         ""
     }
 
+    /// the local head spoke in the last 200 ms
+    pub fn head_fresh(&self) -> bool {
+        self.head_at.map_or(false, |t| t.elapsed() < Duration::from_millis(200))
+    }
+
     pub fn effective_rate(&self) -> f64 {
-        if self.scrubbing {
+        if self.head_fresh() {
+            self.head_rate
+        } else if self.scrubbing {
             self.transport_rate
         } else if self.playing {
             self.pos_rate
@@ -286,6 +301,10 @@ impl DeckSharedState {
     }
 
     pub fn heard_pos_ms(&self, now: Instant, dur_ms: f64) -> f64 {
+        if let (true, Some(at)) = (self.head_fresh(), self.head_at) {
+            let dt_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.0;
+            return (self.head_pos_ms + dt_ms * self.head_rate).clamp(0.0, dur_ms.max(1.0));
+        }
         let rate = self.effective_rate();
         if rate.abs() > 1e-4 {
             let dt_ms = (now.duration_since(self.pos_anchor_at).as_secs_f64() * 1000.0).min(1500.0);
@@ -1135,25 +1154,41 @@ fn spawn_shell_watcher(hub: Arc<WireHub>) {
 /// while playing): read on the UI thread, as a StreamView reads its stream.
 fn take_streams(hub: &WireHub, seen: &mut [u64; 4]) -> bool {
     // the local head's own number first: [pos_ms, rate, dur_ms] (docs/lgtm/HEAD.md)
+    let mut head_moved = false;
     if let Some((v, values)) = crate::stream::latest("lgtm_head", seen[3]) {
         seen[3] = v;
         if values.len() >= 2 {
+            let (pos, rate, now) = (values[0] as f64, values[1] as f64, Instant::now());
             if let Ok(mut g) = HEAD_POS.lock() {
-                *g = Some((values[0] as f64, values[1] as f64, Instant::now()));
+                *g = Some((pos, rate, now));
+            }
+            if let Ok(mut st) = hub.state.lock() {
+                let stale = st.head_at.map_or(true, |t| t.elapsed() > Duration::from_millis(50));
+                if (pos - st.head_pos_ms).abs() > 0.01 || (rate - st.head_rate).abs() > 0.001 || stale {
+                    st.head_pos_ms = pos;
+                    st.head_rate = rate;
+                    st.head_at = Some(now);
+                    if values.len() >= 3 && values[2] as f64 > 100.0 {
+                        st.dur_ms = values[2] as f64;
+                    }
+                    st.rev += 1;
+                    head_moved = true;
+                }
             }
         }
     }
     let pos = crate::stream::latest("lgtm_pos", seen[0]);
+    let head_fresh = hub.state.lock().map(|st| st.head_fresh()).unwrap_or(false);
     let orig = crate::stream::latest("lgtm_orig", seen[1]);
     let new = crate::stream::latest("lgtm_new", seen[2]);
     if pos.is_none() && orig.is_none() && new.is_none() {
-        return false;
+        return head_moved;
     }
     let now = Instant::now();
     let Ok(mut st) = hub.state.lock() else { return false };
     if let Some((v, values)) = pos {
         seen[0] = v;
-        if let Some(f) = values.last() {
+        if let (false, Some(f)) = (head_fresh, values.last()) {
             let clamped = (*f as f64).clamp(0.0, 1.0) * st.dur_ms.max(1.0);
             // re-anchor only on a real move (or a stale or still anchor), so the reels keep
             // dead-reckoning smoothly between pushes (lgtm-deck3d's scrub rule)
