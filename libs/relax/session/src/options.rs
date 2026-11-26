@@ -84,7 +84,7 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64, IosArm64, Web(PtrWidth) }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, LinuxArm64, WindowsX64, AndroidArm64, IosArm64, Web(PtrWidth) }
 /// The web target's pointer width, a parameter of the target (`wasm32-unknown-unknown` /
 /// `wasm64-unknown-unknown`): usize, isize and pointers are 4 or 8 bytes, every layout is rustc's
 /// for that triple, and the trace host runs the program in that mode (32: pointers are offsets into
@@ -106,9 +106,11 @@ impl PtrWidth {
 }
 impl CheckTarget {
     /// The targets Relax runs on (and checks for), by triple: `RELAX_CHECK_TARGET` and `makepad host-gen`.
-    pub const TRIPLES: [(&'static str, CheckTarget); 5] = [
+    pub const TRIPLES: [(&'static str, CheckTarget); 6] = [
         ("aarch64-apple-darwin", CheckTarget::MacosArm64),
         ("x86_64-unknown-linux-gnu", CheckTarget::LinuxX64),
+        // glibc Linux on arm64 (a Linux phone): pack-src --target packs its arch modules
+        ("aarch64-unknown-linux-gnu", CheckTarget::LinuxArm64),
         ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
         ("aarch64-linux-android", CheckTarget::AndroidArm64),
         ("aarch64-apple-ios", CheckTarget::IosArm64),
@@ -817,6 +819,7 @@ impl Options {
             CheckTarget::Web(PtrWidth::W32) => 5,
             CheckTarget::Web(PtrWidth::W64) => 6,
             CheckTarget::IosArm64 => 7,
+            CheckTarget::LinuxArm64 => 8,
         });
         h.str("ctfe");
         h.u8(*ctfe as u8);

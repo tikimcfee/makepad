@@ -513,6 +513,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
             match C::from_triple(t).ok_or_else(|| format!("could not find specification for target \"{t}\""))? {
                 C::MacosArm64 => crate::cfg::CfgSet::macos_arm64(sess, &[]),
                 C::LinuxX64 => crate::cfg::CfgSet::linux_x64(sess, &[]),
+                C::LinuxArm64 => crate::cfg::CfgSet::linux_arm64(sess, &[]),
                 C::WindowsX64 => crate::cfg::CfgSet::windows_x64(sess, &[]),
                 C::AndroidArm64 => crate::cfg::CfgSet::android_arm64(sess, &[]),
                 C::IosArm64 => crate::cfg::CfgSet::ios_arm64(sess, &[]),

@@ -23,6 +23,7 @@ impl CfgSet {
             crate::options::CheckTarget::WindowsX64 => CfgSet::windows_x64(sess, features),
             crate::options::CheckTarget::MacosArm64 => CfgSet::macos_arm64(sess, features),
             crate::options::CheckTarget::LinuxX64 => CfgSet::linux_x64(sess, features),
+            crate::options::CheckTarget::LinuxArm64 => CfgSet::linux_arm64(sess, features),
             crate::options::CheckTarget::AndroidArm64 => CfgSet::android_arm64(sess, features),
             crate::options::CheckTarget::IosArm64 => CfgSet::ios_arm64(sess, features),
             crate::options::CheckTarget::Web(w) => CfgSet::web(sess, w, features),
