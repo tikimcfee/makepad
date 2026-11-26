@@ -17,11 +17,14 @@
 
 use makepad_widgets::*;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// lgtm-head's local socket in $XDG_RUNTIME_DIR (docs/lgtm/HEAD.md): the reel's speed goes there.
+const HEAD_SOCK_NAME: &str = "lgtm-head.sock";
 
 /// The view file that places the deck (`ui/views/deck.splash`): its surface name, the one the
 /// board fronts and lgtm-link counts as "lgtm on screen".
@@ -300,6 +303,55 @@ pub struct WireHub {
 }
 
 static WIRE_HUB: OnceLock<Arc<WireHub>> = OnceLock::new();
+static HEAD_DGRAM: OnceLock<Option<UnixDatagram>> = OnceLock::new();
+
+/// Non-blocking high-rate local socket feed to the phone's native audio head (`lgtm-head.sock`).
+/// Returns `true` if delivered to a live local head (skipping 20 Hz network `lgtm_cmd` scrub);
+/// returns `false` (ENOENT/ECONNREFUSED) when running against the remote monolith1 stream.
+fn send_head_vel(op: &str, omega: f32, rate: f32, held: bool, coast: bool) -> bool {
+    let sock_opt = HEAD_DGRAM.get_or_init(|| {
+        let s = UnixDatagram::unbound().ok()?;
+        let _ = s.set_nonblocking(true);
+        Some(s)
+    });
+    let Some(sock) = sock_opt.as_ref() else {
+        return false;
+    };
+    let path = format!("{}/{}", runtime_dir(), HEAD_SOCK_NAME);
+    let t_ms = unix_now_ms();
+    let msg = format!(
+        "{{\"op\":\"{}\",\"t\":{},\"omega\":{:.4},\"rate\":{:.4},\"held\":{},\"coast\":{}}}\n",
+        op, t_ms, omega, rate, held, coast
+    );
+    sock.send_to(msg.as_bytes(), &path).is_ok()
+}
+
+/// One plain datagram to the head (e.g. {"scrub_end":{}}); false when no head is listening.
+fn send_head_raw(msg: &str) -> bool {
+    let sock_opt = HEAD_DGRAM.get_or_init(|| {
+        let s = UnixDatagram::unbound().ok()?;
+        let _ = s.set_nonblocking(true);
+        Some(s)
+    });
+    let Some(sock) = sock_opt.as_ref() else {
+        return false;
+    };
+    let path = format!("{}/{}", runtime_dir(), HEAD_SOCK_NAME);
+    sock.send_to(msg.as_bytes(), &path).is_ok()
+}
+
+/// The head's heard position (ms) from its push stream `lgtm_head` [pos_ms, rate, dur_ms], and
+/// when it came; the hand-back to the engine (scrub_end {pos_ms}) carries it.
+static HEAD_POS: Mutex<Option<(f64, f64, Instant)>> = Mutex::new(None);
+
+fn head_heard_ms() -> Option<f64> {
+    let g = HEAD_POS.lock().ok()?;
+    let (pos, rate, at) = (*g)?;
+    if at.elapsed() > Duration::from_secs(2) {
+        return None;
+    }
+    Some(pos + at.elapsed().as_secs_f64() * 1000.0 * rate)
+}
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()
@@ -1081,7 +1133,16 @@ fn spawn_shell_watcher(hub: Arc<WireHub>) {
 
 /// The shell's push streams that carry the position and the two levels (lgtm-down pushes them
 /// while playing): read on the UI thread, as a StreamView reads its stream.
-fn take_streams(hub: &WireHub, seen: &mut [u64; 3]) -> bool {
+fn take_streams(hub: &WireHub, seen: &mut [u64; 4]) -> bool {
+    // the local head's own number first: [pos_ms, rate, dur_ms] (docs/lgtm/HEAD.md)
+    if let Some((v, values)) = crate::stream::latest("lgtm_head", seen[3]) {
+        seen[3] = v;
+        if values.len() >= 2 {
+            if let Ok(mut g) = HEAD_POS.lock() {
+                *g = Some((values[0] as f64, values[1] as f64, Instant::now()));
+            }
+        }
+    }
     let pos = crate::stream::latest("lgtm_pos", seen[0]);
     let orig = crate::stream::latest("lgtm_orig", seen[1]);
     let new = crate::stream::latest("lgtm_new", seen[2]);
@@ -1712,6 +1773,8 @@ pub struct DeckViewport {
     #[rust]
     scrub_coasting: bool,
     #[rust]
+    scrub_omega: f32, // signed rad/s (+ = clockwise = forward)
+    #[rust]
     scrub_rate: f32,
     #[rust]
     last_scrub_rate_sent: f32,
@@ -1719,6 +1782,16 @@ pub struct DeckViewport {
     last_scrub_sent: Option<Instant>,
     #[rust]
     last_reel_move_at: Option<Instant>,
+    #[rust]
+    reel_unwrapped_ang: f32,
+    #[rust]
+    reel_hist: [(f64, f32); 8],
+    #[rust]
+    reel_hist_len: usize,
+    #[rust]
+    reel_hist_head: usize,
+    #[rust]
+    last_finger_time: f64,
 
     // Key travel (0 = up, 1 = fully pressed) & LED flash
     #[rust]
@@ -1796,9 +1869,12 @@ pub struct DeckViewport {
     /// DECK_SHOWN_EPOCH as last seen: a change means the deck was hidden and is back
     #[rust]
     shown_epoch: u64,
-    /// versions of the push streams lgtm_pos, lgtm_orig, lgtm_new last read
+    /// versions of the push streams lgtm_pos, lgtm_orig, lgtm_new, lgtm_head last read
     #[rust]
-    streams_seen: [u64; 3],
+    streams_seen: [u64; 4],
+    /// the engine has been told this gesture is a scrub (stage 1: it stops the live stream)
+    #[rust]
+    engine_scrub_told: bool,
 }
 
 impl ScriptHook for DeckViewport {
@@ -2047,7 +2123,7 @@ impl DeckViewport {
     fn redraw_throttled(&mut self, cx: &mut Cx) {
         let now = Instant::now();
         if let Some(last) = self.last_drag_draw_at {
-            if now.duration_since(last) < Duration::from_millis(41) {
+            if now.duration_since(last) < Duration::from_millis(32) {
                 return;
             }
         }
@@ -2082,7 +2158,55 @@ impl DeckViewport {
         }
     }
 
+    fn reset_reel_hist(&mut self, time: f64) {
+        self.reel_unwrapped_ang = 0.0;
+        self.reel_hist[0] = (time, 0.0);
+        self.reel_hist_len = 1;
+        self.reel_hist_head = 0;
+    }
+
+    fn push_reel_hist(&mut self, time: f64, unwrapped_ang: f32) -> f32 {
+        self.reel_hist_head = (self.reel_hist_head + 1) % 8;
+        self.reel_hist[self.reel_hist_head] = (time, unwrapped_ang);
+        if self.reel_hist_len < 8 {
+            self.reel_hist_len += 1;
+        }
+        // Sliding-window slope over ~45-60 ms eliminates single-sample touch dt jitter
+        let mut best_old: Option<(f64, f32)> = None;
+        for back in 1..self.reel_hist_len {
+            let idx = (self.reel_hist_head + 8 - back) % 8;
+            let (t_old, a_old) = self.reel_hist[idx];
+            let dt = time - t_old;
+            if dt >= 0.008 {
+                best_old = Some((t_old, a_old));
+                if dt >= 0.045 {
+                    break;
+                }
+            }
+        }
+        if let Some((t_old, a_old)) = best_old {
+            let dt = (time - t_old).max(0.008) as f32;
+            // Clockwise (d_ang < 0) = forward (+omega)
+            (-(unwrapped_ang - a_old) / dt).clamp(-24.0, 24.0)
+        } else {
+            0.0
+        }
+    }
+
     fn emit_scrub_rate(&mut self, raw_rate: f32, force: bool) {
+        let held = matches!(self.grab, GrabTarget::LeftReel | GrabTarget::RightReel);
+        let op = if force && raw_rate == 0.0 && held { "grab" } else { "vel" };
+        // Always feed the local native phone head at full frame/touch rate (no 20 Hz throttle)
+        if send_head_vel(op, self.scrub_omega, raw_rate, held, self.scrub_coasting) {
+            // stage 1: the engine is told once that this is a scrub (it marks the transport
+            // scrubbing and stops the live stream to the head); the speed is the head's alone
+            if !self.engine_scrub_told {
+                self.engine_scrub_told = true;
+                let _ = send_lgtm_cmd("scrub", "{\"rate\":0.0}");
+            }
+            return;
+        }
+        // Fallback when no local head is running: remote monolith1 stream <= 20 Hz
         let rate = Self::quantize_scrub_rate(raw_rate);
         let now = Instant::now();
         if !force {
@@ -2115,11 +2239,26 @@ impl DeckViewport {
         if self.scrub_active || self.scrub_coasting || self.cached_state.scrubbing {
             self.scrub_active = false;
             self.scrub_coasting = false;
+            self.scrub_omega = 0.0;
             self.scrub_rate = 0.0;
             self.last_scrub_rate_sent = 0.0;
             self.last_scrub_sent = None;
             self.last_reel_move_at = None;
-            let _ = send_lgtm_cmd("scrub_end", "{}");
+            let had_head = send_head_vel("release", 0.0, 0.0, false, false);
+            if had_head {
+                // the hand-back: the head stops, and the engine goes on from where the tape is heard
+                let _ = send_head_raw("{\"scrub_end\":{}}");
+                let payload = match head_heard_ms() {
+                    Some(ms) => format!("{{\"pos_ms\":{:.1}}}", ms.max(0.0)),
+                    None => "{}".to_string(),
+                };
+                if self.engine_scrub_told {
+                    let _ = send_lgtm_cmd("scrub_end", &payload);
+                }
+            } else {
+                let _ = send_lgtm_cmd("scrub_end", "{}");
+            }
+            self.engine_scrub_told = false;
         }
     }
 
@@ -2162,8 +2301,8 @@ impl DeckViewport {
         // hidden in the shell: no timer (it starts again when the deck is shown)
         if self.needs_animation() && deck_visible() {
             if !self.timer_running {
-                // Cap active 3D animation strictly <= 24 fps (thermal + GE8320 rule)
-                self.anim_timer = cx.start_interval(1.0 / 24.0);
+                // Even 30 fps (exact 2x divisor of 60 Hz display vsync, <= 30 fps thermal cap; 0 fps at idle)
+                self.anim_timer = cx.start_interval(1.0 / 30.0);
                 self.timer_running = true;
                 self.last_frame_time = 0.0;
             }
@@ -2177,7 +2316,7 @@ impl DeckViewport {
     fn step_animation(&mut self, cx: &mut Cx, dt: f32) {
         let dt = dt.clamp(0.001, 0.05);
 
-        // 1. Reel-motor scrub control (finger-hold brake + flick-coast decay, <= 20 Hz)
+        // 1. Reel-motor scrub control (continuous hold-still damping + flick-coast decay)
         let holding_reel = matches!(self.grab, GrabTarget::LeftReel | GrabTarget::RightReel);
         if self.scrub_active {
             if holding_reel {
@@ -2185,15 +2324,20 @@ impl DeckViewport {
                     .last_reel_move_at
                     .map(|t| t.elapsed().as_millis())
                     .unwrap_or(999);
-                if idle_ms >= 110 {
-                    self.scrub_rate *= (-24.0 * dt).exp();
+                if idle_ms >= 55 {
+                    let decay = (-18.0 * dt).exp();
+                    self.scrub_omega *= decay;
+                    self.scrub_rate *= decay;
                     if self.scrub_rate.abs() < 0.05 {
+                        self.scrub_omega = 0.0;
                         self.scrub_rate = 0.0;
                     }
                 }
                 self.emit_scrub_rate(self.scrub_rate, false);
             } else if self.scrub_coasting {
-                self.scrub_rate *= (-2.8 * dt).exp();
+                let decay = (-2.8 * dt).exp();
+                self.scrub_omega *= decay;
+                self.scrub_rate *= decay;
                 let hit_end = (self.scrub_rate < 0.0 && self.pos_ms <= 1.0)
                     || (self.scrub_rate > 0.0 && self.pos_ms >= self.dur_ms - 1.0);
                 if hit_end || self.scrub_rate.abs() < 0.05 {
@@ -3116,11 +3260,11 @@ impl Widget for DeckViewport {
             return;
         }
         if let Some(te) = self.anim_timer.is_event(event) {
-            let now_t = te.time.unwrap_or(self.last_frame_time + (1.0 / 28.0));
+            let now_t = te.time.unwrap_or(self.last_frame_time + (1.0 / 30.0));
             let dt = if self.last_frame_time > 0.0 {
                 (now_t - self.last_frame_time) as f32
             } else {
-                1.0 / 28.0
+                1.0 / 30.0
             };
             self.last_frame_time = now_t;
             self.step_animation(cx, dt);
@@ -3136,13 +3280,15 @@ impl Widget for DeckViewport {
                 self.grab = target;
                 self.grab_start_abs = fe.abs;
                 self.last_abs = fe.abs;
-                self.last_frame_time = fe.time;
+                self.last_finger_time = fe.time;
 
                 match target {
                     GrabTarget::LeftReel => {
                         self.scrub_active = true;
                         self.scrub_coasting = false;
+                        self.scrub_omega = 0.0;
                         self.scrub_rate = 0.0;
+                        self.reset_reel_hist(fe.time);
                         self.last_reel_move_at = Some(Instant::now());
                         self.last_angle = (wp.y - LEFT_REEL_POS.1).atan2(wp.x - LEFT_REEL_POS.0);
                         self.emit_scrub_rate(0.0, true);
@@ -3152,7 +3298,9 @@ impl Widget for DeckViewport {
                     GrabTarget::RightReel => {
                         self.scrub_active = true;
                         self.scrub_coasting = false;
+                        self.scrub_omega = 0.0;
                         self.scrub_rate = 0.0;
+                        self.reset_reel_hist(fe.time);
                         self.last_reel_move_at = Some(Instant::now());
                         self.last_angle = (wp.y - RIGHT_REEL_POS.1).atan2(wp.x - RIGHT_REEL_POS.0);
                         self.emit_scrub_rate(0.0, true);
@@ -3195,8 +3343,8 @@ impl Widget for DeckViewport {
                 }
             }
             Hit::FingerMove(fe) => {
-                let dt = (fe.time - self.last_frame_time).clamp(0.008, 0.08) as f32;
-                self.last_frame_time = fe.time;
+                let dt = (fe.time - self.last_finger_time).clamp(0.008, 0.08) as f32;
+                self.last_finger_time = fe.time;
                 let rect = self.last_rect;
                 let aspect = (rect.size.x / rect.size.y.max(1.0)) as f32;
 
@@ -3205,18 +3353,24 @@ impl Widget for DeckViewport {
                         let is_left = matches!(self.grab, GrabTarget::LeftReel);
                         let center = if is_left { LEFT_REEL_POS } else { RIGHT_REEL_POS };
                         let wp = unproject_to_plane_z(self.camera_eye(), self.camera_target(), 36.0, aspect, rect, fe.abs, REEL_Z);
-                        let ang = (wp.y - center.1).atan2(wp.x - center.0);
+                        let dx = wp.x - center.0;
+                        let dy = wp.y - center.1;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let ang = dy.atan2(dx);
                         let mut d_ang = ang - self.last_angle;
                         while d_ang > std::f32::consts::PI { d_ang -= std::f32::consts::TAU; }
                         while d_ang < -std::f32::consts::PI { d_ang += std::f32::consts::TAU; }
                         self.last_angle = ang;
 
-                        let omega = (d_ang / dt).clamp(-30.0, 30.0);
+                        // Smoothly damp atan2 angular spikes near the center brass hub spindle
+                        let hub_gain = ((dist - 0.14) / 0.16).clamp(0.0, 1.0);
+                        self.reel_unwrapped_ang += d_ang * hub_gain;
+                        let omega = self.push_reel_hist(fe.time, self.reel_unwrapped_ang);
+                        self.scrub_omega = omega;
                         let (r_left, r_right) = self.reel_radii();
                         let r_grab = if is_left { r_left } else { r_right };
-                        // Clockwise (d_ang < 0) = forward (+rate); counter-clockwise = reverse (-rate)
-                        let inst_rate = ((-omega * r_grab) / 1.45).clamp(-4.0, 4.0);
-                        self.scrub_rate = (self.scrub_rate * 0.35 + inst_rate * 0.65).clamp(-4.0, 4.0);
+                        let inst_rate = ((omega * r_grab) / 1.45).clamp(-4.0, 4.0);
+                        self.scrub_rate = (self.scrub_rate * 0.25 + inst_rate * 0.75).clamp(-4.0, 4.0);
                         if self.scrub_rate.abs() < 0.05 {
                             self.scrub_rate = 0.0;
                         }
@@ -3281,13 +3435,16 @@ impl Widget for DeckViewport {
                             .map(|t| t.elapsed() > Duration::from_millis(120))
                             .unwrap_or(true);
                         if stale_hold {
+                            self.scrub_omega = 0.0;
                             self.scrub_rate = 0.0;
                         }
                         if self.scrub_rate.abs() < 0.35 {
                             self.finish_scrub();
                         } else {
                             self.scrub_coasting = true;
-                            self.emit_scrub_rate(self.scrub_rate, false);
+                            if !send_head_vel("release", self.scrub_omega, self.scrub_rate, false, true) {
+                                self.emit_scrub_rate(self.scrub_rate, false);
+                            }
                         }
                         cx.widget_action(self.uid, DeckAction::StateUpdated);
                         self.ensure_anim_or_redraw(cx);
