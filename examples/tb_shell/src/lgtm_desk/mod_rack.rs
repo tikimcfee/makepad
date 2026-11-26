@@ -74,12 +74,12 @@ impl RackModule {
 
     fn prev_rect(&self) -> PanelRect {
         let r = RECT_RACK;
-        PanelRect::new(r.right() - 32.0, r.y + 2.0, 11.5, 7.2)
+        PanelRect::new(r.right() - 34.0, r.y + 2.0, 11.5, 7.2)
     }
 
     fn next_rect(&self) -> PanelRect {
         let r = RECT_RACK;
-        PanelRect::new(r.right() - 19.0, r.y + 2.0, 11.5, 7.2)
+        PanelRect::new(r.right() - 20.5, r.y + 2.0, 11.5, 7.2)
     }
 }
 
@@ -113,15 +113,19 @@ impl DeskModule for RackModule {
 
         if pages > 1 {
             p.title_text(
-                r.right() - 35.0,
+                r.right() - 37.5,
                 r.y + 5.7,
-                3.6,
+                4.0,
                 vec4(0.75, 0.82, 0.92, 0.94),
                 TextAlign::Right,
                 &count_lbl,
             );
-            p.pill(self.prev_rect(), vec4(0.16, 0.21, 0.30, 1.0), vec4(0.90, 0.95, 1.0, 1.0), "<");
-            p.pill(self.next_rect(), vec4(0.16, 0.21, 0.30, 1.0), vec4(0.90, 0.95, 1.0, 1.0), ">");
+            let pr = self.prev_rect();
+            p.plate(pr, 0.95, 0.45, vec4(0.16, 0.21, 0.30, 1.0), 0.35, 0.12);
+            p.title_text(pr.cx(), pr.cy(), 4.2, vec4(0.92, 0.96, 1.0, 1.0), TextAlign::Center, "<");
+            let nr = self.next_rect();
+            p.plate(nr, 0.95, 0.45, vec4(0.16, 0.21, 0.30, 1.0), 0.35, 0.12);
+            p.title_text(nr.cx(), nr.cy(), 4.2, vec4(0.92, 0.96, 1.0, 1.0), TextAlign::Center, ">");
         }
 
         if rows.is_empty() {
@@ -172,7 +176,7 @@ impl DeskModule for RackModule {
                 rr.x + 7.2,
                 rr.cy(),
                 rr.w - 10.0,
-                3.8,
+                4.8,
                 fg,
                 TextAlign::Left,
                 &row.label,

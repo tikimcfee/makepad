@@ -184,11 +184,11 @@ impl PanelDraw {
                 mat: vec4(0.8, 0.0, 0.4, 0.0),
             });
         }
-        self.title_text(rect.x + 6.5, rect.y + 5.7, 5.2, vec4(0.95, 0.97, 1.0, 1.0), TextAlign::Left, title);
+        self.title_text(rect.x + 7.0, rect.y + 5.5, 5.2, vec4(0.95, 0.97, 1.0, 1.0), TextAlign::Left, title);
         if !right_status.is_empty() {
-            let title_w = title.chars().count() as f32 * 4.4;
-            let avail_w = (rect.w - 17.5 - title_w).max(12.0);
-            let max_chars = (avail_w / 2.95).floor().max(4.0) as usize;
+            let title_w = title.chars().count() as f32 * 4.8;
+            let avail_w = (rect.w - 19.0 - title_w).max(12.0);
+            let max_chars = (avail_w / 3.25).floor().max(4.0) as usize;
             let clipped: String = if right_status.chars().count() > max_chars {
                 let mut out: String = right_status.chars().take(max_chars.saturating_sub(1)).collect();
                 out.push('…');
@@ -196,7 +196,7 @@ impl PanelDraw {
             } else {
                 right_status.to_string()
             };
-            self.title_text(rect.right() - 7.5, rect.y + 5.7, 4.0, vec4(0.72, 0.80, 0.90, 0.96), TextAlign::Right, &clipped);
+            self.title_text(rect.right() - 8.5, rect.y + 5.5, 4.0, vec4(0.72, 0.80, 0.90, 0.96), TextAlign::Right, &clipped);
         }
     }
 
@@ -391,7 +391,7 @@ impl PanelDraw {
         self.text(rect.cx(), rect.y - 2.8, 3.4, vec4(0.65, 0.82, 0.98, 0.95), TextAlign::Center, label);
         let bg = if active { vec4(0.18, 0.28, 0.42, 1.0) } else { vec4(0.13, 0.17, 0.24, 1.0) };
         self.plate(rect, 1.15, 1.0, bg, 0.45, if active { 0.12 } else { 0.0 });
-        self.text(rect.cx(), rect.y + rect.h * 0.42, 3.9, vec4(0.96, 0.98, 1.0, 1.0), TextAlign::Center, value);
+        self.text_clip(rect.cx(), rect.y + rect.h * 0.42, (rect.w - 3.0).max(4.0), 4.8, vec4(0.96, 0.98, 1.0, 1.0), TextAlign::Center, value);
         let n = count.clamp(1, 8);
         let gap = 1.6;
         let pip_w = ((rect.w - 6.0 - gap * (n.saturating_sub(1)) as f32) / n as f32).clamp(2.0, 8.0);

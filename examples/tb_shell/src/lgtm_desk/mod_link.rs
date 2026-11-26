@@ -50,7 +50,7 @@ impl DeskModule for LinkModule {
             _ => vec4(0.88, 0.28, 0.32, 1.0),
         };
         p.dot(r.x + 8.0, row1_y, 2.0, link_col, 0.85);
-        p.text(r.x + 12.0, row1_y, 3.6, vec4(0.90, 0.95, 1.0, 0.96), TextAlign::Left, "NET");
+        p.text(r.x + 12.0, row1_y, 4.7, vec4(0.90, 0.95, 1.0, 0.96), TextAlign::Left, "NET");
 
         let (head_col, head_emit) = if st.head_underruns > 0 {
             (vec4(0.98, 0.32, 0.34, 1.0), 0.95)
@@ -61,7 +61,7 @@ impl DeskModule for LinkModule {
         } else {
             (vec4(0.42, 0.50, 0.60, 1.0), 0.15)
         };
-        p.dot(r.x + 31.0, row1_y, 2.0, head_col, head_emit);
+        p.dot(r.x + 33.5, row1_y, 2.0, head_col, head_emit);
         let head_lbl = if st.head_underruns > 0 {
             format!("u{}", st.head_underruns)
         } else if head_active {
@@ -69,7 +69,7 @@ impl DeskModule for LinkModule {
         } else {
             "LV".to_string()
         };
-        p.text(r.x + 35.0, row1_y, 3.6, vec4(0.90, 0.95, 1.0, 0.96), TextAlign::Left, &head_lbl);
+        p.text(r.x + 37.5, row1_y, 4.7, vec4(0.90, 0.95, 1.0, 0.96), TextAlign::Left, &head_lbl);
 
         // Engine parts light
         let (eng_col, eng_emit, eng_lbl) = if st.parts_total > 0 {
@@ -86,15 +86,12 @@ impl DeskModule for LinkModule {
                 "ENG".to_string(),
             )
         };
-        p.dot(r.x + 54.0, row1_y, 2.0, eng_col, eng_emit);
-        p.text(r.x + 58.0, row1_y, 3.6, vec4(0.86, 0.92, 0.98, 0.94), TextAlign::Left, &eng_lbl);
+        p.dot(r.x + 56.0, row1_y, 2.0, eng_col, eng_emit);
+        p.text(r.x + 60.0, row1_y, 4.7, vec4(0.86, 0.92, 0.98, 0.94), TextAlign::Left, &eng_lbl);
 
-        p.pill(
-            self.sync_rect(),
-            vec4(0.15, 0.22, 0.34, 1.0),
-            vec4(0.84, 0.92, 1.0, 1.0),
-            "SYNC",
-        );
+        let sr = self.sync_rect();
+        p.plate(sr, 0.95, 0.45, vec4(0.15, 0.22, 0.34, 1.0), 0.35, 0.14);
+        p.title_text(sr.cx(), sr.cy(), 4.2, vec4(0.88, 0.95, 1.0, 1.0), TextAlign::Center, "SYNC");
 
         // Row 2: Backing cache fill (left) + Voice lines cache fill (right)
         let bar_y = r.y + 28.5;
@@ -151,7 +148,7 @@ impl DeskModule for LinkModule {
         } else {
             (st.transport_state.clone(), vec4(0.72, 0.80, 0.90, 0.90))
         };
-        p.text_clip(r.x + 6.0, r.bottom() - 4.8, r.w - 12.0, 3.6, foot_col, TextAlign::Left, &foot_txt);
+        p.text_clip(r.x + 6.0, r.bottom() - 4.8, r.w - 12.0, 4.8, foot_col, TextAlign::Left, &foot_txt);
     }
 
     fn hit_control(&self, px: f32, py: f32, _st: &DeskState) -> Option<ControlHit> {

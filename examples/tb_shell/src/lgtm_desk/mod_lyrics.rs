@@ -216,21 +216,21 @@ impl DeskModule for LyricsModule {
         }
 
         // Upper row of active card: word-by-word rewritten lyric with per-band colored chips
-        let row_y = cr.y + 5.6;
+        let row_y = cr.y + 5.8;
         let max_x = cr.right() - right_reserve;
         if chg_pairs.is_empty() {
             p.text_clip(
                 cr.x + 3.5,
                 row_y,
                 (max_x - cr.x - 4.0).max(16.0),
-                4.6,
+                5.4,
                 vec4(0.98, 0.99, 1.0, 1.0),
                 TextAlign::Left,
                 out_s,
             );
         } else {
             let mut x = cr.x + 3.5;
-            let sz = 4.3f32;
+            let sz = 5.0f32;
             let char_w = sz * 0.56;
             for (wi, word) in out_s.split_whitespace().enumerate() {
                 let w_chars = word.chars().count() as f32;
@@ -245,7 +245,7 @@ impl DeskModule for LyricsModule {
                 }
                 if let Some(bidx) = band_opt {
                     let (bg, hi) = palette_color(bidx, st);
-                    let chip = PanelRect::new(x, row_y - 3.5, w_u, 7.0);
+                    let chip = PanelRect::new(x, row_y - 3.6, w_u, 7.2);
                     p.plate(chip, 0.95, 0.35, bg, 0.30, 0.16);
                     p.text(chip.cx(), row_y, sz, hi, TextAlign::Center, word);
                 } else {

@@ -104,17 +104,17 @@ impl BandsModule {
 
     fn add_btn_rect(&self) -> PanelRect {
         let r = RECT_BANDS;
-        PanelRect::new(r.right() - 26.0, r.y + 2.0, 19.0, 7.2)
+        PanelRect::new(r.right() - 28.0, r.y + 2.0, 20.5, 7.2)
     }
 
     fn bank_prev_rect(&self) -> PanelRect {
         let r = RECT_BANDS;
-        PanelRect::new(r.right() - 56.0, r.y + 2.0, 12.0, 7.2)
+        PanelRect::new(r.right() - 58.0, r.y + 2.0, 12.0, 7.2)
     }
 
     fn bank_next_rect(&self) -> PanelRect {
         let r = RECT_BANDS;
-        PanelRect::new(r.right() - 42.0, r.y + 2.0, 12.0, 7.2)
+        PanelRect::new(r.right() - 44.0, r.y + 2.0, 12.0, 7.2)
     }
 }
 
@@ -147,9 +147,9 @@ impl DeskModule for BandsModule {
 
         // Header status + paging + "+ ADD" button
         let status_x = if total > MAX_VISIBLE_STRIPS {
-            r.right() - 60.0
+            r.right() - 62.0
         } else if total < 12 {
-            r.right() - 30.0
+            r.right() - 32.0
         } else {
             r.right() - 6.5
         };
@@ -157,38 +157,30 @@ impl DeskModule for BandsModule {
             p.title_text(
                 status_x,
                 r.y + 5.7,
-                3.8,
+                4.2,
                 vec4(0.72, 0.80, 0.90, 0.95),
                 TextAlign::Right,
                 &right,
             );
         }
         if total > MAX_VISIBLE_STRIPS {
-            p.pill(
-                self.bank_prev_rect(),
-                vec4(0.14, 0.20, 0.30, 1.0),
-                vec4(0.90, 0.95, 1.0, 1.0),
-                "<",
-            );
-            p.pill(
-                self.bank_next_rect(),
-                vec4(0.14, 0.20, 0.30, 1.0),
-                vec4(0.90, 0.95, 1.0, 1.0),
-                ">",
-            );
+            let pr = self.bank_prev_rect();
+            p.plate(pr, 0.95, 0.45, vec4(0.14, 0.20, 0.30, 1.0), 0.35, 0.12);
+            p.title_text(pr.cx(), pr.cy(), 4.2, vec4(0.92, 0.96, 1.0, 1.0), TextAlign::Center, "<");
+            let nr = self.bank_next_rect();
+            p.plate(nr, 0.95, 0.45, vec4(0.14, 0.20, 0.30, 1.0), 0.35, 0.12);
+            p.title_text(nr.cx(), nr.cy(), 4.2, vec4(0.92, 0.96, 1.0, 1.0), TextAlign::Center, ">");
         }
         if total < 12 {
             let adding = st.edit_id == "__add__";
-            p.pill(
-                self.add_btn_rect(),
-                if adding {
-                    vec4(0.18, 0.42, 0.62, 1.0)
-                } else {
-                    vec4(0.14, 0.22, 0.34, 1.0)
-                },
-                vec4(0.72, 0.90, 1.0, 1.0),
-                "+ADD",
-            );
+            let ar = self.add_btn_rect();
+            let abg = if adding {
+                vec4(0.18, 0.42, 0.62, 1.0)
+            } else {
+                vec4(0.14, 0.22, 0.34, 1.0)
+            };
+            p.plate(ar, 0.95, 0.45, abg, 0.35, 0.14);
+            p.title_text(ar.cx(), ar.cy(), 4.0, vec4(0.78, 0.92, 1.0, 1.0), TextAlign::Center, "+ADD");
         }
 
         if total == 0 {

@@ -672,14 +672,18 @@ impl DeskViewport {
             let fs = snap_font_size(target_fs);
             self.draw_txt.text_style.font_size = fs;
             self.draw_txt.color = vec4(t.color.x, t.color.y, t.color.z, t.color.w * alpha);
-            let char_mult = if t.align == TextAlign::Right { 0.58 } else { 0.54 };
+            let char_mult = match t.align {
+                TextAlign::Left => 0.62,
+                TextAlign::Center => 0.64,
+                TextAlign::Right => 0.68,
+            };
             let est_w = t.text.chars().count() as f64 * (fs as f64 * char_mult);
             let draw_x = match t.align {
                 TextAlign::Left => sx,
                 TextAlign::Center => sx - est_w * 0.5,
                 TextAlign::Right => sx - est_w,
             };
-            let draw_y = sy - (fs as f64 * 0.58);
+            let draw_y = sy - (fs as f64 * 0.68);
             self.draw_txt.draw_abs(cx, dvec2(draw_x, draw_y), &t.text);
         }
     }

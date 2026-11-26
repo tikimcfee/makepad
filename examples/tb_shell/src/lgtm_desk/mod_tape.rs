@@ -215,14 +215,24 @@ impl DeskModule for TapeModule {
     fn draw(&self, p: &mut PanelDraw, st: &DeskState) {
         let r = RECT_TAPE;
         let gen_tag = if st.song_gen > 0 { format!("g{}", st.song_gen) } else { "orig".into() };
-        let short_title: String = if st.song_title.chars().count() > 16 {
-            let mut s: String = st.song_title.chars().take(15).collect();
+        let short_title: String = if st.song_title.chars().count() > 13 {
+            let mut s: String = st.song_title.chars().take(12).collect();
             s.push('…');
             s
         } else {
             st.song_title.clone()
         };
-        let status = format!("{} [{}] {}/{}", short_title, gen_tag, fmt_time_ms(self.pos_ms), fmt_time_ms(st.dur_ms));
+        let pos_s = (self.pos_ms.max(0.0) / 1000.0).floor() as i32;
+        let dur_s = (st.dur_ms.max(0.0) / 1000.0).floor() as i32;
+        let status = format!(
+            "{} [{}] {:02}:{:02}/{:02}:{:02}",
+            short_title,
+            gen_tag,
+            pos_s / 60,
+            pos_s % 60,
+            dur_s / 60,
+            dur_s % 60
+        );
         p.module_frame(r, "TAPE", &status, vec4(0.96, 0.56, 0.20, 1.0));
 
         // Loop fractional range
