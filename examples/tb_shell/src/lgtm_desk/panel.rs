@@ -28,6 +28,20 @@ const PASS_SCALE: f64 = 0.80;
 /// ~7 mm on a 384x854 (~68 mm wide) phone glass = ~40 logical px.
 const MIN_GRAB_PX: f32 = 40.0;
 
+fn snap_font_size(fs: f32) -> f32 {
+    const STEPS: [f32; 8] = [7.5, 9.0, 10.5, 12.0, 14.0, 16.0, 18.0, 20.0];
+    let mut best = STEPS[0];
+    let mut best_d = (fs - best).abs();
+    for &s in &STEPS[1..] {
+        let d = (fs - s).abs();
+        if d < best_d {
+            best = s;
+            best_d = d;
+        }
+    }
+    best
+}
+
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 pub struct DrawDeskMesh {
@@ -643,9 +657,9 @@ impl DeskViewport {
                 continue;
             }
             let raw_fs = t.size_u * zoom * 0.82;
-            let (fs, alpha) = if t.is_title {
-                let min_px = if t.size_u >= 5.0 { 9.2 } else { 7.4 };
-                (raw_fs.clamp(min_px, 16.5), 1.0)
+            let (target_fs, alpha) = if t.is_title {
+                let min_px = if t.size_u >= 5.0 { 9.0 } else { 7.5 };
+                (raw_fs.clamp(min_px, 16.0), 1.0)
             } else {
                 if raw_fs < 5.4 {
                     continue;
@@ -653,6 +667,9 @@ impl DeskViewport {
                 let a = ((raw_fs - 5.4) / 2.4).clamp(0.0, 1.0);
                 (raw_fs.min(20.0), a)
             };
+            // Snap to 8 discrete hinted sizes so pinch/zoom never thrashes DrawText's glyph atlas
+            // or layout cache with hundreds of distinct fractional font sizes.
+            let fs = snap_font_size(target_fs);
             self.draw_txt.text_style.font_size = fs;
             self.draw_txt.color = vec4(t.color.x, t.color.y, t.color.z, t.color.w * alpha);
             let char_mult = if t.align == TextAlign::Right { 0.58 } else { 0.54 };

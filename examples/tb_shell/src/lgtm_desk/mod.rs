@@ -184,7 +184,7 @@ script_mod! {
             }
         }
         draw_txt +: {
-            text_style.font_size: 10.0
+            text_style: theme.font_regular{ font_size: 10.0 }
             color: #xe2e8f0
         }
     }
