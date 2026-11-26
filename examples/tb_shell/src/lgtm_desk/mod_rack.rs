@@ -175,7 +175,7 @@ impl DeskModule for RackModule {
             p.text_clip(
                 rr.x + 7.2,
                 rr.cy(),
-                rr.w - 10.0,
+                rr.w - 16.0,
                 4.8,
                 fg,
                 TextAlign::Left,

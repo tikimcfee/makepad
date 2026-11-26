@@ -19,6 +19,8 @@ pub struct TransportModule {
     refused_why: String,
     refused_until: Option<Instant>,
     last_ack_seq: u64,
+    last_tr_seq: u64,
+    latch_hold_until: Option<Instant>,
     pressed_key: Option<usize>,
 }
 
@@ -35,6 +37,8 @@ impl Default for TransportModule {
             refused_why: String::new(),
             refused_until: None,
             last_ack_seq: 0,
+            last_tr_seq: 0,
+            latch_hold_until: None,
             pressed_key: None,
         }
     }
@@ -50,30 +54,41 @@ impl TransportModule {
     }
 
     pub fn sync_from_state(&mut self, st: &DeskState) {
+        let now = Instant::now();
+        let mut seq_advanced = false;
         if st.ack_seq > self.last_ack_seq {
             self.last_ack_seq = st.ack_seq;
+            seq_advanced = true;
             if st.ack_state == "refused" {
                 self.refused_why = if st.ack_why.is_empty() {
                     format!("{} refused", st.ack_name)
                 } else {
                     st.ack_why.clone()
                 };
-                self.refused_until = Some(Instant::now() + Duration::from_secs(4));
+                self.refused_until = Some(now + Duration::from_secs(4));
             }
             if st.ack_state != "queued" {
                 self.pending_key = -1;
                 self.pending_since = None;
             }
         }
-        // Latch PLAY and LOOP keys strictly from authoritative state
-        if self.pressed_key != Some(1) {
+        if st.transport_seq > self.last_tr_seq {
+            self.last_tr_seq = st.transport_seq;
+            seq_advanced = true;
+        }
+        if seq_advanced {
+            self.latch_hold_until = None;
+        }
+        let hold_active = self.latch_hold_until.map(|u| now < u).unwrap_or(false);
+        // Latch PLAY and LOOP keys from authoritative state (unless held briefly after local tap)
+        if self.pressed_key != Some(1) && !hold_active {
             self.key_target[1] = match st.transport_state.as_str() {
                 "playing" | "seeking" => 0.85,
                 "starting" => 0.45,
                 _ => if !st.has_transport && st.playing { 0.85 } else { 0.0 },
             };
         }
-        if self.pressed_key != Some(3) {
+        if self.pressed_key != Some(3) && !hold_active {
             self.key_target[3] = if st.loop_active { 0.78 } else { 0.0 };
         }
     }
@@ -99,20 +114,31 @@ impl TransportModule {
                 self.set_pending(0, "seek");
             }
             1 => {
-                self.key_target[1] = 0.45;
+                // Local-first latch feedback immediately on tap
+                self.key_target[1] = 0.85;
+                self.key_travel[1] = 0.85;
+                self.latch_hold_until = Some(Instant::now() + Duration::from_millis(350));
                 cmds.cmd_pending("play", "{}", "play");
                 self.set_pending(1, "play");
             }
             2 => {
+                self.key_target[1] = 0.0;
+                self.key_travel[1] = 0.0;
+                self.latch_hold_until = Some(Instant::now() + Duration::from_millis(350));
                 let pos = st.heard_pos_ms(Instant::now());
                 cmds.head_end(pos);
                 cmds.cmd_pending("stop", "{}", "stop");
                 self.set_pending(2, "stop");
             }
             3 => {
+                self.latch_hold_until = Some(Instant::now() + Duration::from_millis(350));
                 if st.loop_active {
+                    self.key_target[3] = 0.0;
+                    self.key_travel[3] = 0.0;
                     cmds.cmd_pending("loop", "{}", "loop");
                 } else {
+                    self.key_target[3] = 0.78;
+                    self.key_travel[3] = 0.78;
                     let pos = st.heard_pos_ms(Instant::now());
                     let ln = st.line_index_at_ms(pos).unwrap_or(0);
                     cmds.cmd_pending("loop", &format!("{{\"line\":{}}}", ln), "loop");
@@ -253,6 +279,8 @@ impl DeskModule for TransportModule {
         match ev.kind {
             TouchKind::Down => {
                 self.pressed_key = Some(idx);
+                // Local-first: depress key cap immediately on touch frame
+                self.key_travel[idx] = 1.0;
                 self.key_target[idx] = 1.0;
                 cmds.request_redraw = true;
             }

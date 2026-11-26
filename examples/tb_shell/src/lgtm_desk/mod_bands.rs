@@ -27,6 +27,8 @@ const CTRL_BANK_PREV: u32 = 300;
 const CTRL_BANK_NEXT: u32 = 301;
 const CTRL_ADD_BAND: u32 = 302;
 
+const ECHO_HOLD_MS: u64 = 600;
+
 #[derive(Default)]
 pub struct BandsModule {
     bank: usize,
@@ -34,7 +36,8 @@ pub struct BandsModule {
     grab_start_y: f32,
     grab_start_val: f32,
     local_vals: Vec<f32>,
-    last_sent: Option<Instant>,
+    last_sent_vals: Vec<f32>,
+    hold_until: Vec<Option<Instant>>,
 }
 
 fn snap_band_val(b: &BandInfo, raw: f32) -> f32 {
@@ -59,6 +62,35 @@ fn format_band_val(b: &BandInfo, val: f32) -> String {
 }
 
 impl BandsModule {
+    fn ensure_len(&mut self, total: usize, st: &DeskState) {
+        while self.local_vals.len() < total {
+            let v = st.bands.get(self.local_vals.len()).map(|b| b.value).unwrap_or(0.0);
+            self.local_vals.push(v);
+        }
+        while self.last_sent_vals.len() < total {
+            let v = st.bands.get(self.last_sent_vals.len()).map(|b| b.value).unwrap_or(-1.0);
+            self.last_sent_vals.push(v);
+        }
+        if self.hold_until.len() < total {
+            self.hold_until.resize(total, None);
+        }
+    }
+
+    fn effective_val(&self, idx: usize, store_val: f32, now: Instant) -> f32 {
+        if self.grabbed == Some(idx) {
+            return self.local_vals.get(idx).copied().unwrap_or(store_val);
+        }
+        if let Some(Some(until)) = self.hold_until.get(idx) {
+            if now < *until {
+                let lv = self.local_vals.get(idx).copied().unwrap_or(store_val);
+                if (store_val - lv).abs() > 0.015 {
+                    return lv;
+                }
+            }
+        }
+        store_val
+    }
+
     fn bank_count(&self, total: usize) -> usize {
         if total <= MAX_VISIBLE_STRIPS {
             1
@@ -130,7 +162,7 @@ impl DeskModule for BandsModule {
         let total = st.bands.len();
         let (start, end) = self.visible_slice(total);
         let vis = end.saturating_sub(start);
-        let active_words: i32 = st.bands.iter().map(|b| b.fx_count.max(0)).sum();
+        let active_words: i32 = st.bands.iter().map(|b| st.band_fx_count(b).max(0)).sum();
 
         let right = if total == 0 {
             "waiting".to_string()
@@ -195,16 +227,13 @@ impl DeskModule for BandsModule {
             return;
         }
 
+        let now = Instant::now();
         for slot in 0..vis {
             let idx = start + slot;
             let b = &st.bands[idx];
             let (cx, cy, w, h) = self.strip_geom(slot, vis);
             let is_grabbed = self.grabbed == Some(idx);
-            let val = if is_grabbed {
-                self.local_vals.get(idx).copied().unwrap_or(b.value)
-            } else {
-                b.value
-            };
+            let val = self.effective_val(idx, b.value, now);
             let accent = parse_hex_color(&b.color_hex, vec4(0.24, 0.78, 0.98, 1.0));
             let is_editing = !st.edit_id.is_empty() && st.edit_id == b.id;
 
@@ -256,13 +285,14 @@ impl DeskModule for BandsModule {
                     TextAlign::Center,
                     &format!("{}/{}", b.n_done, b.n_total),
                 );
-            } else if b.fx_count > 0 {
+            } else if st.band_fx_count(b) > 0 {
+                let fx_cnt = st.band_fx_count(b);
                 let badge_bg = vec4(accent.x * 0.28, accent.y * 0.28, accent.z * 0.28, 1.0);
                 p.pill(
                     PanelRect::new(cx - 2.0, top_y - 2.8, w * 0.52, 5.6),
                     badge_bg,
                     vec4(0.94, 0.98, 1.0, 1.0),
-                    &format!("{}w", b.fx_count),
+                    &format!("{}w", fx_cnt),
                 );
             } else {
                 p.text(
@@ -413,44 +443,51 @@ impl DeskModule for BandsModule {
         let slot = ev.control_id as usize;
         let idx = start + slot;
         let Some(b) = st.bands.get(idx) else { return; };
-        if self.local_vals.len() < total {
-            self.local_vals.resize(total, 0.0);
-        }
+        self.ensure_len(total, st);
 
         match ev.kind {
             TouchKind::Down => {
+                let now = Instant::now();
+                let start_v = self.effective_val(idx, b.value, now);
                 self.grabbed = Some(idx);
                 self.grab_start_y = ev.y;
-                self.grab_start_val = b.value;
-                self.local_vals[idx] = b.value;
+                self.grab_start_val = start_v;
+                self.local_vals[idx] = start_v;
+                self.last_sent_vals[idx] = start_v;
+                self.hold_until[idx] = None;
                 cmds.request_redraw = true;
             }
             TouchKind::Move => {
                 let (_, _, _, h) = self.strip_geom(slot, vis);
                 let raw = self.grab_start_val + (self.grab_start_y - ev.y) / h.max(10.0);
                 let snapped = snap_band_val(b, raw);
-                self.local_vals[idx] = snapped;
-                let now = Instant::now();
-                let due = self
-                    .last_sent
-                    .map(|t| now.duration_since(t) >= Duration::from_millis(33))
-                    .unwrap_or(true);
-                if due {
-                    self.last_sent = Some(now);
-                    cmds.mix_patch(&b.id, snapped);
-                } else {
+                if (snapped - self.local_vals[idx]).abs() >= 0.001 {
+                    self.local_vals[idx] = snapped;
                     cmds.request_redraw = true;
+                }
+                if (snapped - self.last_sent_vals[idx]).abs() >= 0.005 {
+                    self.last_sent_vals[idx] = snapped;
+                    cmds.mix_patch(&b.id, snapped);
                 }
             }
             TouchKind::Up => {
                 let v = snap_band_val(b, self.local_vals.get(idx).copied().unwrap_or(b.value));
                 self.grabbed = None;
-                cmds.mix_patch(&b.id, v);
+                self.local_vals[idx] = v;
+                self.hold_until[idx] = Some(Instant::now() + Duration::from_millis(ECHO_HOLD_MS));
+                if (v - self.last_sent_vals[idx]).abs() >= 0.005 {
+                    self.last_sent_vals[idx] = v;
+                    cmds.mix_patch(&b.id, v);
+                } else {
+                    cmds.request_redraw = true;
+                }
             }
             TouchKind::DoubleTap => {
                 self.grabbed = None;
                 let v = snap_band_val(b, b.rest);
                 self.local_vals[idx] = v;
+                self.last_sent_vals[idx] = v;
+                self.hold_until[idx] = Some(Instant::now() + Duration::from_millis(ECHO_HOLD_MS));
                 cmds.mix_patch(&b.id, v);
             }
         }

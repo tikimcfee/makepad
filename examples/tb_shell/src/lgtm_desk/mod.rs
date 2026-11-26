@@ -61,6 +61,8 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
     let hub = wire::wire_hub();
     let now = Instant::now();
     let mut moved = false;
+    let mut tape_moved = false;
+    let mut out_moved = false;
     let head = crate::stream::latest("lgtm_head", seen[3]);
     let pos = crate::stream::latest("lgtm_pos", seen[0]);
     let orig = crate::stream::latest("lgtm_orig", seen[1]);
@@ -79,6 +81,7 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
                 st.dur_ms = values[2] as f64;
             }
             moved = true;
+            tape_moved = true;
         }
     }
     let head_fresh = st.head_is_fresh(now);
@@ -95,6 +98,7 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
             }
             st.last_stream_at = now;
             moved = true;
+            tape_moved = true;
         }
     }
     if let Some((v, values)) = orig {
@@ -102,6 +106,7 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
         if let Some(f) = values.last() {
             st.level_orig = f.clamp(0.0, 1.0);
             moved = true;
+            out_moved = true;
         }
     }
     if let Some((v, values)) = new {
@@ -109,7 +114,15 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
         if let Some(f) = values.last() {
             st.level_new = f.clamp(0.0, 1.0);
             moved = true;
+            out_moved = true;
         }
+    }
+    // the desk copies by domain (rev_tape: head and position; rev_out: the meters), then rev
+    if tape_moved {
+        st.rev_tape += 1;
+    }
+    if out_moved {
+        st.rev_out += 1;
     }
     if moved {
         st.rev += 1;

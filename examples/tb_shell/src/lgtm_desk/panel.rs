@@ -17,8 +17,10 @@ use super::mod_transport::TransportModule;
 use super::mod_voice::VoiceModule;
 use super::module::{DeskModule, ModuleTouch, PanelDraw, PanelRect, TextAlign, TouchKind, PANEL_H, PANEL_W};
 use super::wire::{
-    send_close_prompt_edit, send_head_json, send_head_vel, send_lgtm_cmd, send_lgtm_mix_one,
-    send_lgtm_out, send_open_prompt_edit, wire_hub, DeskCmd, DeskCmds, DeskState,
+    json_escape, send_close_prompt_edit, send_head_json, send_head_out, send_head_vel,
+    send_lgtm_cmd, send_lgtm_mix_batch, send_lgtm_out, send_open_prompt_edit, wire_hub,
+    DeskCmd, DeskCmds, DeskState, DIRTY_BANDS, DIRTY_MIX_VALS, DIRTY_OUT, DIRTY_TAPE,
+    DIRTY_TRANSPORT, DIRTY_VOICE,
 };
 use makepad_widgets::event::{TouchState, TouchUpdateEvent};
 use makepad_widgets::*;
@@ -193,6 +195,34 @@ pub struct DeskViewport {
     #[rust]
     last_scrub_cmd_rate: f32,
 
+    // Per-frame outbound coalescer & change-only deduper (<=1 write per control per frame, 0 if unchanged)
+    #[rust]
+    pending_out: Option<[f32; 4]>,
+    #[rust]
+    last_sent_head_out: Option<[i32; 4]>,
+    #[rust]
+    last_sent_store_out: Option<[i32; 4]>,
+    #[rust]
+    last_store_out_at: Option<Instant>,
+    #[rust]
+    pending_mix: Vec<(String, f32)>,
+    #[rust]
+    last_sent_mix: Vec<(String, i32)>,
+    #[rust]
+    pending_voice_param: Vec<(String, String, String)>,
+    #[rust]
+    last_sent_voice_param: Vec<(String, String, String)>,
+
+    // Live 1.0 s rolling frame pacing meter (zero-alloc fixed capacity ring -> DeskState.perf_fps/perf_max_gap_ms)
+    #[rust]
+    perf_ring: Vec<(Instant, f32)>,
+    #[rust]
+    perf_head: usize,
+    #[rust]
+    perf_last_frame: Option<Instant>,
+    #[rust]
+    perf_was_active: bool,
+
     // Animation pacing & zero-idle timer
     #[rust]
     anim_timer: Timer,
@@ -222,9 +252,11 @@ impl ScriptHook for DeskViewport {
     fn on_after_new(&mut self, vm: &mut ScriptVm) {
         self.zoom = 1.58;
         self.tgt_zoom = 1.58;
+        self.perf_ring = Vec::with_capacity(96);
         let hub = wire_hub();
         if let Ok(st) = hub.state.lock() {
-            self.state = st.clone();
+            let _ = self.state.sync_changed_from(&st);
+            self.last_wire_rev = st.rev;
         }
         self.tape.sync_static_anchor(&self.state);
         self.transport.sync_from_state(&self.state);
@@ -267,19 +299,6 @@ impl DeskViewport {
             5 => &self.voice,
             6 => &self.rack,
             _ => &self.link,
-        }
-    }
-
-    fn module_mut(&mut self, idx: usize) -> &mut dyn DeskModule {
-        match idx {
-            0 => &mut self.tape,
-            1 => &mut self.transport,
-            2 => &mut self.lyrics,
-            3 => &mut self.bands,
-            4 => &mut self.out_mod,
-            5 => &mut self.voice,
-            6 => &mut self.rack,
-            _ => &mut self.link,
         }
     }
 
@@ -405,6 +424,118 @@ impl DeskViewport {
         self.area.redraw(cx);
     }
 
+    fn call_module_touch(&mut self, mod_idx: usize, ev: ModuleTouch, cmds: &mut DeskCmds) {
+        match mod_idx {
+            0 => self.tape.on_touch(ev, &self.state, cmds),
+            1 => self.transport.on_touch(ev, &self.state, cmds),
+            2 => self.lyrics.on_touch(ev, &self.state, cmds),
+            3 => self.bands.on_touch(ev, &self.state, cmds),
+            4 => self.out_mod.on_touch(ev, &self.state, cmds),
+            5 => self.voice.on_touch(ev, &self.state, cmds),
+            6 => self.rack.on_touch(ev, &self.state, cmds),
+            _ => self.link.on_touch(ev, &self.state, cmds),
+        }
+    }
+
+    fn quant_out(v: [f32; 4]) -> [i32; 4] {
+        [
+            (v[0].clamp(0.0, 1.0) * 1000.0).round() as i32,
+            (v[1].clamp(0.0, 1.0) * 1000.0).round() as i32,
+            (v[2].clamp(0.0, 1.0) * 1000.0).round() as i32,
+            (v[3].clamp(0.0, 1.0) * 120.0).round() as i32, // 0.1 dB resolution matching wire
+        ]
+    }
+
+    fn flush_pending_writes(&mut self, force_store_out: bool) {
+        // 1. OUT: instant lgtm-head.sock datagram (<=1/frame, 0 if unchanged) + throttled store sync (<=5Hz & on release)
+        if let Some(out_v) = self.pending_out.take() {
+            let q = Self::quant_out(out_v);
+            let head_ok = if self.last_sent_head_out != Some(q) {
+                let ok = send_head_out(out_v[0], out_v[1], out_v[2], out_v[3], self.state.out_presence_db);
+                if ok {
+                    self.last_sent_head_out = Some(q);
+                }
+                ok
+            } else {
+                true
+            };
+            if self.last_sent_store_out != Some(q) {
+                let now = Instant::now();
+                let store_due = force_store_out
+                    || !head_ok
+                    || self
+                        .last_store_out_at
+                        .map(|t| now.duration_since(t) >= Duration::from_millis(200))
+                        .unwrap_or(true);
+                if store_due {
+                    self.last_sent_store_out = Some(q);
+                    self.last_store_out_at = Some(now);
+                    send_lgtm_out(out_v[0], out_v[1], out_v[2], out_v[3], self.state.out_presence_db);
+                } else {
+                    // Keep pending until 200ms store window or FingerUp flushes it
+                    self.pending_out = Some(out_v);
+                }
+            }
+        }
+
+        // 2. BANDS mix: coalesce all changed faders into at most ONE batched store write per frame (0 if unchanged)
+        if !self.pending_mix.is_empty() {
+            let mut changed: Vec<(String, f32)> = Vec::new();
+            for (band_id, val) in self.pending_mix.drain(..) {
+                let q = (val.clamp(0.0, 1.0) * 1000.0).round() as i32;
+                let same = self
+                    .last_sent_mix
+                    .iter()
+                    .find(|(k, _)| k == &band_id)
+                    .map(|(_, prev)| *prev == q)
+                    .unwrap_or(false);
+                if !same {
+                    if let Some(entry) = self.last_sent_mix.iter_mut().find(|(k, _)| k == &band_id) {
+                        entry.1 = q;
+                    } else {
+                        self.last_sent_mix.push((band_id.clone(), q));
+                    }
+                    changed.push((band_id, val));
+                }
+            }
+            if !changed.is_empty() {
+                send_lgtm_mix_batch(&changed);
+            }
+        }
+
+        // 3. VOICE params: at most 1 command per changed param per frame (0 when unchanged/same step)
+        if !self.pending_voice_param.is_empty() {
+            for (vid, pid, raw) in self.pending_voice_param.drain(..) {
+                let same = self
+                    .last_sent_voice_param
+                    .iter()
+                    .find(|(v, p, _)| v == &vid && p == &pid)
+                    .map(|(_, _, prev)| prev == &raw)
+                    .unwrap_or(false);
+                if !same {
+                    if let Some(entry) = self
+                        .last_sent_voice_param
+                        .iter_mut()
+                        .find(|(v, p, _)| v == &vid && p == &pid)
+                    {
+                        entry.2 = raw.clone();
+                    } else {
+                        self.last_sent_voice_param.push((vid.clone(), pid.clone(), raw.clone()));
+                    }
+                    let _ = send_lgtm_cmd(
+                        "voice_param",
+                        &format!(
+                            "{{\"voice\":\"{}\",\"id\":\"{}\",\"value\":{}}}",
+                            json_escape(&vid),
+                            json_escape(&pid),
+                            raw
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     fn dispatch_cmds(&mut self, cx: &mut Cx, cmds: DeskCmds) {
         let mut focus_id: Option<&'static str> = None;
         for cmd in cmds.items {
@@ -413,10 +544,25 @@ impl DeskViewport {
                     let _ = send_lgtm_cmd(&name, &data_json);
                 }
                 DeskCmd::OutPatch { level, balance, tone, duck } => {
-                    send_lgtm_out(level, balance, tone, duck, self.state.out_presence_db);
+                    self.pending_out = Some([level, balance, tone, duck]);
                 }
                 DeskCmd::MixPatch { band_id, value } => {
-                    send_lgtm_mix_one(&band_id, value);
+                    if let Some(ex) = self.pending_mix.iter_mut().find(|(k, _)| k == &band_id) {
+                        ex.1 = value;
+                    } else {
+                        self.pending_mix.push((band_id, value));
+                    }
+                }
+                DeskCmd::VoiceParam { voice_id, param_id, raw_value } => {
+                    if let Some(ex) = self
+                        .pending_voice_param
+                        .iter_mut()
+                        .find(|(v, p, _)| v == &voice_id && p == &param_id)
+                    {
+                        ex.2 = raw_value;
+                    } else {
+                        self.pending_voice_param.push((voice_id, param_id, raw_value));
+                    }
                 }
                 DeskCmd::HeadVel { op, omega, rate, held, coast } => {
                     if send_head_vel(op, omega, rate, held, coast) {
@@ -479,19 +625,52 @@ impl DeskViewport {
 
     pub fn sync_from_wire(&mut self, cx: &mut Cx) {
         let hub = wire_hub();
-        let snap = {
+        let dirty = {
             let st = hub.state.lock().unwrap();
             if st.rev == self.last_wire_rev {
                 return;
             }
             self.last_wire_rev = st.rev;
-            st.clone()
+            self.state.sync_changed_from(&st)
         };
-        self.state = snap;
-        self.tape.sync_static_anchor(&self.state);
-        self.transport.sync_from_state(&self.state);
-        self.out_mod.sync_from_state(&self.state);
-        self.voice.sync_from_state(&self.state);
+        if dirty == 0 {
+            return;
+        }
+        // Only recompute the specific module(s) whose store keys actually changed
+        if (dirty & DIRTY_TAPE) != 0 {
+            self.tape.sync_static_anchor(&self.state);
+        }
+        if (dirty & DIRTY_TRANSPORT) != 0 {
+            self.transport.sync_from_state(&self.state);
+        }
+        if (dirty & DIRTY_OUT) != 0 {
+            self.out_mod.sync_from_state(&self.state);
+            if self.pending_out.is_none() {
+                let q = Self::quant_out([
+                    self.state.out_level,
+                    self.state.out_balance,
+                    self.state.out_tone,
+                    self.state.out_duck,
+                ]);
+                self.last_sent_store_out = Some(q);
+            }
+        }
+        if (dirty & (DIRTY_BANDS | DIRTY_MIX_VALS)) != 0 {
+            for b in &self.state.bands {
+                if self.pending_mix.iter().any(|(k, _)| k == &b.id) {
+                    continue;
+                }
+                let q = (b.value.clamp(0.0, 1.0) * 1000.0).round() as i32;
+                if let Some(entry) = self.last_sent_mix.iter_mut().find(|(k, _)| k == &b.id) {
+                    entry.1 = q;
+                } else {
+                    self.last_sent_mix.push((b.id.clone(), q));
+                }
+            }
+        }
+        if (dirty & DIRTY_VOICE) != 0 {
+            self.voice.sync_from_state(&self.state);
+        }
 
         if self.needs_animation() {
             if !self.timer_running {
@@ -524,15 +703,14 @@ impl DeskViewport {
         }
 
         let mut cmds = DeskCmds::default();
-        let st = self.state.clone();
-        self.tape.step(dt, &st, &mut cmds);
-        self.transport.step(dt, &st, &mut cmds);
-        self.out_mod.step(dt, &st, &mut cmds);
-        self.voice.step(dt, &st, &mut cmds);
-        self.lyrics.step(dt, &st, &mut cmds);
-        self.bands.step(dt, &st, &mut cmds);
-        self.rack.step(dt, &st, &mut cmds);
-        self.link.step(dt, &st, &mut cmds);
+        self.tape.step(dt, &self.state, &mut cmds);
+        self.transport.step(dt, &self.state, &mut cmds);
+        self.out_mod.step(dt, &self.state, &mut cmds);
+        self.voice.step(dt, &self.state, &mut cmds);
+        self.lyrics.step(dt, &self.state, &mut cmds);
+        self.bands.step(dt, &self.state, &mut cmds);
+        self.rack.step(dt, &self.state, &mut cmds);
+        self.link.step(dt, &self.state, &mut cmds);
         self.dispatch_cmds(cx, cmds);
 
         self.area.redraw(cx);
@@ -577,8 +755,7 @@ impl DeskViewport {
                 // Cancel any in-progress control scrub if a second finger lands for pinch
                 if matches!(self.grab, GrabMode::Control { mod_idx: 0, .. }) {
                     let mut cmds = DeskCmds::default();
-                    let st = self.state.clone();
-                    self.tape.end_scrub_if_active(&st, &mut cmds);
+                    self.tape.end_scrub_if_active(&self.state, &mut cmds);
                     self.dispatch_cmds(cx, cmds);
                 }
                 self.grab = GrabMode::Pinch;
@@ -602,7 +779,7 @@ impl DeskViewport {
                 self.tgt_zoom = self.zoom;
                 self.pinch_last_mid = mid;
                 self.pinch_last_dist = dist;
-                self.redraw_throttled(cx);
+                self.area.redraw(cx);
             }
         } else if self.grab == GrabMode::Pinch {
             self.grab = GrabMode::None;
@@ -687,6 +864,57 @@ impl DeskViewport {
             self.draw_txt.draw_abs(cx, dvec2(draw_x, draw_y), &t.text);
         }
     }
+    fn record_frame_pacing(&mut self, t_start: Instant) {
+        let active_now = self.timer_running || self.grab != GrabMode::None || self.camera_animating();
+        let gap_ms = if self.perf_was_active {
+            self.perf_last_frame
+                .map(|prev| {
+                    let d = t_start.duration_since(prev).as_secs_f32() * 1000.0;
+                    if d < 1500.0 { d } else { 0.0 }
+                })
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if self.perf_ring.len() < 96 {
+            self.perf_ring.push((t_start, gap_ms));
+        } else {
+            self.perf_ring[self.perf_head] = (t_start, gap_ms);
+            self.perf_head = (self.perf_head + 1) % 96;
+        }
+        self.perf_last_frame = Some(t_start);
+        self.perf_was_active = active_now;
+
+        let window = Duration::from_secs(1);
+        let mut count = 0u32;
+        let mut oldest = t_start;
+        let mut max_gap = 0.0f32;
+        for &(ts, g) in &self.perf_ring {
+            if t_start.duration_since(ts) <= window {
+                count += 1;
+                if ts < oldest {
+                    oldest = ts;
+                }
+                if g > max_gap {
+                    max_gap = g;
+                }
+            }
+        }
+        let fps = if !active_now && count <= 2 {
+            0.0
+        } else if count >= 3 {
+            let span = t_start.duration_since(oldest).as_secs_f32();
+            if span >= 0.12 && span < 0.85 {
+                ((count - 1) as f32 / span).min(60.0)
+            } else {
+                (count as f32).min(60.0)
+            }
+        } else {
+            count as f32
+        };
+        self.state.perf_fps = fps;
+        self.state.perf_max_gap_ms = max_gap;
+    }
 }
 
 impl Widget for DeskViewport {
@@ -701,6 +929,7 @@ impl Widget for DeskViewport {
             self.cam_initialized = true;
             self.set_fit_whole_desk(true);
         }
+        self.record_frame_pacing(t_start);
 
         // Orthographic viewport bounds in panel units (for exact camera + per-module frustum culling)
         let view_w = rect.size.x as f32 / self.zoom.max(0.2);
@@ -755,8 +984,12 @@ impl Widget for DeskViewport {
         // Sharp real text in exact panel transform
         self.draw_all_texts(cx, rect);
 
+        // Flush coalesced outgoing control writes at most once per rendered frame (0 if unchanged)
+        self.flush_pending_writes(false);
+
         // Record steady-state CPU frame cost (skipping frame 1 cold JIT compile)
         let us = t_start.elapsed().as_micros() as u64;
+        self.state.perf_draw_ms = us as f32 / 1000.0;
         let (_, _, fit_z) = self.whole_desk_fit_params(rect);
         let is_zoomed = self.zoom > fit_z * 1.35;
         if is_zoomed {
@@ -876,35 +1109,34 @@ impl Widget for DeskViewport {
                             self.last_ctrl_tap = None;
                             self.grab = GrabMode::None;
                             let mut cmds = DeskCmds::default();
-                            let st = self.state.clone();
                             let zoom = self.zoom;
-                            self.module_mut(mi).on_touch(
+                            self.call_module_touch(
+                                mi,
                                 ModuleTouch {
                                     kind: TouchKind::DoubleTap,
                                     control_id: ch.id,
                                     x: px, y: py, dx: 0.0, dy: 0.0,
                                     time: fe.time, px_per_u: zoom,
                                 },
-                                &st,
                                 &mut cmds,
                             );
                             self.dispatch_cmds(cx, cmds);
+                            self.flush_pending_writes(true);
                             return;
                         }
                         self.last_ctrl_tap = Some((mi, ch.id));
                         self.last_ctrl_tap_time = fe.time;
                         self.grab = GrabMode::Control { mod_idx: mi, control_id: ch.id };
                         let mut cmds = DeskCmds::default();
-                        let st = self.state.clone();
                         let zoom = self.zoom;
-                        self.module_mut(mi).on_touch(
+                        self.call_module_touch(
+                            mi,
                             ModuleTouch {
                                 kind: TouchKind::Down,
                                 control_id: ch.id,
                                 x: px, y: py, dx: 0.0, dy: 0.0,
                                 time: fe.time, px_per_u: zoom,
                             },
-                            &st,
                             &mut cmds,
                         );
                         self.dispatch_cmds(cx, cmds);
@@ -947,20 +1179,19 @@ impl Widget for DeskViewport {
                         self.tgt_pan_y = self.pan_y;
                         self.tgt_zoom = self.zoom;
                         self.fitted_module = None;
-                        self.redraw_throttled(cx);
+                        self.area.redraw(cx);
                     }
                     GrabMode::Control { mod_idx, control_id } => {
                         let mut cmds = DeskCmds::default();
-                        let st = self.state.clone();
                         let zoom = self.zoom;
-                        self.module_mut(mod_idx).on_touch(
+                        self.call_module_touch(
+                            mod_idx,
                             ModuleTouch {
                                 kind: TouchKind::Move,
                                 control_id,
                                 x: px, y: py, dx: dx_u, dy: dy_u,
                                 time: fe.time, px_per_u: zoom,
                             },
-                            &st,
                             &mut cmds,
                         );
                         self.dispatch_cmds(cx, cmds);
@@ -974,19 +1205,19 @@ impl Widget for DeskViewport {
                 let (px, py) = self.screen_to_panel(fe.abs);
                 if let GrabMode::Control { mod_idx, control_id } = self.grab {
                     let mut cmds = DeskCmds::default();
-                    let st = self.state.clone();
                     let zoom = self.zoom;
-                    self.module_mut(mod_idx).on_touch(
+                    self.call_module_touch(
+                        mod_idx,
                         ModuleTouch {
                             kind: TouchKind::Up,
                             control_id,
                             x: px, y: py, dx: 0.0, dy: 0.0,
                             time: fe.time, px_per_u: zoom,
                         },
-                        &st,
                         &mut cmds,
                     );
                     self.dispatch_cmds(cx, cmds);
+                    self.flush_pending_writes(true);
                 }
                 self.grab = GrabMode::None;
             }
@@ -1005,7 +1236,7 @@ impl Widget for DeskViewport {
                 self.tgt_pan_y = self.pan_y;
                 self.tgt_zoom = self.zoom;
                 self.fitted_module = None;
-                self.redraw_throttled(cx);
+                self.area.redraw(cx);
             }
             _ => {}
         }

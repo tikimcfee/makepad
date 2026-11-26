@@ -179,12 +179,46 @@ pub struct DeskState {
     pub wave_src: Vec<f32>,
     pub sections: Vec<SectionInfo>,
 
+    // Sparse live drag overlay (`lgtm_live`: <=20/s changed lines + fx while dragging, null when settled)
+    pub live_lines: Vec<(usize, String, Vec<(usize, i32)>)>,
+    pub live_fx: Vec<(String, i32)>,
+
     // Cassette rack
     pub saves: Vec<CassetteEntry>,
     pub library: Vec<CassetteEntry>,
 
     pub rev: u64,
+
+    // Per-domain dirty revisions (sync_from_wire copies ONLY changed domains & syncs ONLY changed modules)
+    pub rev_tape: u64,
+    pub rev_tape_meta: u64,
+    pub rev_wave: u64,
+    pub rev_transport: u64,
+    pub rev_lyrics: u64,
+    pub rev_bands: u64,
+    pub rev_mix_vals: u64,
+    pub rev_live: u64,
+    pub rev_out: u64,
+    pub rev_voice: u64,
+    pub rev_rack: u64,
+    pub rev_link: u64,
+
+    // Live frame pacing telemetry (updated by DeskViewport each draw_walk, read by LINK)
+    pub perf_fps: f32,
+    pub perf_max_gap_ms: f32,
+    pub perf_draw_ms: f32,
 }
+
+pub const DIRTY_TAPE: u32      = 1 << 0;
+pub const DIRTY_TRANSPORT: u32 = 1 << 1;
+pub const DIRTY_LYRICS: u32    = 1 << 2;
+pub const DIRTY_BANDS: u32     = 1 << 3;
+pub const DIRTY_MIX_VALS: u32  = 1 << 4;
+pub const DIRTY_OUT: u32       = 1 << 5;
+pub const DIRTY_VOICE: u32     = 1 << 6;
+pub const DIRTY_RACK: u32      = 1 << 7;
+pub const DIRTY_LINK: u32      = 1 << 8;
+pub const DIRTY_WAVE: u32      = 1 << 9;
 
 impl Default for DeskState {
     fn default() -> Self {
@@ -286,9 +320,26 @@ impl Default for DeskState {
             wave_back: Vec::new(),
             wave_src: Vec::new(),
             sections: Vec::new(),
+            live_lines: Vec::new(),
+            live_fx: Vec::new(),
             saves: Vec::new(),
             library: Vec::new(),
             rev: 0,
+            rev_tape: 0,
+            rev_tape_meta: 0,
+            rev_wave: 0,
+            rev_transport: 0,
+            rev_lyrics: 0,
+            rev_bands: 0,
+            rev_mix_vals: 0,
+            rev_live: 0,
+            rev_out: 0,
+            rev_voice: 0,
+            rev_rack: 0,
+            rev_link: 0,
+            perf_fps: 0.0,
+            perf_max_gap_ms: 0.0,
+            perf_draw_ms: 0.0,
         }
     }
 }
@@ -343,6 +394,11 @@ impl DeskState {
     }
 
     pub fn line_text_at(&self, idx: usize) -> &str {
+        if let Some((_, out, _)) = self.live_lines.iter().find(|(i, _, _)| *i == idx) {
+            if !out.is_empty() {
+                return out.as_str();
+            }
+        }
         if let Some(s) = self.out_lines.get(idx) {
             if !s.is_empty() {
                 return s.as_str();
@@ -354,11 +410,179 @@ impl DeskState {
         ""
     }
 
+    pub fn line_chg_at(&self, idx: usize) -> &[(usize, i32)] {
+        if let Some((_, _, pairs)) = self.live_lines.iter().find(|(i, _, _)| *i == idx) {
+            return pairs.as_slice();
+        }
+        self.chg.get(idx).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn band_fx_count(&self, b: &BandInfo) -> i32 {
+        if let Some((_, n)) = self.live_fx.iter().find(|(id, _)| id == &b.id) {
+            return *n;
+        }
+        b.fx_count
+    }
+
     pub fn active_voice(&self) -> Option<&VoiceInfo> {
         self.voices
             .iter()
             .find(|v| v.id == self.voice_id)
             .or_else(|| self.voices.first())
+    }
+
+    /// Incrementally copy ONLY domains whose `rev_*` changed from `src`, returning a `DIRTY_*` bitmask.
+    /// Hot paths (`lgtm_mix`, `lgtm_out`, `lgtm_head` stream) perform zero heap allocations.
+    pub fn sync_changed_from(&mut self, src: &DeskState) -> u32 {
+        let mut dirty = 0u32;
+        if self.rev_out != src.rev_out {
+            self.rev_out = src.rev_out;
+            self.out_level = src.out_level;
+            self.out_balance = src.out_balance;
+            self.out_tone = src.out_tone;
+            self.out_duck = src.out_duck;
+            self.out_presence_db = src.out_presence_db;
+            self.out_rev = src.out_rev;
+            self.level_orig = src.level_orig;
+            self.level_new = src.level_new;
+            dirty |= DIRTY_OUT;
+        }
+        if self.rev_bands != src.rev_bands {
+            self.rev_bands = src.rev_bands;
+            self.rev_mix_vals = src.rev_mix_vals;
+            self.bands = src.bands.clone();
+            self.mix_rev = src.mix_rev;
+            self.edit_id = src.edit_id.clone();
+            dirty |= DIRTY_BANDS | DIRTY_MIX_VALS;
+        } else if self.rev_mix_vals != src.rev_mix_vals {
+            self.rev_mix_vals = src.rev_mix_vals;
+            self.mix_rev = src.mix_rev;
+            // Zero-allocation in-place float copy when only mix fader values changed
+            if self.bands.len() == src.bands.len() {
+                for (dst, sb) in self.bands.iter_mut().zip(src.bands.iter()) {
+                    dst.value = sb.value;
+                }
+            } else {
+                self.bands = src.bands.clone();
+            }
+            dirty |= DIRTY_MIX_VALS;
+        }
+        if self.rev_live != src.rev_live {
+            self.rev_live = src.rev_live;
+            self.live_lines = src.live_lines.clone();
+            self.live_fx = src.live_fx.clone();
+            dirty |= DIRTY_LYRICS | DIRTY_BANDS;
+        }
+        if self.rev_wave != src.rev_wave {
+            self.rev_wave = src.rev_wave;
+            self.wave_back = src.wave_back.clone();
+            self.wave_src = src.wave_src.clone();
+            dirty |= DIRTY_WAVE | DIRTY_TAPE;
+        }
+        if self.rev_tape != src.rev_tape {
+            self.rev_tape = src.rev_tape;
+            self.dur_ms = src.dur_ms;
+            self.pos_anchor_ms = src.pos_anchor_ms;
+            self.pos_anchor_at = src.pos_anchor_at;
+            self.pos_rate = src.pos_rate;
+            self.has_stream_pos = src.has_stream_pos;
+            self.last_stream_at = src.last_stream_at;
+            self.head_pos_ms = src.head_pos_ms;
+            self.head_rate = src.head_rate;
+            self.head_at = src.head_at;
+            self.head_runs = src.head_runs;
+            self.head_live = src.head_live;
+            self.scrubbing = src.scrubbing;
+            self.transport_rate = src.transport_rate;
+            dirty |= DIRTY_TAPE;
+        }
+        if self.rev_tape_meta != src.rev_tape_meta {
+            self.rev_tape_meta = src.rev_tape_meta;
+            self.song_title = src.song_title.clone();
+            self.song_gen = src.song_gen;
+            self.sections = src.sections.clone();
+            dirty |= DIRTY_TAPE;
+        }
+        if self.rev_transport != src.rev_transport {
+            self.rev_transport = src.rev_transport;
+            self.has_transport = src.has_transport;
+            self.transport_state = src.transport_state.clone();
+            self.transport_sub = src.transport_sub.clone();
+            self.transport_rate = src.transport_rate;
+            self.scrubbing = src.scrubbing;
+            self.playing = src.playing;
+            self.transport_seq = src.transport_seq;
+            self.transport_pass = src.transport_pass;
+            self.line = src.line;
+            self.loop_active = src.loop_active;
+            self.loop_line = src.loop_line;
+            self.loop_a_ms = src.loop_a_ms;
+            self.loop_b_ms = src.loop_b_ms;
+            self.ack_seq = src.ack_seq;
+            self.ack_name = src.ack_name.clone();
+            self.ack_state = src.ack_state.clone();
+            self.ack_why = src.ack_why.clone();
+            self.status = src.status.clone();
+            dirty |= DIRTY_TRANSPORT;
+        }
+        if self.rev_lyrics != src.rev_lyrics {
+            self.rev_lyrics = src.rev_lyrics;
+            self.src_lines = src.src_lines.clone();
+            self.out_lines = src.out_lines.clone();
+            self.line_times_ms = src.line_times_ms.clone();
+            self.chg = src.chg.clone();
+            self.settled = src.settled.clone();
+            self.line = src.line;
+            self.loop_active = src.loop_active;
+            self.loop_line = src.loop_line;
+            self.loop_a_ms = src.loop_a_ms;
+            self.loop_b_ms = src.loop_b_ms;
+            self.sections = src.sections.clone();
+            dirty |= DIRTY_LYRICS;
+        }
+        if self.rev_voice != src.rev_voice {
+            self.rev_voice = src.rev_voice;
+            self.voice_id = src.voice_id.clone();
+            self.scratch_voice_id = src.scratch_voice_id.clone();
+            self.voices = src.voices.clone();
+            self.singers = src.singers.clone();
+            self.singer_id = src.singer_id.clone();
+            self.singer_state = src.singer_state.clone();
+            self.singer_why = src.singer_why.clone();
+            dirty |= DIRTY_VOICE;
+        }
+        if self.rev_rack != src.rev_rack {
+            self.rev_rack = src.rev_rack;
+            self.song_id = src.song_id.clone();
+            self.song_title = src.song_title.clone();
+            self.song_gen = src.song_gen;
+            self.parent_id = src.parent_id.clone();
+            self.saves = src.saves.clone();
+            self.library = src.library.clone();
+            dirty |= DIRTY_RACK;
+        }
+        if self.rev_link != src.rev_link {
+            self.rev_link = src.rev_link;
+            self.link = src.link.clone();
+            self.status = src.status.clone();
+            self.note = src.note.clone();
+            self.song_artist = src.song_artist.clone();
+            self.parts_done = src.parts_done;
+            self.parts_total = src.parts_total;
+            self.head_runs = src.head_runs;
+            self.head_live = src.head_live;
+            self.head_stage = src.head_stage;
+            self.head_cache_backing = src.head_cache_backing;
+            self.head_cache_backing_frac = src.head_cache_backing_frac;
+            self.head_cache_lines = src.head_cache_lines;
+            self.head_underruns = src.head_underruns;
+            self.ack_name = src.ack_name.clone();
+            self.ack_state = src.ack_state.clone();
+            self.ack_why = src.ack_why.clone();
+            dirty |= DIRTY_LINK;
+        }
+        self.rev = src.rev;
+        dirty
     }
 }
 
@@ -371,6 +595,7 @@ pub enum DeskCmd {
     LgtmCmd { name: String, data_json: String, pending_tag: Option<String> },
     OutPatch { level: f32, balance: f32, tone: f32, duck: f32 },
     MixPatch { band_id: String, value: f32 },
+    VoiceParam { voice_id: String, param_id: String, raw_value: String },
     HeadVel { op: &'static str, omega: f32, rate: f32, held: bool, coast: bool },
     HeadEnd { end_ms: f64 },
     OpenPromptEdit { band_id: String, name: String, prompt: String },
@@ -411,6 +636,15 @@ impl DeskCmds {
 
     pub fn mix_patch(&mut self, band_id: &str, value: f32) {
         self.items.push(DeskCmd::MixPatch { band_id: band_id.to_string(), value });
+        self.request_redraw = true;
+    }
+
+    pub fn voice_param(&mut self, voice_id: &str, param_id: &str, raw_value: &str) {
+        self.items.push(DeskCmd::VoiceParam {
+            voice_id: voice_id.to_string(),
+            param_id: param_id.to_string(),
+            raw_value: raw_value.to_string(),
+        });
         self.request_redraw = true;
     }
 
@@ -532,6 +766,21 @@ pub fn send_head_vel(op: &str, omega: f32, rate: f32, held: bool, coast: bool) -
     send_head_json(&msg)
 }
 
+/// Immediate zero-store-latency OUT control datagram directly to `lgtm-head.sock`.
+pub fn send_head_out(level: f32, balance: f32, tone: f32, duck_norm: f32, presence_db: f32) -> bool {
+    let duck_db = (duck_norm.clamp(0.0, 1.0) * 12.0 * 10.0).round() / 10.0;
+    let pres_db = (presence_db.clamp(0.0, 6.0) * 10.0).round() / 10.0;
+    let msg = format!(
+        "{{\"out\":{{\"level\":{:.3},\"balance\":{:.3},\"tone\":{:.3},\"duck\":{:.1},\"presence\":{:.1}}}}}\n",
+        level.clamp(0.0, 1.0),
+        balance.clamp(0.0, 1.0),
+        tone.clamp(0.0, 1.0),
+        duck_db,
+        pres_db,
+    );
+    send_head_json(&msg)
+}
+
 fn send_shell_line(line: String) {
     let hub = wire_hub();
     let guard = hub.tx.lock();
@@ -581,6 +830,26 @@ pub fn send_lgtm_mix_one(band_id: &str, value: f32) {
         value.clamp(0.0, 1.0),
     );
     send_shell_line(line);
+}
+
+/// Coalesced single store write for one or more changed mix faders in one frame.
+pub fn send_lgtm_mix_batch(items: &[(String, f32)]) {
+    if items.is_empty() {
+        return;
+    }
+    let mut body = String::with_capacity(48 + items.len() * 24);
+    body.push_str("{\"op\":\"set\",\"reply\":false,\"patch\":{\"lgtm_mix\":{");
+    for (i, (id, val)) in items.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push('"');
+        body.push_str(&json_escape(id));
+        body.push_str("\":");
+        body.push_str(&format!("{:.3}", val.clamp(0.0, 1.0)));
+    }
+    body.push_str("}}}");
+    send_shell_line(body);
 }
 
 pub fn send_open_prompt_edit(band_id: &str, name: &str, prompt: &str) {
@@ -638,8 +907,8 @@ fn spawn_shell_watcher(hub: Arc<WireHub>) {
     std::thread::spawn(move || {
         let path = tb_shell_sock_path();
         // Stage 1: fetch lightweight control/lyric/band/head keys first so all 8 modules populate immediately
-        let core_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_edit\"]";
-        let watch_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_wave\",\"lgtm_edit\"]";
+        let core_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_edit\",\"lgtm_live\"]";
+        let watch_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_wave\",\"lgtm_edit\",\"lgtm_live\"]";
         loop {
             if let Ok(mut sock) = UnixStream::connect(&path) {
                 let mut reader = BufReader::new(sock.try_clone().unwrap());
@@ -750,11 +1019,18 @@ fn spawn_dgram_listener(hub: Arc<WireHub>) {
                                             st.last_stream_at = now;
                                         }
                                     }
+                                    let mut out_dirty = false;
                                     if let Some(o) = v.get("orig").and_then(|x| x.as_f64()) {
                                         st.level_orig = (o as f32).clamp(0.0, 1.0);
+                                        out_dirty = true;
                                     }
                                     if let Some(nw) = v.get("new").and_then(|x| x.as_f64()) {
                                         st.level_new = (nw as f32).clamp(0.0, 1.0);
+                                        out_dirty = true;
+                                    }
+                                    st.rev_tape += 1;
+                                    if out_dirty {
+                                        st.rev_out += 1;
                                     }
                                     st.rev += 1;
                                 }
@@ -1131,6 +1407,8 @@ fn apply_raw_wave_json(st: &mut DeskState, line: &str) -> bool {
         }
     }
     if changed {
+        st.rev_wave += 1;
+        st.rev_tape += 1;
         st.rev += 1;
     }
     changed
@@ -1263,6 +1541,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
     let now = Instant::now();
     if let Some(link) = root.get("lgtm_link").and_then(|v| v.as_str()) {
         st.link = link.to_string();
+        st.rev_link += 1;
     }
     if let Some(ed) = root.get("lgtm_edit") {
         if ed.is_null() {
@@ -1270,16 +1549,60 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
         } else if let Some(s) = ed.as_str() {
             st.edit_id = s.to_string();
         }
+        st.rev_bands += 1;
+    }
+    if let Some(lv) = root.get("lgtm_live") {
+        if lv.is_null() {
+            st.live_lines.clear();
+            st.live_fx.clear();
+        } else {
+            if let Some(lines_obj) = lv.get("lines").and_then(|v| v.as_obj()) {
+                let mut parsed = Vec::with_capacity(lines_obj.len());
+                for (k, entry) in lines_obj {
+                    if let Ok(idx) = k.parse::<usize>() {
+                        let out_txt = entry.get("out").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut pairs = Vec::new();
+                        if let Some(arr) = entry.get("chg").and_then(|v| v.as_arr()) {
+                            for item in arr {
+                                if let Some(sub) = item.as_arr() {
+                                    if let Some(pos) = sub.first().and_then(|x| x.as_f64()) {
+                                        let bidx = sub.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+                                        pairs.push((pos.max(0.0) as usize, bidx));
+                                    }
+                                } else if let Some(pos) = item.as_f64() {
+                                    pairs.push((pos.max(0.0) as usize, 0));
+                                }
+                            }
+                        }
+                        parsed.push((idx, out_txt, pairs));
+                    }
+                }
+                st.live_lines = parsed;
+            }
+            if let Some(fx_obj) = lv.get("fx").and_then(|v| v.as_obj()) {
+                let mut fxs = Vec::with_capacity(fx_obj.len());
+                for (k, v) in fx_obj {
+                    let n = v.as_f64().unwrap_or(0.0).round() as i32;
+                    fxs.push((k.clone(), n));
+                }
+                st.live_fx = fxs;
+            }
+        }
+        st.rev_live += 1;
     }
     if let Some(lh) = root.get("lgtm_head") {
+        let mut link_chg = false;
         if let Some(r) = lh.get("runs").and_then(|v| v.as_bool()) {
             st.head_runs = r;
+            link_chg = true;
         }
         if let Some(lv) = lh.get("live").and_then(|v| v.as_bool()) {
             st.head_live = lv;
+            link_chg = true;
         }
         if let Some(sg) = lh.get("stage").and_then(|v| v.as_f64()) {
             st.head_stage = sg as i32;
+            link_chg = true;
         }
         if let Some(d) = lh.get("dur_ms").and_then(|v| v.as_f64()) {
             if d > 100.0 { st.dur_ms = d; }
@@ -1306,28 +1629,43 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
         }
         if let Some(u) = lh.get("underruns").and_then(|v| v.as_f64()) {
             st.head_underruns = u as i32;
+            link_chg = true;
         }
         if let Some(cache) = lh.get("cache") {
             if let Some(b) = cache.get("backing").and_then(|v| v.as_f64()) {
                 st.head_cache_backing_frac = (b as f32).clamp(0.0, 1.0);
                 st.head_cache_backing = b > 0.0;
+                link_chg = true;
             }
             if let Some(l) = cache.get("lines").and_then(|v| v.as_f64()) {
                 st.head_cache_lines = l as i32;
+                link_chg = true;
             }
+        }
+        st.rev_tape += 1;
+        if link_chg {
+            st.rev_link += 1;
         }
     }
     if let Some(wave) = root.get("lgtm_wave") {
+        let mut any = false;
         if let Some(b) = wave.get("back").and_then(|v| v.as_arr()) {
             st.wave_back = downsample_wave(b, 180);
+            any = true;
         }
         if let Some(s) = wave.get("src").and_then(|v| v.as_arr()) {
             st.wave_src = downsample_wave(s, 180);
+            any = true;
+        }
+        if any {
+            st.rev_wave += 1;
+            st.rev_tape += 1;
         }
     }
     if let Some(mix) = root.get("lgtm_mix") {
         if let Some(t) = mix.get("tempo").and_then(|v| v.as_f64()) {
             st.pos_rate = (0.65 + t * 0.70).clamp(0.5, 1.8);
+            st.rev_tape += 1;
         }
         if let Some(entries) = mix.as_obj() {
             for (k, v) in entries {
@@ -1340,6 +1678,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
             }
             st.mix_rev += 1;
+            st.rev_mix_vals += 1;
         }
     }
     if let Some(out) = root.get("lgtm_out") {
@@ -1357,16 +1696,28 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
             st.out_presence_db = (v as f32).clamp(0.0, 6.0);
             any = true;
         }
-        if any { st.out_rev += 1; }
+        if any {
+            st.out_rev += 1;
+            st.rev_out += 1;
+        }
     }
     if let Some(tr) = root.get("lgtm_transport") {
         if !tr.is_null() {
+            let had_voice = tr.get("voice").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
             apply_transport(st, tr, now);
+            st.rev_transport += 1;
+            st.rev_tape += 1;
+            st.rev_lyrics += 1;
+            if had_voice {
+                st.rev_voice += 1;
+            }
         }
     }
     if let Some(ack) = root.get("lgtm_ack") {
         if !ack.is_null() {
             apply_ack(st, ack);
+            st.rev_transport += 1;
+            st.rev_link += 1;
         }
     }
     if let Some(lg) = root.get("lgtm") {
@@ -1375,9 +1726,12 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
             if !st.has_transport {
                 st.playing = status == "playing";
             }
+            st.rev_link += 1;
+            st.rev_transport += 1;
         }
         if let Some(note) = lg.get("note").and_then(|v| v.as_str()) {
             st.note = note.to_string();
+            st.rev_link += 1;
         }
         if let Some(song) = lg.get("song") {
             if let Some(id) = song.get("id").and_then(|v| v.as_str()) { st.song_id = id.to_string(); }
@@ -1390,10 +1744,16 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
             } else if song.get("parent").map(|v| v.is_null()).unwrap_or(false) {
                 st.parent_id.clear();
             }
+            st.rev_tape += 1;
+            st.rev_tape_meta += 1;
+            st.rev_rack += 1;
+            st.rev_link += 1;
         }
         if let Some(wave) = lg.get("wave") {
             if let Some(b) = wave.get("back").and_then(|v| v.as_arr()) { st.wave_back = downsample_wave(b, 180); }
             if let Some(s) = wave.get("src").and_then(|v| v.as_arr()) { st.wave_src = downsample_wave(s, 180); }
+            st.rev_wave += 1;
+            st.rev_tape += 1;
         }
         if let Some(secs) = lg.get("sections").and_then(|v| v.as_arr()) {
             let mut parsed = Vec::with_capacity(secs.len());
@@ -1405,12 +1765,17 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 parsed.push(SectionInfo { idx: i, label, t0_ms: t0, t1_ms: t1, state });
             }
             st.sections = parsed;
+            st.rev_tape_meta += 1;
+            st.rev_lyrics += 1;
+            st.rev_link += 1;
         }
         if let Some(src_arr) = lg.get("src").and_then(|v| v.as_arr()) {
             st.src_lines = src_arr.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect();
             if st.out_lines.len() < st.src_lines.len() {
                 st.out_lines.resize(st.src_lines.len(), String::new());
             }
+            st.rev_lyrics += 1;
+            st.rev_link += 1;
         }
         if let Some(out_v) = lg.get("out") {
             if let Some(arr) = out_v.as_arr() {
@@ -1425,6 +1790,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                     }
                 }
             }
+            st.rev_lyrics += 1;
         }
         if let Some(chg_obj) = lg.get("chg").and_then(|v| v.as_obj()) {
             for (k, v) in chg_obj {
@@ -1448,6 +1814,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                     st.chg[idx] = pairs;
                 }
             }
+            st.rev_lyrics += 1;
         }
         if let Some(set_obj) = lg.get("settled").and_then(|v| v.as_obj()) {
             for (k, v) in set_obj {
@@ -1458,6 +1825,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                     st.settled[idx] = v.as_bool().unwrap_or(false);
                 }
             }
+            st.rev_lyrics += 1;
         }
         if let Some(parts) = lg.get("parts").and_then(|v| v.as_arr()) {
             st.parts_total = parts.len() as i32;
@@ -1472,6 +1840,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                             .unwrap_or(false)
                 })
                 .count() as i32;
+            st.rev_link += 1;
         }
         if let Some(words_lines) = lg.get("words").and_then(|v| v.as_arr()) {
             let mut times = Vec::with_capacity(words_lines.len());
@@ -1487,9 +1856,12 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 times.push(t0);
             }
             st.line_times_ms = times;
+            st.rev_lyrics += 1;
+            st.rev_tape += 1;
         }
         if let Some(line_n) = lg.get("line").and_then(|v| v.as_f64()) {
             st.line = line_n as i32;
+            st.rev_lyrics += 1;
         }
         if let Some(pos_at) = lg.get("pos_at") {
             if !st.scrubbing {
@@ -1501,30 +1873,42 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
             if let Some(r) = pos_at.get("rate").and_then(|v| v.as_f64()) {
                 if r > 0.1 && r < 4.0 { st.pos_rate = r; }
             }
+            st.rev_tape += 1;
         }
         let stage2_head_owns = st.head_runs && !st.head_live;
         if !stage2_head_owns {
             if let Some(tr) = lg.get("transport") {
                 if !tr.is_null() {
                     apply_transport(st, tr, now);
+                    st.rev_transport += 1;
+                    st.rev_tape += 1;
+                    st.rev_lyrics += 1;
                 }
             }
             if let Some(ack) = lg.get("ack") {
                 if !ack.is_null() {
                     apply_ack(st, ack);
+                    st.rev_transport += 1;
+                    st.rev_link += 1;
                 }
             }
         }
         if let Some(lp) = lg.get("loop") {
             if !stage2_head_owns {
                 apply_loop(st, lp);
+                st.rev_transport += 1;
+                st.rev_tape += 1;
+                st.rev_lyrics += 1;
             }
         }
+        let mut voice_chg = false;
         if let Some(v_id) = lg.get("voice").and_then(|v| v.as_str()) {
             st.voice_id = v_id.to_string();
+            voice_chg = true;
         }
         if let Some(sv_id) = lg.get("scratch_voice").and_then(|v| v.as_str()) {
             st.scratch_voice_id = sv_id.to_string();
+            voice_chg = true;
         }
         if let Some(s_arr) = lg.get("singers").and_then(|v| v.as_arr()) {
             let mut list = Vec::with_capacity(s_arr.len());
@@ -1540,6 +1924,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
             }
             st.singers = list;
+            voice_chg = true;
         }
         if let Some(sg) = lg.get("singer") {
             if sg.is_null() {
@@ -1568,6 +1953,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                     None => st.singer_why.clear(),
                 }
             }
+            voice_chg = true;
         }
         if let Some(voices_arr) = lg.get("voices").and_then(|v| v.as_arr()) {
             let mut parsed = Vec::new();
@@ -1641,7 +2027,13 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
                 parsed.push(VoiceInfo { id, name, kind, state, params, fit });
             }
-            if !parsed.is_empty() { st.voices = parsed; }
+            if !parsed.is_empty() {
+                st.voices = parsed;
+                voice_chg = true;
+            }
+        }
+        if voice_chg {
+            st.rev_voice += 1;
         }
         if let Some(bands_arr) = lg.get("bands").and_then(|v| v.as_arr()) {
             let old_vals: Vec<(String, f32)> = st.bands.iter().map(|b| (b.id.clone(), b.value)).collect();
@@ -1685,6 +2077,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 });
             }
             st.bands = parsed;
+            st.rev_bands += 1;
         }
         if let Some(fx_obj) = lg.get("fx").and_then(|v| v.as_obj()) {
             for (k, v) in fx_obj {
@@ -1693,6 +2086,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                     if &b.id == k { b.fx_count = n; }
                 }
             }
+            st.rev_bands += 1;
         }
         if let Some(saves_arr) = lg.get("saves").and_then(|v| v.as_arr()) {
             let mut saves = Vec::new();
@@ -1705,6 +2099,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
             }
             st.saves = saves;
+            st.rev_rack += 1;
         }
         if let Some(lib_arr) = lg.get("library").and_then(|v| v.as_arr()) {
             let mut lib = Vec::new();
@@ -1717,6 +2112,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
             }
             st.library = lib;
+            st.rev_rack += 1;
         }
     }
     st.rev += 1;

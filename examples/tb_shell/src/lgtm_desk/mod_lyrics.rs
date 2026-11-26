@@ -171,7 +171,7 @@ impl DeskModule for LyricsModule {
         if cur > 0 {
             let pr = self.prev_rect();
             let prev_txt = st.line_text_at(cur - 1);
-            let prev_chg = st.chg.get(cur - 1).map(|v| !v.is_empty()).unwrap_or(false);
+            let prev_chg = !st.line_chg_at(cur - 1).is_empty();
             let col = if prev_chg {
                 vec4(0.68, 0.78, 0.90, 0.90)
             } else {
@@ -191,7 +191,7 @@ impl DeskModule for LyricsModule {
 
         let out_s = st.line_text_at(cur);
         let src_s = st.src_lines.get(cur).map(|s| s.as_str()).unwrap_or("");
-        let chg_pairs = st.chg.get(cur).map(|v| v.as_slice()).unwrap_or(&[]);
+        let chg_pairs = st.line_chg_at(cur);
 
         // Right-edge status pills inside active card ([LOOP] / [FIRM] / change count)
         let mut right_reserve = 6.0f32;
@@ -273,7 +273,7 @@ impl DeskModule for LyricsModule {
         if cur + 1 < total {
             let nr = self.next_rect();
             let next_txt = st.line_text_at(cur + 1);
-            let next_chg = st.chg.get(cur + 1).map(|v| !v.is_empty()).unwrap_or(false);
+            let next_chg = !st.line_chg_at(cur + 1).is_empty();
             let col = if next_chg {
                 vec4(0.74, 0.84, 0.96, 0.92)
             } else {

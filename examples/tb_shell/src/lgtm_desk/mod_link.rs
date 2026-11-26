@@ -125,7 +125,7 @@ impl DeskModule for LinkModule {
             &ln_val,
         );
 
-        // Row 3: What is being sung now / ack refusal / engine note
+        // Row 3: Left = active singing / ack / note; Right = live FPS + worst frame gap meter
         let singing_sec = st.sections.iter().find(|s| s.state == "singing");
         let (foot_txt, foot_col) = if let Some(sec) = singing_sec {
             let nm = if sec.label.is_empty() {
@@ -133,7 +133,10 @@ impl DeskModule for LinkModule {
             } else {
                 sec.label.clone()
             };
-            (format!("SINGING · {}", nm), vec4(0.84, 0.68, 1.0, 0.98))
+            (format!("SING · {}", nm), vec4(0.84, 0.68, 1.0, 0.98))
+        } else if st.singer_state == "singing" || st.singer_state == "loading" {
+            let nm = if st.singer_id.is_empty() { "singer" } else { st.singer_id.as_str() };
+            (format!("{} {}", nm, st.singer_state), vec4(0.84, 0.68, 1.0, 0.98))
         } else if st.ack_state == "refused" && !st.ack_why.is_empty() {
             (format!("REFUSED · {}", st.ack_why), vec4(0.98, 0.58, 0.60, 0.98))
         } else if st.ack_state == "queued" && !st.ack_name.is_empty() {
@@ -148,7 +151,23 @@ impl DeskModule for LinkModule {
         } else {
             (st.transport_state.clone(), vec4(0.72, 0.80, 0.90, 0.90))
         };
-        p.text_clip(r.x + 6.0, r.bottom() - 4.8, r.w - 12.0, 4.8, foot_col, TextAlign::Left, &foot_txt);
+
+        let (perf_txt, perf_col) = if st.perf_fps < 0.5 && st.perf_max_gap_ms < 0.5 {
+            ("0f · idle".to_string(), vec4(0.54, 0.64, 0.76, 0.92))
+        } else {
+            let gap = st.perf_max_gap_ms.max(0.0);
+            let col = if gap <= 36.0 {
+                vec4(0.30, 0.94, 0.60, 1.0)
+            } else if gap <= 60.0 {
+                vec4(0.98, 0.78, 0.28, 1.0)
+            } else {
+                vec4(0.98, 0.36, 0.38, 1.0)
+            };
+            (format!("{:.0}f · {:.0}ms", st.perf_fps.max(0.0).round(), gap.round()), col)
+        };
+        let foot_y = r.bottom() - 4.8;
+        p.text_clip(r.x + 6.0, foot_y, r.w - 48.0, 4.7, foot_col, TextAlign::Left, &foot_txt);
+        p.text(r.right() - 6.0, foot_y, 4.6, perf_col, TextAlign::Right, &perf_txt);
     }
 
     fn hit_control(&self, px: f32, py: f32, _st: &DeskState) -> Option<ControlHit> {

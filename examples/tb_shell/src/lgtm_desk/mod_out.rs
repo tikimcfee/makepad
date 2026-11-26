@@ -18,7 +18,7 @@ pub struct OutModule {
     grab_start_val: f32,
     last_time: f64,
     last_out_rev: u64,
-    last_sent: Option<Instant>,
+    local_hold_until: [Option<Instant>; 4],
 }
 
 impl Default for OutModule {
@@ -32,7 +32,7 @@ impl Default for OutModule {
             grab_start_val: 0.0,
             last_time: 0.0,
             last_out_rev: 0,
-            last_sent: None,
+            local_hold_until: [None; 4],
         }
     }
 }
@@ -56,24 +56,27 @@ impl OutModule {
             return;
         }
         self.last_out_rev = st.out_rev;
+        let now = Instant::now();
         let incoming = [st.out_level, st.out_balance, st.out_tone, st.out_duck];
         for i in 0..4 {
-            if self.grabbed != Some(i) && self.vel[i].abs() < 0.01 {
-                self.val[i] = incoming[i].clamp(0.0, 1.0);
+            let v = incoming[i].clamp(0.0, 1.0);
+            if self.grabbed == Some(i) || self.vel[i].abs() >= 0.01 {
+                continue;
             }
+            if let Some(until) = self.local_hold_until[i] {
+                if (v - self.val[i]).abs() <= 0.008 || now >= until {
+                    self.local_hold_until[i] = None;
+                } else {
+                    // Stale store echo right after release: keep local-first cap position
+                    continue;
+                }
+            }
+            self.val[i] = v;
         }
     }
 
-    fn emit_out(&mut self, cmds: &mut DeskCmds, force: bool) {
-        let now = Instant::now();
-        if !force {
-            if let Some(last) = self.last_sent {
-                if now.duration_since(last) < Duration::from_millis(45) {
-                    return;
-                }
-            }
-        }
-        self.last_sent = Some(now);
+    fn emit_out(&self, cmds: &mut DeskCmds) {
+        // DeskViewport coalesces OutPatch to <=1/frame, sends instant head datagrams, and throttles store <=5Hz
         cmds.out_patch(self.val[0], self.val[1], self.val[2], self.val[3]);
     }
 
@@ -109,20 +112,25 @@ impl DeskModule for OutModule {
     fn step(&mut self, dt: f32, _st: &DeskState, cmds: &mut DeskCmds) {
         let dt = dt.clamp(0.001, 0.05);
         for i in 0..4 {
-            if self.grabbed != Some(i) && self.vel[i].abs() > 0.01 {
+            if self.grabbed == Some(i) {
+                self.disp[i] = self.val[i];
+                continue;
+            }
+            if self.vel[i].abs() > 0.01 {
                 self.val[i] = (self.val[i] + self.vel[i] * dt).clamp(0.0, 1.0);
+                self.disp[i] = self.val[i];
                 self.vel[i] *= (-8.5 * dt).exp();
                 if self.vel[i].abs() <= 0.01 {
                     self.vel[i] = 0.0;
-                    self.emit_out(cmds, true);
-                } else {
-                    self.emit_out(cmds, false);
+                    self.local_hold_until[i] = Some(Instant::now() + Duration::from_millis(450));
                 }
-            }
-            let diff = self.val[i] - self.disp[i];
-            self.disp[i] += diff * (1.0 - (-18.0 * dt).exp());
-            if diff.abs() < 0.003 {
-                self.disp[i] = self.val[i];
+                self.emit_out(cmds);
+            } else {
+                let diff = self.val[i] - self.disp[i];
+                self.disp[i] += diff * (1.0 - (-18.0 * dt).exp());
+                if diff.abs() < 0.003 {
+                    self.disp[i] = self.val[i];
+                }
             }
         }
     }
@@ -167,6 +175,7 @@ impl DeskModule for OutModule {
             TouchKind::Down => {
                 self.grabbed = Some(idx);
                 self.vel[idx] = 0.0;
+                self.disp[idx] = self.val[idx];
                 self.grab_start_y = ev.y;
                 self.grab_start_val = self.val[idx];
                 self.last_time = ev.time;
@@ -177,18 +186,21 @@ impl DeskModule for OutModule {
                 let prev = self.val[idx];
                 let dy = self.grab_start_y - ev.y; // up = positive
                 let next = (self.grab_start_val + dy / h.max(10.0)).clamp(0.0, 1.0);
+                // Local-first: cap tracks finger immediately on this touch event with zero store/spring lag
                 self.val[idx] = next;
+                self.disp[idx] = next;
                 let dt = (ev.time - self.last_time).clamp(0.008, 0.08) as f32;
                 self.last_time = ev.time;
                 let inst_v = ((next - prev) / dt).clamp(-4.5, 4.5);
                 self.vel[idx] = self.vel[idx] * 0.45 + inst_v * 0.55;
-                self.emit_out(cmds, false);
+                self.emit_out(cmds);
             }
             TouchKind::Up => {
                 self.grabbed = None;
+                self.local_hold_until[idx] = Some(Instant::now() + Duration::from_millis(450));
                 if self.vel[idx].abs() < 0.25 {
                     self.vel[idx] = 0.0;
-                    self.emit_out(cmds, true);
+                    self.emit_out(cmds);
                 }
                 cmds.request_redraw = true;
             }
@@ -196,7 +208,9 @@ impl DeskModule for OutModule {
                 self.grabbed = None;
                 self.vel[idx] = 0.0;
                 self.val[idx] = REST[idx];
-                self.emit_out(cmds, true);
+                self.disp[idx] = REST[idx];
+                self.local_hold_until[idx] = Some(Instant::now() + Duration::from_millis(450));
+                self.emit_out(cmds);
             }
         }
     }

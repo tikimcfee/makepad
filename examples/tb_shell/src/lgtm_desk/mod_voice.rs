@@ -18,8 +18,10 @@ pub struct VoiceModule {
     param_bank: usize,
     grabbed_knob: Option<usize>,
     last_angle: f32,
-    last_sent: Option<Instant>,
     last_voice_id: String,
+    local_knob_hold: [Option<Instant>; 2],
+    opt_singer: Option<(Option<String>, Instant)>,
+    opt_voice: Option<(String, Instant)>,
 }
 
 impl Default for VoiceModule {
@@ -30,8 +32,10 @@ impl Default for VoiceModule {
             param_bank: 0,
             grabbed_knob: None,
             last_angle: 0.0,
-            last_sent: None,
             last_voice_id: String::new(),
+            local_knob_hold: [None; 2],
+            opt_singer: None,
+            opt_voice: None,
         }
     }
 }
@@ -111,10 +115,44 @@ impl VoiceModule {
         }
     }
 
+    fn effective_singer<'a>(&'a self, st: &'a DeskState) -> Option<&'a str> {
+        let now = Instant::now();
+        if let Some((ref opt, until)) = self.opt_singer {
+            if now < until {
+                return opt.as_deref();
+            }
+        }
+        if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) }
+    }
+
+    fn effective_voice_id<'a>(&'a self, st: &'a DeskState) -> &'a str {
+        let now = Instant::now();
+        if let Some((ref vid, until)) = self.opt_voice {
+            if now < until {
+                return vid.as_str();
+            }
+        }
+        st.voice_id.as_str()
+    }
+
     pub fn sync_from_state(&mut self, st: &DeskState) {
-        if st.voice_id != self.last_voice_id {
-            self.last_voice_id = st.voice_id.clone();
+        let now = Instant::now();
+        if let Some((ref opt, until)) = self.opt_singer {
+            let st_opt = if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) };
+            if opt.as_deref() == st_opt || now >= until {
+                self.opt_singer = None;
+            }
+        }
+        if let Some((ref vid, until)) = self.opt_voice {
+            if vid.as_str() == st.voice_id.as_str() || now >= until {
+                self.opt_voice = None;
+            }
+        }
+        let eff_vid = self.effective_voice_id(st).to_string();
+        if eff_vid != self.last_voice_id {
+            self.last_voice_id = eff_vid;
             self.param_bank = 0;
+            self.local_knob_hold = [None; 2];
         }
         let banks = self.param_bank_count(st);
         if self.param_bank >= banks {
@@ -126,35 +164,32 @@ impl VoiceModule {
                 if self.grabbed_knob == Some(slot) {
                     continue;
                 }
-                if let Some(p) = v.params.get(base + slot) {
-                    self.knob_val[slot] = if !p.steps.is_empty() {
+                let incoming = if let Some(p) = v.params.get(base + slot) {
+                    if !p.steps.is_empty() {
                         if p.steps.len() > 1 { p.step_idx as f32 / (p.steps.len() - 1) as f32 } else { 0.5 }
                     } else {
                         let span = (p.max - p.min).max(1e-4);
                         ((p.value - p.min) / span).clamp(0.0, 1.0)
-                    };
+                    }
                 } else {
-                    self.knob_val[slot] = 0.0;
+                    0.0
+                };
+                if let Some(until) = self.local_knob_hold[slot] {
+                    if (incoming - self.knob_val[slot]).abs() <= 0.015 || now >= until {
+                        self.local_knob_hold[slot] = None;
+                    } else {
+                        continue;
+                    }
                 }
+                self.knob_val[slot] = incoming;
             }
         }
     }
 
-    fn commit_knob(&mut self, slot: usize, st: &DeskState, cmds: &mut DeskCmds, force: bool) {
-        let now = Instant::now();
-        if !force {
-            if let Some(last) = self.last_sent {
-                if now.duration_since(last) < Duration::from_millis(55) {
-                    return;
-                }
-            }
-        }
-        self.last_sent = Some(now);
+    fn commit_knob(&mut self, slot: usize, st: &DeskState, cmds: &mut DeskCmds) {
         let pi = self.param_bank * 2 + slot;
         let Some(v) = st.active_voice() else { return; };
         let Some(p) = v.params.get(pi) else { return; };
-        let vesc = json_escape(&v.id);
-        let pid = json_escape(&p.id);
         if !p.steps.is_empty() {
             let n = p.steps.len();
             let si = if n > 1 {
@@ -162,16 +197,19 @@ impl VoiceModule {
             } else {
                 0
             };
-            self.knob_val[slot] = if n > 1 { si as f32 / (n - 1) as f32 } else { 0.5 };
+            let snapped = if n > 1 { si as f32 / (n - 1) as f32 } else { 0.5 };
+            self.knob_disp[slot] = snapped;
             let raw = if p.step_is_num {
                 p.steps[si].clone()
             } else {
                 format!("\"{}\"", json_escape(&p.steps[si]))
             };
-            cmds.cmd("voice_param", &format!("{{\"voice\":\"{}\",\"id\":\"{}\",\"value\":{}}}", vesc, pid, raw));
+            // DeskViewport coalesces VoiceParam to <=1/frame and skips unchanged values/steps!
+            cmds.voice_param(&v.id, &p.id, &raw);
         } else {
             let real_v = p.min + self.knob_val[slot].clamp(0.0, 1.0) * (p.max - p.min);
-            cmds.cmd("voice_param", &format!("{{\"voice\":\"{}\",\"id\":\"{}\",\"value\":{:.3}}}", vesc, pid, real_v));
+            let q = (real_v * 100.0).round() / 100.0;
+            cmds.voice_param(&v.id, &p.id, &format!("{:.2}", q));
         }
     }
 
@@ -248,10 +286,10 @@ impl DeskModule for VoiceModule {
 
         // Stepped SINGER selector (`lgtm.singers` / `lgtm.singer`: none, yingmusic, soulx, acestep, vevo2)
         let choices = self.singer_choices(st);
-        let cur_opt = if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) };
+        let cur_opt = self.effective_singer(st);
         let s_idx = choices.iter().position(|c| c.as_deref() == cur_opt).unwrap_or(0);
         let s_name = cur_opt.unwrap_or("none");
-        let s_active = !st.singer_id.is_empty();
+        let s_active = cur_opt.is_some();
         let s_accent = match st.singer_state.as_str() {
             "error" | "refused" | "failed" => vec4(0.96, 0.34, 0.36, 1.0),
             "singing" | "loading" => vec4(0.80, 0.52, 1.0, 1.0),
@@ -269,8 +307,9 @@ impl DeskModule for VoiceModule {
         );
 
         // Stepped SCRATCH selector (`lgtm.voices` / `lgtm.voice`) + BANK pill for its 2 param knobs
-        let v_idx = st.voices.iter().position(|v| v.id == st.voice_id).unwrap_or(0);
-        let v_name = st.active_voice().map(|v| v.id.as_str()).unwrap_or(&st.voice_id);
+        let eff_vid = self.effective_voice_id(st);
+        let v_idx = st.voices.iter().position(|v| v.id == eff_vid).unwrap_or(0);
+        let v_name = st.voices.get(v_idx).map(|v| v.id.as_str()).unwrap_or(eff_vid);
         p.selector(
             self.scratch_rect(),
             "SCRATCH",
@@ -330,22 +369,26 @@ impl DeskModule for VoiceModule {
             CTRL_SINGER => {
                 if ev.kind == TouchKind::Up {
                     let choices = self.singer_choices(st);
-                    let cur_opt = if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) };
+                    let cur_opt = self.effective_singer(st);
                     let cur = choices.iter().position(|c| c.as_deref() == cur_opt).unwrap_or(0);
-                    let next = &choices[(cur + 1) % choices.len().max(1)];
+                    let next = choices[(cur + 1) % choices.len().max(1)].clone();
+                    // Local-first: flip selector immediately without waiting for monolith1
+                    self.opt_singer = Some((next.clone(), Instant::now() + Duration::from_millis(1500)));
                     match next {
                         None => cmds.cmd_pending("singer", "{\"id\":null}", "singer"),
-                        Some(id) => cmds.cmd_pending("singer", &format!("{{\"id\":\"{}\"}}", json_escape(id)), "singer"),
+                        Some(id) => cmds.cmd_pending("singer", &format!("{{\"id\":\"{}\"}}", json_escape(&id)), "singer"),
                     }
                 }
             }
             CTRL_SCRATCH => {
                 if ev.kind == TouchKind::Up && !st.voices.is_empty() {
-                    let cur = st.voices.iter().position(|v| v.id == st.voice_id).unwrap_or(0);
+                    let eff_vid = self.effective_voice_id(st);
+                    let cur = st.voices.iter().position(|v| v.id == eff_vid).unwrap_or(0);
                     let next = (cur + 1) % st.voices.len();
-                    let vid = &st.voices[next].id;
+                    let vid = st.voices[next].id.clone();
                     self.param_bank = 0;
-                    cmds.cmd_pending("voice", &format!("{{\"id\":\"{}\"}}", json_escape(vid)), "voice");
+                    self.opt_voice = Some((vid.clone(), Instant::now() + Duration::from_millis(1500)));
+                    cmds.cmd_pending("voice", &format!("{{\"id\":\"{}\"}}", json_escape(&vid)), "voice");
                 }
             }
             CTRL_BANK => {
@@ -362,6 +405,7 @@ impl DeskModule for VoiceModule {
                 match ev.kind {
                     TouchKind::Down => {
                         self.grabbed_knob = Some(slot);
+                        self.knob_disp[slot] = self.knob_val[slot];
                         self.last_angle = (-(ev.y - cy)).atan2(ev.x - cx);
                         cmds.request_redraw = true;
                     }
@@ -379,15 +423,22 @@ impl DeskModule for VoiceModule {
                             -ev.dy / 22.0
                         };
                         self.last_angle = ang;
-                        self.knob_val[slot] = (self.knob_val[slot] + delta).clamp(0.0, 1.0);
-                        self.commit_knob(slot, st, cmds, false);
+                        let next = (self.knob_val[slot] + delta).clamp(0.0, 1.0);
+                        // Local-first: knob follows finger straight from touch event
+                        self.knob_val[slot] = next;
+                        self.knob_disp[slot] = next;
+                        self.commit_knob(slot, st, cmds);
+                        cmds.request_redraw = true;
                     }
                     TouchKind::Up => {
                         self.grabbed_knob = None;
-                        self.commit_knob(slot, st, cmds, true);
+                        self.local_knob_hold[slot] = Some(Instant::now() + Duration::from_millis(450));
+                        self.commit_knob(slot, st, cmds);
+                        cmds.request_redraw = true;
                     }
                     TouchKind::DoubleTap => {
                         self.grabbed_knob = None;
+                        self.local_knob_hold[slot] = Some(Instant::now() + Duration::from_millis(450));
                         let pi = self.param_bank * 2 + slot;
                         if let Some(v) = st.active_voice() {
                             if let Some(p) = v.params.get(pi) {
@@ -397,9 +448,11 @@ impl DeskModule for VoiceModule {
                                     let span = (p.max - p.min).max(1e-4);
                                     ((p.rest - p.min) / span).clamp(0.0, 1.0)
                                 };
+                                self.knob_disp[slot] = self.knob_val[slot];
                             }
                         }
-                        self.commit_knob(slot, st, cmds, true);
+                        self.commit_knob(slot, st, cmds);
+                        cmds.request_redraw = true;
                     }
                 }
             }
