@@ -87,7 +87,7 @@ fn jit_scope(slot_name: &str) -> Option<Vec<String>> {
         .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '%' || c == '.'))
         .unwrap_or_else(|| "1800M".to_string());
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    Some(vec![
+    let mut args: Vec<String> = vec![
         "--user".into(),
         "--scope".into(),
         "--quiet".into(),
@@ -96,7 +96,23 @@ fn jit_scope(slot_name: &str) -> Option<Vec<String>> {
         format!("--description=tb-shell JIT guest {slot_name}"),
         format!("-pMemoryMax={max}"),
         "-pMemorySwapMax=0".into(),
-    ])
+    ];
+    // Out of tb-shell's cgroup, a guest would outlive the shell (a crash, a restart, the
+    // session's end): bound to the shell's unit, its scope is stopped with it. A guest left
+    // behind also maps the old Android property area and blocks tinybot-lxc-cleanup's re-arm.
+    if let Some(unit) = own_service_unit() {
+        args.push(format!("-pBindsTo={unit}"));
+        args.push(format!("-pAfter={unit}"));
+    }
+    Some(args)
+}
+
+/// The systemd unit tb-shell runs in (`tb-shell.service`), from its own cgroup, if it is a service.
+fn own_service_unit() -> Option<String> {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let unit = path.rsplit('/').next().filter(|seg| seg.ends_with(".service"))?;
+    unit.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@:\\".contains(c)).then(|| unit.to_string())
 }
 
 pub struct JitFrame {
