@@ -80,6 +80,8 @@ enum Ev {
     Socket(JsonValue),
     SocketClosed,
     FsChanged,
+    /// speaker-state changed: only that file is read again
+    SpeakerChanged,
     DelayedRefresh,
 }
 
@@ -94,10 +96,32 @@ fn opt_str(v: Option<&String>) -> JsonValue {
     v.map(|s| JsonValue::String(s.clone())).unwrap_or(JsonValue::Null)
 }
 
-/// Reads `--volume get` and `/run/tinybot/speaker-state`, returning `(floor_db, top_db, patch_obj)`.
+/// The last `tb-sound --volume get` answer, and whether it must be asked again. The speaker
+/// service rewrites speaker-state about once a second while a stream plays (its current and
+/// guard readings): those changes re-read only that file. The stored volume and the guard's
+/// settings change only through tb-sound, so `--volume get` (a sudo and a process) runs when
+/// one of those could have changed it: the bridge's volume-bridge.last, a view shown, the panel
+/// on, an emit from a view, or after this helper's own calls (2026-11-25: it ran every second
+/// while lgtm audio played).
+static VOLUME_CACHE: Mutex<Option<String>> = Mutex::new(None);
+static VOLUME_DIRTY: AtomicBool = AtomicBool::new(true);
+
+fn volume_dirty() {
+    VOLUME_DIRTY.store(true, Ordering::SeqCst);
+}
+
+/// Reads `--volume get` (when dirty, else the cached answer) and `/run/tinybot/speaker-state`,
+/// returning `(floor_db, top_db, patch_obj)`.
 fn read_fast_state(cfg: &Config) -> (f64, f64, Vec<(&'static str, JsonValue)>) {
-    let vol_res = run_root_tool(&cfg.sound_bin, &["--volume", "get"], Duration::from_secs(5), None);
-    let vol_kv = parse_kv(&vol_res.stdout);
+    let vol_out = {
+        let mut cache = VOLUME_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if VOLUME_DIRTY.swap(false, Ordering::SeqCst) || cache.is_none() {
+            let vol_res = run_root_tool(&cfg.sound_bin, &["--volume", "get"], Duration::from_secs(5), None);
+            *cache = Some(vol_res.stdout);
+        }
+        cache.clone().unwrap_or_default()
+    };
+    let vol_kv = parse_kv(&vol_out);
 
     let spk_text = std::fs::read_to_string(&cfg.speaker_state_path).unwrap_or_default();
     let spk_kv = parse_kv(&spk_text);
@@ -435,20 +459,16 @@ fn main() {
         });
     }
 
-    // Inotify watcher thread for speaker-state and volume-bridge.last (zero wakeups at rest).
-    {
-        let mut watches = Vec::new();
-        if let Some(p) = Path::new(&cfg.speaker_state_path).parent() {
-            if let Some(fname) = Path::new(&cfg.speaker_state_path).file_name() {
-                watches.push((
-                    p.to_string_lossy().to_string(),
-                    vec![fname.to_string_lossy().to_string()],
-                ));
-            }
-        }
-        if let Some(dir) = &cfg.volume_bridge_dir {
-            watches.push((dir.clone(), vec!["volume-bridge.last".to_string()]));
-        }
+    // Inotify watcher threads for speaker-state and volume-bridge.last (zero wakeups at rest).
+    if let (Some(p), Some(fname)) = (Path::new(&cfg.speaker_state_path).parent(), Path::new(&cfg.speaker_state_path).file_name()) {
+        let watches = vec![(p.to_string_lossy().to_string(), vec![fname.to_string_lossy().to_string()])];
+        let tx = tx.clone();
+        spawn_inotify_watcher(watches, move || {
+            let _ = tx.send(Ev::SpeakerChanged);
+        });
+    }
+    if let Some(dir) = &cfg.volume_bridge_dir {
+        let watches = vec![(dir.clone(), vec!["volume-bridge.last".to_string()])];
         let tx = tx.clone();
         spawn_inotify_watcher(watches, move || {
             let _ = tx.send(Ev::FsChanged);
@@ -471,13 +491,22 @@ fn main() {
     while let Ok(msg) = rx.recv() {
         match msg {
             Ev::SocketClosed => break,
+            Ev::SpeakerChanged => {
+                if let Ok(v) = publish_fast(&writer, &cfg, vec![], Some(&mut last_fast_json)) {
+                    (floor_db, top_db) = v;
+                }
+            }
             Ev::FsChanged | Ev::DelayedRefresh => {
+                volume_dirty();
                 if let Ok(v) = publish_fast(&writer, &cfg, vec![], Some(&mut last_fast_json)) {
                     (floor_db, top_db) = v;
                 }
             }
             Ev::Socket(ev) => {
                 let kind = ev.get("ev").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(kind, "shown" | "panel" | "emit") {
+                    volume_dirty();
+                }
                 match kind {
                     "shown" => {
                         if let Ok(v) = publish_fast(&writer, &cfg, vec![], Some(&mut last_fast_json)) {
