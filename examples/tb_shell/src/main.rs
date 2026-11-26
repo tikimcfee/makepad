@@ -29,7 +29,7 @@ use makepad_widgets::splash_host::take_splash_host_requests;
 use makepad_widgets::*;
 use shell::{GuardView, SafeArea, Shell, ShellAction};
 use stage::{SlotMode, Stage, StageLayer, StageMode, StageSlot};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
@@ -319,6 +319,11 @@ struct State {
     split: split::Split,
     trace: paneltrace::PanelTrace,
     render_pending: Vec<(String, WidgetRef)>,
+    /// store keys touched since the last frame, by the surface that reads them: fed once a frame
+    /// (lgtm day two: a drag set keys 30 times a second and each set re-marshalled whole values)
+    feed_pending: BTreeMap<String, BTreeSet<String>>,
+    /// surfaces that were not shown when their keys changed: fed in full when they are shown
+    unfed: HashSet<String>,
     stale: HashSet<String>,
     render_frame: NextFrame,
     watch_frame: NextFrame,
@@ -383,6 +388,7 @@ impl AppMain for App {
         self.st.trace.event(event);
         self.check_panel(cx);
         if self.st.render_frame.is_event(event).is_some() {
+            self.flush_feeds(cx);
             self.render_pending(cx);
         }
         if let Event::Signal = event {
@@ -1253,6 +1259,7 @@ impl App {
             self.update_strip_status(cx);
             self.arm_clock_timer(cx);
             self.sync_visibility_and_lifecycle(cx);
+            self.flush_feeds(cx);
             self.render_pending(cx);
             cx.redraw_all();
             self.st.panel_wake_ticks = 2;
@@ -1363,6 +1370,8 @@ impl App {
         self.st.parked.insert(name.to_string());
         self.st.slot_prelude_cache.remove(name);
         self.st.stale.remove(name);
+        self.st.feed_pending.remove(name);
+        self.st.unfed.remove(name);
     }
 
     fn park_timer_bearing_hidden(&mut self, cx: &mut Cx) {
@@ -1415,7 +1424,13 @@ impl App {
         for s in &added {
             self.st.warm_lru.retain(|x| x != s);
             self.ensure_surface_live(cx, s);
-            if self.st.stale.remove(s) {
+            if self.st.unfed.remove(s) {
+                // its keys changed while it was hidden: everything it reads, once, now
+                self.st.stale.remove(s);
+                if let Some(splash) = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(s)) {
+                    self.feed_all(cx, s, &splash);
+                }
+            } else if self.st.stale.remove(s) {
                 if let Some(splash) = self.shell(cx).borrow::<Shell>().and_then(|sh| sh.surface(s)) {
                     self.queue_render(cx, s, &splash);
                 }
@@ -2785,6 +2800,8 @@ impl App {
         self.st.bodies.remove(name);
         self.st.parked.remove(name);
         self.st.stale.remove(name);
+        self.st.feed_pending.remove(name);
+        self.st.unfed.remove(name);
         self.st.warm_lru.retain(|n| n != name);
         self.st.slot_prelude_cache.remove(name);
         self.st.slot_dims.remove(name);
@@ -2875,6 +2892,29 @@ impl App {
             split.timed(2, || inner.call_script_fn_with_strings(cx, live_id!(__assign), &[&text]));
         }
         self.queue_render(cx, name, splash);
+    }
+
+    /// The keys touched since the last frame, fed to the surfaces that read them: a shown surface
+    /// gets one marshal of each key however many sets came; a hidden one gets none, and is fed in
+    /// full when it is shown (sync_visibility_and_lifecycle).
+    fn flush_feeds(&mut self, cx: &mut Cx) {
+        if self.st.feed_pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.st.feed_pending);
+        let shell = self.shell(cx);
+        for (name, keys) in pending {
+            if self.st.parked.contains(&name) {
+                continue;
+            }
+            if !self.st.visible.contains(&name) {
+                self.st.unfed.insert(name);
+                continue;
+            }
+            let Some(splash) = shell.borrow::<Shell>().and_then(|sh| sh.surface(&name)) else { continue };
+            let keys: Vec<String> = keys.into_iter().collect();
+            self.feed(cx, &name, &splash, &keys);
+        }
     }
 
     fn render_pending(&mut self, cx: &mut Cx) {
@@ -2989,14 +3029,23 @@ impl App {
                     None => continue,
                 };
                 if !keys.is_empty() {
-                    self.feed(cx, &name, &splash, &keys);
+                    // not now: once a frame, merged with whatever else changed before it
+                    let _ = splash;
+                    self.st.feed_pending.entry(name).or_default().extend(keys);
                 }
             }
+            if !self.st.feed_pending.is_empty() {
+                self.st.render_frame = cx.new_next_frame();
+            }
         }
-        let ev = obj(vec![("ev", "set".into()), ("patch", patch.clone()), ("by", by.into())]).serialize_json();
+        // serialized only if someone watches these keys (a 49 KB patch is not free)
+        let mut ev: Option<String> = None;
         for c in self.st.conns.values() {
             if c.watch.as_ref().map_or(false, |w| w.wants_keys(&touched)) {
-                let _ = c.tx.send(ev.clone());
+                let line = ev.get_or_insert_with(|| {
+                    obj(vec![("ev", "set".into()), ("patch", patch.clone()), ("by", by.into())]).serialize_json()
+                });
+                let _ = c.tx.send(line.clone());
             }
         }
     }
