@@ -7,7 +7,7 @@ pub use makepad_widgets;
 mod chat_feed;
 mod io;
 mod jit_slot;
-mod lgtm_deck;
+mod lgtm_desk;
 mod library;
 mod paneltrace;
 mod sched;
@@ -358,11 +358,11 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         chat_feed::script_mod(vm);
         termd_view::script_mod(vm);
-        lgtm_deck::script_mod(vm);
+        lgtm_desk::script_mod(vm);
         makepad_widgets::widget_async::register_splash_isolate_mod(stream::isolate_mod);
         makepad_widgets::widget_async::register_splash_isolate_mod(chat_feed::isolate_mod);
         makepad_widgets::widget_async::register_splash_isolate_mod(termd_view::isolate_mod);
-        makepad_widgets::widget_async::register_splash_isolate_mod(lgtm_deck::isolate_mod);
+        makepad_widgets::widget_async::register_splash_isolate_mod(lgtm_desk::isolate_mod);
         crate::shell::script_mod(vm);
         self::script_mod(vm)
     }
@@ -1431,7 +1431,7 @@ impl App {
             sh.jit.sync_visibility(&self.st.visible, self.st.panel_off);
         }
         termd_view::sync_global_visibility(&self.st.visible, &self.st.bodies, self.st.panel_off);
-        lgtm_deck::sync_visibility(&self.st.visible, &self.st.bodies, self.st.panel_off);
+        lgtm_desk::sync_visibility(&self.st.visible, &self.st.bodies, self.st.panel_off);
         if !self.st.panel_off && added.iter().any(|s| matches!(s.as_str(), "terminal" | "agents" | "home")) {
             if let Some(ref tb) = self.st.termd {
                 tb.probe_disconnected();
