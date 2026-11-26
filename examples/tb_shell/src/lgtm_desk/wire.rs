@@ -1587,6 +1587,20 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                 }
                 st.live_fx = fxs;
             }
+            if let Some(ack) = lv.get("ack") {
+                if !ack.is_null() {
+                    let seq = ack
+                        .get("seq")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| n.max(0.0) as u64)
+                        .unwrap_or(st.ack_seq);
+                    if seq >= st.ack_seq {
+                        apply_ack(st, ack);
+                        st.rev_transport += 1;
+                        st.rev_link += 1;
+                    }
+                }
+            }
         }
         st.rev_live += 1;
     }

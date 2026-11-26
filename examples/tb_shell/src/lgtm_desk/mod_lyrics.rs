@@ -231,12 +231,12 @@ impl DeskModule for LyricsModule {
         } else {
             let mut x = cr.x + 3.5;
             let sz = 5.0f32;
-            let char_w = sz * 0.56;
+            let char_w = sz * 0.62;
             for (wi, word) in out_s.split_whitespace().enumerate() {
                 let w_chars = word.chars().count() as f32;
                 let band_opt = chg_band_for(chg_pairs, wi);
-                let pad = if band_opt.is_some() { 3.2 } else { 0.8 };
-                let w_u = (w_chars * char_w + pad).max(4.8);
+                let pad = if band_opt.is_some() { 3.4 } else { 0.8 };
+                let w_u = (w_chars * char_w + pad).max(5.2);
                 if x + w_u > max_x {
                     if x + 4.0 <= max_x {
                         p.text(x, row_y, sz, vec4(0.75, 0.82, 0.92, 0.9), TextAlign::Left, "…");
@@ -251,7 +251,7 @@ impl DeskModule for LyricsModule {
                 } else {
                     p.text(x, row_y, sz, vec4(0.96, 0.98, 1.0, 1.0), TextAlign::Left, word);
                 }
-                x += w_u + 1.8;
+                x += w_u + 2.4;
             }
         }
 
