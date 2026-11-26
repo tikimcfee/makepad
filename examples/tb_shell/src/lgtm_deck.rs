@@ -3405,7 +3405,7 @@ impl LgtmDeck {
             if let Some(mut deck) = vp.borrow_mut::<DeckViewport>() {
                 deck.end_scrub_if_active();
             }
-            let _ = send_lgtm_cmd("view_flip", "{\"from\":\"deck\",\"to\":\"board\"}");
+            let _ = send_lgtm_cmd("view", "{\"to\":\"board\"}");
             send_front_surface("lgtm");
         }
         if self.view.button(cx, ids!(bank_btn)).clicked(actions) {
