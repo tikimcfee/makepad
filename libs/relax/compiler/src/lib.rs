@@ -535,7 +535,7 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
     // split-debuginfo kinds, only_cdylib)
     let (dll_pre, dll_suf, exe_suf, st_pre, st_suf, split, only_cdylib): (&str, &str, &str, &str, &str, &[&str], bool) = match triple {
         "aarch64-apple-darwin" | "aarch64-apple-ios" => ("lib", ".dylib", "", "lib", ".a", &["off", "packed", "unpacked"], false),
-        "x86_64-unknown-linux-gnu" | "aarch64-linux-android" => ("lib", ".so", "", "lib", ".a", &["off", "packed", "unpacked"], false),
+        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" | "aarch64-linux-android" => ("lib", ".so", "", "lib", ".a", &["off", "packed", "unpacked"], false),
         "x86_64-pc-windows-gnu" => ("", ".dll", ".exe", "lib", ".a", &["off"], false),
         "wasm32-unknown-unknown" | "wasm64-unknown-unknown" => ("", ".wasm", ".wasm", "lib", ".a", &["off"], true),
         t => return Err(format!("no target model for {t}")),

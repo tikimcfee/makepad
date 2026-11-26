@@ -58,9 +58,30 @@ impl CfgSet {
             CfgSet::ios_arm64(sess, features)
         } else if cfg!(windows) {
             CfgSet::windows_x64(sess, features)
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            CfgSet::linux_arm64(sess, features)
         } else {
             CfgSet::linux_x64(sess, features)
         }
+    }
+
+    /// aarch64 Linux with glibc (a Linux phone, an arm64 board), release, panic=abort, not test.
+    /// Until 2026-11-25 this machine read programs as x86_64 Linux: std's `SYS_FUTEX` was 202
+    /// (aarch64's `accept`), so every parked thread spun on EBADF at full CPU.
+    pub fn linux_arm64(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        // rustc --print cfg --target aarch64-unknown-linux-gnu: neon is the only default
+        // target_feature (do not assume LSE/AES/SHA2)
+        let mut set: Vec<String> = [
+            "unix", "target_os=linux", "target_family=unix", "target_env=gnu", "target_abi=",
+            "target_vendor=unknown", "target_arch=aarch64",
+            "target_pointer_width=64", "target_endian=little", "panic=abort",
+            "target_feature=neon", "target_has_atomic=8", "target_has_atomic=16",
+            "target_has_atomic=32", "target_has_atomic=64", "target_has_atomic=ptr",
+        ].iter().map(|s| s.to_string()).collect();
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
     }
 
     /// aarch64 macOS, release, panic=abort, not test.
@@ -255,6 +276,8 @@ impl CfgSet {
             "aarch64-apple-darwin"
         } else if self.has("target_os=ios") {
             "aarch64-apple-ios"
+        } else if self.has("target_arch=aarch64") {
+            "aarch64-unknown-linux-gnu"
         } else {
             "x86_64-unknown-linux-gnu"
         }
