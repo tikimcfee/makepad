@@ -1945,7 +1945,12 @@ impl App {
         let Some(JsonValue::Array(items)) = self.st.persist.load_layers() else { return };
         let home = self.st.bodies.contains_key("home");
         for item in &items {
-            if let Some(layer) = StageLayer::from_json(item) {
+            if let Some(mut layer) = StageLayer::from_json(item) {
+                // A popup (one an outside press dismisses: the switcher) comes back closed after a
+                // restart; a fresh `stage float` still shows it at once.
+                if layer.dismiss_outside {
+                    layer.shown = false;
+                }
                 if self.st.bodies.contains_key(&layer.surface) {
                     self.st.stage.float(layer, home);
                 } else {
