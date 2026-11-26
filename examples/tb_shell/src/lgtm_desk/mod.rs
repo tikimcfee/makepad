@@ -5,8 +5,11 @@
 //! WireHub still talks to the store over the shell's own socket, as the JIT app did.
 
 pub mod mesh;
-mod mod_board_slots;
+mod mod_bands;
+mod mod_link;
+mod mod_lyrics;
 mod mod_out;
+mod mod_rack;
 mod mod_tape;
 mod mod_transport;
 mod mod_voice;
@@ -113,6 +116,7 @@ pub fn take_streams(seen: &mut [u64; 4]) -> bool {
     }
     moved
 }
+
 
 script_mod! {
     use mod.prelude.widgets.*

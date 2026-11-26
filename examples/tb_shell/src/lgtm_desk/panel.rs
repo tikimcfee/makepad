@@ -7,8 +7,11 @@
 //! - Zero frames when nothing moves + built-in frame-cost measurement (whole-desk vs 1-module zoom)
 
 use super::mesh::{build_box_mesh, build_cyl_mesh, build_jog_mesh, build_knob_mesh, mat4_ortho_world};
-use super::mod_board_slots::{BandsSlotModule, LinkSlotModule, LyricsSlotModule, RackSlotModule};
+use super::mod_bands::BandsModule;
+use super::mod_link::LinkModule;
+use super::mod_lyrics::LyricsModule;
 use super::mod_out::OutModule;
+use super::mod_rack::RackModule;
 use super::mod_tape::TapeModule;
 use super::mod_transport::TransportModule;
 use super::mod_voice::VoiceModule;
@@ -139,7 +142,7 @@ pub struct DeskViewport {
     #[rust]
     pinch_last_dist: f64,
 
-    // Modules (4 core + 4 lgtm-board slots)
+    // Modules (all 8 full-parity One Desk modules)
     #[rust]
     tape: TapeModule,
     #[rust]
@@ -149,13 +152,13 @@ pub struct DeskViewport {
     #[rust]
     voice: VoiceModule,
     #[rust]
-    lyrics: LyricsSlotModule,
+    lyrics: LyricsModule,
     #[rust]
-    bands: BandsSlotModule,
+    bands: BandsModule,
     #[rust]
-    rack: RackSlotModule,
+    rack: RackModule,
     #[rust]
-    link: LinkSlotModule,
+    link: LinkModule,
 
     // Reusable batch buffer & wire state
     #[rust]
@@ -288,17 +291,31 @@ impl DeskViewport {
         }
     }
 
-    fn set_fit_module(&mut self, mod_idx: usize) {
+    fn set_fit_module(&mut self, mod_idx: usize, focus_x: Option<f32>) {
         let mr = self.module_ref(mod_idx).rect();
         let rw = self.last_rect.size.x.max(10.0) as f32;
         let rh = self.last_rect.size.y.max(10.0) as f32;
         let (_, _, min_z) = self.whole_desk_fit_params(self.last_rect);
         let pad = 6.0;
-        let z = (rw / (mr.w + pad * 2.0))
-            .min(rh / (mr.h + pad * 2.0))
-            .clamp(min_z * 1.05, 5.5);
+        let fit_z = (rw / (mr.w + pad * 2.0)).min(rh / (mr.h + pad * 2.0));
+        // Full-width modules (TAPE, TRANSPORT, LYRICS, BANDS) zoom to a genuine working close-up
+        // (>= 1.80x whole-desk so every fader/chip exceeds the 7 mm grab threshold), centered on tap X.
+        let z = if mr.w > 180.0 {
+            fit_z.max(min_z * 1.80).clamp(min_z * 1.50, 5.5)
+        } else {
+            fit_z.clamp(min_z * 1.15, 5.5)
+        };
+        let view_w = rw / z;
+        let cx = if mr.w > 180.0 {
+            let fx = focus_x.unwrap_or(mr.cx());
+            let lo = mr.x - 4.0 + view_w * 0.5;
+            let hi = mr.right() + 4.0 - view_w * 0.5;
+            if hi > lo { fx.clamp(lo, hi) } else { mr.cx() }
+        } else {
+            mr.cx()
+        };
         self.tgt_zoom = z;
-        self.tgt_pan_x = mr.cx() - (rw * 0.5) / z;
+        self.tgt_pan_x = cx - view_w * 0.5;
         self.tgt_pan_y = mr.cy() - (rh * 0.5) / z;
         self.fitted_module = Some(mod_idx);
     }
@@ -436,7 +453,7 @@ impl DeskViewport {
         if let Some(mid) = focus_id {
             for i in 0..self.module_count() {
                 if self.module_ref(i).id() == mid {
-                    self.set_fit_module(i);
+                    self.set_fit_module(i, None);
                     break;
                 }
             }
@@ -463,7 +480,9 @@ impl DeskViewport {
         self.voice.sync_from_state(&self.state);
 
         if self.needs_animation() {
-            self.ensure_anim_or_redraw(cx);
+            if !self.timer_running {
+                self.ensure_anim_or_redraw(cx);
+            }
         } else {
             if self.timer_running {
                 cx.stop_timer(self.anim_timer);
@@ -625,17 +644,19 @@ impl DeskViewport {
             }
             let raw_fs = t.size_u * zoom * 0.82;
             let (fs, alpha) = if t.is_title {
-                (raw_fs.clamp(9.2, 18.0), 1.0)
+                let min_px = if t.size_u >= 5.0 { 9.2 } else { 7.4 };
+                (raw_fs.clamp(min_px, 16.5), 1.0)
             } else {
-                if raw_fs < 6.2 {
+                if raw_fs < 5.4 {
                     continue;
                 }
-                let a = ((raw_fs - 6.2) / 3.0).clamp(0.0, 1.0);
+                let a = ((raw_fs - 5.4) / 2.4).clamp(0.0, 1.0);
                 (raw_fs.min(20.0), a)
             };
             self.draw_txt.text_style.font_size = fs;
             self.draw_txt.color = vec4(t.color.x, t.color.y, t.color.z, t.color.w * alpha);
-            let est_w = t.text.chars().count() as f64 * (fs as f64 * 0.54);
+            let char_mult = if t.align == TextAlign::Right { 0.58 } else { 0.54 };
+            let est_w = t.text.chars().count() as f64 * (fs as f64 * char_mult);
             let draw_x = match t.align {
                 TextAlign::Left => sx,
                 TextAlign::Center => sx - est_w * 0.5,
@@ -660,23 +681,32 @@ impl Widget for DeskViewport {
             self.set_fit_whole_desk(true);
         }
 
-        // Collect all 8 modules' 3D instances & panel-space labels
+        // Orthographic viewport bounds in panel units (for exact camera + per-module frustum culling)
+        let view_w = rect.size.x as f32 / self.zoom.max(0.2);
+        let view_h = rect.size.y as f32 / self.zoom.max(0.2);
+        let vis_x0 = self.pan_x - 10.0;
+        let vis_x1 = self.pan_x + view_w + 10.0;
+        let vis_y0 = self.pan_y - 10.0;
+        let vis_y1 = self.pan_y + view_h + 10.0;
+        let in_view = |mr: PanelRect| -> bool {
+            mr.right() >= vis_x0 && mr.x <= vis_x1 && mr.bottom() >= vis_y0 && mr.y <= vis_y1
+        };
+
+        // Collect only on-screen modules' 3D instances & panel-space labels
         self.batch.clear(self.zoom);
         // Dark outer soundboard chassis backing plate
         self.batch.plate(PanelRect::new(0.0, 0.0, PANEL_W, PANEL_H), -0.35, 0.6, vec4(0.055, 0.072, 0.102, 1.0), 0.15, 0.0);
 
-        self.tape.draw(&mut self.batch, &self.state);
-        self.transport.draw(&mut self.batch, &self.state);
-        self.lyrics.draw(&mut self.batch, &self.state);
-        self.bands.draw(&mut self.batch, &self.state);
-        self.out_mod.draw(&mut self.batch, &self.state);
-        self.voice.draw(&mut self.batch, &self.state);
-        self.rack.draw(&mut self.batch, &self.state);
-        self.link.draw(&mut self.batch, &self.state);
+        if in_view(self.tape.rect())      { self.tape.draw(&mut self.batch, &self.state); }
+        if in_view(self.transport.rect()) { self.transport.draw(&mut self.batch, &self.state); }
+        if in_view(self.lyrics.rect())    { self.lyrics.draw(&mut self.batch, &self.state); }
+        if in_view(self.bands.rect())     { self.bands.draw(&mut self.batch, &self.state); }
+        if in_view(self.out_mod.rect())   { self.out_mod.draw(&mut self.batch, &self.state); }
+        if in_view(self.voice.rect())     { self.voice.draw(&mut self.batch, &self.state); }
+        if in_view(self.rack.rect())      { self.rack.draw(&mut self.batch, &self.state); }
+        if in_view(self.link.rect())      { self.link.draw(&mut self.batch, &self.state); }
 
         // Orthographic projection straight at the panel (one pass, 4 instanced draws)
-        let view_w = rect.size.x as f32 / self.zoom.max(0.2);
-        let view_h = rect.size.y as f32 / self.zoom.max(0.2);
         let view = Mat4f::identity();
         let proj = mat4_ortho_world(
             self.pan_x,
@@ -814,7 +844,7 @@ impl Widget for DeskViewport {
                         if screen_grab_px < MIN_GRAB_PX {
                             // Control too small (< 7 mm on glass): zoom smoothly to its module instead of moving it!
                             self.grab = GrabMode::None;
-                            self.set_fit_module(mi);
+                            self.set_fit_module(mi, Some(px));
                             self.ensure_anim_or_redraw(cx);
                             return;
                         }
@@ -870,7 +900,7 @@ impl Widget for DeskViewport {
                         if self.fitted_module == Some(mi) {
                             self.set_fit_whole_desk(false);
                         } else {
-                            self.set_fit_module(mi);
+                            self.set_fit_module(mi, Some(px));
                         }
                     } else {
                         self.set_fit_whole_desk(false);

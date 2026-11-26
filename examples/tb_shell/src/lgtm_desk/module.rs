@@ -186,7 +186,17 @@ impl PanelDraw {
         }
         self.title_text(rect.x + 6.5, rect.y + 5.7, 5.2, vec4(0.95, 0.97, 1.0, 1.0), TextAlign::Left, title);
         if !right_status.is_empty() {
-            self.title_text(rect.right() - 6.5, rect.y + 5.7, 4.4, vec4(0.72, 0.80, 0.90, 0.96), TextAlign::Right, right_status);
+            let title_w = title.chars().count() as f32 * 4.4;
+            let avail_w = (rect.w - 17.5 - title_w).max(12.0);
+            let max_chars = (avail_w / 2.95).floor().max(4.0) as usize;
+            let clipped: String = if right_status.chars().count() > max_chars {
+                let mut out: String = right_status.chars().take(max_chars.saturating_sub(1)).collect();
+                out.push('…');
+                out
+            } else {
+                right_status.to_string()
+            };
+            self.title_text(rect.right() - 7.5, rect.y + 5.7, 4.0, vec4(0.72, 0.80, 0.90, 0.96), TextAlign::Right, &clipped);
         }
     }
 
@@ -288,6 +298,15 @@ impl PanelDraw {
             color: cap_col,
             mat: vec4(0.72, if active { 0.15 } else { 0.0 }, 0.6, 0.0),
         });
+        // Luminous white indicator bar on top of the pointer ridge so angle reads at a glance
+        let ptr_d = r * 0.43;
+        let ptr_x = cx - rot.sin() * ptr_d;
+        let ptr_y = -cy + rot.cos() * ptr_d;
+        self.boxes.push(MeshInst {
+            model: mat4_trs_z(ptr_x, ptr_y, 0.90 + r * 0.44, rot, r * 0.10, r * 0.32, r * 0.05),
+            color: vec4(0.96, 0.98, 1.0, 1.0),
+            mat: vec4(0.35, 0.70, 0.2, 0.0),
+        });
         // Name above, value below
         self.text(cx, cy - r * 1.55 - 2.6, 3.6, vec4(0.68, 0.84, 0.98, 0.96), TextAlign::Center, label);
         self.text(cx, cy + r * 1.35 + 2.8, 3.8, vec4(0.95, 0.97, 1.0, 0.98), TextAlign::Center, value);
@@ -353,9 +372,9 @@ impl PanelDraw {
         // Top LED indicator bar
         let led_r = PanelRect::new(rect.x + rect.w * 0.22, rect.y + 2.4, rect.w * 0.56, 2.0);
         self.plate(led_r, z + depth * 0.5 + 0.15, 0.3, led_col, 0.3, led_on.clamp(0.0, 1.0));
-        // Label centered in lower key face
-        let txt_col = if led_on > 0.6 { vec4(0.98, 1.0, 0.98, 1.0) } else { vec4(0.84, 0.89, 0.95, 0.95) };
-        self.text(rect.cx(), rect.y + rect.h * 0.62, 4.1, txt_col, TextAlign::Center, label);
+        // Label centered in lower key face (5.8 u -> ~7.5 px at whole-desk zoom so keys always read)
+        let txt_col = if led_on > 0.6 { vec4(0.98, 1.0, 0.98, 1.0) } else { vec4(0.86, 0.91, 0.97, 0.96) };
+        self.text_clip(rect.cx(), rect.y + rect.h * 0.65, (rect.w - 2.0).max(4.0), 5.8, txt_col, TextAlign::Center, label);
     }
 
     /// Stepped selector strip with name above, value inside, and step pips along bottom.

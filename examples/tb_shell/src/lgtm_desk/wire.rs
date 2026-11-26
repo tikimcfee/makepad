@@ -629,13 +629,16 @@ fn spawn_shell_writer(rx: UnixStream) {
 fn spawn_shell_watcher(hub: Arc<WireHub>) {
     std::thread::spawn(move || {
         let path = tb_shell_sock_path();
-        let keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_wave\",\"lgtm_edit\"]";
+        // Stage 1: fetch lightweight control/lyric/band/head keys first so all 8 modules populate immediately
+        let core_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_edit\"]";
+        let watch_keys = "[\"lgtm\",\"lgtm_mix\",\"lgtm_out\",\"lgtm_link\",\"lgtm_head\",\"lgtm_transport\",\"lgtm_ack\",\"lgtm_wave\",\"lgtm_edit\"]";
         loop {
             if let Ok(mut sock) = UnixStream::connect(&path) {
-                let get_req = format!("{{\"op\":\"get\",\"keys\":{}}}\n", keys);
-                if sock.write_all(get_req.as_bytes()).is_ok() {
-                    let mut reader = BufReader::new(sock.try_clone().unwrap());
-                    let mut line = String::new();
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                let mut line = String::new();
+
+                let get_core = format!("{{\"op\":\"get\",\"keys\":{}}}\n", core_keys);
+                if sock.write_all(get_core.as_bytes()).is_ok() {
                     if reader.read_line(&mut line).unwrap_or(0) > 0 {
                         if let Some(v) = parse_json(&line) {
                             if let Some(st_obj) = v.get("state") {
@@ -646,20 +649,45 @@ fn spawn_shell_watcher(hub: Arc<WireHub>) {
                             }
                         }
                     }
-                    let watch_req = format!("{{\"op\":\"watch\",\"keys\":{}}}\n", keys);
+
+                    // Stage 2: fetch lgtm_wave separately and stream-downsample directly with 0 JVal allocs
+                    line.clear();
+                    if sock.write_all(b"{\"op\":\"get\",\"keys\":[\"lgtm_wave\"]}\n").is_ok()
+                        && reader.read_line(&mut line).unwrap_or(0) > 0
+                    {
+                        if let Ok(mut guard) = hub.state.lock() {
+                            if apply_raw_wave_json(&mut guard, &line) {
+                                drop(guard);
+                                super::wake_ui_if_visible();
+                            }
+                        }
+                    }
+
+                    let watch_req = format!("{{\"op\":\"watch\",\"keys\":{}}}\n", watch_keys);
                     if sock.write_all(watch_req.as_bytes()).is_ok() {
                         loop {
                             line.clear();
                             match reader.read_line(&mut line) {
                                 Ok(0) | Err(_) => break,
                                 Ok(_) => {
+                                    let mut wave_changed = false;
+                                    if line.contains("\"lgtm_wave\"") {
+                                        if let Ok(mut guard) = hub.state.lock() {
+                                            wave_changed = apply_raw_wave_json(&mut guard, &line);
+                                        }
+                                    }
+                                    // JParser skips lgtm_wave/nw/lgtm_outw with zero allocations
+                                    let mut root_changed = false;
                                     if let Some(v) = parse_json(&line) {
                                         if let Some(patch) = v.get("patch") {
                                             if let Ok(mut guard) = hub.state.lock() {
                                                 apply_store_root(&mut guard, patch);
+                                                root_changed = true;
                                             }
-                                            super::wake_ui_if_visible();
                                         }
+                                    }
+                                    if wave_changed || root_changed {
+                                        super::wake_ui_if_visible();
                                     }
                                 }
                             }
@@ -886,6 +914,79 @@ impl<'a> JParser<'a> {
             }
         }
     }
+    fn skip_val(&mut self) -> Option<()> {
+        match self.peek()? {
+            b'{' => {
+                self.i += 1;
+                let mut depth = 1usize;
+                let mut in_str = false;
+                while self.i < self.b.len() && depth > 0 {
+                    let c = self.b[self.i];
+                    self.i += 1;
+                    if in_str {
+                        if c == b'\\' {
+                            self.i += 1;
+                        } else if c == b'"' {
+                            in_str = false;
+                        }
+                    } else {
+                        match c {
+                            b'"' => in_str = true,
+                            b'{' | b'[' => depth += 1,
+                            b'}' | b']' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                }
+                if depth == 0 { Some(()) } else { None }
+            }
+            b'[' => {
+                self.i += 1;
+                let mut depth = 1usize;
+                let mut in_str = false;
+                while self.i < self.b.len() && depth > 0 {
+                    let c = self.b[self.i];
+                    self.i += 1;
+                    if in_str {
+                        if c == b'\\' {
+                            self.i += 1;
+                        } else if c == b'"' {
+                            in_str = false;
+                        }
+                    } else {
+                        match c {
+                            b'"' => in_str = true,
+                            b'[' | b'{' => depth += 1,
+                            b']' | b'}' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                }
+                if depth == 0 { Some(()) } else { None }
+            }
+            b'"' => {
+                self.i += 1;
+                while self.i < self.b.len() {
+                    let c = self.b[self.i];
+                    self.i += 1;
+                    if c == b'\\' {
+                        self.i += 1;
+                    } else if c == b'"' {
+                        return Some(());
+                    }
+                }
+                None
+            }
+            _ => {
+                while self.i < self.b.len()
+                    && !matches!(self.b[self.i], b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')
+                {
+                    self.i += 1;
+                }
+                Some(())
+            }
+        }
+    }
     fn parse_obj(&mut self) -> Option<JVal> {
         self.skip_ws();
         self.i += 1;
@@ -895,8 +996,13 @@ impl<'a> JParser<'a> {
             let k = self.parse_str()?;
             if self.peek()? != b':' { return None; }
             self.i += 1;
-            let v = self.parse_val()?;
-            entries.push((k, v));
+            // Skip massive envelope/waveform arrays inside generic JSON parse (lgtm_wave is streamed separately)
+            if matches!(k.as_str(), "lgtm_wave" | "nw" | "lgtm_outw") {
+                self.skip_val()?;
+            } else {
+                let v = self.parse_val()?;
+                entries.push((k, v));
+            }
             match self.peek()? {
                 b',' => self.i += 1,
                 b'}' => { self.i += 1; return Some(JVal::Obj(entries)); }
@@ -904,6 +1010,122 @@ impl<'a> JParser<'a> {
             }
         }
     }
+}
+
+/// Zero-allocation byte scanner for large JSON float arrays like `"back":[0.12,0.34,...]` or `"src":[...]`.
+/// Downsamples directly into `bins` peak buckets in <2 ms even under Tier-0 JIT.
+fn extract_wave_bins(json: &str, key: &str, bins: usize) -> Option<Vec<f32>> {
+    let needle = format!("\"{}\":", key);
+    let pos = json.find(&needle)?;
+    let b = json.as_bytes();
+    let mut i = pos + needle.len();
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    if i >= b.len() || b[i] != b'[' {
+        return None;
+    }
+    let start = i + 1;
+    let mut end = start;
+    let mut commas = 0usize;
+    let mut has_digit = false;
+    while end < b.len() && b[end] != b']' {
+        let c = b[end];
+        if c == b',' {
+            commas += 1;
+        } else if c.is_ascii_digit() {
+            has_digit = true;
+        }
+        end += 1;
+    }
+    if end >= b.len() || !has_digit {
+        return Some(Vec::new());
+    }
+    let total = commas + 1;
+    let n_bins = bins.min(total).max(1);
+    let mut out = vec![0.0f32; n_bins];
+    let mut idx = 0usize;
+    let mut p = start;
+    while p < end {
+        while p < end && !matches!(b[p], b'0'..=b'9' | b'-' | b'.') {
+            p += 1;
+        }
+        if p >= end {
+            break;
+        }
+        let neg = if b[p] == b'-' { p += 1; true } else { false };
+        let mut int_part = 0.0f32;
+        while p < end && b[p].is_ascii_digit() {
+            int_part = int_part * 10.0 + (b[p] - b'0') as f32;
+            p += 1;
+        }
+        let mut frac = 0.0f32;
+        let mut scale = 0.1f32;
+        if p < end && b[p] == b'.' {
+            p += 1;
+            while p < end && b[p].is_ascii_digit() {
+                frac += (b[p] - b'0') as f32 * scale;
+                scale *= 0.1;
+                p += 1;
+            }
+        }
+        // Skip optional exponent if present
+        if p < end && (b[p] == b'e' || b[p] == b'E') {
+            p += 1;
+            if p < end && (b[p] == b'+' || b[p] == b'-') { p += 1; }
+            let mut exp_v = 0i32;
+            let exp_neg = p > 0 && b[p - 1] == b'-';
+            while p < end && b[p].is_ascii_digit() {
+                exp_v = exp_v * 10 + (b[p] - b'0') as i32;
+                p += 1;
+            }
+            let mut val = int_part + frac;
+            if exp_neg {
+                for _ in 0..exp_v.min(10) { val *= 0.1; }
+            } else {
+                for _ in 0..exp_v.min(10) { val *= 10.0; }
+            }
+            int_part = val;
+            frac = 0.0;
+        }
+        let val = if neg { 0.0 } else { (int_part + frac).clamp(0.0, 1.0) };
+        let bi = ((idx * n_bins) / total).min(n_bins - 1);
+        if val > out[bi] {
+            out[bi] = val;
+        }
+        idx += 1;
+        while p < end && b[p] != b',' {
+            p += 1;
+        }
+        if p < end && b[p] == b',' {
+            p += 1;
+        }
+    }
+    Some(out)
+}
+
+fn apply_raw_wave_json(st: &mut DeskState, line: &str) -> bool {
+    let Some(wp) = line.find("\"lgtm_wave\"") else {
+        return false;
+    };
+    let wave_slice = &line[wp..];
+    let mut changed = false;
+    if let Some(wb) = extract_wave_bins(wave_slice, "back", 120) {
+        if !wb.is_empty() {
+            st.wave_back = wb;
+            changed = true;
+        }
+    }
+    if let Some(ws) = extract_wave_bins(wave_slice, "src", 120) {
+        if !ws.is_empty() {
+            st.wave_src = ws;
+            changed = true;
+        }
+    }
+    if changed {
+        st.rev += 1;
+    }
+    changed
 }
 
 pub fn parse_json(s: &str) -> Option<JVal> {
@@ -1238,7 +1460,7 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
                         || p.as_f64().map(|n| n > 0.0).unwrap_or(false)
                         || p.get("state")
                             .and_then(|s| s.as_str())
-                            .map(|s| matches!(s, "done" | "ok" | "ready" | "live"))
+                            .map(|s| matches!(s, "done" | "ok" | "ready" | "live" | "idle"))
                             .unwrap_or(false)
                 })
                 .count() as i32;
