@@ -280,13 +280,30 @@ impl Context {
         let wayland = if native.platform == PLATFORM_WAYLAND { Some(Wayland::load()?) } else { None };
         unsafe {
             // Android's one display is the default one, which an EGL 1.4 driver opens too
-            let display = if native.platform == PLATFORM_ANDROID {
+            let mut display = if native.platform == PLATFORM_ANDROID {
                 (egl.get_display)(ptr::null_mut())
+            } else if let Some(platform_display) = egl.platform_display {
+                platform_display(native.platform, native.native as Handle, ptr::null())
+            } else if native.platform == PLATFORM_SURFACELESS {
+                ptr::null_mut()
             } else {
-                (egl.platform_display.ok_or("libEGL lacks eglGetPlatformDisplay")?)(native.platform, native.native as Handle, ptr::null())
+                return Err("libEGL lacks eglGetPlatformDisplay".into());
             };
             let (mut major, mut minor) = (0, 0);
-            if display.is_null() || (egl.initialize)(display, &mut major, &mut minor) == 0 {
+            let mut ok = !display.is_null() && (egl.initialize)(display, &mut major, &mut minor) != 0;
+            // Hidden runs on an EGL without the surfaceless platform (libhybris on a PowerVR phone
+            // answers EGL_BAD_PARAMETER for it): the default display, whose contexts can still be
+            // current without a surface (EGL_KHR_surfaceless_context) or on a 1x1 pbuffer.
+            // Windows stay offscreen render targets either way.
+            if !ok && native.platform == PLATFORM_SURFACELESS {
+                let why = (egl.error)();
+                display = (egl.get_display)(ptr::null_mut());
+                ok = !display.is_null() && (egl.initialize)(display, &mut major, &mut minor) != 0;
+                if ok {
+                    eprintln!("[hal-gl] no surfaceless EGL platform ({why:#x}): hidden windows use the default display");
+                }
+            }
+            if !ok {
                 return Err(format!("eglInitialize (platform {:#x}): {:#x}", native.platform, (egl.error)()));
             }
             let extensions = (egl.query_string)(display, EXTENSIONS);
