@@ -67,6 +67,38 @@ fn resolve_jit_workspace(explicit: Option<&str>) -> Option<String> {
     None
 }
 
+/// The `systemd-run` arguments that put a guest in its own user scope, or None to spawn it
+/// directly (TB_JIT_SCOPE=0, no systemd-run, or no user bus to reach the user manager).
+/// TB_JIT_MEMORY_MAX sets the scope's MemoryMax (default 1800M: a cold lgtm-deck3d compile peaks near 1.1 GB; swap is off on the phone).
+fn jit_scope(slot_name: &str) -> Option<Vec<String>> {
+    if std::env::var("TB_JIT_SCOPE").map_or(false, |v| v.trim() == "0") {
+        return None;
+    }
+    let has_run = ["/usr/bin/systemd-run", "/bin/systemd-run"].iter().any(|p| Path::new(p).is_file());
+    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").map_or(false, |v| !v.trim().is_empty())
+        || std::env::var("XDG_RUNTIME_DIR").map_or(false, |d| Path::new(&format!("{d}/bus")).exists());
+    if !has_run || !bus {
+        log!("tb-shell: jit {slot_name}: no systemd-run or user bus, the guest shares tb-shell's cgroup");
+        return None;
+    }
+    let max = std::env::var("TB_JIT_MEMORY_MAX")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '%' || c == '.'))
+        .unwrap_or_else(|| "1800M".to_string());
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    Some(vec![
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+        format!("--unit=tb-jit-{slot_name}-{ms}"),
+        format!("--description=tb-shell JIT guest {slot_name}"),
+        format!("-pMemoryMax={max}"),
+        "-pMemorySwapMax=0".into(),
+    ])
+}
+
 pub struct JitFrame {
     pub width: usize,
     pub height: usize,
@@ -115,7 +147,18 @@ impl JitInstance {
         let workspace = resolve_jit_workspace(dir);
         let fps = fps.clamp(1.0, 60.0);
 
-        let mut cmd = Command::new(&bin);
+        // The guest runs in its own systemd user scope with its own memory limit, outside
+        // tb-shell's cgroup: a JIT compile that grows past tb-shell's MemoryMax would otherwise
+        // OOM-kill the shell. `systemd-run --scope` moves itself into the scope and then execs
+        // the command, so the child pid stays the guest's. TB_JIT_SCOPE=0 spawns it directly.
+        let mut cmd = match jit_scope(slot_name) {
+            Some(scope_args) => {
+                let mut c = Command::new("systemd-run");
+                c.args(&scope_args).arg("--").arg(&bin);
+                c
+            }
+            None => Command::new(&bin),
+        };
         cmd.arg("run");
         if let Some(store) = src_store.map(str::trim).filter(|s| !s.is_empty()) {
             cmd.arg("--src").arg(store);
@@ -177,13 +220,17 @@ impl JitInstance {
             let tag = format!("jit-err-{slot_name}");
             let _ = std::thread::Builder::new().name(tag).spawn(move || {
                 read_output_lines(err, &sh, &stx);
-                let code = child.wait().ok().and_then(|s| s.code());
+                let st = child.wait().ok();
+                let code = st.and_then(|s| s.code());
+                let sig = st.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s));
                 if let Ok(mut g) = sh.mu.lock() {
                     g.child_pid = None;
                     if !g.stopped {
-                        g.status = match code {
-                            Some(c) => format!("JIT {pkg_lbl} exited ({c}): {}", g.status),
-                            None => format!("JIT {pkg_lbl} stopped"),
+                        g.status = match (code, sig) {
+                            (Some(c), _) => format!("JIT {pkg_lbl} exited ({c}): {}", g.status),
+                            (None, Some(9)) => format!("JIT {pkg_lbl} was killed (SIGKILL: out of memory in its scope?)"),
+                            (None, Some(s)) => format!("JIT {pkg_lbl} stopped by signal {s}"),
+                            (None, None) => format!("JIT {pkg_lbl} stopped"),
                         };
                     }
                     sh.alive.store(false, Ordering::SeqCst);
