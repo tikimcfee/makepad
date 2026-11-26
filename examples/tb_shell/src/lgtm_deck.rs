@@ -144,6 +144,9 @@ pub struct DeckSharedState {
     // Authoritative engine transport (`lgtm.transport`) + command ack (`lgtm.ack`)
     pub has_transport: bool,
     pub transport_state: String, // "stopped" | "starting" | "playing" | "stopping" | "seeking"
+    pub transport_sub: String,   // "" | "scrubbing" | "seeking"
+    pub transport_rate: f64,     // signed tape rate (authoritative when transport_sub == "scrubbing")
+    pub scrubbing: bool,
     pub transport_seq: u64,
     pub ack_seq: u64,
     pub ack_name: String,
@@ -230,6 +233,9 @@ impl Default for DeckSharedState {
             line_times_ms: Vec::new(),
             has_transport: false,
             transport_state: "stopped".to_string(),
+            transport_sub: String::new(),
+            transport_rate: 1.0,
+            scrubbing: false,
             transport_seq: 0,
             ack_seq: 0,
             ack_name: String::new(),
@@ -264,6 +270,26 @@ impl DeckSharedState {
             return s.as_str();
         }
         ""
+    }
+
+    pub fn effective_rate(&self) -> f64 {
+        if self.scrubbing {
+            self.transport_rate
+        } else if self.playing {
+            self.pos_rate
+        } else {
+            0.0
+        }
+    }
+
+    pub fn heard_pos_ms(&self, now: Instant, dur_ms: f64) -> f64 {
+        let rate = self.effective_rate();
+        if rate.abs() > 1e-4 {
+            let dt_ms = (now.duration_since(self.pos_anchor_at).as_secs_f64() * 1000.0).min(1500.0);
+            (self.pos_anchor_ms + dt_ms * rate).clamp(0.0, dur_ms.max(1.0))
+        } else {
+            self.pos_anchor_ms.clamp(0.0, dur_ms.max(1.0))
+        }
     }
 }
 
@@ -778,7 +804,9 @@ fn apply_store_root(st: &mut DeckSharedState, root: &JVal) {
                 let ms = st.line_times_ms[idx as usize];
                 if ms >= 0.0 {
                     st.line_start_ms = ms;
-                    if !st.has_stream_pos || now.duration_since(st.last_stream_at) > Duration::from_millis(600) {
+                    if !st.scrubbing
+                        && (!st.has_stream_pos || now.duration_since(st.last_stream_at) > Duration::from_millis(600))
+                    {
                         st.pos_anchor_ms = ms;
                         st.pos_anchor_at = now;
                     }
@@ -786,9 +814,11 @@ fn apply_store_root(st: &mut DeckSharedState, root: &JVal) {
             }
         }
         if let Some(pos_at) = lg.get("pos_at") {
-            if let Some(ms) = pos_at.get("ms").and_then(|v| v.as_f64()) {
-                st.pos_anchor_ms = ms.clamp(0.0, st.dur_ms.max(1.0));
-                st.pos_anchor_at = now;
+            if !st.scrubbing {
+                if let Some(ms) = pos_at.get("ms").and_then(|v| v.as_f64()) {
+                    st.pos_anchor_ms = ms.clamp(0.0, st.dur_ms.max(1.0));
+                    st.pos_anchor_at = now;
+                }
             }
             if let Some(r) = pos_at.get("rate").and_then(|v| v.as_f64()) {
                 if r > 0.1 && r < 4.0 {
@@ -802,18 +832,34 @@ fn apply_store_root(st: &mut DeckSharedState, root: &JVal) {
                 }
             }
         }
-        // Single authoritative engine transport (`lgtm.transport {state, seq, line, pos_ms, voice}`)
+        // Single authoritative engine transport (`lgtm.transport {state, sub, seq, line, pos_ms, voice, rate, t}`)
         if let Some(tr) = lg.get("transport") {
+            let prev_rate = st.effective_rate();
+            let tr_has_pos = tr
+                .get("pos_ms")
+                .and_then(|v| v.as_f64())
+                .map(|ms| ms >= 0.0)
+                .unwrap_or(false);
+            if !tr_has_pos && prev_rate.abs() > 1e-4 {
+                let dt = (now.duration_since(st.pos_anchor_at).as_secs_f64() * 1000.0).min(1500.0);
+                st.pos_anchor_ms = (st.pos_anchor_ms + dt * prev_rate).clamp(0.0, st.dur_ms.max(1.0));
+                st.pos_anchor_at = now;
+            }
             st.has_transport = true;
+            if let Some(sub) = tr.get("sub").and_then(|v| v.as_str()) {
+                st.transport_sub = sub.to_string();
+                st.scrubbing = sub == "scrubbing";
+            }
+            if let Some(r) = tr.get("rate").and_then(|v| v.as_f64()) {
+                if r.is_finite() {
+                    st.transport_rate = r.clamp(-16.0, 16.0);
+                }
+            }
             if let Some(ts) = tr.get("state").and_then(|v| v.as_str()) {
                 let was_playing = st.playing;
                 st.transport_state = ts.to_string();
                 st.playing = ts == "playing" || ts == "seeking";
-                if st.playing && !was_playing {
-                    st.pos_anchor_at = now;
-                } else if !st.playing && was_playing {
-                    let dt = now.duration_since(st.pos_anchor_at).as_secs_f64() * 1000.0;
-                    st.pos_anchor_ms = (st.pos_anchor_ms + dt * st.pos_rate).clamp(0.0, st.dur_ms.max(1.0));
+                if st.playing && !was_playing && !tr_has_pos {
                     st.pos_anchor_at = now;
                 }
             }
@@ -1047,10 +1093,16 @@ fn take_streams(hub: &WireHub, seen: &mut [u64; 3]) -> bool {
     if let Some((v, values)) = pos {
         seen[0] = v;
         if let Some(f) = values.last() {
-            let ms = (*f as f64).clamp(0.0, 1.0) * st.dur_ms.max(1.0);
-            st.pos_anchor_ms = ms;
-            st.pos_anchor_at = now;
-            st.has_stream_pos = true;
+            let clamped = (*f as f64).clamp(0.0, 1.0) * st.dur_ms.max(1.0);
+            // re-anchor only on a real move (or a stale or still anchor), so the reels keep
+            // dead-reckoning smoothly between pushes (lgtm-deck3d's scrub rule)
+            let changed = (clamped - st.pos_anchor_ms).abs() > 0.05;
+            let stale = now.duration_since(st.last_stream_at) > Duration::from_millis(80);
+            if changed || !st.has_stream_pos || stale || st.effective_rate().abs() < 1e-4 {
+                st.pos_anchor_ms = clamped;
+                st.pos_anchor_at = now;
+                st.has_stream_pos = true;
+            }
             st.last_stream_at = now;
         }
     }
@@ -1644,7 +1696,7 @@ pub struct DeckViewport {
     #[rust]
     last_rect: Rect,
 
-    // Mechanical reel & tape physics
+    // Mechanical reel & tape-motor scrub physics
     #[rust]
     pos_ms: f64,
     #[rust]
@@ -1654,9 +1706,19 @@ pub struct DeckViewport {
     #[rust]
     right_angle: f32,
     #[rust]
-    reel_vel: f32,
-    #[rust]
     tape_phase: f32,
+    #[rust]
+    scrub_active: bool,
+    #[rust]
+    scrub_coasting: bool,
+    #[rust]
+    scrub_rate: f32,
+    #[rust]
+    last_scrub_rate_sent: f32,
+    #[rust]
+    last_scrub_sent: Option<Instant>,
+    #[rust]
+    last_reel_move_at: Option<Instant>,
 
     // Key travel (0 = up, 1 = fully pressed) & LED flash
     #[rust]
@@ -1916,20 +1978,21 @@ impl DeckViewport {
             }
         }
 
-        if !matches!(self.grab, GrabTarget::LeftReel | GrabTarget::RightReel) && self.reel_vel.abs() < 0.01 {
-            let now = Instant::now();
-            let live_ms = if st.playing {
-                let dt = now.duration_since(st.pos_anchor_at).as_secs_f64() * 1000.0;
-                (st.pos_anchor_ms + dt * st.pos_rate).clamp(0.0, self.dur_ms)
-            } else {
-                st.pos_anchor_ms.clamp(0.0, self.dur_ms)
-            };
+        // Follow static anchor jumps cleanly when idle, or snap large (>350ms) jumps immediately on show/seek
+        if !self.scrub_active && !st.scrubbing && !st.playing {
+            let live_ms = st.pos_anchor_ms.clamp(0.0, self.dur_ms);
             let delta_ms = live_ms - self.pos_ms;
-            self.pos_ms = live_ms;
-            let d_rad = (delta_ms / 1000.0) as f32 * 2.2;
-            self.left_angle -= d_rad;
-            self.right_angle -= d_rad;
-            self.tape_phase = (self.tape_phase + d_rad * 0.5).rem_euclid(1.0);
+            if delta_ms.abs() > 0.1 {
+                self.pos_ms = live_ms;
+                self.advance_reels_by_ms(delta_ms);
+            }
+        } else if st.scrubbing || st.playing {
+            let heard_ms = st.heard_pos_ms(Instant::now(), self.dur_ms);
+            let err_ms = heard_ms - self.pos_ms;
+            if err_ms.abs() > 350.0 {
+                self.pos_ms = heard_ms;
+                self.advance_reels_by_ms(err_ms.clamp(-180.0, 180.0));
+            }
         }
 
         // Drive PLAY key physical latch strictly from authoritative transport state
@@ -1992,17 +2055,91 @@ impl DeckViewport {
         self.area.redraw(cx);
     }
 
+    fn reel_radii(&self) -> (f32, f32) {
+        let frac = (self.pos_ms / self.dur_ms.max(1.0)).clamp(0.0, 1.0) as f32;
+        let r_min: f32 = 0.45;
+        let r_max: f32 = 0.90;
+        let r_left = (r_min * r_min + (1.0 - frac) * (r_max * r_max - r_min * r_min)).sqrt();
+        let r_right = (r_min * r_min + frac * (r_max * r_max - r_min * r_min)).sqrt();
+        (r_left, r_right)
+    }
+
+    fn advance_reels_by_ms(&mut self, d_ms: f64) {
+        let (r_left, r_right) = self.reel_radii();
+        let clamped_ms = d_ms.clamp(-400.0, 400.0);
+        let tape_ds = (clamped_ms / 1000.0) as f32 * 1.45;
+        self.left_angle -= tape_ds / r_left;
+        self.right_angle -= tape_ds / r_right;
+        self.tape_phase = (self.tape_phase + tape_ds * 0.6).rem_euclid(1.0);
+    }
+
+    fn quantize_scrub_rate(rate: f32) -> f32 {
+        let r = rate.clamp(-4.0, 4.0);
+        if r.abs() < 0.05 {
+            0.0
+        } else {
+            (r * 100.0).round() / 100.0
+        }
+    }
+
+    fn emit_scrub_rate(&mut self, raw_rate: f32, force: bool) {
+        let rate = Self::quantize_scrub_rate(raw_rate);
+        let now = Instant::now();
+        if !force {
+            if let Some(last) = self.last_scrub_sent {
+                let min_gap_ms = if self.last_scrub_rate_sent == 0.0 && rate != 0.0 {
+                    30
+                } else {
+                    50
+                };
+                if now.duration_since(last) < Duration::from_millis(min_gap_ms) {
+                    return;
+                }
+            }
+            let changed_to_zero = rate == 0.0 && self.last_scrub_rate_sent != 0.0;
+            if !changed_to_zero && (rate - self.last_scrub_rate_sent).abs() < 0.02 {
+                return;
+            }
+        }
+        self.last_scrub_sent = Some(now);
+        self.last_scrub_rate_sent = rate;
+        let payload = if rate == 0.0 {
+            "{\"rate\":0.0}".to_string()
+        } else {
+            format!("{{\"rate\":{:.2}}}", rate)
+        };
+        let _ = send_lgtm_cmd("scrub", &payload);
+    }
+
+    fn finish_scrub(&mut self) {
+        if self.scrub_active || self.scrub_coasting || self.cached_state.scrubbing {
+            self.scrub_active = false;
+            self.scrub_coasting = false;
+            self.scrub_rate = 0.0;
+            self.last_scrub_rate_sent = 0.0;
+            self.last_scrub_sent = None;
+            self.last_reel_move_at = None;
+            let _ = send_lgtm_cmd("scrub_end", "{}");
+        }
+    }
+
+    pub fn end_scrub_if_active(&mut self) {
+        if self.scrub_active || self.scrub_coasting {
+            self.finish_scrub();
+        }
+    }
+
     fn needs_animation(&self) -> bool {
         if self.cached_state.playing
+            || self.cached_state.scrubbing
+            || self.scrub_active
+            || self.scrub_coasting
             || self.cached_state.transport_state == "starting"
             || self.cached_state.transport_state == "stopping"
         {
             return true;
         }
         if self.is_pending() {
-            return true;
-        }
-        if self.reel_vel.abs() > 0.015 {
             return true;
         }
         let eject_goal = if self.rack_open { 1.0 } else { 0.0 };
@@ -2040,41 +2177,57 @@ impl DeckViewport {
     fn step_animation(&mut self, cx: &mut Cx, dt: f32) {
         let dt = dt.clamp(0.001, 0.05);
 
-        let jogging = matches!(self.grab, GrabTarget::LeftReel | GrabTarget::RightReel);
-        if !jogging {
-            if self.reel_vel.abs() > 0.015 {
-                let d_rad = self.reel_vel * dt;
-                self.left_angle += d_rad;
-                self.right_angle += d_rad;
-                let ms_per_rad = 1400.0;
-                self.pos_ms = (self.pos_ms - d_rad as f64 * ms_per_rad).clamp(0.0, self.dur_ms);
-                self.tape_phase = (self.tape_phase - d_rad * 0.35).rem_euclid(1.0);
-                self.reel_vel *= (-3.4 * dt).exp();
-                if self.reel_vel.abs() <= 0.015 {
-                    self.reel_vel = 0.0;
-                    self.emit_seek_now(true);
-                } else {
-                    self.emit_seek_now(false);
+        // 1. Reel-motor scrub control (finger-hold brake + flick-coast decay, <= 20 Hz)
+        let holding_reel = matches!(self.grab, GrabTarget::LeftReel | GrabTarget::RightReel);
+        if self.scrub_active {
+            if holding_reel {
+                let idle_ms = self
+                    .last_reel_move_at
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(999);
+                if idle_ms >= 110 {
+                    self.scrub_rate *= (-24.0 * dt).exp();
+                    if self.scrub_rate.abs() < 0.05 {
+                        self.scrub_rate = 0.0;
+                    }
                 }
-            } else if self.cached_state.playing {
-                let now = Instant::now();
-                let elapsed = now.duration_since(self.cached_state.pos_anchor_at).as_secs_f64() * 1000.0;
-                let target_ms = (self.cached_state.pos_anchor_ms + elapsed * self.cached_state.pos_rate)
-                    .clamp(0.0, self.dur_ms);
-                let d_ms = target_ms - self.pos_ms;
-                self.pos_ms = target_ms;
-                let frac = (self.pos_ms / self.dur_ms.max(1.0)).clamp(0.0, 1.0) as f32;
-                let r_left = (0.44_f32.powi(2) + (1.0 - frac) * (0.90_f32.powi(2) - 0.44_f32.powi(2))).sqrt();
-                let r_right = (0.44_f32.powi(2) + frac * (0.90_f32.powi(2) - 0.44_f32.powi(2))).sqrt();
-                let tape_speed = if d_ms.abs() < 400.0 {
-                    (d_ms / 1000.0) as f32 * 1.45
+                self.emit_scrub_rate(self.scrub_rate, false);
+            } else if self.scrub_coasting {
+                self.scrub_rate *= (-2.8 * dt).exp();
+                let hit_end = (self.scrub_rate < 0.0 && self.pos_ms <= 1.0)
+                    || (self.scrub_rate > 0.0 && self.pos_ms >= self.dur_ms - 1.0);
+                if hit_end || self.scrub_rate.abs() < 0.05 {
+                    self.finish_scrub();
                 } else {
-                    dt * 1.45 * self.cached_state.pos_rate as f32
-                };
-                self.left_angle -= tape_speed / r_left;
-                self.right_angle -= tape_speed / r_right;
-                self.tape_phase = (self.tape_phase + tape_speed * 0.6).rem_euclid(1.0);
+                    self.emit_scrub_rate(self.scrub_rate, false);
+                }
             }
+        }
+
+        // 2. Turn reels smoothly from heard position moved along at current signed rate (zero jump)
+        if self.cached_state.scrubbing || self.cached_state.playing {
+            let now = Instant::now();
+            let heard_ms = self.cached_state.heard_pos_ms(now, self.dur_ms);
+            let err_ms = heard_ms - self.pos_ms;
+            if err_ms.abs() > 350.0 {
+                self.pos_ms = heard_ms;
+                self.advance_reels_by_ms(err_ms.clamp(-180.0, 180.0));
+            } else {
+                let rate = self.cached_state.effective_rate();
+                let step_ms = rate * (dt as f64) * 1000.0;
+                let corr = (heard_ms - (self.pos_ms + step_ms)) * (1.0 - (-15.0 * dt as f64).exp());
+                let next_ms = (self.pos_ms + step_ms + corr).clamp(0.0, self.dur_ms);
+                let actual_d_ms = next_ms - self.pos_ms;
+                self.pos_ms = next_ms;
+                self.advance_reels_by_ms(actual_d_ms);
+            }
+        } else if self.scrub_active {
+            // Brief local dead-reckoning before first engine sub=='scrubbing' packet arrives (or offline)
+            let step_ms = (self.scrub_rate as f64) * (dt as f64) * 1000.0;
+            let next_ms = (self.pos_ms + step_ms).clamp(0.0, self.dur_ms);
+            let actual_d_ms = next_ms - self.pos_ms;
+            self.pos_ms = next_ms;
+            self.advance_reels_by_ms(actual_d_ms);
         }
 
         // Keys & detent knobs (crisp spring)
@@ -2167,6 +2320,7 @@ impl DeckViewport {
         self.key_flash[idx] = 1.0;
         match idx {
             0 => {
+                self.finish_scrub();
                 self.pos_ms = (self.pos_ms - 5000.0).max(0.0);
                 self.left_angle += 2.2;
                 self.right_angle += 2.2;
@@ -2179,7 +2333,7 @@ impl DeckViewport {
                 self.set_pending(seq, "play", 1);
             }
             2 => {
-                self.reel_vel = 0.0;
+                self.finish_scrub();
                 let seq = send_lgtm_cmd("stop", "{}");
                 self.set_pending(seq, "stop", 2);
             }
@@ -2192,6 +2346,9 @@ impl DeckViewport {
                 self.set_pending(seq, "again", 4);
             }
             5 => {
+                if !self.rack_open {
+                    self.finish_scrub();
+                }
                 self.rack_open = !self.rack_open;
                 self.key_target[5] = if self.rack_open { 0.7 } else { 0.0 };
             }
@@ -2398,15 +2555,10 @@ impl DeckViewport {
 
     /// 4 instanced GPU draw calls total (boxes, cylinders, reels, knobs).
     fn draw_scene(&mut self, cx: &mut Cx2d) {
-        let frac = (self.pos_ms / self.dur_ms.max(1.0)).clamp(0.0, 1.0) as f32;
         let ej = (self.eject_t + self.eject_drag_extra).clamp(0.0, 1.35);
         let cas_y = ej * 0.85;
         let cas_z = ej * 1.15;
-
-        let r_min: f32 = 0.45;
-        let r_max: f32 = 0.90;
-        let r_left = (r_min * r_min + (1.0 - frac) * (r_max * r_max - r_min * r_min)).sqrt();
-        let r_right = (r_min * r_min + frac * (r_max * r_max - r_min * r_min)).sqrt();
+        let (r_left, r_right) = self.reel_radii();
 
         // === DRAW CALL 1: ALL BOXES ===
         // Main dark-anodized deck faceplate & side rails
@@ -2452,7 +2604,11 @@ impl DeckViewport {
 
         // Magnetic tape ribbon + moving amber shimmer tick
         let tape_col = vec4(0.24, 0.14, 0.10, 1.0);
-        let tape_glint = if self.cached_state.playing || self.reel_vel.abs() > 0.05 { 0.72 } else { 0.42 };
+        let tape_glint = if self.cached_state.playing || self.cached_state.scrubbing || self.scrub_active {
+            0.72
+        } else {
+            0.42
+        };
         self.draw_box(cx, mat4_trs_z(0.0, 1.28 + cas_y, 0.28 + cas_z, 0.0, 1.48, 0.032, 0.06), tape_col, vec4(tape_glint, 0.0, 0.3, 0.0));
         self.draw_box(cx, mat4_trs_z(-1.46, 1.66 + cas_y, 0.28 + cas_z, -0.35, 0.03, 0.45, 0.05), tape_col, vec4(tape_glint, 0.0, 0.2, 0.0));
         self.draw_box(cx, mat4_trs_z(1.46, 1.66 + cas_y, 0.28 + cas_z, 0.35, 0.03, 0.45, 0.05), tape_col, vec4(tape_glint, 0.0, 0.2, 0.0));
@@ -2783,6 +2939,7 @@ impl DeckViewport {
             if rel_y >= 0.0 {
                 let idx = (rel_y / row_h) as usize;
                 if let Some(item) = items.get(idx) {
+                    self.finish_scrub();
                     let (nm, seq) = match item.kind.as_str() {
                         "parent" => ("back", send_lgtm_cmd("back", "{}")),
                         "save" => ("load", send_lgtm_cmd("load", &format!("{{\"id\":\"{}\"}}", json_escape(&item.id)))),
@@ -2870,9 +3027,20 @@ impl DeckViewport {
         if self.is_pending() {
             return format!("{} · pending {}…", fmt_ms(self.pos_ms), self.pending_name);
         }
-        let status = if self.reel_vel.abs() > 0.05 {
-            "coasting"
-        } else if self.cached_state.has_transport {
+        if self.scrub_active || self.cached_state.scrubbing {
+            let r = if self.cached_state.scrubbing {
+                self.cached_state.transport_rate as f32
+            } else {
+                self.scrub_rate
+            };
+            let st_txt = if r.abs() < 0.05 {
+                "scrub hold".to_string()
+            } else {
+                format!("scrub {:+.1}x", r)
+            };
+            return format!("{} / {} · {}", fmt_ms(self.pos_ms), fmt_ms(self.dur_ms), st_txt);
+        }
+        let status = if self.cached_state.has_transport {
             &self.cached_state.transport_state
         } else if self.cached_state.playing {
             "playing"
@@ -2930,7 +3098,11 @@ impl Widget for DeckViewport {
             if deck_visible() {
                 let _ = take_streams(&wire_hub(), &mut self.streams_seen);
                 self.sync_from_wire(cx);
-            } else if self.timer_running {
+            } else {
+                // hidden mid-gesture or mid-coast: the tape stops being scrubbed
+                self.end_scrub_if_active();
+            }
+            if !deck_visible() && self.timer_running {
                 cx.stop_timer(self.anim_timer);
                 self.anim_timer = Timer::default();
                 self.timer_running = false;
@@ -2968,13 +3140,23 @@ impl Widget for DeckViewport {
 
                 match target {
                     GrabTarget::LeftReel => {
-                        self.reel_vel = 0.0;
+                        self.scrub_active = true;
+                        self.scrub_coasting = false;
+                        self.scrub_rate = 0.0;
+                        self.last_reel_move_at = Some(Instant::now());
                         self.last_angle = (wp.y - LEFT_REEL_POS.1).atan2(wp.x - LEFT_REEL_POS.0);
+                        self.emit_scrub_rate(0.0, true);
+                        cx.widget_action(self.uid, DeckAction::StateUpdated);
                         self.ensure_anim_or_redraw(cx);
                     }
                     GrabTarget::RightReel => {
-                        self.reel_vel = 0.0;
+                        self.scrub_active = true;
+                        self.scrub_coasting = false;
+                        self.scrub_rate = 0.0;
+                        self.last_reel_move_at = Some(Instant::now());
                         self.last_angle = (wp.y - RIGHT_REEL_POS.1).atan2(wp.x - RIGHT_REEL_POS.0);
+                        self.emit_scrub_rate(0.0, true);
+                        cx.widget_action(self.uid, DeckAction::StateUpdated);
                         self.ensure_anim_or_redraw(cx);
                     }
                     GrabTarget::Key(idx) => {
@@ -3020,11 +3202,8 @@ impl Widget for DeckViewport {
 
                 match self.grab {
                     GrabTarget::LeftReel | GrabTarget::RightReel => {
-                        let center = if matches!(self.grab, GrabTarget::LeftReel) {
-                            LEFT_REEL_POS
-                        } else {
-                            RIGHT_REEL_POS
-                        };
+                        let is_left = matches!(self.grab, GrabTarget::LeftReel);
+                        let center = if is_left { LEFT_REEL_POS } else { RIGHT_REEL_POS };
                         let wp = unproject_to_plane_z(self.camera_eye(), self.camera_target(), 36.0, aspect, rect, fe.abs, REEL_Z);
                         let ang = (wp.y - center.1).atan2(wp.x - center.0);
                         let mut d_ang = ang - self.last_angle;
@@ -3032,17 +3211,18 @@ impl Widget for DeckViewport {
                         while d_ang < -std::f32::consts::PI { d_ang += std::f32::consts::TAU; }
                         self.last_angle = ang;
 
-                        self.left_angle += d_ang;
-                        self.right_angle += d_ang;
-                        let inst_vel = (d_ang / dt).clamp(-22.0, 22.0);
-                        self.reel_vel = self.reel_vel * 0.45 + inst_vel * 0.55;
-
-                        let ms_per_rad = 1400.0;
-                        self.pos_ms = (self.pos_ms - d_ang as f64 * ms_per_rad).clamp(0.0, self.dur_ms);
-                        self.tape_phase = (self.tape_phase - d_ang * 0.35).rem_euclid(1.0);
-                        self.emit_seek_now(false);
+                        let omega = (d_ang / dt).clamp(-30.0, 30.0);
+                        let (r_left, r_right) = self.reel_radii();
+                        let r_grab = if is_left { r_left } else { r_right };
+                        // Clockwise (d_ang < 0) = forward (+rate); counter-clockwise = reverse (-rate)
+                        let inst_rate = ((-omega * r_grab) / 1.45).clamp(-4.0, 4.0);
+                        self.scrub_rate = (self.scrub_rate * 0.35 + inst_rate * 0.65).clamp(-4.0, 4.0);
+                        if self.scrub_rate.abs() < 0.05 {
+                            self.scrub_rate = 0.0;
+                        }
+                        self.last_reel_move_at = Some(Instant::now());
+                        self.emit_scrub_rate(self.scrub_rate, false);
                         cx.widget_action(self.uid, DeckAction::StateUpdated);
-                        self.redraw_throttled(cx);
                     }
                     GrabTarget::Cassette => {
                         let dy = (self.grab_start_abs.y - fe.abs.y) as f32;
@@ -3096,10 +3276,20 @@ impl Widget for DeckViewport {
             Hit::FingerUp(fe) => {
                 match self.grab {
                     GrabTarget::LeftReel | GrabTarget::RightReel => {
-                        if self.reel_vel.abs() < 0.8 {
-                            self.reel_vel = 0.0;
-                            self.emit_seek_now(true);
+                        let stale_hold = self
+                            .last_reel_move_at
+                            .map(|t| t.elapsed() > Duration::from_millis(120))
+                            .unwrap_or(true);
+                        if stale_hold {
+                            self.scrub_rate = 0.0;
                         }
+                        if self.scrub_rate.abs() < 0.35 {
+                            self.finish_scrub();
+                        } else {
+                            self.scrub_coasting = true;
+                            self.emit_scrub_rate(self.scrub_rate, false);
+                        }
+                        cx.widget_action(self.uid, DeckAction::StateUpdated);
                         self.ensure_anim_or_redraw(cx);
                     }
                     GrabTarget::TapeHead => {
@@ -3211,6 +3401,10 @@ impl LgtmDeck {
         if self.view.button(cx, ids!(toggle_board)).clicked(actions)
             || self.view.button(cx, ids!(toggle_deck)).clicked(actions)
         {
+            let vp = self.view.widget(cx, ids!(viewport));
+            if let Some(mut deck) = vp.borrow_mut::<DeckViewport>() {
+                deck.end_scrub_if_active();
+            }
             let _ = send_lgtm_cmd("view_flip", "{\"from\":\"deck\",\"to\":\"board\"}");
             send_front_surface("lgtm");
         }
