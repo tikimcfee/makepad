@@ -53,6 +53,12 @@ fn current(name: &str, seen: u64) -> Option<(u64, Vec<f32>, bool)> {
     STREAMS.with(|s| s.borrow().get(name).filter(|(v, _, _)| *v != seen).cloned())
 }
 
+/// A stream's version and values if it changed since `seen` (native widgets that read a stream
+/// themselves, such as the lgtm deck's position).
+pub fn latest(name: &str, seen: u64) -> Option<(u64, Vec<f32>)> {
+    current(name, seen).map(|(v, values, _)| (v, values))
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
 
