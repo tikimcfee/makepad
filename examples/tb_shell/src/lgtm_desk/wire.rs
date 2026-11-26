@@ -156,10 +156,14 @@ pub struct DeskState {
     pub out_presence_db: f32,
     pub out_rev: u64,
 
-    // Voices & scratch voice
+    // Voices, scratch voice & Day-2 singer (`lgtm.singers`, `lgtm.singer`)
     pub voice_id: String,
     pub scratch_voice_id: String,
     pub voices: Vec<VoiceInfo>,
+    pub singers: Vec<String>,
+    pub singer_id: String,    // "" == none (scratch)
+    pub singer_state: String, // "off" | "loading" | "ready" | "singing" | "error"
+    pub singer_why: String,
 
     // Bands & mix
     pub bands: Vec<BandInfo>,
@@ -240,6 +244,10 @@ impl Default for DeskState {
             out_rev: 0,
             voice_id: "kokoro".to_string(),
             scratch_voice_id: "kokoro".to_string(),
+            singers: Vec::new(),
+            singer_id: String::new(),
+            singer_state: "off".to_string(),
+            singer_why: String::new(),
             voices: vec![VoiceInfo {
                 id: "kokoro".to_string(),
                 name: "Kokoro".to_string(),
@@ -1517,6 +1525,49 @@ pub fn apply_store_root(st: &mut DeskState, root: &JVal) {
         }
         if let Some(sv_id) = lg.get("scratch_voice").and_then(|v| v.as_str()) {
             st.scratch_voice_id = sv_id.to_string();
+        }
+        if let Some(s_arr) = lg.get("singers").and_then(|v| v.as_arr()) {
+            let mut list = Vec::with_capacity(s_arr.len());
+            for item in s_arr {
+                if let Some(s) = item.as_str() {
+                    if !s.is_empty() {
+                        list.push(s.to_string());
+                    }
+                } else if let Some(s) = item.get("id").and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        list.push(s.to_string());
+                    }
+                }
+            }
+            st.singers = list;
+        }
+        if let Some(sg) = lg.get("singer") {
+            if sg.is_null() {
+                st.singer_id.clear();
+                st.singer_state = "off".to_string();
+                st.singer_why.clear();
+            } else if let Some(s) = sg.as_str() {
+                st.singer_id = s.to_string();
+                st.singer_why.clear();
+            } else {
+                match sg.get("id") {
+                    Some(v) if v.is_null() => st.singer_id.clear(),
+                    Some(v) => {
+                        st.singer_id = v.as_str().unwrap_or("").to_string();
+                    }
+                    None => st.singer_id.clear(),
+                }
+                if let Some(sst) = sg.get("state").and_then(|v| v.as_str()) {
+                    st.singer_state = sst.to_string();
+                } else if st.singer_id.is_empty() {
+                    st.singer_state = "off".to_string();
+                }
+                match sg.get("why") {
+                    Some(v) if v.is_null() => st.singer_why.clear(),
+                    Some(v) => st.singer_why = v.as_str().unwrap_or("").to_string(),
+                    None => st.singer_why.clear(),
+                }
+            }
         }
         if let Some(voices_arr) = lg.get("voices").and_then(|v| v.as_arr()) {
             let mut parsed = Vec::new();

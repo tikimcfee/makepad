@@ -64,6 +64,42 @@ impl VoiceModule {
         ((n + 1) / 2).max(1)
     }
 
+    fn singer_choices(&self, st: &DeskState) -> Vec<Option<String>> {
+        // First choice is always None ("none" -> scratch, sends {"id":null}).
+        // Prefer canonical singer order (yingmusic, soulx, acestep, vevo2) filtered from lgtm.singers,
+        // skipping `voice-*` speech wrappers which live in the SCRATCH selector beside it.
+        const PREFERRED: [&str; 4] = ["yingmusic", "soulx", "acestep", "vevo2"];
+        let mut out: Vec<Option<String>> = vec![None];
+        let raw: Vec<&str> = st
+            .singers
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty() && !s.starts_with("voice-"))
+            .collect();
+        if raw.is_empty() {
+            for &id in &PREFERRED {
+                out.push(Some(id.to_string()));
+            }
+        } else {
+            for &pref in &PREFERRED {
+                if raw.contains(&pref) {
+                    out.push(Some(pref.to_string()));
+                }
+            }
+            for &s in &raw {
+                if !PREFERRED.contains(&s) && !out.iter().any(|x| x.as_deref() == Some(s)) {
+                    out.push(Some(s.to_string()));
+                }
+            }
+        }
+        if !st.singer_id.is_empty()
+            && !out.iter().any(|x| x.as_deref() == Some(st.singer_id.as_str()))
+        {
+            out.push(Some(st.singer_id.clone()));
+        }
+        out
+    }
+
     fn bank_label(&self, st: &DeskState) -> String {
         let n = st.active_voice().map(|v| v.params.len()).unwrap_or(0);
         if n <= 2 {
@@ -188,28 +224,62 @@ impl DeskModule for VoiceModule {
 
     fn draw(&self, p: &mut PanelDraw, st: &DeskState) {
         let r = RECT_VOICE;
-        let v_state = st.active_voice().map(|v| v.state.as_str()).unwrap_or("ready");
-        p.module_frame(r, "VOICE", v_state, vec4(0.24, 0.80, 0.98, 1.0));
+        let hdr_status: String = if !st.singer_why.is_empty()
+            && matches!(st.singer_state.as_str(), "error" | "refused" | "failed")
+        {
+            format!("! {}", st.singer_why)
+        } else if !st.singer_id.is_empty() {
+            if st.singer_state.is_empty() || st.singer_state == "off" {
+                "ready".to_string()
+            } else {
+                st.singer_state.clone()
+            }
+        } else if !st.singer_state.is_empty() && st.singer_state != "off" {
+            st.singer_state.clone()
+        } else {
+            "scratch".to_string()
+        };
+        let hdr_accent = match st.singer_state.as_str() {
+            "error" | "refused" | "failed" => vec4(0.96, 0.34, 0.36, 1.0),
+            "singing" | "loading" => vec4(0.76, 0.48, 0.98, 1.0),
+            _ => vec4(0.24, 0.80, 0.98, 1.0),
+        };
+        p.module_frame(r, "VOICE", &hdr_status, hdr_accent);
 
-        // Stepped SINGER & SCRATCH selectors + BANK pill
+        // Stepped SINGER selector (`lgtm.singers` / `lgtm.singer`: none, yingmusic, soulx, acestep, vevo2)
+        let choices = self.singer_choices(st);
+        let cur_opt = if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) };
+        let s_idx = choices.iter().position(|c| c.as_deref() == cur_opt).unwrap_or(0);
+        let s_name = cur_opt.unwrap_or("none");
+        let s_active = !st.singer_id.is_empty();
+        let s_accent = match st.singer_state.as_str() {
+            "error" | "refused" | "failed" => vec4(0.96, 0.34, 0.36, 1.0),
+            "singing" | "loading" => vec4(0.80, 0.52, 1.0, 1.0),
+            _ if s_active => vec4(0.24, 0.92, 0.66, 1.0),
+            _ => vec4(0.24, 0.82, 0.98, 1.0),
+        };
+        p.selector(
+            self.singer_rect(),
+            "SINGER",
+            s_name,
+            s_idx,
+            choices.len().max(1),
+            s_active,
+            s_accent,
+        );
+
+        // Stepped SCRATCH selector (`lgtm.voices` / `lgtm.voice`) + BANK pill for its 2 param knobs
         let v_idx = st.voices.iter().position(|v| v.id == st.voice_id).unwrap_or(0);
         let v_name = st.active_voice().map(|v| v.id.as_str()).unwrap_or(&st.voice_id);
-        p.selector(self.singer_rect(), "SINGER", v_name, v_idx, st.voices.len().max(1), false, vec4(0.24, 0.82, 0.98, 1.0));
-
-        let speech_voices: Vec<&str> = st
-            .voices
-            .iter()
-            .filter(|v| v.kind == "speech")
-            .map(|v| v.id.as_str())
-            .collect();
-        let sc_list: Vec<&str> = if speech_voices.is_empty() {
-            st.voices.iter().map(|v| v.id.as_str()).collect()
-        } else {
-            speech_voices
-        };
-        let sc_idx = sc_list.iter().position(|id| *id == st.scratch_voice_id).unwrap_or(0);
-        let sc_name = sc_list.get(sc_idx).copied().unwrap_or("kokoro");
-        p.selector(self.scratch_rect(), "SCRATCH", sc_name, sc_idx, sc_list.len().max(1), false, vec4(0.96, 0.68, 0.24, 1.0));
+        p.selector(
+            self.scratch_rect(),
+            "SCRATCH",
+            v_name,
+            v_idx,
+            st.voices.len().max(1),
+            false,
+            vec4(0.96, 0.68, 0.24, 1.0),
+        );
 
         let bank_txt = self.bank_label(st);
         p.pill(self.bank_rect(), vec4(0.16, 0.22, 0.32, 1.0), vec4(0.86, 0.94, 1.0, 1.0), &bank_txt);
@@ -236,15 +306,15 @@ impl DeskModule for VoiceModule {
     }
 
     fn hit_control(&self, px: f32, py: f32, _st: &DeskState) -> Option<ControlHit> {
-        // Controls are ~12-16 u (< 40 px at whole desk) -> automatically zoom into VOICE when tapped zoomed out!
+        // Controls are ~15.5 u (< 40 px at whole desk -> auto-zoom into VOICE; >= 45 px once zoomed in!)
         if self.singer_rect().contains(px, py) {
-            return Some(ControlHit::new(CTRL_SINGER, 14.0));
+            return Some(ControlHit::new(CTRL_SINGER, 15.5));
         }
         if self.scratch_rect().contains(px, py) {
-            return Some(ControlHit::new(CTRL_SCRATCH, 14.0));
+            return Some(ControlHit::new(CTRL_SCRATCH, 15.5));
         }
         if self.bank_rect().contains(px, py) {
-            return Some(ControlHit::new(CTRL_BANK, 14.0));
+            return Some(ControlHit::new(CTRL_BANK, 15.5));
         }
         for slot in 0..2 {
             let (cx, cy, kr) = self.knob_geom(slot);
@@ -258,21 +328,24 @@ impl DeskModule for VoiceModule {
     fn on_touch(&mut self, ev: ModuleTouch, st: &DeskState, cmds: &mut DeskCmds) {
         match ev.control_id {
             CTRL_SINGER => {
+                if ev.kind == TouchKind::Up {
+                    let choices = self.singer_choices(st);
+                    let cur_opt = if st.singer_id.is_empty() { None } else { Some(st.singer_id.as_str()) };
+                    let cur = choices.iter().position(|c| c.as_deref() == cur_opt).unwrap_or(0);
+                    let next = &choices[(cur + 1) % choices.len().max(1)];
+                    match next {
+                        None => cmds.cmd_pending("singer", "{\"id\":null}", "singer"),
+                        Some(id) => cmds.cmd_pending("singer", &format!("{{\"id\":\"{}\"}}", json_escape(id)), "singer"),
+                    }
+                }
+            }
+            CTRL_SCRATCH => {
                 if ev.kind == TouchKind::Up && !st.voices.is_empty() {
                     let cur = st.voices.iter().position(|v| v.id == st.voice_id).unwrap_or(0);
                     let next = (cur + 1) % st.voices.len();
                     let vid = &st.voices[next].id;
                     self.param_bank = 0;
                     cmds.cmd_pending("voice", &format!("{{\"id\":\"{}\"}}", json_escape(vid)), "voice");
-                }
-            }
-            CTRL_SCRATCH => {
-                if ev.kind == TouchKind::Up && !st.voices.is_empty() {
-                    let speech: Vec<&str> = st.voices.iter().filter(|v| v.kind == "speech").map(|v| v.id.as_str()).collect();
-                    let list: Vec<&str> = if speech.is_empty() { st.voices.iter().map(|v| v.id.as_str()).collect() } else { speech };
-                    let cur = list.iter().position(|id| *id == st.scratch_voice_id).unwrap_or(0);
-                    let next = list[(cur + 1) % list.len()];
-                    cmds.cmd("scratch_voice", &format!("{{\"id\":\"{}\"}}", json_escape(next)));
                 }
             }
             CTRL_BANK => {
